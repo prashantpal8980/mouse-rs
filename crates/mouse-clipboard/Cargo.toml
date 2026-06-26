@@ -1,0 +1,17 @@
+[package]
+name = "mouse-clipboard"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Clipboard sync for mouse-rs"
+
+[dependencies]
+mouse-core = { path = "../mouse-core" }
+tracing.workspace = true
+# Only the lock-free sender: the sync thread pushes clipboard messages straight to
+# the link with no runtime.
+tokio = { version = "1.40", default-features = false, features = ["sync"] }
+# Cross-platform clipboard (X11 on Linux, Win32 on Windows). default-features=false
+# drops the image-data (image crate) and wayland features — text-only for now.
+arboard = { version = "3", default-features = false }

@@ -1,0 +1,51 @@
+[workspace]
+resolver = "2"
+members = ["crates/mouse-core", "crates/mouse-input", "crates/mouse-engine", "crates/mouse-clipboard", "crates/mouse"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/yourname/mouse-rs"
+authors = ["mouse-rs contributors"]
+
+[workspace.dependencies]
+# async runtime
+tokio = { version = "1.40", features = ["rt-multi-thread", "net", "time", "sync", "io-util", "macros", "signal"] }
+tokio-util = { version = "0.7", features = ["codec", "rt"] }
+futures = "0.3"
+bytes = "1.7"
+socket2 = "0.5"
+
+# serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# tls + crypto — pin to `ring` (cross-compiles to windows-gnu cleanly; the
+# default aws-lc-rs needs a C toolchain and fights cross-compilation).
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+rustls-pemfile = "2"
+rcgen = "0.13"
+hmac = "0.12"
+sha2 = "0.10"
+rand = "0.8"
+
+# platform input
+x11rb = { version = "0.13", features = ["xtest", "xfixes", "xkb"] }
+libc = "0.2"
+
+# errors + logging
+thiserror = "1"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# release profile: optimize hard for production
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true

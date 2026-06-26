@@ -1,0 +1,17 @@
+[package]
+name = "mouse-engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Edge-crossing engine: binds the async network link to OS input capture/injection"
+
+[dependencies]
+mouse-core = { path = "../mouse-core" }
+mouse-input = { path = "../mouse-input" }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "rt", "macros", "time", "sync"] }

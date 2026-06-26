@@ -1,0 +1,22 @@
+[package]
+name = "mouse"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "mouse-rs: a fast, Barrier-like KVM software switch"
+
+[[bin]]
+name = "mouse-rs"
+path = "src/main.rs"
+
+[dependencies]
+mouse-core = { path = "../mouse-core" }
+mouse-input = { path = "../mouse-input" }
+mouse-engine = { path = "../mouse-engine" }
+mouse-clipboard = { path = "../mouse-clipboard" }
+tokio.workspace = true
+tokio-util.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

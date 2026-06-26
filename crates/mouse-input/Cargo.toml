@@ -1,0 +1,32 @@
+[package]
+name = "mouse-input"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "OS input capture/injection for mouse-rs, behind an OS-neutral trait"
+
+[dependencies]
+mouse-core = { path = "../mouse-core" }
+thiserror.workspace = true
+tracing.workspace = true
+# Only the lock-free channel: the capture thread pushes CaptureSignals straight to
+# the async engine with no spawn_blocking bridge. `sync` needs no runtime and is
+# safe to call from a plain native thread.
+tokio = { version = "1.40", default-features = false, features = ["sync"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+x11rb.workspace = true
+libc.workspace = true
+
+[target.'cfg(target_os = "windows")'.dependencies]
+# windows-sys: thin FFI bindings (no codegen overhead, cross-compiles to
+# windows-gnu cleanly, small binary). Only the modules we touch are enabled.
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_HiDpi",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Threading",
+] }
