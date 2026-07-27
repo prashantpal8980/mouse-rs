@@ -1,0 +1,556 @@
+<title>mouse-rs — UI redesign prototype</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700;12..96,800&family=JetBrains+Mono:wght@400;500;700&display=swap');
+
+  /* ============ THEME TOKENS ============ */
+  .app {
+    --bg:      #0a0e1a;
+    --bg2:     #111726;
+    --bg3:     #0e1420;
+    --inset:   #0b111d;
+    --line:    #1f2839;
+    --line2:   #2a3550;
+    --txt:     #eef2fb;
+    --txt2:    #9aa7c2;
+    --txt3:    #5f6d8a;
+    --accent:  #38d6e6;
+    --accent2: #6a7bff;
+    --accent-ink: #04121a;
+    --good:    #37e0a0;
+    --warn:    #ffcf5c;
+    --danger:  #ff6b7a;
+    --glow:    0 0 0 1px rgba(56,214,230,.35), 0 0 32px -6px rgba(56,214,230,.55);
+  }
+  .app[data-theme="oxide"] {
+    --bg:#100b08; --bg2:#1b130d; --bg3:#150e09; --inset:#120c07; --line:#2c1f15; --line2:#3d2c1d;
+    --txt:#f6ede3; --txt2:#c2ab97; --txt3:#836a55; --accent:#ff7a3d; --accent2:#ffb23d; --accent-ink:#1a0d04;
+    --good:#8bd450; --warn:#ffc94d; --danger:#ff5c5c;
+    --glow:0 0 0 1px rgba(255,122,61,.4), 0 0 34px -6px rgba(255,122,61,.55);
+  }
+  .app[data-theme="synth"] {
+    --bg:#100320; --bg2:#1c0b33; --bg3:#160828; --inset:#12061f; --line:#331452; --line2:#4a1d75;
+    --txt:#fbe9ff; --txt2:#c39cd8; --txt3:#805a9c; --accent:#ff4fa3; --accent2:#31d0ff; --accent-ink:#1a0416;
+    --good:#5cffc4; --warn:#ffd24f; --danger:#ff5c8a;
+    --glow:0 0 0 1px rgba(255,79,163,.45), 0 0 40px -4px rgba(255,79,163,.6);
+  }
+  .app[data-theme="matrix"] {
+    --bg:#030a06; --bg2:#07160e; --bg3:#050f09; --inset:#040d07; --line:#0e2b1a; --line2:#164026;
+    --txt:#d6ffe6; --txt2:#5fbf88; --txt3:#357a52; --accent:#39ff88; --accent2:#7dffb0; --accent-ink:#022012;
+    --good:#39ff88; --warn:#d8ff5c; --danger:#ff6b5c;
+    --glow:0 0 0 1px rgba(57,255,136,.4), 0 0 34px -6px rgba(57,255,136,.5);
+  }
+  .app[data-theme="nord"] {
+    --bg:#242a35; --bg2:#2e3440; --bg3:#2a303c; --inset:#272d38; --line:#3b4252; --line2:#4c566a;
+    --txt:#eceff4; --txt2:#a9b3c7; --txt3:#6b7488; --accent:#88c0d0; --accent2:#a3be8c; --accent-ink:#132029;
+    --good:#a3be8c; --warn:#ebcb8b; --danger:#bf616a;
+    --glow:0 0 0 1px rgba(136,192,208,.4), 0 0 30px -8px rgba(136,192,208,.5);
+  }
+  .app[data-theme="paper"] {
+    --bg:#eceae4; --bg2:#faf9f6; --bg3:#f2f0ea; --inset:#e7e4dc; --line:#dcd8ce; --line2:#c9c4b8;
+    --txt:#1d1c19; --txt2:#5c584f; --txt3:#918b7e; --accent:#5b52e0; --accent2:#e0527a; --accent-ink:#ffffff;
+    --good:#1f9d5b; --warn:#c68a12; --danger:#d13c4b;
+    --glow:0 0 0 1px rgba(91,82,224,.35), 0 0 30px -10px rgba(91,82,224,.4);
+  }
+
+  /* ============ BASE ============ */
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; }
+  body {
+    background:
+      radial-gradient(1200px 600px at 20% -10%, #1b2233 0%, transparent 60%),
+      radial-gradient(1000px 500px at 100% 110%, #14101f 0%, transparent 55%),
+      #06090f;
+    min-height: 100%;
+    display: grid; place-items: center;
+    padding: 34px 18px;
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+    color: #fff;
+  }
+  .display { font-family: "Bricolage Grotesque", system-ui, sans-serif; }
+  .mono { font-family: "JetBrains Mono", ui-monospace, monospace; }
+
+  /* ============ WINDOW ============ */
+  .app {
+    width: 100%; max-width: 940px;
+    background: var(--bg);
+    color: var(--txt);
+    border: 1px solid var(--line);
+    border-radius: 18px;
+    overflow: hidden;
+    box-shadow: 0 40px 120px -30px rgba(0,0,0,.75), 0 0 0 1px rgba(255,255,255,.02) inset;
+    display: grid;
+    grid-template-columns: 220px 1fr;
+    grid-template-rows: 48px 1fr 64px;
+    grid-template-areas: "title title" "nav main" "nav foot";
+    min-height: 640px;
+  }
+
+  /* titlebar */
+  .titlebar {
+    grid-area: title; display: flex; align-items: center; gap: 14px;
+    padding: 0 16px; border-bottom: 1px solid var(--line);
+    background: linear-gradient(var(--bg2), var(--bg));
+  }
+  .lights { display: flex; gap: 7px; }
+  .lights i { width: 12px; height: 12px; border-radius: 50%; display: block; }
+  .lights i:nth-child(1){ background:#ff5f57; }
+  .lights i:nth-child(2){ background:#febc2e; }
+  .lights i:nth-child(3){ background:#28c840; }
+  .wordmark { font-weight: 800; letter-spacing: -.02em; font-size: 15px; }
+  .wordmark b { color: var(--accent); }
+  .titlebar .spacer { flex: 1; }
+  .swatches { display: flex; gap: 7px; align-items: center; }
+  .swatches .lbl { font-size: 10px; letter-spacing: .12em; text-transform: uppercase; color: var(--txt3); margin-right: 2px; }
+  .sw {
+    width: 20px; height: 20px; border-radius: 6px; cursor: pointer; border: 1px solid rgba(255,255,255,.15);
+    padding: 0; position: relative; transition: transform .15s ease;
+  }
+  .sw:hover { transform: translateY(-2px) scale(1.08); }
+  .sw[aria-pressed="true"]{ box-shadow: 0 0 0 2px var(--bg), 0 0 0 3.5px currentColor; }
+  .sw.midnight{ background:linear-gradient(135deg,#38d6e6,#6a7bff); color:#38d6e6; }
+  .sw.oxide{ background:linear-gradient(135deg,#ff7a3d,#ffb23d); color:#ff7a3d; }
+  .sw.synth{ background:linear-gradient(135deg,#ff4fa3,#31d0ff); color:#ff4fa3; }
+  .sw.matrix{ background:linear-gradient(135deg,#39ff88,#0a3d22); color:#39ff88; }
+  .sw.nord{ background:linear-gradient(135deg,#88c0d0,#a3be8c); color:#88c0d0; }
+  .sw.paper{ background:linear-gradient(135deg,#faf9f6,#c9c4b8); color:#5b52e0; }
+
+  /* nav rail */
+  .nav {
+    grid-area: nav; background: var(--bg3); border-right: 1px solid var(--line);
+    padding: 16px 12px; display: flex; flex-direction: column; gap: 4px;
+  }
+  .nav .cap { font-size: 10px; letter-spacing: .14em; text-transform: uppercase; color: var(--txt3); padding: 6px 12px 8px; }
+  .navbtn {
+    display: flex; align-items: center; gap: 12px; width: 100%;
+    background: none; border: 0; cursor: pointer; text-align: left;
+    color: var(--txt2); font-size: 14px; font-weight: 500;
+    padding: 10px 12px; border-radius: 10px; font-family: inherit;
+    transition: background .15s, color .15s;
+  }
+  .navbtn svg { width: 18px; height: 18px; flex-shrink: 0; opacity: .85; }
+  .navbtn:hover { background: color-mix(in srgb, var(--accent) 8%, transparent); color: var(--txt); }
+  .navbtn[aria-selected="true"] {
+    background: color-mix(in srgb, var(--accent) 16%, transparent);
+    color: var(--txt);
+  }
+  .navbtn[aria-selected="true"] svg { opacity: 1; color: var(--accent); }
+  .nav .grow { flex: 1; }
+  .peercard {
+    background: var(--bg2); border: 1px solid var(--line); border-radius: 12px;
+    padding: 12px; font-size: 12px;
+  }
+  .peercard .row { display: flex; align-items: center; gap: 8px; }
+  .peercard .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--good); box-shadow: 0 0 10px var(--good); animation: breathe 2.4s ease-in-out infinite; }
+  .peercard .who { font-weight: 600; }
+  .peercard .sub { color: var(--txt3); margin-top: 6px; }
+  @keyframes breathe { 0%,100%{ opacity: 1 } 50%{ opacity: .35 } }
+
+  /* main */
+  .main { grid-area: main; overflow-y: auto; padding: 22px 26px 8px; }
+
+  /* status hero */
+  .hero {
+    position: relative; border: 1px solid var(--line); border-radius: 16px;
+    background:
+      radial-gradient(600px 200px at 50% -40%, color-mix(in srgb, var(--accent) 18%, transparent), transparent 70%),
+      var(--bg2);
+    padding: 22px; margin-bottom: 24px; overflow: hidden;
+  }
+  .hero .badge {
+    display: inline-flex; align-items: center; gap: 7px; font-size: 11px; font-weight: 700;
+    letter-spacing: .08em; text-transform: uppercase; color: var(--good);
+    background: color-mix(in srgb, var(--good) 14%, transparent);
+    padding: 4px 10px; border-radius: 999px; margin-bottom: 16px;
+  }
+  .hero.off .badge { color: var(--txt3); background: color-mix(in srgb, var(--txt3) 16%, transparent); }
+  .hero .badge .d { width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+  .link {
+    display: grid; grid-template-columns: 1fr auto 1fr; align-items: center; gap: 12px;
+  }
+  .machine { text-align: center; }
+  .screen {
+    height: 92px; border-radius: 12px; border: 1.5px solid var(--line2);
+    background: linear-gradient(160deg, var(--bg3), var(--inset));
+    position: relative; display: grid; place-items: center; overflow: hidden;
+    transition: border-color .3s, box-shadow .3s;
+  }
+  .machine.active .screen { border-color: var(--accent); box-shadow: var(--glow); }
+  .screen .os { font-size: 11px; letter-spacing: .1em; text-transform: uppercase; color: var(--txt3); }
+  .machine .name { margin-top: 9px; font-weight: 700; font-size: 14px; }
+  .machine .res { font-size: 11px; color: var(--txt3); }
+  .cursor { position: absolute; width: 14px; height: 14px; color: var(--accent);
+    filter: drop-shadow(0 0 6px var(--accent)); }
+  /* the wire */
+  .wire { width: 120px; height: 40px; position: relative; }
+  .wire svg { width: 100%; height: 100%; overflow: visible; }
+  .wire .track { stroke: var(--line2); stroke-width: 2; fill: none; }
+  .wire .flow { stroke: var(--accent); stroke-width: 2.5; fill: none;
+    stroke-dasharray: 5 9; stroke-linecap: round; animation: dash 1s linear infinite; }
+  .hero.off .wire .flow { display: none; }
+  @keyframes dash { to { stroke-dashoffset: -28; } }
+  .wire .bead { fill: var(--accent); filter: drop-shadow(0 0 5px var(--accent)); }
+  .hero.off .wire .bead { display: none; }
+  .hero.off .machine.active .screen { border-color: var(--line2); box-shadow: none; }
+
+  /* section cards */
+  .panel { display: none; animation: fade .25s ease; }
+  .panel.on { display: block; }
+  @keyframes fade { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+  .h2 { font-family: "Bricolage Grotesque", sans-serif; font-weight: 700; font-size: 19px; letter-spacing: -.01em; margin: 4px 0 2px; }
+  .sub { color: var(--txt2); font-size: 13px; margin: 0 0 18px; }
+
+  .field { margin-bottom: 16px; }
+  .field > label { display: block; font-size: 12.5px; font-weight: 600; color: var(--txt2); margin-bottom: 7px; }
+  .field .hint { font-size: 11.5px; color: var(--txt3); margin-top: 6px; }
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+
+  input[type="text"], input[type="password"], input[type="number"], select {
+    width: 100%; font: inherit; font-size: 14px; color: var(--txt);
+    background: var(--inset); border: 1px solid var(--line2); border-radius: 10px;
+    padding: 11px 13px; outline: none; transition: border-color .15s, box-shadow .15s;
+  }
+  input::placeholder { color: var(--txt3); }
+  input:focus, select:focus { border-color: var(--accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 22%, transparent); }
+  .mono-in { font-family: "JetBrains Mono", monospace; letter-spacing: .02em; }
+
+  .inpwrap { position: relative; display: flex; gap: 8px; }
+  .inpwrap input { flex: 1; }
+  .btn {
+    font: inherit; font-weight: 600; font-size: 13px; cursor: pointer;
+    border-radius: 10px; padding: 10px 15px; border: 1px solid var(--line2);
+    background: var(--bg3); color: var(--txt); transition: .15s;
+    white-space: nowrap;
+  }
+  .btn:hover { border-color: var(--accent); color: var(--accent); }
+  .btn.ghost { background: transparent; }
+
+  /* segmented control */
+  .seg { display: inline-flex; background: var(--inset); border: 1px solid var(--line2); border-radius: 11px; padding: 4px; gap: 4px; }
+  .seg button {
+    font: inherit; font-size: 13px; font-weight: 600; cursor: pointer; border: 0; border-radius: 8px;
+    padding: 9px 18px; background: transparent; color: var(--txt2); transition: .18s;
+  }
+  .seg button[aria-pressed="true"] {
+    background: linear-gradient(135deg, var(--accent), var(--accent2));
+    color: var(--accent-ink); box-shadow: 0 6px 18px -8px var(--accent);
+  }
+
+  /* toggle switch */
+  .toggle-row { display: flex; align-items: center; justify-content: space-between; gap: 16px;
+    padding: 13px 15px; background: var(--bg2); border: 1px solid var(--line); border-radius: 12px; margin-bottom: 10px; }
+  .toggle-row .t { font-size: 13.5px; font-weight: 600; }
+  .toggle-row .d { font-size: 11.5px; color: var(--txt3); margin-top: 2px; }
+  .switch { position: relative; width: 44px; height: 26px; flex-shrink: 0; cursor: pointer; }
+  .switch input { position: absolute; opacity: 0; width: 100%; height: 100%; margin: 0; cursor: pointer; }
+  .switch .track { position: absolute; inset: 0; border-radius: 999px; background: var(--line2); transition: .2s; }
+  .switch .knob { position: absolute; top: 3px; left: 3px; width: 20px; height: 20px; border-radius: 50%;
+    background: #fff; transition: .22s cubic-bezier(.3,.8,.4,1.4); box-shadow: 0 2px 5px rgba(0,0,0,.35); }
+  .switch input:checked + .track { background: linear-gradient(135deg, var(--accent), var(--accent2)); }
+  .switch input:checked ~ .knob { transform: translateX(18px); }
+
+  /* edge selector */
+  .edgepick { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+  .edgebox { border: 1px solid var(--line); border-radius: 14px; padding: 16px; background: var(--bg2); }
+  .edgebox .cap { font-size: 12px; font-weight: 600; color: var(--txt2); margin-bottom: 12px; }
+  .stage { position: relative; height: 96px; border-radius: 10px; border: 1.5px dashed var(--line2); background: var(--inset); }
+  .stage .e { position: absolute; background: var(--line2); cursor: pointer; transition: .18s; border-radius: 6px; }
+  .stage .e:hover { background: color-mix(in srgb, var(--accent) 50%, var(--line2)); }
+  .stage .e.sel { background: linear-gradient(135deg, var(--accent), var(--accent2)); box-shadow: var(--glow); }
+  .stage .e.top{ top:6px; left:22%; right:22%; height:8px; }
+  .stage .e.bottom{ bottom:6px; left:22%; right:22%; height:8px; }
+  .stage .e.left{ left:6px; top:26%; bottom:26%; width:8px; }
+  .stage .e.right{ right:6px; top:26%; bottom:26%; width:8px; }
+  .stage .lab { position: absolute; inset: 0; display: grid; place-items: center; font-size: 11px; color: var(--txt3); pointer-events: none; }
+
+  /* clipboard history */
+  .clip { display: flex; gap: 11px; padding: 12px 14px; border: 1px solid var(--line); border-radius: 11px; background: var(--bg2); margin-bottom: 8px; }
+  .clip .arw { width: 26px; height: 26px; border-radius: 7px; display: grid; place-items: center; flex-shrink: 0; font-size: 13px; font-weight: 700; }
+  .clip.in .arw { background: color-mix(in srgb, var(--accent) 16%, transparent); color: var(--accent); }
+  .clip.out .arw { background: color-mix(in srgb, var(--good) 16%, transparent); color: var(--good); }
+  .clip .txt { font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .clip .meta { font-size: 10.5px; color: var(--txt3); margin-top: 2px; letter-spacing: .04em; }
+
+  /* footer */
+  .foot { grid-area: foot; border-top: 1px solid var(--line); background: linear-gradient(var(--bg), var(--bg2));
+    display: flex; align-items: center; gap: 14px; padding: 0 22px; }
+  .foot .status { display: flex; align-items: center; gap: 9px; font-size: 13px; font-weight: 600; }
+  .foot .status .d { width: 9px; height: 9px; border-radius: 50%; background: var(--good); box-shadow: 0 0 10px var(--good); }
+  .foot.off .status { color: var(--txt3); }
+  .foot.off .status .d { background: var(--txt3); box-shadow: none; }
+  .foot .spacer { flex: 1; }
+  .btn-primary {
+    font: inherit; font-weight: 700; font-size: 14px; cursor: pointer; border: 0; border-radius: 11px;
+    padding: 12px 26px; color: var(--accent-ink);
+    background: linear-gradient(135deg, var(--accent), var(--accent2));
+    box-shadow: 0 10px 26px -10px var(--accent); transition: .18s;
+  }
+  .btn-primary:hover { transform: translateY(-1px); filter: brightness(1.05); }
+  .btn-primary.stop { background: linear-gradient(135deg, var(--danger), #ff9a6b); box-shadow: 0 10px 26px -10px var(--danger); }
+
+  @media (prefers-reduced-motion: reduce) { * { animation: none !important; transition: none !important; } }
+  @media (max-width: 720px) {
+    .app { grid-template-columns: 1fr; grid-template-areas: "title" "main" "foot"; }
+    .nav { display: none; }
+    .grid2, .edgepick { grid-template-columns: 1fr; }
+  }
+</style>
+
+<div class="app" data-theme="midnight" id="app">
+  <!-- TITLEBAR -->
+  <div class="titlebar">
+    <div class="lights"><i></i><i></i><i></i></div>
+    <span class="wordmark display">mouse<b>-</b>rs</span>
+    <span class="spacer"></span>
+    <div class="swatches">
+      <span class="lbl mono">theme</span>
+      <button class="sw midnight" data-set="midnight" aria-pressed="true" title="Midnight"></button>
+      <button class="sw oxide"    data-set="oxide"    aria-pressed="false" title="Oxide"></button>
+      <button class="sw synth"    data-set="synth"    aria-pressed="false" title="Synthwave"></button>
+      <button class="sw matrix"   data-set="matrix"   aria-pressed="false" title="Matrix"></button>
+      <button class="sw nord"     data-set="nord"     aria-pressed="false" title="Nord"></button>
+      <button class="sw paper"    data-set="paper"    aria-pressed="false" title="Paper (light)"></button>
+    </div>
+  </div>
+
+  <!-- NAV -->
+  <nav class="nav">
+    <div class="cap mono">Control</div>
+    <button class="navbtn" data-tab="conn" aria-selected="true">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12h14M5 12l4-4M5 12l4 4M19 12l-4-4M19 12l-4 4"/></svg>
+      Connection
+    </button>
+    <button class="navbtn" data-tab="layout" aria-selected="false">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="4" width="8" height="16" rx="1.5"/><rect x="13" y="4" width="8" height="16" rx="1.5"/></svg>
+      Layout
+    </button>
+    <button class="navbtn" data-tab="sec" aria-selected="false">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3l7 3v5c0 4.4-3 7.6-7 9-4-1.4-7-4.6-7-9V6l7-3z"/></svg>
+      Security
+    </button>
+    <button class="navbtn" data-tab="clip" aria-selected="false">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="6" y="4" width="12" height="16" rx="2"/><path d="M9 4V3h6v1"/></svg>
+      Clipboard
+    </button>
+    <div class="grow"></div>
+    <div class="peercard">
+      <div class="row"><span class="dot"></span><span class="who">laptop</span></div>
+      <div class="sub mono">1440 × 900 · 13 ms · TLS</div>
+    </div>
+  </nav>
+
+  <!-- MAIN -->
+  <main class="main">
+    <!-- STATUS HERO -->
+    <div class="hero" id="hero">
+      <span class="badge"><span class="d"></span><span id="heroState">Connected · controlling laptop</span></span>
+      <div class="link">
+        <div class="machine active" id="mA">
+          <div class="screen">
+            <span class="os mono">KALI · X11</span>
+            <svg class="cursor" viewBox="0 0 24 24" fill="currentColor"><path d="M4 2l7 18 2.5-7L21 10z"/></svg>
+          </div>
+          <div class="name">kali-desktop</div>
+          <div class="res mono">server · 1920×1080</div>
+        </div>
+        <div class="wire">
+          <svg viewBox="0 0 120 40" preserveAspectRatio="none">
+            <path class="track" d="M4,20 C40,20 80,20 116,20"/>
+            <path class="flow"  d="M4,20 C40,20 80,20 116,20"/>
+            <circle class="bead" r="3.2"><animateMotion dur="1.6s" repeatCount="indefinite" path="M4,20 C40,20 80,20 116,20"/></circle>
+          </svg>
+        </div>
+        <div class="machine" id="mB">
+          <div class="screen"><span class="os mono">WINDOWS</span></div>
+          <div class="name">laptop</div>
+          <div class="res mono">client · 1440×900</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- CONNECTION -->
+    <section class="panel on" data-panel="conn">
+      <h2 class="h2">Connection</h2>
+      <p class="sub">Name this machine and choose whether it hosts the keyboard &amp; mouse or receives them.</p>
+
+      <div class="field">
+        <label>Machine name</label>
+        <input type="text" class="mono-in" value="kali-desktop">
+      </div>
+
+      <div class="field">
+        <label>Role</label><br>
+        <div class="seg" id="roleSeg">
+          <button data-role="server" aria-pressed="true">Server · has mouse</button>
+          <button data-role="client" aria-pressed="false">Client · receives</button>
+        </div>
+      </div>
+
+      <div class="grid2" id="clientGroup" style="display:none">
+        <div class="field"><label>Server host / IP</label><input type="text" class="mono-in" value="192.168.137.1"></div>
+        <div class="field"><label>Server port</label><input type="number" class="mono-in" value="24800"></div>
+      </div>
+      <div class="grid2" id="serverGroup">
+        <div class="field"><label>Listen host</label><input type="text" class="mono-in" value="0.0.0.0"></div>
+        <div class="field"><label>Listen port</label><input type="number" class="mono-in" value="24800"></div>
+      </div>
+
+      <div class="toggle-row">
+        <div><div class="t">Auto-reconnect</div><div class="d">Client keeps retrying with backoff until the server appears</div></div>
+        <label class="switch"><input type="checkbox" checked><span class="track"></span><span class="knob"></span></label>
+      </div>
+    </section>
+
+    <!-- LAYOUT -->
+    <section class="panel" data-panel="layout">
+      <h2 class="h2">Layout</h2>
+      <p class="sub">Click the edge on each screen that physically faces the other machine — that's where the cursor crosses.</p>
+
+      <div class="edgepick">
+        <div class="edgebox">
+          <div class="cap">Exit edge · this machine leaves here</div>
+          <div class="stage" data-stage="exit">
+            <span class="e top"></span><span class="e right sel"></span><span class="e bottom"></span><span class="e left"></span>
+            <span class="lab mono">kali-desktop</span>
+          </div>
+        </div>
+        <div class="edgebox">
+          <div class="cap">Entry edge · client appears here</div>
+          <div class="stage" data-stage="entry">
+            <span class="e top"></span><span class="e right"></span><span class="e bottom"></span><span class="e left sel"></span>
+            <span class="lab mono">laptop</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="grid2" style="margin-top:20px">
+        <div class="field">
+          <label>Screen size (px)</label>
+          <div class="inpwrap">
+            <input type="number" class="mono-in" value="1920">
+            <input type="number" class="mono-in" value="1080">
+            <button class="btn">Detect</button>
+          </div>
+        </div>
+        <div class="field">
+          <label>Edge threshold (px)</label>
+          <input type="number" class="mono-in" value="2">
+          <div class="hint">Distance from the edge that triggers a crossing.</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- SECURITY -->
+    <section class="panel" data-panel="sec">
+      <h2 class="h2">Sync &amp; Security</h2>
+      <p class="sub">Both machines must share the exact same secret. The link is encrypted end-to-end.</p>
+
+      <div class="field">
+        <label>Shared secret</label>
+        <div class="inpwrap">
+          <input type="password" id="secret" class="mono-in" value="9f3a-c71b-42de-88a0-fe12">
+          <button class="btn ghost" id="showSecret">Show</button>
+          <button class="btn">Generate</button>
+        </div>
+      </div>
+
+      <div class="toggle-row">
+        <div><div class="t">Encrypt link (TLS)</div><div class="d">rustls · self-signed cert pinned to the shared secret</div></div>
+        <label class="switch"><input type="checkbox" checked><span class="track"></span><span class="knob"></span></label>
+      </div>
+      <div class="toggle-row">
+        <div><div class="t">Sync clipboard</div><div class="d">Copy on one machine, paste on the other</div></div>
+        <label class="switch"><input type="checkbox" checked><span class="track"></span><span class="knob"></span></label>
+      </div>
+
+      <div class="grid2" style="margin-top:8px">
+        <div class="field">
+          <label>Return hotkey (server)</label>
+          <input type="text" class="mono-in" value="ctrl+win+alt+esc">
+          <div class="hint">Hand control back from the remote machine.</div>
+        </div>
+        <div class="field">
+          <label>Lock / cross hotkey</label>
+          <input type="text" class="mono-in" value="scroll_lock">
+          <div class="hint">In-process failsafe wedge.</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- CLIPBOARD -->
+    <section class="panel" data-panel="clip">
+      <h2 class="h2">Clipboard history</h2>
+      <p class="sub">The last 25 items synced between machines · newest first.</p>
+      <div class="clip in"><div class="arw">↓</div><div><div class="txt">https://github.com/rust-lang/rust/issues/12345</div><div class="meta mono">IN · from laptop · 12s ago</div></div></div>
+      <div class="clip out"><div class="arw">↑</div><div><div class="txt">cargo build --release --target x86_64-pc-windows-gnu</div><div class="meta mono">OUT · to laptop · 1m ago</div></div></div>
+      <div class="clip in"><div class="arw">↓</div><div><div class="txt">192.168.137.2</div><div class="meta mono">IN · from laptop · 4m ago</div></div></div>
+      <div class="clip out"><div class="arw">↑</div><div><div class="txt">The quick brown fox jumps over the lazy dog</div><div class="meta mono">OUT · to laptop · 9m ago</div></div></div>
+    </section>
+  </main>
+
+  <!-- FOOTER -->
+  <div class="foot" id="foot">
+    <div class="status"><span class="d"></span><span id="footState">Connected to laptop</span></div>
+    <span class="spacer"></span>
+    <button class="btn ghost">Save</button>
+    <button class="btn-primary stop" id="power">Stop</button>
+  </div>
+</div>
+
+<script>
+  const app = document.getElementById('app');
+
+  // theme switch
+  document.querySelectorAll('.sw').forEach(sw => sw.addEventListener('click', () => {
+    document.querySelectorAll('.sw').forEach(s => s.setAttribute('aria-pressed','false'));
+    sw.setAttribute('aria-pressed','true');
+    app.setAttribute('data-theme', sw.dataset.set);
+  }));
+
+  // nav tabs
+  document.querySelectorAll('.navbtn').forEach(b => b.addEventListener('click', () => {
+    document.querySelectorAll('.navbtn').forEach(x => x.setAttribute('aria-selected','false'));
+    b.setAttribute('aria-selected','true');
+    document.querySelectorAll('.panel').forEach(p => p.classList.remove('on'));
+    document.querySelector('.panel[data-panel="'+b.dataset.tab+'"]').classList.add('on');
+  }));
+
+  // role segmented
+  document.querySelectorAll('#roleSeg button').forEach(b => b.addEventListener('click', () => {
+    document.querySelectorAll('#roleSeg button').forEach(x => x.setAttribute('aria-pressed','false'));
+    b.setAttribute('aria-pressed','true');
+    const isServer = b.dataset.role === 'server';
+    document.getElementById('serverGroup').style.display = isServer ? '' : 'none';
+    document.getElementById('clientGroup').style.display = isServer ? 'none' : '';
+  }));
+
+  // edge selector
+  document.querySelectorAll('.stage').forEach(stage => {
+    stage.querySelectorAll('.e').forEach(e => e.addEventListener('click', () => {
+      stage.querySelectorAll('.e').forEach(x => x.classList.remove('sel'));
+      e.classList.add('sel');
+    }));
+  });
+
+  // show secret
+  const secret = document.getElementById('secret');
+  document.getElementById('showSecret').addEventListener('click', e => {
+    const show = secret.type === 'password';
+    secret.type = show ? 'text' : 'password';
+    e.target.textContent = show ? 'Hide' : 'Show';
+  });
+
+  // power toggle (Start/Stop) — flips the hero + footer state
+  let running = true;
+  document.getElementById('power').addEventListener('click', () => {
+    running = !running;
+    const hero = document.getElementById('hero'), foot = document.getElementById('foot');
+    const btn = document.getElementById('power');
+    hero.classList.toggle('off', !running);
+    foot.classList.toggle('off', !running);
+    document.getElementById('mA').classList.toggle('active', running);
+    btn.textContent = running ? 'Stop' : 'Start';
+    btn.classList.toggle('stop', running);
+    document.getElementById('heroState').textContent = running ? 'Connected · controlling laptop' : 'Stopped';
+    document.getElementById('footState').textContent = running ? 'Connected to laptop' : 'Idle — press Start';
+  });
+</script>

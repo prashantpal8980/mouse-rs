@@ -24,9 +24,13 @@ use std::time::Duration;
 
 use tokio::sync::mpsc::UnboundedSender;
 
-use windows_sys::Win32::Foundation::{LPARAM, LRESULT, POINT, WPARAM};
+use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Threading::GetCurrentThreadId;
+use windows_sys::Win32::UI::Input::{
+    GetRawInputData, RegisterRawInputDevices, HRAWINPUT, MOUSE_MOVE_ABSOLUTE, RAWINPUT,
+    RAWINPUTDEVICE, RAWINPUTHEADER, RIDEV_INPUTSINK, RID_INPUT, RIM_TYPEMOUSE,
+};
 use windows_sys::Win32::UI::HiDpi::{
     SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
@@ -38,26 +42,35 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL, MOUSEINPUT,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, DispatchMessageW, GetCursorPos, GetSystemMetrics, MsgWaitForMultipleObjectsEx,
-    PeekMessageW, PostThreadMessageW, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx,
-    HC_ACTION, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, LLKHF_UP, MSG, MSLLHOOKSTRUCT, MWMO_INPUTAVAILABLE,
-    PM_REMOVE, QS_ALLINPUT, SM_CXSCREEN, SM_CXVIRTUALSCREEN, SM_CYSCREEN, SM_CYVIRTUALSCREEN,
-    SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, WH_KEYBOARD_LL, WH_MOUSE_LL, WHEEL_DELTA, WM_LBUTTONDOWN,
-    WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL,
-    WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP,
+    CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetCursorPos,
+    GetSystemMetrics, MsgWaitForMultipleObjectsEx, PeekMessageW, PostThreadMessageW, RegisterClassW,
+    SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, UnregisterClassW, HC_ACTION,
+    HWND_MESSAGE, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, LLKHF_UP, MSG, MSLLHOOKSTRUCT,
+    MWMO_INPUTAVAILABLE, PM_REMOVE, QS_ALLINPUT, SM_CXSCREEN, SM_CXVIRTUALSCREEN, SM_CYSCREEN,
+    SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, WH_KEYBOARD_LL, WH_MOUSE_LL,
+    WHEEL_DELTA, WM_INPUT, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP,
+    WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP, WNDCLASSW,
 };
 
 use mouse_core::protocol::Button;
 
 use crate::event::InputEvent;
 use crate::keys::{Key, NamedKey};
-use crate::motion::{Motion, MotionAction, MotionGeom};
 use crate::{CaptureSignal, InputCapture, InputError, InputInjector};
 
 /// Stamped into `dwExtraInfo` of every event we inject, so the capture hooks can
 /// recognise our own warp/inject echoes (distinct from third-party injection,
 /// which `LLMHF_INJECTED` cannot tell apart). ASCII "mousRS".
 const INJECT_MAGIC: usize = 0x6D6F_7573_5253;
+
+// --- Diagnostics (temporary): counters on the keyboard/mouse hot paths, logged once
+// a second by the pump while suppressing, so a hardware run reveals exactly why keys
+// leak (hook not firing vs. grabbed-false vs. swallowed-but-Windows-ignores = UIPI). ---
+static DIAG_KBD_SEEN: AtomicU64 = AtomicU64::new(0);
+static DIAG_KBD_SWALLOWED: AtomicU64 = AtomicU64::new(0);
+static DIAG_KBD_BORROW_FAIL: AtomicU64 = AtomicU64::new(0);
+static DIAG_MOUSE_HOOK: AtomicU64 = AtomicU64::new(0);
+static DIAG_RAW: AtomicU64 = AtomicU64::new(0);
 
 // ---------------------------------------------------------------------------
 // Virtual-key constants (stable Win32 values; defined locally for a compact,
@@ -448,8 +461,6 @@ struct HookState {
     suppress: Arc<AtomicBool>,
     grabbed: bool,
     sink: UnboundedSender<CaptureSignal>,
-    geom: MotionGeom,
-    motion: Motion,
     return_vk: u16,
     last_cursor: Option<(i32, i32)>,
 }
@@ -460,33 +471,25 @@ thread_local! {
 
 impl HookState {
     /// Handle a mouse hook event. Returns `true` to swallow it.
+    ///
+    /// The hook is used only to (a) freeze the local cursor and block local clicks
+    /// while grabbed, and (b) carry button/wheel events. **Motion is NOT read here** —
+    /// it comes from Raw Input (`WM_INPUT` → [`HookState::on_raw_motion`]), which gives
+    /// true device deltas that are immune to cursor position, screen-edge clamping, and
+    /// pointer acceleration (the position-based hook model jammed at corners).
     fn on_mouse(&mut self, message: u32, info: &MSLLHOOKSTRUCT) -> bool {
-        // Our own injected event (warp echo or self-inject): never treat as input.
+        // Ignore our own injected events (the injector stamps INJECT_MAGIC); swallow
+        // them while grabbed so an echo never leaks. The server no longer injects, so
+        // this is just defence in depth.
         if info.dwExtraInfo == INJECT_MAGIC {
-            if message == WM_MOUSEMOVE {
-                // Rebaseline to where the cursor actually landed (the warp's
-                // normalize/denormalize round-trip can land ±1px off centre), so the
-                // next real delta is measured from the true position.
-                self.motion.absorb_warp_echo((info.pt.x, info.pt.y));
-            }
-            return self.grabbed; // swallow if grabbed, else let it pass
+            return self.grabbed;
         }
 
         if self.grabbed {
             match message {
-                WM_MOUSEMOVE => {
-                    let (action, warp) =
-                        self.motion.on_motion(info.pt.x, info.pt.y, &self.geom);
-                    if let MotionAction::Forward { dx, dy } = action {
-                        let _ = self
-                            .sink
-                            .send(CaptureSignal::Input(InputEvent::MouseMove { dx, dy }));
-                    }
-                    if warp {
-                        let _ = warp_to_center(&self.geom);
-                        self.motion.note_warp_issued();
-                    }
-                }
+                // Motion is swallowed here (freezes the local cursor) but read from Raw
+                // Input, not from `pt` — so edge clamping / acceleration can't distort it.
+                WM_MOUSEMOVE => {}
                 WM_LBUTTONDOWN => self.send_button(Button::Left, true),
                 WM_LBUTTONUP => self.send_button(Button::Left, false),
                 WM_RBUTTONDOWN => self.send_button(Button::Right, true),
@@ -569,23 +572,209 @@ fn wheel_delta(mouse_data: u32) -> i32 {
     }
 }
 
-/// Warp the cursor to the screen centre via a tagged `SendInput` (never
-/// `SetCursorPos`, which can't carry `dwExtraInfo` and would be indistinguishable
-/// from third-party injection).
-fn warp_to_center(geom: &MotionGeom) -> Result<(), InputError> {
-    let (nx, ny) = normalize_abs(geom.cx, geom.cy);
-    send_inputs(&[mk_mouse(
-        MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
-        nx,
-        ny,
+/// UTF-16, null-terminated class name for our hidden Raw Input message window.
+const RAW_CLASS: &[u16] = &[
+    b'm' as u16, b'o' as u16, b'u' as u16, b's' as u16, b'e' as u16, b'r' as u16, b's' as u16,
+    b'_' as u16, b'r' as u16, b'a' as u16, b'w' as u16, 0,
+];
+
+/// Create a hidden message-only window and register for raw **mouse** input targeted
+/// at it (`RIDEV_INPUTSINK` so samples arrive even though the window is never focused).
+/// `WM_INPUT` messages then flow to [`raw_wnd_proc`] via the thread's message pump.
+/// Returns the window handle (destroy it + unregister the class on teardown).
+unsafe fn create_raw_input_window(hinstance: windows_sys::Win32::Foundation::HINSTANCE) -> HWND {
+    let class = WNDCLASSW {
+        style: 0,
+        lpfnWndProc: Some(raw_wnd_proc),
+        cbClsExtra: 0,
+        cbWndExtra: 0,
+        hInstance: hinstance,
+        hIcon: std::ptr::null_mut(),
+        hCursor: std::ptr::null_mut(),
+        hbrBackground: std::ptr::null_mut(),
+        lpszMenuName: std::ptr::null(),
+        lpszClassName: RAW_CLASS.as_ptr(),
+    };
+    // Ignore a nonzero atom vs "already registered" — CreateWindowExW works either way.
+    let _ = RegisterClassW(&class);
+    let hwnd = CreateWindowExW(
         0,
-    )])
+        RAW_CLASS.as_ptr(),
+        std::ptr::null(),
+        0,
+        0,
+        0,
+        0,
+        0,
+        HWND_MESSAGE,
+        std::ptr::null_mut(),
+        hinstance,
+        std::ptr::null(),
+    );
+    if !hwnd.is_null() {
+        let rid = RAWINPUTDEVICE {
+            usUsagePage: 0x01, // generic desktop
+            usUsage: 0x02,     // mouse
+            dwFlags: RIDEV_INPUTSINK,
+            hwndTarget: hwnd,
+        };
+        if RegisterRawInputDevices(&rid, 1, std::mem::size_of::<RAWINPUTDEVICE>() as u32) == 0 {
+            tracing::warn!("RegisterRawInputDevices failed; falling back to no motion");
+        }
+    } else {
+        tracing::warn!("raw-input window creation failed; no mouse motion will be captured");
+    }
+    hwnd
+}
+
+/// State for the dedicated raw-input thread (its own `thread_local`, separate from the
+/// hook thread's `HOOK_STATE`). Motion is gated on the engine's `suppress` flag.
+struct RawState {
+    suppress: Arc<AtomicBool>,
+    sink: UnboundedSender<CaptureSignal>,
+    /// Last absolute sample, only for devices that report absolute (some touchpads/RDP).
+    last_abs: Option<(i32, i32)>,
+}
+
+thread_local! {
+    static RAW_STATE: RefCell<Option<RawState>> = const { RefCell::new(None) };
+}
+
+impl RawState {
+    /// Forward a raw mouse sample as a device delta while suppressing. These deltas are
+    /// position-, clamp-, and acceleration-independent.
+    fn on_motion(&mut self, flags: u16, lx: i32, ly: i32) {
+        if !self.suppress.load(Ordering::SeqCst) {
+            self.last_abs = None;
+            return;
+        }
+        let (dx, dy) = if flags & MOUSE_MOVE_ABSOLUTE != 0 {
+            // Absolute device: coords are normalized 0..=65535 over the virtual desktop.
+            // Convert to pixels and diff consecutive samples.
+            let (vx, vy, vw, vh) = virtual_rect();
+            let ax = vx + (lx as i64 * (vw as i64 - 1) / 65535) as i32;
+            let ay = vy + (ly as i64 * (vh as i64 - 1) / 65535) as i32;
+            let d = match self.last_abs {
+                Some((px, py)) => (ax - px, ay - py),
+                None => (0, 0), // first sample only establishes the reference point
+            };
+            self.last_abs = Some((ax, ay));
+            d
+        } else {
+            self.last_abs = None;
+            (lx, ly)
+        };
+        if dx != 0 || dy != 0 {
+            let _ = self
+                .sink
+                .send(CaptureSignal::Input(InputEvent::MouseMove { dx, dy }));
+        }
+    }
+}
+
+/// Window proc for the hidden raw-input window: reads mouse deltas from `WM_INPUT`.
+unsafe extern "system" fn raw_wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    if msg == WM_INPUT {
+        handle_raw_input(lparam as HRAWINPUT);
+    }
+    DefWindowProcW(hwnd, msg, wparam, lparam)
+}
+
+/// Pull the `RAWINPUT` for a `WM_INPUT` into a **stack** buffer (no per-event heap
+/// allocation — keeps this hot path cheap) and forward a mouse delta.
+unsafe fn handle_raw_input(hri: HRAWINPUT) {
+    let header = std::mem::size_of::<RAWINPUTHEADER>() as u32;
+    let mut raw: RAWINPUT = std::mem::zeroed();
+    let mut size = std::mem::size_of::<RAWINPUT>() as u32;
+    // A mouse RAWINPUT fits in `RAWINPUT`, so a single call suffices. Returns (u32)-1
+    // on error, 0 if nothing was copied.
+    let got = GetRawInputData(
+        hri,
+        RID_INPUT,
+        (&mut raw as *mut RAWINPUT).cast(),
+        &mut size,
+        header,
+    );
+    if got == 0 || got == u32::MAX {
+        return;
+    }
+    if raw.header.dwType != RIM_TYPEMOUSE {
+        return;
+    }
+    DIAG_RAW.fetch_add(1, Ordering::Relaxed);
+    let m = &raw.data.mouse;
+    let (flags, lx, ly) = (m.usFlags, m.lLastX, m.lLastY);
+    RAW_STATE.with(|cell| {
+        if let Ok(mut guard) = cell.try_borrow_mut() {
+            if let Some(state) = guard.as_mut() {
+                state.on_motion(flags, lx, ly);
+            }
+        }
+    });
+}
+
+/// Spawn the dedicated Raw Input thread. It owns the hidden message window + pump, so
+/// the high-frequency `WM_INPUT` mouse stream never runs on the LL-hook thread — which
+/// would otherwise blow the keyboard hook's ~300ms `LowLevelHooksTimeout` and drop keys.
+fn spawn_raw_input_thread(
+    sink: UnboundedSender<CaptureSignal>,
+    suppress: Arc<AtomicBool>,
+    stop: Arc<AtomicBool>,
+) -> JoinHandle<()> {
+    std::thread::Builder::new()
+        .name("raw-input".into())
+        .spawn(move || raw_input_loop(sink, suppress, stop))
+        .expect("spawn raw-input thread")
+}
+
+fn raw_input_loop(
+    sink: UnboundedSender<CaptureSignal>,
+    suppress: Arc<AtomicBool>,
+    stop: Arc<AtomicBool>,
+) {
+    RAW_STATE.with(|cell| {
+        *cell.borrow_mut() = Some(RawState {
+            suppress,
+            sink,
+            last_abs: None,
+        });
+    });
+    let hinstance = unsafe { GetModuleHandleW(std::ptr::null()) };
+    let hwnd = unsafe { create_raw_input_window(hinstance) };
+    if hwnd.is_null() {
+        RAW_STATE.with(|cell| *cell.borrow_mut() = None);
+        return;
+    }
+    let mut msg: MSG = unsafe { std::mem::zeroed() };
+    'pump: loop {
+        unsafe {
+            MsgWaitForMultipleObjectsEx(0, std::ptr::null(), 8, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+        }
+        while unsafe { PeekMessageW(&mut msg, std::ptr::null_mut(), 0, 0, PM_REMOVE) } != 0 {
+            if msg.message == WM_QUIT {
+                break 'pump;
+            }
+            unsafe {
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+        }
+        if stop.load(Ordering::SeqCst) {
+            break;
+        }
+    }
+    unsafe {
+        DestroyWindow(hwnd);
+        UnregisterClassW(RAW_CLASS.as_ptr(), hinstance);
+    }
+    RAW_STATE.with(|cell| *cell.borrow_mut() = None);
 }
 
 unsafe extern "system" fn mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if code != HC_ACTION as i32 {
         return CallNextHookEx(std::mem::zeroed(), code, wparam, lparam);
     }
+    DIAG_MOUSE_HOOK.fetch_add(1, Ordering::Relaxed);
     let swallow = HOOK_STATE.with(|cell| {
         let mut guard = match cell.try_borrow_mut() {
             Ok(g) => g,
@@ -608,10 +797,14 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARA
     if code != HC_ACTION as i32 {
         return CallNextHookEx(std::mem::zeroed(), code, wparam, lparam);
     }
+    DIAG_KBD_SEEN.fetch_add(1, Ordering::Relaxed);
     let swallow = HOOK_STATE.with(|cell| {
         let mut guard = match cell.try_borrow_mut() {
             Ok(g) => g,
-            Err(_) => return false,
+            Err(_) => {
+                DIAG_KBD_BORROW_FAIL.fetch_add(1, Ordering::Relaxed);
+                return false;
+            }
         };
         let Some(state) = guard.as_mut() else {
             return false;
@@ -620,6 +813,7 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARA
         state.on_key(info)
     });
     if swallow {
+        DIAG_KBD_SWALLOWED.fetch_add(1, Ordering::Relaxed);
         1
     } else {
         CallNextHookEx(std::mem::zeroed(), code, wparam, lparam)
@@ -661,21 +855,12 @@ fn capture_loop(
     return_vk: u16,
 ) -> Result<(), InputError> {
     ensure_dpi_aware();
-    let (w, h) = primary_size();
-    let geom = MotionGeom {
-        cx: w / 2,
-        cy: h / 2,
-        w,
-        h,
-    };
 
     HOOK_STATE.with(|cell| {
         *cell.borrow_mut() = Some(HookState {
             suppress: suppress.clone(),
             grabbed: false,
             sink: sink.clone(),
-            geom,
-            motion: Motion::new((geom.cx, geom.cy)),
             return_vk,
             last_cursor: None,
         });
@@ -697,9 +882,14 @@ fn capture_loop(
         return Err(InputError::Backend("SetWindowsHookEx failed".into()));
     }
 
+    // Motion is captured via Raw Input on its OWN thread (device-level deltas), kept off
+    // this LL-hook thread so a fast mouse can't starve the keyboard hook's timeout.
+    let raw_thread = spawn_raw_input_thread(sink.clone(), suppress.clone(), stop.clone());
+
     // Pump: wake on input or every ~8ms (so toggles/stop and the heartbeat are
     // honoured even with no input), drain messages so the hooks fire, reconcile.
     let mut msg: MSG = unsafe { std::mem::zeroed() };
+    let mut last_diag = std::time::Instant::now();
     'pump: loop {
         unsafe {
             MsgWaitForMultipleObjectsEx(0, std::ptr::null(), 8, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
@@ -717,20 +907,45 @@ fn capture_loop(
         if stop.load(Ordering::SeqCst) {
             break;
         }
-        reconcile(&suppress, &sink, geom);
+        reconcile(&suppress, &sink);
+        // Diagnostics: once a second while suppressing, dump the keyboard-hook counters
+        // so a hardware run shows whether keys are being seen / swallowed / leaked.
+        if suppress.load(Ordering::SeqCst) && last_diag.elapsed() >= Duration::from_secs(1) {
+            last_diag = std::time::Instant::now();
+            let grabbed = HOOK_STATE.with(|c| c.borrow().as_ref().map(|s| s.grabbed).unwrap_or(false));
+            let seen = DIAG_KBD_SEEN.load(Ordering::Relaxed);
+            let swallowed = DIAG_KBD_SWALLOWED.load(Ordering::Relaxed);
+            tracing::info!(
+                target: "kbd_diag",
+                grabbed,
+                suppress = true,
+                kbd_seen = seen,
+                kbd_swallowed = swallowed,
+                kbd_passed_to_windows = seen - swallowed,
+                kbd_borrow_fail = DIAG_KBD_BORROW_FAIL.load(Ordering::Relaxed),
+                mouse_hook_calls = DIAG_MOUSE_HOOK.load(Ordering::Relaxed),
+                raw_samples = DIAG_RAW.load(Ordering::Relaxed),
+                "keyboard diagnostics"
+            );
+        }
     }
 
     unsafe {
         UnhookWindowsHookEx(h_mouse);
         UnhookWindowsHookEx(h_kbd);
     }
+    // Ensure the raw-input thread exits (it polls `stop` every ≤8ms) and reap it, so its
+    // window/class are torn down before we return.
+    stop.store(true, Ordering::SeqCst);
+    let _ = raw_thread.join();
     HOOK_STATE.with(|cell| *cell.borrow_mut() = None);
     Ok(())
 }
 
 /// Reconcile the engine's requested suppression against the actual grabbed state,
-/// doing the warp + held-modifier snapshot on the rising edge.
-fn reconcile(suppress: &Arc<AtomicBool>, sink: &UnboundedSender<CaptureSignal>, geom: MotionGeom) {
+/// snapshotting held modifiers on the rising edge. No cursor warp is needed: motion
+/// comes from Raw Input, which is independent of the (now merely frozen) cursor.
+fn reconcile(suppress: &Arc<AtomicBool>, sink: &UnboundedSender<CaptureSignal>) {
     let want = suppress.load(Ordering::SeqCst);
     HOOK_STATE.with(|cell| {
         let mut guard = cell.borrow_mut();
@@ -738,21 +953,7 @@ fn reconcile(suppress: &Arc<AtomicBool>, sink: &UnboundedSender<CaptureSignal>, 
             return;
         };
         if want && !state.grabbed {
-            // Rising edge: baseline at the current cursor (so any motion event still
-            // queued from before the warp diffs correctly), warp to centre, snapshot
-            // held modifiers. The warp echo (tagged) rebaselines Motion to centre.
-            let mut pt = POINT { x: geom.cx, y: geom.cy };
-            unsafe {
-                GetCursorPos(&mut pt);
-            }
-            state.motion = Motion::new((pt.x, pt.y));
             state.grabbed = true;
-            // Only expect an echo if the warp actually moves the cursor; warping to
-            // an already-centred cursor emits no event, which would leak a pending warp.
-            let already_centered = (pt.x, pt.y) == (geom.cx, geom.cy);
-            if warp_to_center(&geom).is_ok() && !already_centered {
-                state.motion.note_warp_issued();
-            }
             emit_held_modifiers(sink);
         } else if !want && state.grabbed {
             state.grabbed = false;

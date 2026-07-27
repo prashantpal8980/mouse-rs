@@ -17,12 +17,16 @@
 
 pub mod client;
 pub mod geometry;
+pub mod hotkey;
 pub mod injector;
 pub mod server;
+pub mod status;
 
 pub use client::run_client_engine;
+pub use hotkey::Hotkey;
 pub use injector::{InjectCmd, Injector, InjectorTx};
 pub use server::run_server_engine;
+pub use status::{StatusHandle, StatusSnapshot};
 
 use mouse_core::net::{LinkChannels, LinkEvent};
 use mouse_core::protocol::Message;
@@ -41,6 +45,10 @@ pub struct EngineLink {
     pub from_peer: UnboundedReceiver<Message>,
     /// Link status events.
     pub events: UnboundedReceiver<LinkEvent>,
+    /// Optional live-status sink for a UI to observe (`None` for the headless CLI).
+    /// The binary sets this after `new()`; the engine updates it on connect/
+    /// disconnect and edge crossings.
+    pub status: Option<status::StatusHandle>,
 }
 
 /// Wiring the binary hands the engine for clipboard sync. The engine routes
@@ -81,6 +89,7 @@ impl EngineLink {
                 to_peer: to_tx,
                 from_peer: from_rx,
                 events: ev_rx,
+                status: None,
             },
         )
     }

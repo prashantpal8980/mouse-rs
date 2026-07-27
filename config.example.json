@@ -1,0 +1,25 @@
+{
+  "name": "my-machine",
+  "role": "server",
+  "shared_secret": "change-me-to-a-long-random-string",
+  "tls_enabled": true,
+  "clipboard_sync": true,
+  "lock_hotkey": "scroll_lock",
+  "return_hotkey": "ctrl+win+alt+esc",
+
+  "listen_host": "0.0.0.0",
+  "listen_port": 24800,
+
+  "server_host": "192.168.1.50",
+  "server_port": 24800,
+  "reconnect": true,
+
+  "exit_edge": "left",
+  "entry_edge": "right",
+
+  "screen_width": 1920,
+  "screen_height": 1080,
+
+  "edge_threshold_px": 2,
+  "warp_threshold_px": 120
+}

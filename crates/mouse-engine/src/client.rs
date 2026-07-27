@@ -14,6 +14,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::geometry::in_edge_band;
 use crate::injector::{InjectCmd, InjectorTx};
+use crate::status::{set_status_connected, set_status_disconnected, set_status_engaged};
 use crate::{set_clipboard_connected, ClipboardRoute, EngineLink};
 
 /// Run the client engine until cancelled (or the link shuts down).
@@ -29,6 +30,7 @@ pub async fn run_client_engine(
         to_peer,
         mut from_peer,
         mut events,
+        status,
     } = link;
 
     let entry_edge = cfg.entry_edge;
@@ -65,11 +67,13 @@ pub async fn run_client_engine(
                         vy = cy;
                         active = true;
                         armed = false;
+                        set_status_engaged(&status, true);
                     }
                     Message::Leave => {
                         inject.send(InjectCmd::ReleaseAll);
                         active = false;
                         armed = false;
+                        set_status_engaged(&status, false);
                     }
                     Message::MouseMove { dx, dy } if active => {
                         // saturating_add so a malformed/hostile peer delta can't
@@ -84,6 +88,7 @@ pub async fn run_client_engine(
                             let _ = to_peer.send(Message::LeaveRequest);
                             active = false;
                             armed = false;
+                            set_status_engaged(&status, false);
                         }
                     }
                     // Clipboard sync is independent of who owns input: hand it to the
@@ -115,6 +120,7 @@ pub async fn run_client_engine(
                         active = false;
                         armed = false;
                         set_clipboard_connected(&clipboard, false);
+                        set_status_disconnected(&status);
                         tracing::info!("disconnected from server: {reason:?}");
                     }
                     Some(LinkEvent::Connected { peer, width, height }) => {
@@ -127,6 +133,7 @@ pub async fn run_client_engine(
                         vx = 0;
                         vy = 0;
                         set_clipboard_connected(&clipboard, true);
+                        set_status_connected(&status, &peer, width, height);
                         tracing::info!("connected to server '{peer}': {width}x{height}");
                     }
                     Some(_) => {}

@@ -1,12 +1,13 @@
-//! Pointer-motion tracking shared by the platform capture backends.
+//! Pointer-motion tracking for the X11 capture backend.
 //!
-//! Both the X11 and Windows backends capture relative mouse motion by warping the
-//! cursor to the screen centre and reading absolute event positions. The delta math
-//! and edge-recentre policy are identical and platform-neutral, so they live here
-//! (and their tests run on any host). Only *echo absorption* differs per platform:
-//! X11 has no way to tag its synthetic warp event, so it matches the centre position
-//! via [`Motion::pending_warps`]; Windows tags injected events with a magic
-//! `dwExtraInfo` and calls [`Motion::absorb_warp_echo`] directly.
+//! X11 grabs the pointer (which keeps *moving*), warps it back to centre, and reads
+//! relative motion as the delta from the previous event, absorbing its own warp echo.
+//! The Windows backend uses a different model — it *swallows* moves so the cursor is
+//! frozen, and reads each delta straight from that frozen centre (see `windows.rs`) —
+//! so it only needs [`MotionGeom`]'s centre, not [`Motion`].
+// On Windows only the centre fields of `MotionGeom` are used; the rest is the X11
+// warp model, which the Windows build doesn't compile a user for.
+#![cfg_attr(target_os = "windows", allow(dead_code))]
 
 /// Fixed geometry of the grabbed screen: centre and dimensions.
 #[derive(Clone, Copy)]

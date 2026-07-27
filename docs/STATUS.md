@@ -14,8 +14,8 @@ cursor freeze) by construction.
 | 3 | Linux/X11 input + the edge-crossing engine | ✅ done, tested (live loopback) |
 | 4 | Windows input backend + Fn+Up suppression failsafe | ✅ code-complete — **needs laptop test** |
 | 5 | Clipboard sync (text) | ✅ code-complete — **needs 2-machine test** |
-| 6 | egui + tray GUI | ⬜ pending |
-| 7 | auto-reconnect + packaging | ⬜ pending |
+| 6 | egui + tray GUI | ✅ control panel, tray (live tooltip), status, Quit, profiles, detect-screen, clipboard history |
+| 7 | auto-reconnect + packaging | ✅ reconnect + `scripts/package.sh` (Win zip + Linux tar, bundled libxdo) |
 
 **Verification status:** 56 tests pass; clippy clean and release builds link on BOTH
 `x86_64-unknown-linux-gnu` and `x86_64-pc-windows-gnu`. Phases 1–3 are also validated
@@ -54,6 +54,13 @@ Run headless: `mouse-rs server` (Kali) / `mouse-rs client` (laptop). Linux must 
    hotkey escape (`docs/phase4-windows-design.md`); clipboard copy/paste both ways +
    no echo loop + sync-on-reconnect. Deploy via a Kali `python -m http.server` the
    laptop pulls (the Python-era workflow).
-2. **Phase 6** — egui + tray GUI (config editor, Start/Stop, status, maybe clipboard view).
-3. **Phase 7** — auto-reconnect (client retries on drop) + packaging.
-4. **Image clipboard** — finish the deferred `ClipboardImage` path (RGBA<->PNG + cap).
+2. **Phase 6 ✅ DONE** — detect-screen display + Detect button, network profiles
+   (save/load/delete under `~/.mouse_share/profiles/`), clipboard-history view, live
+   tray tooltip. (Remaining nicety: console double-click flash on Windows.)
+3. **Phase 7 ✅ DONE** — auto-reconnect (client retries with exponential backoff 1s→15s
+   after any recoverable drop, and before the server is up; `cfg.reconnect`, default on)
+   + `scripts/package.sh` (Windows zip + Linux tarball, slim headless build, bundled
+   libxdo). See `docs/PACKAGING.md`.
+4. **Hardware retest** — F1–F4 in `docs/TESTING.md` (frozen-cursor, close=quit, combo
+   hotkey, auto-reconnect) need the two-machine run; the first three are off-box paths.
+5. **Image clipboard** — finish the deferred `ClipboardImage` path (RGBA<->PNG + cap).

@@ -1,0 +1,470 @@
+<title>mouse-rs — Architecture & Product Decision</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700;12..96,800&family=JetBrains+Mono:wght@400;500;700&display=swap');
+
+  .app{
+    --bg:#0a0e1a; --bg2:#111726; --bg3:#0e1420; --inset:#0b111d; --line:#1f2839; --line2:#2a3550;
+    --txt:#eef2fb; --txt2:#9aa7c2; --txt3:#5f6d8a; --accent:#38d6e6; --accent2:#6a7bff; --accent-ink:#04121a;
+    --good:#37e0a0; --good-bg:#0f2a22; --warn:#ffcf5c; --warn-bg:#2c2410; --danger:#ff6b7a; --danger-bg:#2c1416;
+    --glow:0 0 0 1px rgba(56,214,230,.3), 0 0 30px -8px rgba(56,214,230,.5);
+  }
+  .app[data-theme="oxide"]{--bg:#100b08;--bg2:#1b130d;--bg3:#150e09;--inset:#120c07;--line:#2c1f15;--line2:#3d2c1d;--txt:#f6ede3;--txt2:#c2ab97;--txt3:#836a55;--accent:#ff7a3d;--accent2:#ffb23d;--accent-ink:#1a0d04;--good:#8bd450;--good-bg:#1a220e;--warn:#ffc94d;--warn-bg:#2b2410;--danger:#ff5c5c;--danger-bg:#2a1210;--glow:0 0 0 1px rgba(255,122,61,.35),0 0 30px -8px rgba(255,122,61,.5);}
+  .app[data-theme="synth"]{--bg:#100320;--bg2:#1c0b33;--bg3:#160828;--inset:#12061f;--line:#331452;--line2:#4a1d75;--txt:#fbe9ff;--txt2:#c39cd8;--txt3:#805a9c;--accent:#ff4fa3;--accent2:#31d0ff;--accent-ink:#1a0416;--good:#5cffc4;--good-bg:#0f2a24;--warn:#ffd24f;--warn-bg:#2a2410;--danger:#ff5c8a;--danger-bg:#2a1020;--glow:0 0 0 1px rgba(255,79,163,.4),0 0 34px -6px rgba(255,79,163,.55);}
+  .app[data-theme="matrix"]{--bg:#030a06;--bg2:#07160e;--bg3:#050f09;--inset:#040d07;--line:#0e2b1a;--line2:#164026;--txt:#d6ffe6;--txt2:#5fbf88;--txt3:#357a52;--accent:#39ff88;--accent2:#7dffb0;--accent-ink:#022012;--good:#39ff88;--good-bg:#08210f;--warn:#d8ff5c;--warn-bg:#22260c;--danger:#ff6b5c;--danger-bg:#2a1210;--glow:0 0 0 1px rgba(57,255,136,.35),0 0 30px -8px rgba(57,255,136,.45);}
+  .app[data-theme="nord"]{--bg:#242a35;--bg2:#2e3440;--bg3:#2a303c;--inset:#272d38;--line:#3b4252;--line2:#4c566a;--txt:#eceff4;--txt2:#a9b3c7;--txt3:#6b7488;--accent:#88c0d0;--accent2:#a3be8c;--accent-ink:#132029;--good:#a3be8c;--good-bg:#2b3428;--warn:#ebcb8b;--warn-bg:#332e1e;--danger:#bf616a;--danger-bg:#33232a;--glow:0 0 0 1px rgba(136,192,208,.35),0 0 26px -10px rgba(136,192,208,.45);}
+  .app[data-theme="paper"]{--bg:#eceae4;--bg2:#faf9f6;--bg3:#f2f0ea;--inset:#e7e4dc;--line:#dcd8ce;--line2:#c9c4b8;--txt:#1d1c19;--txt2:#5c584f;--txt3:#918b7e;--accent:#5b52e0;--accent2:#e0527a;--accent-ink:#fff;--good:#1f9d5b;--good-bg:#e3f3e8;--warn:#b5820f;--warn-bg:#f6eed6;--danger:#d13c4b;--danger-bg:#f7e2e4;--glow:0 0 0 1px rgba(91,82,224,.3),0 0 26px -12px rgba(91,82,224,.4);}
+
+  *{box-sizing:border-box;}
+  html,body{margin:0;}
+  body{background:#06090f;font-family:system-ui,-apple-system,"Segoe UI",sans-serif;}
+  .display{font-family:"Bricolage Grotesque",system-ui,sans-serif;}
+  .mono{font-family:"JetBrains Mono",ui-monospace,monospace;}
+
+  .app{
+    background:radial-gradient(1100px 500px at 15% -8%,color-mix(in srgb,var(--accent) 10%,transparent),transparent 60%),var(--bg);
+    color:var(--txt); min-height:100vh; transition:background .3s;
+  }
+  .wrap{max-width:1080px;margin:0 auto;padding:0 22px 90px;}
+
+  /* top bar */
+  .topbar{position:sticky;top:0;z-index:20;backdrop-filter:blur(12px);
+    background:color-mix(in srgb,var(--bg) 82%,transparent);border-bottom:1px solid var(--line);}
+  .topbar .in{max-width:1080px;margin:0 auto;padding:12px 22px;display:flex;align-items:center;gap:16px;}
+  .logo{font-family:"Bricolage Grotesque";font-weight:800;font-size:17px;letter-spacing:-.02em;}
+  .logo b{color:var(--accent);}
+  .topbar .doc{font-size:11px;color:var(--txt3);letter-spacing:.06em;text-transform:uppercase;}
+  .topbar .spacer{flex:1;}
+  .swatches{display:flex;gap:6px;align-items:center;}
+  .swatches .lbl{font-size:9.5px;letter-spacing:.14em;text-transform:uppercase;color:var(--txt3);margin-right:2px;}
+  .sw{width:18px;height:18px;border-radius:5px;cursor:pointer;border:1px solid rgba(255,255,255,.14);padding:0;transition:transform .15s;}
+  .sw:hover{transform:translateY(-2px) scale(1.1);}
+  .sw[aria-pressed="true"]{box-shadow:0 0 0 2px var(--bg),0 0 0 3.5px currentColor;}
+  .sw.midnight{background:linear-gradient(135deg,#38d6e6,#6a7bff);color:#38d6e6;}
+  .sw.oxide{background:linear-gradient(135deg,#ff7a3d,#ffb23d);color:#ff7a3d;}
+  .sw.synth{background:linear-gradient(135deg,#ff4fa3,#31d0ff);color:#ff4fa3;}
+  .sw.matrix{background:linear-gradient(135deg,#39ff88,#0a3d22);color:#39ff88;}
+  .sw.nord{background:linear-gradient(135deg,#88c0d0,#a3be8c);color:#88c0d0;}
+  .sw.paper{background:linear-gradient(135deg,#faf9f6,#c9c4b8);color:#5b52e0;}
+
+  /* hero */
+  .hero{padding:52px 0 30px;}
+  .eyebrow{display:inline-flex;align-items:center;gap:8px;font-family:"JetBrains Mono";font-size:11px;font-weight:600;letter-spacing:.1em;text-transform:uppercase;color:var(--accent);background:color-mix(in srgb,var(--accent) 12%,transparent);padding:5px 12px;border-radius:999px;}
+  h1{font-family:"Bricolage Grotesque";font-weight:800;font-size:40px;line-height:1.08;letter-spacing:-.02em;margin:18px 0 12px;text-wrap:balance;max-width:20ch;}
+  .lede{font-size:16px;color:var(--txt2);max-width:64ch;line-height:1.6;margin:0;}
+
+  /* verdict banner */
+  .verdict{margin-top:28px;border:1px solid color-mix(in srgb,var(--accent) 40%,var(--line));border-radius:16px;
+    background:linear-gradient(160deg,color-mix(in srgb,var(--accent) 12%,var(--bg2)),var(--bg2));padding:24px;box-shadow:var(--glow);}
+  .verdict .tag{font-family:"JetBrains Mono";font-size:11px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--accent);}
+  .verdict .big{font-family:"Bricolage Grotesque";font-weight:700;font-size:23px;margin:8px 0 6px;letter-spacing:-.01em;}
+  .verdict p{margin:0;color:var(--txt2);font-size:14px;line-height:1.6;}
+  .verdict .pills{display:flex;flex-wrap:wrap;gap:8px;margin-top:16px;}
+  .vp{font-family:"JetBrains Mono";font-size:11.5px;font-weight:600;padding:6px 11px;border-radius:8px;background:var(--inset);border:1px solid var(--line2);}
+  .vp b{color:var(--accent);}
+
+  /* section nav */
+  .secnav{display:flex;flex-wrap:wrap;gap:8px;margin:36px 0 8px;position:sticky;top:57px;z-index:15;padding:10px 0;
+    background:color-mix(in srgb,var(--bg) 85%,transparent);backdrop-filter:blur(8px);}
+  .secnav a{font-size:12.5px;font-weight:600;color:var(--txt2);text-decoration:none;padding:6px 12px;border-radius:999px;border:1px solid var(--line);transition:.15s;}
+  .secnav a:hover{color:var(--accent);border-color:var(--accent);}
+
+  section{padding-top:40px;}
+  .sh{display:flex;align-items:baseline;gap:12px;margin-bottom:6px;}
+  .sh .n{font-family:"JetBrains Mono";font-size:13px;color:var(--accent);font-weight:700;}
+  .sh h2{font-family:"Bricolage Grotesque";font-weight:700;font-size:24px;letter-spacing:-.01em;margin:0;}
+  .sdesc{color:var(--txt2);font-size:14px;margin:0 0 20px;max-width:70ch;line-height:1.6;}
+
+  .card{background:var(--bg2);border:1px solid var(--line);border-radius:14px;padding:20px;}
+  .card + .card{margin-top:14px;}
+
+  /* tables */
+  .tw{overflow-x:auto;border:1px solid var(--line);border-radius:14px;background:var(--bg2);}
+  table{width:100%;border-collapse:collapse;min-width:640px;font-size:13px;}
+  th{text-align:left;font-family:"JetBrains Mono";font-size:10px;text-transform:uppercase;letter-spacing:.06em;color:var(--txt3);font-weight:600;padding:12px 14px;border-bottom:1px solid var(--line);white-space:nowrap;}
+  td{padding:12px 14px;border-bottom:1px solid var(--line2);vertical-align:top;color:var(--txt2);}
+  tr:last-child td{border-bottom:none;}
+  td b,td .name{color:var(--txt);font-weight:600;}
+  tr.win{background:color-mix(in srgb,var(--accent) 8%,transparent);}
+  tr.win td:first-child{box-shadow:inset 3px 0 0 var(--accent);}
+  .lic-ok{color:var(--good);font-weight:600;}
+  .lic-warn{color:var(--warn);font-weight:600;}
+  .lic-bad{color:var(--danger);font-weight:600;}
+  .chip{display:inline-block;font-family:"JetBrains Mono";font-size:10px;font-weight:700;padding:2px 7px;border-radius:5px;}
+  .chip.pick{background:var(--accent);color:var(--accent-ink);}
+  .chip.good{background:var(--good-bg);color:var(--good);}
+  .chip.warn{background:var(--warn-bg);color:var(--warn);}
+  .chip.bad{background:var(--danger-bg);color:var(--danger);}
+
+  /* bar chart */
+  .chart{display:flex;flex-direction:column;gap:14px;}
+  .chart .unit{font-family:"JetBrains Mono";font-size:10.5px;color:var(--txt3);text-transform:uppercase;letter-spacing:.08em;margin-bottom:4px;}
+  .bar-row{display:grid;grid-template-columns:130px 1fr 96px;align-items:center;gap:12px;}
+  .bar-row .k{font-size:12.5px;font-weight:600;color:var(--txt);display:flex;align-items:center;gap:7px;}
+  .bar-track{height:16px;background:var(--inset);border-radius:5px;overflow:hidden;}
+  .bar-fill{height:100%;border-radius:5px;width:0;transition:width 1s cubic-bezier(.2,.7,.3,1);}
+  .bar-row .v{font-family:"JetBrains Mono";font-size:12px;color:var(--txt2);text-align:right;font-variant-numeric:tabular-nums;}
+  .dot{width:8px;height:8px;border-radius:50%;flex-shrink:0;}
+
+  /* reliability ladder */
+  .ladder{display:flex;flex-direction:column;gap:10px;}
+  .rung{display:flex;gap:14px;align-items:center;padding:14px 16px;border-radius:12px;border:1px solid var(--line);background:var(--bg2);}
+  .rung .rank{font-family:"Bricolage Grotesque";font-weight:800;font-size:20px;width:26px;flex-shrink:0;}
+  .rung .body .t{font-weight:700;font-size:14px;}
+  .rung .body .d{font-size:12.5px;color:var(--txt2);margin-top:2px;line-height:1.5;}
+  .rung .score{margin-left:auto;flex-shrink:0;}
+
+  /* two-col cards */
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:14px;}
+  .grid3{display:grid;grid-template-columns:repeat(3,1fr);gap:14px;}
+  .mini{background:var(--bg2);border:1px solid var(--line);border-radius:12px;padding:16px;}
+  .mini .h{font-weight:700;font-size:14px;display:flex;align-items:center;gap:8px;margin-bottom:8px;}
+  .mini ul{margin:0;padding-left:16px;color:var(--txt2);font-size:12.5px;line-height:1.65;}
+  .mini .n{font-family:"JetBrains Mono";font-size:11px;color:var(--txt3);}
+
+  /* architecture diagram */
+  .arch{display:grid;grid-template-columns:1fr 1fr 1fr;gap:14px;align-items:stretch;}
+  .node{border:1px solid var(--line2);border-radius:14px;padding:18px;background:linear-gradient(160deg,var(--bg3),var(--inset));position:relative;}
+  .node.hot{border-color:var(--accent);box-shadow:var(--glow);}
+  .node .lab{font-family:"JetBrains Mono";font-size:10px;letter-spacing:.1em;text-transform:uppercase;color:var(--txt3);}
+  .node .nm{font-family:"Bricolage Grotesque";font-weight:700;font-size:16px;margin:6px 0 8px;}
+  .node .ds{font-size:12px;color:var(--txt2);line-height:1.55;}
+  .node .badge{margin-top:10px;display:inline-block;font-family:"JetBrains Mono";font-size:10px;font-weight:700;padding:3px 8px;border-radius:6px;background:var(--inset);border:1px solid var(--line2);color:var(--txt2);}
+  .node.hot .badge{background:color-mix(in srgb,var(--accent) 16%,transparent);color:var(--accent);border-color:transparent;}
+
+  /* roadmap list */
+  .road{display:flex;flex-direction:column;gap:10px;}
+  .ri{display:flex;gap:14px;padding:15px 17px;border:1px solid var(--line);border-left:3px solid var(--warn);border-radius:12px;background:var(--bg2);}
+  .ri.crit{border-left-color:var(--danger);}
+  .ri.ok{border-left-color:var(--good);}
+  .ri .rank{font-family:"JetBrains Mono";font-size:12px;font-weight:700;color:var(--txt3);flex-shrink:0;width:20px;}
+  .ri .t{font-weight:700;font-size:14px;}
+  .ri .d{font-size:12.5px;color:var(--txt2);margin-top:3px;line-height:1.55;}
+  .ri .d code{font-family:"JetBrains Mono";font-size:11.5px;background:var(--inset);padding:1px 5px;border-radius:4px;color:var(--txt);}
+
+  .callout{border:1px solid var(--line);border-radius:12px;padding:16px 18px;background:var(--inset);font-size:13.5px;color:var(--txt2);line-height:1.6;}
+  .callout b{color:var(--txt);}
+  .callout.warn{border-color:color-mix(in srgb,var(--warn) 40%,var(--line));background:var(--warn-bg);}
+
+  .foot{margin-top:60px;padding-top:22px;border-top:1px solid var(--line);font-family:"JetBrains Mono";font-size:11px;color:var(--txt3);line-height:1.9;}
+  .foot a{color:var(--txt2);}
+  a.src{color:var(--txt3);font-size:11px;text-decoration:none;border-bottom:1px dotted var(--txt3);}
+
+  @media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important;}}
+  @media (max-width:760px){
+    h1{font-size:30px;} .grid2,.grid3,.arch{grid-template-columns:1fr;}
+    .bar-row{grid-template-columns:96px 1fr 76px;} .secnav{position:static;}
+  }
+</style>
+
+<div class="app" data-theme="midnight" id="app">
+  <div class="topbar">
+    <div class="in">
+      <span class="logo display">mouse<b>-</b>rs</span>
+      <span class="doc mono">Architecture &amp; Product Decision · v1</span>
+      <span class="spacer"></span>
+      <div class="swatches">
+        <span class="lbl mono">theme</span>
+        <button class="sw midnight" data-set="midnight" aria-pressed="true" title="Midnight"></button>
+        <button class="sw oxide" data-set="oxide" aria-pressed="false" title="Oxide"></button>
+        <button class="sw synth" data-set="synth" aria-pressed="false" title="Synthwave"></button>
+        <button class="sw matrix" data-set="matrix" aria-pressed="false" title="Matrix"></button>
+        <button class="sw nord" data-set="nord" aria-pressed="false" title="Nord"></button>
+        <button class="sw paper" data-set="paper" aria-pressed="false" title="Paper"></button>
+      </div>
+    </div>
+  </div>
+
+  <div class="wrap">
+    <div class="hero">
+      <span class="eyebrow mono">◆ Research synthesis · 4 investigations</span>
+      <h1 class="display">How to build the UI for a product you'll sell.</h1>
+      <p class="lede">You loved the mockup and want it built for Windows + Linux, then tested — while keeping the door open to a paid tier and an eventual sale. That makes the GUI toolkit a load-bearing, hard-to-reverse choice. Four parallel investigations (Tauri, native-Rust toolkits, resource/reliability, and commercialization) all point the same way.</p>
+
+      <div class="verdict">
+        <div class="tag mono">The recommendation</div>
+        <div class="big display">Build native in <span style="color:var(--accent)">iced (MIT)</span> — not a webview — as a daemon + on-demand panel.</div>
+        <p>iced is the only pure-Rust toolkit that is simultaneously permissively licensed (safe to sell closed-source), production-proven (System76 ships an entire desktop on it), resource-light, cross-compilable Kali→Windows in one command, and capable of the modern look you liked — with a software-render fallback so it runs on machines with no GPU, in VMs, and over remote desktop, which is exactly where a KVM tool gets used.</p>
+        <div class="pills">
+          <span class="vp mono">License: <b>MIT — sellable</b></span>
+          <span class="vp mono">RAM: <b>~30–60 MB</b></span>
+          <span class="vp mono">Binary: <b>~17 MB self-contained</b></span>
+          <span class="vp mono">Win build: <b>1 command on Kali</b></span>
+          <span class="vp mono">Runs on: <b>GPU-less / VM / RDP</b></span>
+        </div>
+      </div>
+    </div>
+
+    <nav class="secnav">
+      <a href="#why">Why not a webview</a>
+      <a href="#frameworks">Framework shootout</a>
+      <a href="#resources">Resources</a>
+      <a href="#reliability">Runs everywhere</a>
+      <a href="#arch">Architecture</a>
+      <a href="#commercial">Selling it</a>
+      <a href="#wedge">The competition</a>
+      <a href="#next">Next steps</a>
+    </nav>
+
+    <!-- WHY NOT WEBVIEW -->
+    <section id="why">
+      <div class="sh"><span class="n mono">01</span><h2 class="display">Why not Tauri / a webview</h2></div>
+      <p class="sdesc">A webview (Tauri) would let the mockup HTML become the UI almost verbatim — genuinely tempting. But "webview" means the UI is rendered by <em>whatever browser engine the OS ships</em>, and that engine is different on every platform. For a product that must "run flawlessly everywhere," that's the core problem.</p>
+      <div class="grid3">
+        <div class="mini">
+          <div class="h">🪟 Windows</div>
+          <div class="n mono">WebView2 (Chromium)</div>
+          <ul><li>Modern engine — good</li><li>But runtime <b>may be absent</b>; guaranteeing it adds ~150 MB</li></ul>
+        </div>
+        <div class="mini">
+          <div class="h">🍎 macOS</div>
+          <div class="n mono">WKWebView</div>
+          <ul><li>Modern, ships with OS</li><li>Its own rendering/JS quirks vs the others</li></ul>
+        </div>
+        <div class="mini" style="border-color:color-mix(in srgb,var(--danger) 45%,var(--line));">
+          <div class="h">🐧 Linux — the problem</div>
+          <div class="n mono">WebKitGTK (old, fragmented)</div>
+          <ul><li>Fonts render <b>too bold</b>; glitches after updates</li><li>Hard <b>libsoup2 vs 3</b> distro split</li><li>NVIDIA/DMABUF input-latency bugs</li></ul>
+        </div>
+      </div>
+      <div class="callout warn" style="margin-top:14px;">
+        <b>Your dev + daemon box is Kali (Linux) — the exact platform where a webview is weakest.</b> Add two more strikes for a product: you <b>cannot</b> cross-compile a Tauri Windows build from Kali (it needs Windows CI runners, ~67% pricier), and you inherit a <b>3-engine security-patch + support surface</b>. Tauri's headline "5 MB binary" also omits the ~100 MB system webview it borrows at runtime.
+      </div>
+    </section>
+
+    <!-- FRAMEWORKS -->
+    <section id="frameworks">
+      <div class="sh"><span class="n mono">02</span><h2 class="display">Pure-Rust framework shootout</h2></div>
+      <p class="sdesc">Every candidate, scored on the axes that matter for a <em>sellable</em> product. License is the first filter — anything copyleft or attribution-bound is a liability for a paid tier or a sale.</p>
+      <div class="tw">
+        <table>
+          <thead><tr><th>Framework</th><th>License</th><th>Polish ceiling</th><th>Production use</th><th>Runs GPU-less</th><th>Verdict</th></tr></thead>
+          <tbody>
+            <tr class="win">
+              <td><span class="name">iced</span></td>
+              <td><span class="lic-ok">MIT ✓</span></td>
+              <td>High — GPU gradients, theming, custom-painted toggles/shadows</td>
+              <td>System76 COSMIC desktop</td>
+              <td><span class="lic-ok">Yes</span> (tiny-skia SW fallback)</td>
+              <td><span class="chip pick">THE PICK</span></td>
+            </tr>
+            <tr>
+              <td><span class="name">egui</span> <span class="mono" style="color:var(--txt3);font-size:11px;">(current)</span></td>
+              <td><span class="lic-ok">MIT/Apache ✓</span></td>
+              <td>Utilitarian — polish fights the grain</td>
+              <td>Rerun, many tools</td>
+              <td><span class="lic-ok">Yes</span> (glow/OpenGL)</td>
+              <td><span class="chip good">keep only if look relaxes</span></td>
+            </tr>
+            <tr>
+              <td><span class="name">Slint</span></td>
+              <td><span class="lic-warn">GPL / badge / paid ⚠</span></td>
+              <td>Excellent — built for this</td>
+              <td>Production-ready</td>
+              <td><span class="lic-ok">Yes</span> (SW renderer)</td>
+              <td><span class="chip warn">"Made with Slint" badge or opaque paid fee</span></td>
+            </tr>
+            <tr>
+              <td><span class="name">gpui</span> <span class="mono" style="color:var(--txt3);font-size:11px;">(Zed)</span></td>
+              <td><span class="lic-bad">links GPL-3.0 ✗</span></td>
+              <td>Very high</td>
+              <td>Zed editor</td>
+              <td>—</td>
+              <td><span class="chip bad">blocker for closed-source</span></td>
+            </tr>
+            <tr>
+              <td><span class="name">Dioxus / freya / Xilem</span></td>
+              <td><span class="lic-ok">MIT/Apache ✓</span></td>
+              <td>High potential</td>
+              <td><span class="lic-warn">experimental</span></td>
+              <td>varies</td>
+              <td><span class="chip warn">watch list — not shippable in 2026</span></td>
+            </tr>
+            <tr>
+              <td><span class="name">Qt (cxx-qt)</span></td>
+              <td><span class="lic-warn">LGPL relink / commercial ⚠</span></td>
+              <td>Excellent + best a11y</td>
+              <td>Extremely mature</td>
+              <td>Yes</td>
+              <td><span class="chip warn">not pure-Rust; heavy; relink discipline</span></td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="callout" style="margin-top:14px;">
+        <b>Two honest corrections to what I told you earlier:</b> Slint isn't strictly "GPL-or-pay" — there's a free closed-source path, but it forces a visible <b>"Made with Slint"</b> badge in your UI, with removal only via an opaque, size-priced license. And <b>gpui</b> looks Apache-2.0 but currently static-links GPL-3.0 code — a hard blocker for a product with a closed paid tier. Both stay off the table.
+      </div>
+    </section>
+
+    <!-- RESOURCES -->
+    <section id="resources">
+      <div class="sh"><span class="n mono">03</span><h2 class="display">Resource footprint</h2></div>
+      <p class="sdesc">Field numbers (small-N, directional). The one that matters continuously is the always-on process — which in the recommended architecture carries <em>no GUI at all</em>. The panel's cost is paid only while it's open.</p>
+      <div class="grid2">
+        <div class="card">
+          <div class="unit mono">Self-contained binary / install footprint — smaller is better</div>
+          <div class="chart" id="chartBinary">
+            <div class="bar-row"><span class="k"><span class="dot" style="background:var(--accent)"></span>iced</span><div class="bar-track"><div class="bar-fill" data-w="17" style="background:linear-gradient(90deg,var(--accent),var(--accent2))"></div></div><span class="v">17 MB</span></div>
+            <div class="bar-row"><span class="k"><span class="dot" style="background:var(--accent)"></span>egui</span><div class="bar-track"><div class="bar-fill" data-w="18" style="background:linear-gradient(90deg,var(--accent),var(--accent2))"></div></div><span class="v">18 MB</span></div>
+            <div class="bar-row"><span class="k"><span class="dot" style="background:var(--warn)"></span>Tauri*</span><div class="bar-track"><div class="bar-fill" data-w="8" style="background:var(--warn)"></div></div><span class="v">8 MB*</span></div>
+            <div class="bar-row"><span class="k"><span class="dot" style="background:var(--danger)"></span>Electron</span><div class="bar-track"><div class="bar-fill" data-w="100" style="background:var(--danger)"></div></div><span class="v">244 MB</span></div>
+          </div>
+          <div class="mono" style="font-size:10.5px;color:var(--txt3);margin-top:12px;line-height:1.5;">* Tauri's app binary excludes the ~100 MB system webview it borrows — and +150 MB if you must bundle WebView2. Native's ~17 MB is the whole app.</div>
+        </div>
+        <div class="card">
+          <div class="unit mono">Idle RAM with panel open — smaller is better</div>
+          <div class="chart" id="chartRam">
+            <div class="bar-row"><span class="k"><span class="dot" style="background:var(--accent)"></span>iced / egui</span><div class="bar-track"><div class="bar-fill" data-w="15" style="background:linear-gradient(90deg,var(--accent),var(--accent2))"></div></div><span class="v">~30–60</span></div>
+            <div class="bar-row"><span class="k"><span class="dot" style="background:var(--good)"></span>Slint (SW)</span><div class="bar-track"><div class="bar-fill" data-w="10" style="background:var(--good)"></div></div><span class="v">lowest</span></div>
+            <div class="bar-row"><span class="k"><span class="dot" style="background:var(--warn)"></span>Tauri</span><div class="bar-track"><div class="bar-fill" data-w="30" style="background:var(--warn)"></div></div><span class="v">30–170+</span></div>
+            <div class="bar-row"><span class="k"><span class="dot" style="background:var(--danger)"></span>Electron</span><div class="bar-track"><div class="bar-fill" data-w="75" style="background:var(--danger)"></div></div><span class="v">200–300</span></div>
+          </div>
+          <div class="mono" style="font-size:10.5px;color:var(--txt3);margin-top:12px;line-height:1.5;">MB. Native startup: window in ~33 ms. Tauri pays webview init (100–400 ms). The always-on <b>daemon</b> (no GUI) sits at single-digit MB.</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- RELIABILITY -->
+    <section id="reliability">
+      <div class="sh"><span class="n mono">04</span><h2 class="display">"Runs flawlessly on every device" — the real answer</h2></div>
+      <p class="sdesc">There is no "flawless everywhere" — the failure modes just differ. The single biggest lever isn't the framework name, it's the <b>rendering backend</b>. Ranked most→least universally reliable, and a KVM tool lives on exactly the low-end / VM / remote machines at the top:</p>
+      <div class="ladder">
+        <div class="rung">
+          <span class="rank display" style="color:var(--good)">1</span>
+          <div class="body"><div class="t">Software rendering (CPU)<span class="mono" style="color:var(--txt3);font-weight:400;font-size:11px;"> — Slint SW, tiny-skia</span></div><div class="d">Needs no GPU at all. Runs on headless boxes, ancient laptops, VMs, over RDP, on ARM. The literal closest to "runs on anything."</div></div>
+          <span class="score chip good">most reliable</span>
+        </div>
+        <div class="rung" style="border-color:var(--accent);">
+          <span class="rank display" style="color:var(--accent)">2</span>
+          <div class="body"><div class="t">OpenGL / glow<span class="mono" style="color:var(--txt3);font-weight:400;font-size:11px;"> — egui, iced</span></div><div class="d">OpenGL 2.1+ is nearly ubiquitous and usually works in VMs / remote sessions. iced falls back to software when even GL is absent — best of both.</div></div>
+          <span class="score chip pick">iced lives here + rung 1 fallback</span>
+        </div>
+        <div class="rung">
+          <span class="rank display" style="color:var(--warn)">3</span>
+          <div class="body"><div class="t">wgpu (Vulkan / Metal / DX12)<span class="mono" style="color:var(--txt3);font-weight:400;font-size:11px;"> — modern, fast</span></div><div class="d">Fails on old GPUs, many VMs, and remote-desktop sessions that don't forward a GPU — unless a software Vulkan driver happens to be installed.</div></div>
+          <span class="score chip warn">least universal GPU path</span>
+        </div>
+        <div class="rung" style="border-color:color-mix(in srgb,var(--danger) 40%,var(--line));">
+          <span class="rank display" style="color:var(--danger)">4</span>
+          <div class="body"><div class="t">Webview<span class="mono" style="color:var(--txt3);font-weight:400;font-size:11px;"> — Tauri</span></div><div class="d">Three different engines, a Linux libsoup version split, and a Windows runtime that may be missing. Most moving parts, least uniform.</div></div>
+          <span class="score chip bad">least "just works"</span>
+        </div>
+      </div>
+    </section>
+
+    <!-- ARCHITECTURE -->
+    <section id="arch">
+      <div class="sh"><span class="n mono">05</span><h2 class="display">The architecture that actually wins</h2></div>
+      <p class="sdesc">The sharpest insight from the research: <b>your performance-critical path (input capture/injection + LAN networking) is native Rust no matter what you pick for the GUI.</b> The panel is idle 99% of the time. So split it — and the GUI's footprint stops mattering for the always-on part. Your codebase already has most of this (a headless <code style="font-family:'JetBrains Mono';font-size:12px">run_blocking</code> path + a GUI path).</p>
+      <div class="arch">
+        <div class="node hot">
+          <div class="lab mono">always on · single-digit MB</div>
+          <div class="nm display">Headless daemon</div>
+          <div class="ds">Pure Rust. Input hooks, TLS link, engine. No window, no renderer linked. This is the 99%-of-the-time process — essentially free.</div>
+          <span class="badge mono">performance-critical · native</span>
+        </div>
+        <div class="node">
+          <div class="lab mono">on demand · dies when closed</div>
+          <div class="nm display">Config panel</div>
+          <div class="ds">iced window, spawned only when the user opens settings. Talks to the daemon over local IPC. Its 30–60 MB is reclaimed on close.</div>
+          <span class="badge mono">the mockup lives here</span>
+        </div>
+        <div class="node">
+          <div class="lab mono">thin · one event loop</div>
+          <div class="nm display">Tray helper</div>
+          <div class="ds">Owns the tray icon (needs a GTK loop on Linux). Keeps the daemon a pure headless binary. Opens the panel on click.</div>
+          <span class="badge mono">tray-icon crate</span>
+        </div>
+      </div>
+      <div class="callout" style="margin-top:14px;">This is <b>smaller and more reliable than any single-process option</b>, and it makes the open-core split natural later: the daemon/engine crates stay open (MIT), a closed <code style="font-family:'JetBrains Mono';font-size:12px">pro</code> crate compiles only into paid builds.</div>
+    </section>
+
+    <!-- COMMERCIAL -->
+    <section id="commercial">
+      <div class="sh"><span class="n mono">06</span><h2 class="display">What actually bites when you sell it</h2></div>
+      <p class="sdesc">Ranked by how much they'll hurt. Most are GUI-independent — but note where native's one-command Windows build and no-webview surface quietly save you money and support load.</p>
+      <div class="road">
+        <div class="ri crit"><span class="rank mono">1</span><div><div class="t">Windows SmartScreen reputation</div><div class="d">Unsigned/new-publisher installers show scary warnings until reputation builds over weeks. Fix: <b>Azure Trusted Signing — $10/mo</b> (no USB token, CI-friendly, now open to individuals). EV certs lost their instant-trust perk in 2024, so don't overpay.</div></div></div>
+        <div class="ri crit"><span class="rank mono">2</span><div><div class="t">Open-core split + a CLA from commit #1</div><div class="d">To ever sell the whole product you must own every line — require a <b>CLA</b> before the first outside PR, keep the core <b>MIT/Apache</b>, and put paid logic in a <b>closed <code>pro</code> crate</b> (not behind an <code>if licensed</code> in open code, which is patched out in minutes). Retrofitting this later is often impossible.</div></div></div>
+        <div class="ri"><span class="rank mono">3</span><div><div class="t">Installers + auto-update</div><div class="d">Native closes Tauri's one real advantage with <b>cargo-packager</b> (MSI/NSIS/DMG/AppImage/.deb) + <b>Velopack</b> (delta updates, signed, works with plain Rust). Sign update artifacts separately from the OS cert — an auto-updater is a code-execution path.</div></div></div>
+        <div class="ri"><span class="rank mono">4</span><div><div class="t">Paid-tier licensing + tax</div><div class="d">Use a <b>Merchant-of-Record</b> (Lemon Squeezy / Paddle, ~5% + $0.50) so they remit global VAT for you. Gate features with <b>Keygen offline signed licenses</b> — important for a LAN tool that may be offline. macOS: $99/yr Apple Developer + notarization.</div></div></div>
+        <div class="ri ok"><span class="rank mono">5</span><div><div class="t">Support surface — native quietly wins</div><div class="d">No webview = uniform rendering everywhere + no stale-WebKitGTK bug reports. Add <b>Sentry + minidumps</b> for native crashes (input hooks live near the OS and will segfault on some configs). Budget for <b>AV false-positives</b> — input-hooking tools get flagged as keyloggers.</div></div></div>
+      </div>
+    </section>
+
+    <!-- WEDGE -->
+    <section id="wedge">
+      <div class="sh"><span class="n mono">07</span><h2 class="display">The competition — and your wedge</h2></div>
+      <p class="sdesc">Read this before building. You're entering a category with a well-funded incumbent that owns both the paid product and the open-source upstream.</p>
+      <div class="grid2">
+        <div class="mini">
+          <div class="h">📉 What killed the open-source ones</div>
+          <ul>
+            <li>Synergy → went paid → community forked <b>Barrier</b> → <b>InputLeap</b> → both stalled on <b>governance/maintainer disputes</b>, not lack of demand.</li>
+            <li>Symless now owns both sides: <b>Deskflow</b> (OSS upstream) + <b>Synergy 3</b> (paid), priced <b>$15–29 one-time</b>.</li>
+            <li>Gating <b>encryption</b> behind a paywall caused lasting resentment + forks.</li>
+          </ul>
+        </div>
+        <div class="mini" style="border-color:color-mix(in srgb,var(--accent) 40%,var(--line));">
+          <div class="h">🎯 Where you win</div>
+          <ul>
+            <li><b>Reliability</b> — your Rust rewrite already fixes the hang/stale-connection/freeze bugs. That's the wedge Synergy is weakest on.</li>
+            <li><b>Zero-config LAN discovery</b>, rock-solid reconnect, clean cross-platform clipboard.</li>
+            <li><b>Never</b> gate security (encryption) — keep TLS free. Don't move core value across the free/paid line later.</li>
+            <li>Clean-room Rust build (you own it) — <b>don't fork Deskflow</b> (GPL-2.0 would infect your paid tier).</li>
+          </ul>
+        </div>
+      </div>
+      <div class="callout warn" style="margin-top:14px;"><b>Trademark:</b> "Synergy" is registered. Don't pick a confusingly similar name or imply affiliation. Nominative "a Synergy alternative" marketing is fine; using their logo/name as your own is not.</div>
+    </section>
+
+    <!-- NEXT -->
+    <section id="next">
+      <div class="sh"><span class="n mono">08</span><h2 class="display">Recommended stack &amp; next steps</h2></div>
+      <div class="grid2">
+        <div class="card">
+          <div class="h" style="font-weight:700;font-size:14px;margin-bottom:12px;">The stack</div>
+          <div class="chart">
+            <div class="bar-row" style="grid-template-columns:120px 1fr;"><span class="k">GUI</span><span class="v" style="text-align:left;color:var(--txt)">iced 0.14 (MIT), OpenGL + SW fallback</span></div>
+            <div class="bar-row" style="grid-template-columns:120px 1fr;"><span class="k">Shape</span><span class="v" style="text-align:left;color:var(--txt)">daemon + panel + tray helper</span></div>
+            <div class="bar-row" style="grid-template-columns:120px 1fr;"><span class="k">Packaging</span><span class="v" style="text-align:left;color:var(--txt)">cargo-packager</span></div>
+            <div class="bar-row" style="grid-template-columns:120px 1fr;"><span class="k">Updates</span><span class="v" style="text-align:left;color:var(--txt)">Velopack (signed, delta)</span></div>
+            <div class="bar-row" style="grid-template-columns:120px 1fr;"><span class="k">Signing</span><span class="v" style="text-align:left;color:var(--txt)">Azure Trusted Signing $10/mo</span></div>
+            <div class="bar-row" style="grid-template-columns:120px 1fr;"><span class="k">Payments</span><span class="v" style="text-align:left;color:var(--txt)">Lemon Squeezy + Keygen</span></div>
+            <div class="bar-row" style="grid-template-columns:120px 1fr;"><span class="k">License</span><span class="v" style="text-align:left;color:var(--txt)">MIT core + closed pro crate + CLA</span></div>
+          </div>
+        </div>
+        <div class="card">
+          <div class="h" style="font-weight:700;font-size:14px;margin-bottom:12px;">The plan</div>
+          <div class="road">
+            <div class="ri ok" style="padding:12px 14px;"><span class="rank mono">A</span><div><div class="t" style="font-size:13px;">Port the panel to iced</div><div class="d">Rebuild the mockup on iced, wired to the existing <code>EngineHandle</code>. Themes + animated toggles + two-machine hero. Keep egui as fallback until parity.</div></div></div>
+            <div class="ri ok" style="padding:12px 14px;"><span class="rank mono">B</span><div><div class="t" style="font-size:13px;">Both platforms</div><div class="d">Linux binary + Windows exe (cross-compiled on Kali). Verify software-render fallback on a VM.</div></div></div>
+            <div class="ri ok" style="padding:12px 14px;"><span class="rank mono">C</span><div><div class="t" style="font-size:13px;">Then test</div><div class="d">The two-machine hardware pass (F1–F4) you already had queued — now on the new UI.</div></div></div>
+          </div>
+        </div>
+      </div>
+      <div class="callout" style="margin-top:16px;">
+        <b>One honesty note on the look:</b> a native toolkit reimplements each visual primitive, so the mockup's glassy blur / layered soft-shadows are custom-paint work in iced. I'd adapt the design to a <b>native-polished</b> rendition — same themes, gradients, animated toggles, and the two-machine hero, with tasteful solid+gradient surfaces instead of literal glassmorphism. It'll read as the same product, ~85–90% of the exact mockup. If you insist on <b>pixel-perfect</b> HTML fidelity and accept build-on-Windows + WebView2, Tauri remains the only 100% path — but for everything else, iced is the better product decision.
+      </div>
+    </section>
+
+    <div class="foot mono">
+      <div>Synthesis of 4 research investigations · sources incl. Tauri docs, iced/COSMIC, Lukas Kalbertodt &amp; gethopp benchmarks, Slint pricing, Zed issue #55470, Symless/Deskflow, Azure Trusted Signing, Keygen, Lemon Squeezy. Numbers are directional (small-N benchmarks).</div>
+      <div style="margin-top:8px;">mouse-rs · /home/kalip/mouse-rs · decision doc v1 · switch theme ↑ to preview all 6 palettes on the real UI</div>
+    </div>
+  </div>
+</div>
+
+<script>
+  const app=document.getElementById('app');
+  document.querySelectorAll('.sw').forEach(sw=>sw.addEventListener('click',()=>{
+    document.querySelectorAll('.sw').forEach(s=>s.setAttribute('aria-pressed','false'));
+    sw.setAttribute('aria-pressed','true');
+    app.setAttribute('data-theme',sw.dataset.set);
+  }));
+  document.querySelectorAll('.secnav a').forEach(a=>a.addEventListener('click',e=>{
+    e.preventDefault();
+    document.querySelector(a.getAttribute('href')).scrollIntoView({behavior:'smooth',block:'start'});
+  }));
+  function fill(){document.querySelectorAll('.bar-fill').forEach(b=>{b.style.width=b.dataset.w+'%';});}
+  window.addEventListener('load',()=>requestAnimationFrame(fill));
+</script>

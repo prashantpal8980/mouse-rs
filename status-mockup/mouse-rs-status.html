@@ -1,0 +1,391 @@
+<title>mouse-rs — project status</title>
+<style>
+  :root {
+    /* neutrals with a faint warm/oxide bias — grounded in "Rust" */
+    --bg:        #f7f4f0;
+    --panel:     #ffffff;
+    --panel-2:   #faf7f3;
+    --ink:       #1c1a17;
+    --ink-soft:  #55504a;
+    --ink-faint: #8a837a;
+    --line:      #e6e0d7;
+    --line-2:    #efe9e0;
+
+    /* brand accent: oxide / rust */
+    --rust:      #c0501f;
+
+    /* semantic status (kept distinct from the accent) */
+    --good:      #2f8f46;
+    --good-bg:   #e7f4e9;
+    --warn:      #b57d10;
+    --warn-bg:   #f8efd6;
+    --risk:      #c23b34;
+    --risk-bg:   #f8e3e1;
+    --neutral:   #6b6b74;
+
+    --radius: 10px;
+    --shadow: 0 1px 2px rgba(28,26,23,.05), 0 4px 16px rgba(28,26,23,.05);
+
+    --mono: ui-monospace, "SF Mono", "JetBrains Mono", "Cascadia Code", Menlo, Consolas, monospace;
+    --sans: system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg:        #14120f;
+      --panel:     #1c1a16;
+      --panel-2:   #211e19;
+      --ink:       #ece7df;
+      --ink-soft:  #b3aaa0;
+      --ink-faint: #7d766b;
+      --line:      #2c2823;
+      --line-2:    #262319;
+
+      --rust:      #e07a45;
+      --good:      #4fbf6a;
+      --good-bg:   #16281a;
+      --warn:      #d4a02a;
+      --warn-bg:   #2b2410;
+      --risk:      #ef6b60;
+      --risk-bg:   #2c1614;
+      --neutral:   #9a95a2;
+      --shadow: 0 1px 2px rgba(0,0,0,.3), 0 6px 20px rgba(0,0,0,.28);
+    }
+  }
+  :root[data-theme="light"] {
+    --bg:#f7f4f0; --panel:#fff; --panel-2:#faf7f3; --ink:#1c1a17; --ink-soft:#55504a;
+    --ink-faint:#8a837a; --line:#e6e0d7; --line-2:#efe9e0; --rust:#c0501f;
+    --good:#2f8f46; --good-bg:#e7f4e9; --warn:#b57d10; --warn-bg:#f8efd6;
+    --risk:#c23b34; --risk-bg:#f8e3e1; --neutral:#6b6b74;
+    --shadow:0 1px 2px rgba(28,26,23,.05),0 4px 16px rgba(28,26,23,.05);
+  }
+  :root[data-theme="dark"] {
+    --bg:#14120f; --panel:#1c1a16; --panel-2:#211e19; --ink:#ece7df; --ink-soft:#b3aaa0;
+    --ink-faint:#7d766b; --line:#2c2823; --line-2:#262319; --rust:#e07a45;
+    --good:#4fbf6a; --good-bg:#16281a; --warn:#d4a02a; --warn-bg:#2b2410;
+    --risk:#ef6b60; --risk-bg:#2c1614; --neutral:#9a95a2;
+    --shadow:0 1px 2px rgba(0,0,0,.3),0 6px 20px rgba(0,0,0,.28);
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font-family: var(--sans); line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 1080px; margin: 0 auto; padding: 40px 24px 72px; }
+
+  /* ---------- header ---------- */
+  header { display: flex; flex-wrap: wrap; align-items: flex-end; justify-content: space-between; gap: 20px; margin-bottom: 32px; }
+  .brand { display: flex; align-items: baseline; gap: 14px; }
+  .logo {
+    font-family: var(--mono); font-weight: 700; font-size: 30px; letter-spacing: -.5px;
+    color: var(--ink);
+  }
+  .logo .dot { color: var(--rust); }
+  .tagline { color: var(--ink-faint); font-size: 13.5px; max-width: 40ch; }
+  .meta-side { text-align: right; font-family: var(--mono); font-size: 12px; color: var(--ink-faint); line-height: 1.7; }
+  .meta-side b { color: var(--ink-soft); font-weight: 600; }
+
+  .overall-chip {
+    display: inline-flex; align-items: center; gap: 8px;
+    font-family: var(--mono); font-size: 12.5px; font-weight: 600;
+    padding: 6px 12px; border-radius: 999px;
+    background: var(--warn-bg); color: var(--warn);
+    border: 1px solid color-mix(in srgb, var(--warn) 28%, transparent);
+  }
+  .overall-chip .pulse { width: 8px; height: 8px; border-radius: 50%; background: currentColor; }
+
+  /* ---------- kpi row ---------- */
+  .kpis { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; margin-bottom: 30px; }
+  .kpi {
+    background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius);
+    padding: 16px 18px; box-shadow: var(--shadow);
+  }
+  .kpi .label { font-family: var(--mono); font-size: 10.5px; letter-spacing: .08em; text-transform: uppercase; color: var(--ink-faint); }
+  .kpi .num { font-size: 30px; font-weight: 700; letter-spacing: -.5px; margin-top: 6px; font-variant-numeric: tabular-nums; }
+  .kpi .sub { font-size: 12px; color: var(--ink-soft); margin-top: 2px; }
+  .kpi .num small { font-size: 15px; font-weight: 600; color: var(--ink-faint); }
+
+  /* ---------- progress bars ---------- */
+  .progress-card { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 22px 24px; box-shadow: var(--shadow); margin-bottom: 34px; }
+  .pbar-row { display: flex; align-items: center; gap: 16px; }
+  .pbar-row + .pbar-row { margin-top: 18px; }
+  .pbar-label { width: 168px; flex-shrink: 0; font-size: 13.5px; }
+  .pbar-label .k { display: block; font-family: var(--mono); font-size: 10.5px; text-transform: uppercase; letter-spacing: .07em; color: var(--ink-faint); }
+  .pbar-track { flex: 1; height: 10px; border-radius: 6px; background: var(--line-2); overflow: hidden; }
+  .pbar-fill { height: 100%; border-radius: 6px; width: 0; transition: width 1.1s cubic-bezier(.2,.7,.3,1); }
+  .pbar-pct { width: 46px; text-align: right; font-family: var(--mono); font-size: 13px; font-weight: 600; font-variant-numeric: tabular-nums; }
+
+  /* ---------- sections ---------- */
+  section { margin-bottom: 40px; }
+  .sec-head { display: flex; align-items: baseline; gap: 12px; margin-bottom: 16px; }
+  .sec-head h2 { font-size: 18px; margin: 0; letter-spacing: -.2px; }
+  .sec-head .n { font-family: var(--mono); font-size: 12px; color: var(--rust); font-weight: 600; }
+  .sec-head .rule { flex: 1; height: 1px; background: var(--line); }
+
+  /* ---------- phase table ---------- */
+  .table-wrap { overflow-x: auto; border: 1px solid var(--line); border-radius: var(--radius); background: var(--panel); box-shadow: var(--shadow); }
+  table { width: 100%; border-collapse: collapse; min-width: 640px; }
+  th { text-align: left; font-family: var(--mono); font-size: 10.5px; text-transform: uppercase; letter-spacing: .07em; color: var(--ink-faint); font-weight: 600; padding: 12px 18px; border-bottom: 1px solid var(--line); }
+  td { padding: 13px 18px; border-bottom: 1px solid var(--line-2); font-size: 13.5px; vertical-align: middle; }
+  tr:last-child td { border-bottom: none; }
+  td .ph { font-family: var(--mono); font-weight: 700; color: var(--rust); }
+  td .what { font-weight: 600; }
+  td .desc { color: var(--ink-soft); font-size: 12.5px; }
+
+  /* ---------- status pills ---------- */
+  .pill { display: inline-flex; align-items: center; gap: 6px; font-family: var(--mono); font-size: 11px; font-weight: 600; padding: 3px 9px; border-radius: 999px; white-space: nowrap; }
+  .pill::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+  .pill.good { color: var(--good); background: var(--good-bg); }
+  .pill.warn { color: var(--warn); background: var(--warn-bg); }
+  .pill.risk { color: var(--risk); background: var(--risk-bg); }
+
+  /* ---------- bug columns ---------- */
+  .cols { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
+  .col-card { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); box-shadow: var(--shadow); overflow: hidden; }
+  .col-card > .cap { display: flex; align-items: center; justify-content: space-between; padding: 13px 18px; border-bottom: 1px solid var(--line); }
+  .col-card > .cap .t { font-weight: 700; font-size: 14px; display: flex; align-items: center; gap: 8px; }
+  .col-card > .cap .count { font-family: var(--mono); font-size: 12px; font-weight: 700; padding: 2px 9px; border-radius: 999px; }
+  .cap.fixed .count { color: var(--good); background: var(--good-bg); }
+  .cap.open .count { color: var(--risk); background: var(--risk-bg); }
+  .buglist { list-style: none; margin: 0; padding: 6px 0; }
+  .buglist li { padding: 11px 18px; border-bottom: 1px solid var(--line-2); display: flex; gap: 11px; }
+  .buglist li:last-child { border-bottom: none; }
+  .buglist .mk { flex-shrink: 0; width: 18px; height: 18px; border-radius: 5px; display: grid; place-items: center; font-size: 12px; font-weight: 700; margin-top: 1px; }
+  .mk.ok { background: var(--good-bg); color: var(--good); }
+  .mk.no { background: var(--risk-bg); color: var(--risk); }
+  .mk.wn { background: var(--warn-bg); color: var(--warn); }
+  .bug-body .bt { font-size: 13px; font-weight: 600; }
+  .bug-body .bd { font-size: 12px; color: var(--ink-soft); margin-top: 2px; }
+  .tag { font-family: var(--mono); font-size: 9.5px; text-transform: uppercase; letter-spacing: .05em; padding: 1px 6px; border-radius: 4px; background: var(--line-2); color: var(--ink-faint); margin-left: 6px; vertical-align: middle; }
+  .tag.arch { background: color-mix(in srgb, var(--rust) 16%, transparent); color: var(--rust); }
+  .tag.hw { background: var(--warn-bg); color: var(--warn); }
+
+  /* ---------- UI checklist ---------- */
+  .ui-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
+  .ui-item { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 13px 15px; box-shadow: var(--shadow); display: flex; gap: 11px; align-items: flex-start; }
+  .ui-item .ck { flex-shrink: 0; width: 20px; height: 20px; border-radius: 6px; background: var(--good-bg); color: var(--good); display: grid; place-items: center; font-weight: 700; font-size: 12px; }
+  .ui-item .ct { font-size: 13px; font-weight: 600; }
+  .ui-item .cd { font-size: 11.5px; color: var(--ink-soft); margin-top: 1px; }
+
+  /* ---------- roadmap ---------- */
+  .road { display: flex; flex-direction: column; gap: 12px; }
+  .road-item { display: flex; gap: 14px; background: var(--panel); border: 1px solid var(--line); border-left: 3px solid var(--neutral); border-radius: var(--radius); padding: 15px 18px; box-shadow: var(--shadow); }
+  .road-item.risk { border-left-color: var(--risk); }
+  .road-item.next { border-left-color: var(--warn); }
+  .road-item .rp { font-family: var(--mono); font-size: 11px; font-weight: 700; padding: 3px 8px; border-radius: 6px; height: fit-content; white-space: nowrap; }
+  .road-item.risk .rp { color: var(--risk); background: var(--risk-bg); }
+  .road-item.next .rp { color: var(--warn); background: var(--warn-bg); }
+  .road-item.later .rp { color: var(--neutral); background: var(--line-2); }
+  .road-item .rt { font-weight: 700; font-size: 14px; }
+  .road-item .rd { font-size: 12.5px; color: var(--ink-soft); margin-top: 3px; }
+  .road-item .rd code { font-family: var(--mono); font-size: 11.5px; background: var(--line-2); padding: 1px 5px; border-radius: 4px; }
+
+  footer { margin-top: 48px; padding-top: 20px; border-top: 1px solid var(--line); font-family: var(--mono); font-size: 11.5px; color: var(--ink-faint); display: flex; flex-wrap: wrap; justify-content: space-between; gap: 10px; }
+
+  @media (max-width: 720px) {
+    .kpis { grid-template-columns: repeat(2, 1fr); }
+    .cols { grid-template-columns: 1fr; }
+    .ui-grid { grid-template-columns: repeat(2, 1fr); }
+    .pbar-label { width: 120px; }
+  }
+  @media (max-width: 460px) {
+    .ui-grid { grid-template-columns: 1fr; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .pbar-fill { transition: none; }
+  }
+</style>
+
+<div class="wrap">
+  <header>
+    <div>
+      <div class="brand">
+        <span class="logo">mouse<span class="dot">-</span>rs</span>
+      </div>
+      <p class="tagline">Production-grade Rust rewrite of the <code>mouse_share</code> KVM switch — one keyboard &amp; mouse shared between a Kali/X11 desktop and a Windows laptop over the LAN.</p>
+    </div>
+    <div class="meta-side">
+      <div><b>Overall:</b> feature-complete</div>
+      <div><b>Last worked:</b> 2026-06-29</div>
+      <div><b>toolchain:</b> rustc 1.96</div>
+      <div style="margin-top:8px"><span class="overall-chip"><span class="pulse"></span>Awaiting hardware test</span></div>
+    </div>
+  </header>
+
+  <!-- KPIs -->
+  <div class="kpis">
+    <div class="kpi">
+      <div class="label">Phases</div>
+      <div class="num">7<small> / 7</small></div>
+      <div class="sub">code-complete</div>
+    </div>
+    <div class="kpi">
+      <div class="label">Tests passing</div>
+      <div class="num">68</div>
+      <div class="sub">core · engine · input · clip</div>
+    </div>
+    <div class="kpi">
+      <div class="label">Build targets</div>
+      <div class="num">2<small> ✓</small></div>
+      <div class="sub">linux-gnu · windows-gnu</div>
+    </div>
+    <div class="kpi">
+      <div class="label">Bugs fixed</div>
+      <div class="num">12<small>+</small></div>
+      <div class="sub">3 open / to verify</div>
+    </div>
+  </div>
+
+  <!-- progress -->
+  <div class="progress-card">
+    <div class="pbar-row">
+      <div class="pbar-label"><span class="k">Track A</span> Code / features</div>
+      <div class="pbar-track"><div class="pbar-fill" data-pct="100" style="background:var(--good)"></div></div>
+      <div class="pbar-pct">100%</div>
+    </div>
+    <div class="pbar-row">
+      <div class="pbar-label"><span class="k">Track B</span> Automated tests</div>
+      <div class="pbar-track"><div class="pbar-fill" data-pct="100" style="background:var(--good)"></div></div>
+      <div class="pbar-pct">100%</div>
+    </div>
+    <div class="pbar-row">
+      <div class="pbar-label"><span class="k">Track C</span> Hardware-validated</div>
+      <div class="pbar-track"><div class="pbar-fill" data-pct="35" style="background:var(--warn)"></div></div>
+      <div class="pbar-pct">~35%</div>
+    </div>
+  </div>
+
+  <!-- PHASES -->
+  <section>
+    <div class="sec-head"><span class="n">01</span><h2>Phases</h2><span class="rule"></span></div>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th style="width:44px">#</th><th>Deliverable</th><th style="width:200px">Status</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><span class="ph">1</span></td>
+            <td><div class="what">Workspace · config · protocol · HMAC auth</div><div class="desc">Cargo workspace; reads the same <code>~/.mouse_share/config.json</code>; length-delimited <code>Message</code> frames; HMAC-SHA256 handshake.</div></td>
+            <td><span class="pill good">Done · tested</span></td>
+          </tr>
+          <tr>
+            <td><span class="ph">2</span></td>
+            <td><div class="what">Async TLS link + liveness + clean stop</div><div class="desc">tokio + rustls (ring), self-signed cert, PING/PONG heartbeat, TCP keepalive, <code>CancellationToken</code> for instant Stop.</div></td>
+            <td><span class="pill good">Done · HW-validated</span></td>
+          </tr>
+          <tr>
+            <td><span class="ph">3</span></td>
+            <td><div class="what">Linux/X11 input + edge-crossing engine</div><div class="desc">XTEST inject + grab/warp capture; Local↔Remote state machine; panic-safe release-all injector thread.</div></td>
+            <td><span class="pill good">Done · loopback</span></td>
+          </tr>
+          <tr>
+            <td><span class="ph">4</span></td>
+            <td><div class="what">Windows input + Fn+Up freeze failsafe</div><div class="desc">SendInput + WH_MOUSE_LL/WH_KEYBOARD_LL; 4-layer failsafe (O(1) hooks, OS timeout, watchdog, self-releasing hotkey).</div></td>
+            <td><span class="pill warn">Code-complete · needs laptop</span></td>
+          </tr>
+          <tr>
+            <td><span class="ph">5</span></td>
+            <td><div class="what">Clipboard sync (text)</div><div class="desc">arboard-based sync thread, loop-free via single content guard; gated on <code>cfg.clipboard_sync</code>.</div></td>
+            <td><span class="pill warn">Code-complete · needs 2-machine</span></td>
+          </tr>
+          <tr>
+            <td><span class="ph">6</span></td>
+            <td><div class="what">egui control panel + system tray</div><div class="desc">Config editor, live status, tray (live tooltip), profiles, detect-screen, clipboard history, Quit.</div></td>
+            <td><span class="pill good">Done</span></td>
+          </tr>
+          <tr>
+            <td><span class="ph">7</span></td>
+            <td><div class="what">Auto-reconnect + packaging</div><div class="desc">Client exponential backoff 1s→15s (recoverable drops + pre-server polling); <code>scripts/package.sh</code> → Win zip + Linux tar.</div></td>
+            <td><span class="pill good">Done · loopback</span></td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- BUGS -->
+  <section>
+    <div class="sec-head"><span class="n">02</span><h2>Bugs</h2><span class="rule"></span></div>
+    <div class="cols">
+      <!-- fixed -->
+      <div class="col-card">
+        <div class="cap fixed"><span class="t">✓ Fixed &amp; verified</span><span class="count">12</span></div>
+        <ul class="buglist">
+          <li><span class="mk ok">✓</span><div class="bug-body"><div class="bt">Stale &ldquo;connected&rdquo; after peer drops<span class="tag arch">root cause</span></div><div class="bd">Now heartbeat + read-timeout liveness — the #1 Python bug, gone by design.</div></div></li>
+          <li><span class="mk ok">✓</span><div class="bug-body"><div class="bt">Stop / Reload hangs the process<span class="tag arch">root cause</span></div><div class="bd">Cancellable async teardown; SIGINT shuts down in ~1ms.</div></div></li>
+          <li><span class="mk ok">✓</span><div class="bug-body"><div class="bt">Fn+Up freezes the cursor on both machines<span class="tag arch">root cause</span></div><div class="bd">4-layer hook failsafe so a stuck hook can never freeze input.</div></div></li>
+          <li><span class="mk ok">✓</span><div class="bug-body"><div class="bt">Motion over-count (warp-echo)<span class="tag">phase 3</span></div><div class="bd">Pure <code>Motion</code> struct absorbs the recenter echo; +5 regression tests.</div></div></li>
+          <li><span class="mk ok">✓</span><div class="bug-body"><div class="bt">ShiftR + extended-key mis-mapping<span class="tag">phase 4</span></div><div class="bd">Found by adversarial review of the Windows keyboard path.</div></div></li>
+          <li><span class="mk ok">✓</span><div class="bug-body"><div class="bt">Watchdog terminal &amp; false-fire<span class="tag">phase 4</span></div><div class="bd">Made non-terminal + heartbeat-gated so it can't kill a live hook.</div></div></li>
+          <li><span class="mk ok">✓</span><div class="bug-body"><div class="bt">Clipboard queues while disconnected<span class="tag">phase 5</span></div><div class="bd">Broadcast only while <code>connected</code> — no stale flush to the next peer.</div></div></li>
+          <li><span class="mk ok">✓</span><div class="bug-body"><div class="bt">Kali cursor drifts while controlling Windows<span class="tag hw">hardware</span></div><div class="bd">X11 grab doesn't freeze the cursor — now warp-to-centre after every motion.</div></div></li>
+          <li><span class="mk ok">✓</span><div class="bug-body"><div class="bt">Confined cursor, Windows-as-server capture<span class="tag hw">hardware</span></div><div class="bd">Windows swallows moves → froze delta; now delta from swallowed centre. <em>Needs retest.</em></div></div></li>
+          <li><span class="mk ok">✓</span><div class="bug-body"><div class="bt">Close didn't quit on Xfce<span class="tag hw">hardware</span></div><div class="bd">Reverted minimize-to-tray — close = quit again.</div></div></li>
+          <li><span class="mk ok">✓</span><div class="bug-body"><div class="bt">No multi-key escape combo</div><div class="bd">Added <code>return_hotkey</code> (e.g. <code>ctrl+win+alt+esc</code>), matched engine-side.</div></div></li>
+          <li><span class="mk ok">✓</span><div class="bug-body"><div class="bt">Review-batch fixes</div><div class="bd">Cancel-aware net sends, client <code>saturating_add</code>, injector <code>spawn→Result</code>.</div></div></li>
+        </ul>
+      </div>
+      <!-- open -->
+      <div class="col-card">
+        <div class="cap open"><span class="t">△ Open / to verify</span><span class="count">3</span></div>
+        <ul class="buglist">
+          <li><span class="mk no">!</span><div class="bug-body"><div class="bt">F1 — frozen-cursor full-reach <span class="tag hw">the real risk</span></div><div class="bd">Windows-as-server capture assumes the cursor freezes by swallowing moves. If it <em>accelerates</em> instead, the assumption fails and the client cursor won't reach the screen edge. Can only be confirmed on the laptop.</div></div></li>
+          <li><span class="mk wn">~</span><div class="bug-body"><div class="bt">Image clipboard incomplete</div><div class="bd">Text sync works; <code>ClipboardImage</code> RGBA↔PNG + size cap is still stubbed / deferred.</div></div></li>
+          <li><span class="mk wn">~</span><div class="bug-body"><div class="bt">Windows GUI console flash</div><div class="bd">Brief console flash when the GUI is double-clicked from Explorer (console allocated then <code>FreeConsole</code>). Cosmetic.</div></div></li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- UI -->
+  <section>
+    <div class="sec-head"><span class="n">03</span><h2>UI — Phase 6 control panel &amp; tray</h2><span class="rule"></span></div>
+    <div class="ui-grid">
+      <div class="ui-item"><span class="ck">✓</span><div><div class="ct">Config editor</div><div class="cd">name · role · secret · TLS · edges · hosts · ports</div></div></div>
+      <div class="ui-item"><span class="ck">✓</span><div><div class="ct">Start / Stop / Save</div><div class="cd">form locks while running</div></div></div>
+      <div class="ui-item"><span class="ck">✓</span><div><div class="ct">Live status header</div><div class="cd">connected · peer (w×h) · engaged direction</div></div></div>
+      <div class="ui-item"><span class="ck">✓</span><div><div class="ct">System tray</div><div class="cd">Open · Start · Stop · Quit; win + gtk paths</div></div></div>
+      <div class="ui-item"><span class="ck">✓</span><div><div class="ct">Live tray tooltip</div><div class="cd">reflects connection state per frame</div></div></div>
+      <div class="ui-item"><span class="ck">✓</span><div><div class="ct">Network profiles</div><div class="cd">save / load / delete under <code>profiles/</code></div></div></div>
+      <div class="ui-item"><span class="ck">✓</span><div><div class="ct">Detect-screen</div><div class="cd">editable size + Detect button</div></div></div>
+      <div class="ui-item"><span class="ck">✓</span><div><div class="ct">Clipboard history</div><div class="cd">in/out arrows, 25-entry, 60-char preview</div></div></div>
+      <div class="ui-item"><span class="ck">✓</span><div><div class="ct">Quit / kill button</div><div class="cd">graceful stop + 1.5s hard backstop</div></div></div>
+    </div>
+  </section>
+
+  <!-- ROADMAP -->
+  <section>
+    <div class="sec-head"><span class="n">04</span><h2>What's left</h2><span class="rule"></span></div>
+    <div class="road">
+      <div class="road-item risk">
+        <span class="rp">RISK · F1</span>
+        <div><div class="rt">Two-machine hardware test — Phases 4–7</div><div class="rd">The only un-hardware-tested code. Run <code>docs/TESTING.md</code> §6b <b>F1–F4</b>: frozen-cursor full-reach, close=quit on Xfce, combo return-hotkey (set on the <em>server</em>), auto-reconnect across a server restart. Deploy the exe via a Kali <code>python3 -m http.server</code> the laptop pulls. <b>F1 is the one to watch.</b></div></div>
+      </div>
+      <div class="road-item next">
+        <span class="rp">NEXT</span>
+        <div><div class="rt">Image clipboard</div><div class="rd">Finish the deferred <code>ClipboardImage</code> path — RGBA↔PNG conversion + size cap under the 8 MiB frame limit.</div></div>
+      </div>
+      <div class="road-item later">
+        <span class="rp">POLISH</span>
+        <div><div class="rt">Windows console double-click flash</div><div class="rd">Cosmetic — the GUI briefly flashes a console when launched from Explorer.</div></div>
+      </div>
+    </div>
+  </section>
+
+  <footer>
+    <span>mouse-rs · Rust workspace · 5 crates (core · input · engine · clipboard · bin)</span>
+    <span>/home/kalip/mouse-rs · status snapshot</span>
+  </footer>
+</div>
+
+<script>
+  window.addEventListener("load", function () {
+    requestAnimationFrame(function () {
+      document.querySelectorAll(".pbar-fill").forEach(function (el) {
+        el.style.width = el.getAttribute("data-pct") + "%";
+      });
+    });
+  });
+</script>

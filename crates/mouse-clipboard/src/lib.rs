@@ -10,15 +10,67 @@
 //! (it needs RGBA<->PNG conversion and size capping); image messages received now
 //! are simply ignored.
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
 use tokio::sync::mpsc::UnboundedSender;
 
 use mouse_core::protocol::Message;
+
+/// How many recent clipboard entries the history keeps (for the GUI view).
+const HISTORY_CAP: usize = 25;
+
+/// One remembered clipboard transfer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClipEntry {
+    pub text: String,
+    /// True if received from the peer, false if sent from this machine.
+    pub incoming: bool,
+}
+
+/// A small, shared, newest-first ring of recent clipboard transfers. Cheap to clone
+/// (an `Arc`); the sync thread records into it and the GUI snapshots it.
+#[derive(Clone, Default)]
+pub struct ClipboardHistory {
+    inner: Arc<Mutex<VecDeque<ClipEntry>>>,
+}
+
+impl ClipboardHistory {
+    pub fn new() -> ClipboardHistory {
+        ClipboardHistory::default()
+    }
+
+    /// Record a transfer at the front, collapsing an immediate duplicate and capping
+    /// the length. Lock poisoning is ignored (a stale view is harmless).
+    pub fn record(&self, text: String, incoming: bool) {
+        if let Ok(mut q) = self.inner.lock() {
+            if q.front().is_some_and(|e| e.text == text && e.incoming == incoming) {
+                return;
+            }
+            q.push_front(ClipEntry { text, incoming });
+            q.truncate(HISTORY_CAP);
+        }
+    }
+
+    /// Newest-first snapshot for display.
+    pub fn snapshot(&self) -> Vec<ClipEntry> {
+        self.inner
+            .lock()
+            .map(|q| q.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Drop all remembered entries.
+    pub fn clear(&self) {
+        if let Ok(mut q) = self.inner.lock() {
+            q.clear();
+        }
+    }
+}
 
 /// How often the local clipboard is polled for a user change (also the upper bound
 /// on how long a received update waits before being applied).
@@ -62,12 +114,13 @@ impl ClipboardSync {
         to_peer: UnboundedSender<Message>,
         remote_rx: Receiver<Message>,
         connected: Arc<AtomicBool>,
+        history: Option<ClipboardHistory>,
     ) -> ClipboardSync {
         let stop = Arc::new(AtomicBool::new(false));
         let st = stop.clone();
         let join = std::thread::Builder::new()
             .name("clipboard-sync".into())
-            .spawn(move || run(to_peer, remote_rx, st, connected))
+            .spawn(move || run(to_peer, remote_rx, st, connected, history))
             .ok();
         if join.is_none() {
             tracing::warn!("could not spawn clipboard-sync thread; clipboard sync disabled");
@@ -99,6 +152,7 @@ fn run(
     remote_rx: Receiver<Message>,
     stop: Arc<AtomicBool>,
     connected: Arc<AtomicBool>,
+    history: Option<ClipboardHistory>,
 ) {
     let mut clipboard = match arboard::Clipboard::new() {
         Ok(c) => c,
@@ -123,7 +177,13 @@ fn run(
         // Apply a received clipboard update if one arrived; this recv is also the
         // loop's wait point (wakes on a message or every POLL_INTERVAL).
         match remote_rx.recv_timeout(POLL_INTERVAL) {
-            Ok(Message::Clipboard { text }) => apply_remote(&mut clipboard, &mut last, text),
+            Ok(Message::Clipboard { text }) => {
+                if apply_remote(&mut clipboard, &mut last, text.clone()) {
+                    if let Some(h) = &history {
+                        h.record(text, true);
+                    }
+                }
+            }
             Ok(_) => {} // ClipboardImage and any stray message: ignored for now
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break, // engine dropped the sender
@@ -136,44 +196,51 @@ fn run(
         // backlog (clipboard copied while disconnected) to whoever connects next. On
         // reconnect the first poll naturally syncs the current clipboard once.
         if connected.load(Ordering::SeqCst) {
-            poll_local(&mut clipboard, &mut last, &to_peer);
+            if let Some(sent) = poll_local(&mut clipboard, &mut last, &to_peer) {
+                if let Some(h) = &history {
+                    h.record(sent, false);
+                }
+            }
         }
     }
 }
 
 /// Apply a clipboard value received from the peer, unless it's what we already have
-/// (which would mean it originated here and came back — don't reapply).
-fn apply_remote<C: TextClipboard>(clipboard: &mut C, last: &mut Option<String>, text: String) {
+/// (which would mean it originated here and came back — don't reapply). Returns true
+/// if a new value was actually written (so the caller can record it in history).
+fn apply_remote<C: TextClipboard>(clipboard: &mut C, last: &mut Option<String>, text: String) -> bool {
     if last.as_deref() == Some(text.as_str()) {
-        return;
+        return false;
     }
     if clipboard.write_text(&text) {
         *last = Some(text);
+        true
     } else {
         tracing::debug!("clipboard set failed");
+        false
     }
 }
 
 /// Forward a local clipboard change to the peer, unless it's what we last set/sent
-/// (which would echo a value the peer already has).
+/// (which would echo a value the peer already has). Returns the forwarded text (so the
+/// caller can record it in history), or `None` if nothing was sent.
 fn poll_local<C: TextClipboard>(
     clipboard: &mut C,
     last: &mut Option<String>,
     to_peer: &UnboundedSender<Message>,
-) {
-    let Some(text) = clipboard.read_text() else {
-        return; // empty or non-text (e.g. an image) — nothing to forward
-    };
+) -> Option<String> {
+    let text = clipboard.read_text()?; // empty or non-text (e.g. an image): nothing to forward
     if text.is_empty() || last.as_deref() == Some(text.as_str()) {
-        return;
+        return None;
     }
     if text.len() > MAX_TEXT_BYTES {
         tracing::debug!("clipboard text {} bytes exceeds cap; not syncing", text.len());
         *last = Some(text); // remember it so we don't re-check it every poll
-        return;
+        return None;
     }
     *last = Some(text.clone());
-    let _ = to_peer.send(Message::Clipboard { text });
+    let _ = to_peer.send(Message::Clipboard { text: text.clone() });
+    Some(text)
 }
 
 /// Join `handle`, but never block longer than `timeout`: detach a wedged backend
@@ -277,5 +344,42 @@ mod tests {
         let mut last = None;
         poll_local(&mut cb, &mut last, &tx);
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn history_records_newest_first_dedups_and_caps() {
+        let h = ClipboardHistory::new();
+        h.record("a".into(), false);
+        h.record("a".into(), false); // immediate duplicate collapses
+        h.record("b".into(), true);
+        let snap = h.snapshot();
+        assert_eq!(snap.len(), 2);
+        assert_eq!(snap[0], ClipEntry { text: "b".into(), incoming: true }, "newest first");
+        assert_eq!(snap[1], ClipEntry { text: "a".into(), incoming: false });
+
+        // The same text in the other direction is a distinct entry.
+        h.record("b".into(), false);
+        assert_eq!(h.snapshot().len(), 3);
+
+        for i in 0..HISTORY_CAP + 10 {
+            h.record(format!("x{i}"), false);
+        }
+        assert_eq!(h.snapshot().len(), HISTORY_CAP, "capped");
+
+        h.clear();
+        assert!(h.snapshot().is_empty());
+    }
+
+    #[test]
+    fn apply_and_poll_report_changes_for_history() {
+        let (tx, _rx) = unbounded_channel();
+        let mut cb = Fake::default();
+        let mut last = None;
+        assert!(apply_remote(&mut cb, &mut last, "in".into()), "new remote -> true");
+        assert!(!apply_remote(&mut cb, &mut last, "in".into()), "same remote -> false");
+
+        cb.content = Some("out".into());
+        assert_eq!(poll_local(&mut cb, &mut last, &tx).as_deref(), Some("out"));
+        assert_eq!(poll_local(&mut cb, &mut last, &tx), None, "unchanged -> None");
     }
 }

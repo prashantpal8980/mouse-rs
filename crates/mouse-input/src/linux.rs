@@ -709,11 +709,20 @@ fn handle_event(
 ) -> Result<(), InputError> {
     match event {
         Event::MotionNotify(e) => {
-            let (action, warp) = motion.on_motion(e.root_x as i32, e.root_y as i32, &geom);
+            // `_near_edge` is the shared near-edge hint the Windows backend uses; on
+            // X11 we recentre after *every* real move instead (see below).
+            let (action, _near_edge) = motion.on_motion(e.root_x as i32, e.root_y as i32, &geom);
             if let MotionAction::Forward { dx, dy } = action {
                 let _ = sink.send(CaptureSignal::Input(InputEvent::MouseMove { dx, dy }));
-            }
-            if warp {
+                // Pin the local cursor at centre by warping back on every real move.
+                // An X11 pointer grab does NOT freeze the cursor — it keeps tracking
+                // the physical mouse — so recentring only near an edge let the cursor
+                // visibly drift across the central region of the local screen while
+                // control was on the peer (the "Kali cursor still moves while remote"
+                // bug). Recentring every move keeps it parked at centre, matching the
+                // Python build. Deltas are taken event-to-event, so the extra warps
+                // don't distort forwarded motion, and each warp's synthetic centre
+                // echo is absorbed via `note_warp_issued` / `pending_warps`.
                 warp_center(conn, root, geom.cx, geom.cy)?;
                 motion.note_warp_issued();
             }

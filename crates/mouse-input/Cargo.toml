@@ -26,6 +26,12 @@ windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_Input_KeyboardAndMouse",
+    # Raw Input (WM_INPUT): true device-level relative mouse deltas — position- and
+    # acceleration-independent, so motion never jams at screen edges/corners.
+    "Win32_UI_Input",
+    # WNDCLASSW / RegisterClassW (for the hidden Raw Input message window) reference
+    # HBRUSH, so the GDI module is required even though we pass a null brush.
+    "Win32_Graphics_Gdi",
     "Win32_UI_HiDpi",
     "Win32_System_LibraryLoader",
     "Win32_System_Threading",

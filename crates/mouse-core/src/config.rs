@@ -62,6 +62,10 @@ pub struct Config {
     pub clipboard_sync: bool,
     #[serde(default = "default_lock_hotkey")]
     pub lock_hotkey: String,
+    /// Optional multi-key return/escape combo, e.g. `"ctrl+win+alt+esc"`. Empty = none
+    /// (Scroll Lock / `lock_hotkey` still returns control). Matched in the engine.
+    #[serde(default)]
+    pub return_hotkey: String,
 
     // server side
     #[serde(default = "default_listen_host")]
@@ -73,6 +77,10 @@ pub struct Config {
     pub server_host: String,
     #[serde(default = "default_port")]
     pub server_port: u16,
+    /// Client only: automatically reconnect (with backoff) after a recoverable
+    /// disconnect, and keep retrying when the server isn't up yet. Default on.
+    #[serde(default = "default_true")]
+    pub reconnect: bool,
 
     pub exit_edge: Edge,
     pub entry_edge: Edge,
@@ -95,10 +103,12 @@ impl Default for Config {
             tls_enabled: true,
             clipboard_sync: true,
             lock_hotkey: default_lock_hotkey(),
+            return_hotkey: String::new(),
             listen_host: default_listen_host(),
             listen_port: default_port(),
             server_host: "192.168.1.50".into(),
             server_port: default_port(),
+            reconnect: true,
             exit_edge: Edge::Left,
             entry_edge: Edge::Right,
             screen_width: 1920,
@@ -151,6 +161,86 @@ impl Config {
         std::fs::write(path, json).map_err(ConfigError::Io)?;
         Ok(())
     }
+
+    // --- Named profiles: saved configs under ~/.mouse_share/profiles/<name>.json ---
+
+    /// Directory holding named config profiles.
+    pub fn profiles_dir() -> PathBuf {
+        Self::default_path()
+            .parent()
+            .map(|p| p.join("profiles"))
+            .unwrap_or_else(|| PathBuf::from("profiles"))
+    }
+
+    /// Path of a named profile (the name is sanitized to a safe filename).
+    pub fn profile_path(name: &str) -> Option<PathBuf> {
+        let safe = sanitize_profile_name(name)?;
+        Some(Self::profiles_dir().join(format!("{safe}.json")))
+    }
+
+    /// List saved profile names (sorted, no extension). Empty if the dir is absent.
+    pub fn list_profiles() -> Vec<String> {
+        list_profiles_in(&Self::profiles_dir())
+    }
+
+    /// Load a profile by name.
+    pub fn load_profile(name: &str) -> Result<Config, ConfigError> {
+        let path = Self::profile_path(name)
+            .ok_or_else(|| ConfigError::BadName(name.to_string()))?;
+        Self::load(&path)
+    }
+
+    /// Save the current config as a named profile.
+    pub fn save_profile(&self, name: &str) -> Result<(), ConfigError> {
+        let path = Self::profile_path(name)
+            .ok_or_else(|| ConfigError::BadName(name.to_string()))?;
+        self.save(&path)
+    }
+
+    /// Delete a named profile (Ok if it didn't exist).
+    pub fn delete_profile(name: &str) -> Result<(), ConfigError> {
+        let path = Self::profile_path(name)
+            .ok_or_else(|| ConfigError::BadName(name.to_string()))?;
+        match std::fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(ConfigError::Io(e)),
+        }
+    }
+}
+
+/// Reduce a profile name to a safe single-segment filename: keep alphanumerics,
+/// space, `-` and `_`; trim; reject empty / path-like names (no traversal).
+pub fn sanitize_profile_name(name: &str) -> Option<String> {
+    let cleaned: String = name
+        .chars()
+        .filter(|c| c.is_alphanumeric() || matches!(c, ' ' | '-' | '_'))
+        .collect();
+    let trimmed = cleaned.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(trimmed.to_string())
+}
+
+/// List `*.json` profile names in `dir` (stem only, sorted). Empty if unreadable.
+pub fn list_profiles_in(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = match std::fs::read_dir(dir) {
+        Ok(rd) => rd
+            .filter_map(|e| e.ok())
+            .filter_map(|e| {
+                let path = e.path();
+                if path.extension().and_then(|x| x.to_str()) == Some("json") {
+                    path.file_stem().and_then(|s| s.to_str()).map(String::from)
+                } else {
+                    None
+                }
+            })
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+    names.sort();
+    names
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -159,6 +249,8 @@ pub enum ConfigError {
     Io(#[source] std::io::Error),
     #[error("config parse error: {0}")]
     Parse(#[source] serde_json::Error),
+    #[error("invalid profile name: {0:?}")]
+    BadName(String),
 }
 
 #[cfg(test)]
@@ -205,6 +297,39 @@ mod tests {
         let trimmed = with_bom.strip_prefix('\u{feff}').unwrap();
         let back: Config = serde_json::from_str(trimmed).unwrap();
         assert_eq!(back.name, "x");
+    }
+
+    #[test]
+    fn sanitize_rejects_traversal_and_empty() {
+        assert_eq!(sanitize_profile_name("home").as_deref(), Some("home"));
+        assert_eq!(sanitize_profile_name("  work laptop ").as_deref(), Some("work laptop"));
+        // Path separators / traversal characters are stripped, not honored.
+        assert_eq!(sanitize_profile_name("../../etc/passwd").as_deref(), Some("etcpasswd"));
+        assert_eq!(sanitize_profile_name("a/b\\c").as_deref(), Some("abc"));
+        assert_eq!(sanitize_profile_name(""), None);
+        assert_eq!(sanitize_profile_name("/// "), None);
+    }
+
+    #[test]
+    fn profiles_roundtrip_in_a_dir() {
+        let dir = std::env::temp_dir().join(format!("mouse-rs-prof-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        assert!(list_profiles_in(&dir).is_empty(), "starts empty");
+
+        let cfg = Config { name: "p1".into(), ..Default::default() };
+        cfg.save(&dir.join("home.json")).unwrap();
+        cfg.save(&dir.join("work.json")).unwrap();
+        // A non-json file is ignored.
+        std::fs::write(dir.join("notes.txt"), "x").unwrap();
+
+        assert_eq!(list_profiles_in(&dir), vec!["home".to_string(), "work".to_string()]);
+
+        let back = Config::load(&dir.join("home.json")).unwrap();
+        assert_eq!(back.name, "p1");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

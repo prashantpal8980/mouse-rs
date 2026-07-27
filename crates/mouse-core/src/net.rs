@@ -30,7 +30,7 @@ use tokio_util::codec::Framed;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::Config;
-use crate::protocol::{Message, MessageCodec, PROTOCOL_VERSION};
+use crate::protocol::{CodecError, Message, MessageCodec, PROTOCOL_VERSION};
 use crate::{auth, tls};
 
 /// Tunable timing for the link. Defaults are conservative for a LAN.
@@ -42,6 +42,10 @@ pub struct LinkParams {
     pub liveness_timeout: Duration,
     /// Hard cap on the handshake; a stalled peer can't hang us.
     pub handshake_timeout: Duration,
+    /// Client reconnect: delay before the first retry after a drop/failed connect.
+    pub reconnect_initial: Duration,
+    /// Client reconnect: upper bound the backoff grows toward (doubling each try).
+    pub reconnect_max: Duration,
 }
 
 impl Default for LinkParams {
@@ -50,6 +54,8 @@ impl Default for LinkParams {
             heartbeat_interval: Duration::from_secs(2),
             liveness_timeout: Duration::from_secs(6),
             handshake_timeout: Duration::from_secs(10),
+            reconnect_initial: Duration::from_secs(1),
+            reconnect_max: Duration::from_secs(15),
         }
     }
 }
@@ -87,6 +93,18 @@ impl DisconnectReason {
             self,
             DisconnectReason::PeerClosed | DisconnectReason::TimedOut | DisconnectReason::Io(_)
         )
+    }
+}
+
+/// Classify a frame-read error from the session stream. A socket/TLS **`Io`** error —
+/// e.g. the server process was killed/restarted → "connection reset by peer" — is a
+/// **recoverable** drop, so the client reconnects. Only a genuinely malformed frame
+/// (**`Json`**) is a fatal `ProtocolError`. (Getting this wrong made a server restart
+/// permanently stop the client instead of reconnecting.)
+fn classify_read_error(e: &CodecError) -> DisconnectReason {
+    match e {
+        CodecError::Io(io) => DisconnectReason::Io(io.to_string()),
+        CodecError::Json(_) => DisconnectReason::ProtocolError(e.to_string()),
     }
 }
 
@@ -264,29 +282,101 @@ pub async fn run_server(cfg: Config, params: LinkParams, cancel: CancellationTok
 }
 
 // ----------------------------------------------------------------------------
-// Client: connect once. Reconnect policy lives one level up (Phase 7).
+// Client: connect, then (when enabled) reconnect with backoff across drops.
 // ----------------------------------------------------------------------------
 
-/// Run the client side: connect, handshake, pump until disconnect or cancel.
+/// What one connection attempt resulted in, and what the loop should do next.
+enum AttemptOutcome {
+    /// Local Stop/Reload fired — exit, no reconnect.
+    Cancelled,
+    /// A terminal failure whose own descriptive event (AuthFailed/Error) was
+    /// already emitted — exit, no reconnect (retrying can't fix it).
+    Fatal,
+    /// The link dropped or a (re)connect attempt failed. `was_connected` is true
+    /// if we'd fully connected this attempt (so the loop resets the backoff and
+    /// always surfaces the drop); `reason` decides whether a retry makes sense.
+    Lost {
+        was_connected: bool,
+        reason: DisconnectReason,
+    },
+}
+
+/// Run the client side. Connects, handshakes, and pumps; when `cfg.reconnect` is
+/// set it keeps retrying with exponential backoff after any recoverable drop —
+/// including before the server is up — until `cancel` fires. The engine resets its
+/// crossing state on every `Connected`, so reusing this link across reconnects is safe.
 pub async fn run_client(cfg: Config, params: LinkParams, cancel: CancellationToken, mut ch: LinkChannels) {
+    let mut backoff = params.reconnect_initial;
+    // Whether we've already told the UI we're down, so repeated failed retries
+    // while the server stays offline don't spam Disconnected every backoff tick.
+    let mut announced_down = false;
+
+    loop {
+        if cancel.is_cancelled() {
+            return;
+        }
+
+        match connect_once(&cfg, params, &cancel, &mut ch).await {
+            AttemptOutcome::Cancelled | AttemptOutcome::Fatal => return,
+            AttemptOutcome::Lost { was_connected, reason } => {
+                let recoverable = reason.is_recoverable();
+                if was_connected {
+                    // A live session ended: always surface it, and treat the next
+                    // retry as a fresh start (fast backoff, re-announce if it fails).
+                    let _ = ch.events.send(LinkEvent::Disconnected(reason));
+                    backoff = params.reconnect_initial;
+                    announced_down = true;
+                } else if !announced_down {
+                    // First failure of this outage: surface it once, then go quiet.
+                    let _ = ch.events.send(LinkEvent::Disconnected(reason));
+                    announced_down = true;
+                }
+
+                if !cfg.reconnect || !recoverable {
+                    return;
+                }
+            }
+        }
+
+        // Backoff before the next attempt, but wake instantly on cancel.
+        tokio::select! {
+            _ = cancel.cancelled() => return,
+            _ = tokio::time::sleep(backoff) => {}
+        }
+        backoff = (backoff * 2).min(params.reconnect_max);
+    }
+}
+
+/// One client connection attempt: connect → TLS → handshake → pump. Emits the
+/// progress events (Connecting/Connected, plus AuthFailed/Error for terminal
+/// failures); the caller decides whether to retry and emits the final Disconnected.
+async fn connect_once(
+    cfg: &Config,
+    params: LinkParams,
+    cancel: &CancellationToken,
+    ch: &mut LinkChannels,
+) -> AttemptOutcome {
     let addr = format!("{}:{}", cfg.server_host, cfg.server_port);
     let _ = ch.events.send(LinkEvent::Connecting(addr.clone()));
 
     let tcp = tokio::select! {
-        _ = cancel.cancelled() => return,
+        _ = cancel.cancelled() => return AttemptOutcome::Cancelled,
         r = timeout(params.handshake_timeout, TcpStream::connect(&addr)) => r,
     };
     let tcp = match tcp {
         Ok(Ok(s)) => s,
+        // Connection refused/unreachable: recoverable — the server may not be up yet.
         Ok(Err(e)) => {
-            let _ = ch.events.send(LinkEvent::Disconnected(DisconnectReason::Io(format!(
-                "connect {addr}: {e}"
-            ))));
-            return;
+            return AttemptOutcome::Lost {
+                was_connected: false,
+                reason: DisconnectReason::Io(format!("connect {addr}: {e}")),
+            }
         }
         Err(_) => {
-            let _ = ch.events.send(LinkEvent::Disconnected(DisconnectReason::TimedOut));
-            return;
+            return AttemptOutcome::Lost {
+                was_connected: false,
+                reason: DisconnectReason::TimedOut,
+            }
         }
     };
     enable_keepalive(&tcp);
@@ -294,20 +384,27 @@ pub async fn run_client(cfg: Config, params: LinkParams, cancel: CancellationTok
     let stream = if cfg.tls_enabled {
         let connector = match tls::client_connector() {
             Ok(c) => c,
+            // Local TLS provider setup failing won't fix itself: terminal.
             Err(e) => {
                 let _ = ch.events.send(LinkEvent::Error(format!("tls setup: {e}")));
-                return;
+                return AttemptOutcome::Fatal;
             }
         };
         match timeout(params.handshake_timeout, connector.connect(tls::dummy_server_name(), tcp)).await {
             Ok(Ok(s)) => LinkStream::ClientTls(Box::new(s)),
+            // A TLS error mid-restart (TCP accepted before TLS is ready) is transient;
+            // treat as recoverable so reconnect keeps trying.
             Ok(Err(e)) => {
-                let _ = ch.events.send(LinkEvent::Error(format!("tls connect: {e}")));
-                return;
+                return AttemptOutcome::Lost {
+                    was_connected: false,
+                    reason: DisconnectReason::Io(format!("tls connect: {e}")),
+                }
             }
             Err(_) => {
-                let _ = ch.events.send(LinkEvent::Disconnected(DisconnectReason::TimedOut));
-                return;
+                return AttemptOutcome::Lost {
+                    was_connected: false,
+                    reason: DisconnectReason::TimedOut,
+                }
             }
         }
     } else {
@@ -317,18 +414,22 @@ pub async fn run_client(cfg: Config, params: LinkParams, cancel: CancellationTok
     let mut framed = Framed::new(stream, MessageCodec::new());
 
     let server_name = tokio::select! {
-        _ = cancel.cancelled() => return,
-        r = timeout(params.handshake_timeout, client_handshake(&mut framed, &cfg)) => r,
+        _ = cancel.cancelled() => return AttemptOutcome::Cancelled,
+        r = timeout(params.handshake_timeout, client_handshake(&mut framed, cfg)) => r,
     };
     let (server_name, server_w, server_h) = match server_name {
         Ok(Ok(v)) => v,
+        // Rejected (e.g. bad secret / protocol mismatch): retrying can't help.
         Ok(Err(reason)) => {
             let _ = ch.events.send(LinkEvent::AuthFailed(reason));
-            return;
+            return AttemptOutcome::Fatal;
         }
+        // A handshake timeout can be a transient/overloaded server: recoverable.
         Err(_) => {
-            let _ = ch.events.send(LinkEvent::AuthFailed("handshake timed out".into()));
-            return;
+            return AttemptOutcome::Lost {
+                was_connected: false,
+                reason: DisconnectReason::TimedOut,
+            }
         }
     };
 
@@ -337,8 +438,14 @@ pub async fn run_client(cfg: Config, params: LinkParams, cancel: CancellationTok
         width: server_w,
         height: server_h,
     });
-    let reason = pump(framed, params, &cancel, &mut ch).await;
-    let _ = ch.events.send(LinkEvent::Disconnected(reason));
+    let reason = pump(framed, params, cancel, ch).await;
+    match reason {
+        DisconnectReason::Cancelled => AttemptOutcome::Cancelled,
+        reason => AttemptOutcome::Lost {
+            was_connected: true,
+            reason,
+        },
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -475,7 +582,7 @@ async fn pump(
             // Incoming frame from the peer.
             item = stream.next() => match item {
                 None => return DisconnectReason::PeerClosed,
-                Some(Err(e)) => return DisconnectReason::ProtocolError(e.to_string()),
+                Some(Err(e)) => return classify_read_error(&e),
                 Some(Ok(msg)) => {
                     last_recv = Instant::now();
                     match msg {
@@ -528,6 +635,30 @@ async fn send_cancelable(
 mod tests {
     use super::*;
     use crate::config::{Edge, Role};
+
+    /// A mid-session socket drop (server killed → "connection reset by peer") MUST be
+    /// classified recoverable so the client reconnects; only a malformed frame is fatal.
+    /// Regression: this was collapsed to a fatal `ProtocolError`, so any server restart
+    /// permanently stopped the client.
+    #[test]
+    fn read_io_drop_is_recoverable_malformed_is_fatal() {
+        let reset = CodecError::Io(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "connection reset by peer",
+        ));
+        let by_reset = classify_read_error(&reset);
+        assert!(
+            matches!(by_reset, DisconnectReason::Io(_)) && by_reset.is_recoverable(),
+            "a connection reset must be a recoverable Io drop, got {by_reset:?}"
+        );
+
+        let malformed = CodecError::Json(serde_json::from_slice::<Message>(b"not json").unwrap_err());
+        let by_malformed = classify_read_error(&malformed);
+        assert!(
+            matches!(by_malformed, DisconnectReason::ProtocolError(_)) && !by_malformed.is_recoverable(),
+            "a malformed frame must be a fatal ProtocolError, got {by_malformed:?}"
+        );
+    }
 
     fn test_cfg(role: Role, port: u16, tls: bool) -> Config {
         Config {
@@ -586,6 +717,28 @@ mod tests {
             heartbeat_interval: Duration::from_millis(100),
             liveness_timeout: Duration::from_millis(400),
             handshake_timeout: Duration::from_secs(3),
+            reconnect_initial: Duration::from_millis(50),
+            reconnect_max: Duration::from_millis(200),
+        }
+    }
+
+    /// Wait (up to `dur`) for the next `Connected` event, ignoring everything else
+    /// (Connecting/Disconnected churn during a reconnect). Returns false on timeout.
+    async fn wait_for_connect(
+        events: &mut mpsc::UnboundedReceiver<LinkEvent>,
+        dur: Duration,
+    ) -> bool {
+        let deadline = Instant::now() + dur;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            match timeout(remaining, events.recv()).await {
+                Ok(Some(LinkEvent::Connected { .. })) => return true,
+                Ok(Some(_)) => continue,
+                Ok(None) | Err(_) => return false,
+            }
         }
     }
 
@@ -805,5 +958,117 @@ mod tests {
         cancel.cancel();
         let _ = timeout(Duration::from_secs(2), server).await;
         let _ = timeout(Duration::from_secs(2), client).await;
+    }
+
+    #[tokio::test]
+    async fn client_reconnects_after_server_restart() {
+        // The Phase 7 headline: a client survives the server going away and comes
+        // back on its own when the server returns — no manual restart.
+        let port = free_port().await;
+        let client_cancel = CancellationToken::new();
+
+        let (c_ch, _c_to, _c_from, mut c_events) = channels();
+        let client = tokio::spawn(run_client(
+            test_cfg(Role::Client, port, false),
+            fast_params(),
+            client_cancel.clone(),
+            c_ch,
+        ));
+
+        // First server: connect, confirm, then drop it.
+        let s1_cancel = CancellationToken::new();
+        let (s1_ch, _s1_to, _s1_from, mut s1_events) = channels();
+        let server1 = tokio::spawn(run_server(
+            test_cfg(Role::Server, port, false),
+            fast_params(),
+            s1_cancel.clone(),
+            s1_ch,
+        ));
+        assert!(wait_connected(&mut s1_events).await, "server1 sees the client");
+        assert!(wait_for_connect(&mut c_events, Duration::from_secs(3)).await, "initial connect");
+
+        // Kill the server. The client must NOT exit — it should start retrying.
+        s1_cancel.cancel();
+        let _ = timeout(Duration::from_secs(2), server1).await;
+
+        // Bring a fresh server up on the same port after a beat of downtime
+        // (the client is backing off and polling the whole time).
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let s2_cancel = CancellationToken::new();
+        let (s2_ch, _s2_to, _s2_from, mut s2_events) = channels();
+        let server2 = tokio::spawn(run_server(
+            test_cfg(Role::Server, port, false),
+            fast_params(),
+            s2_cancel.clone(),
+            s2_ch,
+        ));
+
+        // The client reconnects on its own.
+        assert!(wait_connected(&mut s2_events).await, "server2 sees the reconnect");
+        assert!(
+            wait_for_connect(&mut c_events, Duration::from_secs(3)).await,
+            "client reconnected without intervention"
+        );
+
+        client_cancel.cancel();
+        s2_cancel.cancel();
+        let _ = timeout(Duration::from_secs(2), client).await;
+        let _ = timeout(Duration::from_secs(2), server2).await;
+    }
+
+    #[tokio::test]
+    async fn client_stops_when_reconnect_disabled() {
+        // With reconnect off, a failed connect (no server) ends the client promptly
+        // instead of looping — preserving the old one-shot behaviour.
+        let port = free_port().await;
+        let cancel = CancellationToken::new();
+        let mut cfg = test_cfg(Role::Client, port, false);
+        cfg.reconnect = false;
+
+        let (c_ch, _c_to, _c_from, _c_events) = channels();
+        let client = tokio::spawn(run_client(cfg, fast_params(), cancel.clone(), c_ch));
+
+        // No server is listening, so the connect fails and the client returns.
+        timeout(Duration::from_secs(2), client)
+            .await
+            .expect("client exits without reconnect")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn client_keeps_retrying_until_server_appears() {
+        // Start the client first against a dead port; it must keep polling and
+        // connect once a server finally shows up.
+        let port = free_port().await;
+        let cancel = CancellationToken::new();
+
+        let (c_ch, _c_to, _c_from, mut c_events) = channels();
+        let client = tokio::spawn(run_client(
+            test_cfg(Role::Client, port, false),
+            fast_params(),
+            cancel.clone(),
+            c_ch,
+        ));
+
+        // Let it fail a few times first.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let (s_ch, _s_to, _s_from, mut s_events) = channels();
+        let server = tokio::spawn(run_server(
+            test_cfg(Role::Server, port, false),
+            fast_params(),
+            cancel.clone(),
+            s_ch,
+        ));
+
+        assert!(wait_connected(&mut s_events).await, "server sees the waiting client");
+        assert!(
+            wait_for_connect(&mut c_events, Duration::from_secs(3)).await,
+            "client connected once the server appeared"
+        );
+
+        cancel.cancel();
+        let _ = timeout(Duration::from_secs(2), client).await;
+        let _ = timeout(Duration::from_secs(2), server).await;
     }
 }

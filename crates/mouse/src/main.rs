@@ -1,199 +1,90 @@
 //! mouse-rs entry point.
 //!
-//! `mouse-rs server` / `mouse-rs client` start a working KVM link: the network
-//! layer (TLS + heartbeat + cancellation) plus the edge-crossing engine bound to
-//! OS input capture/injection. A bare launch will open the GUI (Phase 6).
+//! * `mouse-rs server` / `mouse-rs client` — headless KVM link for that role.
+//! * `mouse-rs` (bare) or `mouse-rs gui` — open the egui control panel (Phase 6),
+//!   which edits config and Start/Stops the engine over the same [`run`] lifecycle.
 //!
-//! Lifecycle (so Stop never hangs and the cursor/keys never stay stuck): the
-//! async runtime owns the link + engine tasks; the blocking input backends
-//! (capture / injector threads) are owned here and torn down **after** the
-//! runtime task finishes, off the async reactor, with bounded joins.
+//! The engine lifecycle (link + edge-crossing engine + input backends, torn down
+//! with bounded joins so Stop never hangs and input is never left stuck) lives in
+//! [`run`]; both the CLI and the GUI drive it.
 
-use std::time::Duration;
-
-use mouse_clipboard::ClipboardSync;
-use mouse_core::net::{run_client, run_server, LinkParams};
-use mouse_core::protocol::Message;
 use mouse_core::{Config, Role};
-use mouse_engine::{run_client_engine, run_server_engine, ClipboardRoute, EngineLink, Injector};
-use mouse_input::{new_injector, screen_size, start_capture, NamedKey};
-use tokio::sync::mpsc::unbounded_channel;
 use tokio_util::sync::CancellationToken;
 
+mod run;
+
+#[cfg(feature = "gui")]
+mod gui;
+#[cfg(feature = "gui")]
+mod ui_theme;
+#[cfg(feature = "gui")]
+mod tray;
+
 fn main() -> anyhow::Result<()> {
+    let sub = std::env::args().nth(1);
+
+    // On Windows the binary stays a *console* subsystem app so `server`/`client` run in
+    // the foreground with logs and Ctrl-C. For a GUI launch we instead drop the console
+    // up-front, so the control panel doesn't carry a console window behind it.
+    #[cfg(all(windows, feature = "gui"))]
+    if matches!(sub.as_deref(), None | Some("gui")) {
+        // SAFETY: FreeConsole takes no arguments and only detaches this process from its
+        // own console; harmless (returns 0) if there isn't one.
+        unsafe { windows_sys::Win32::System::Console::FreeConsole() };
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
 
-    let mut cfg = Config::load_or_default();
+    let cfg = Config::load_or_default();
 
-    let role = match std::env::args().nth(1).as_deref() {
-        Some("server") => Role::Server,
-        Some("client") => Role::Client,
+    match sub.as_deref() {
+        Some("server") => run::run_blocking(
+            force_role(cfg, Role::Server),
+            CancellationToken::new(),
+            true,
+            None,
+            None,
+        ),
+        Some("client") => run::run_blocking(
+            force_role(cfg, Role::Client),
+            CancellationToken::new(),
+            true,
+            None,
+            None,
+        ),
+        Some("gui") | None => launch_gui(cfg),
         Some(other) => {
             eprintln!("unknown argument: {other}");
-            eprintln!("usage: mouse-rs [server|client]");
+            eprintln!("usage: mouse-rs [server|client|gui]");
             std::process::exit(2);
         }
-        None => {
-            tracing::info!("no subcommand (GUI lands in Phase 6); use `server` or `client`");
-            return Ok(());
-        }
-    };
-    cfg.role = role; // the CLI subcommand forces the role
-
-    // Use the real screen size for edge geometry and the handshake, so crossing
-    // math matches the surface the OS actually clamps the cursor against.
-    let local_dims = resolve_dims(&mut cfg);
-
-    tracing::info!(
-        name = %cfg.name,
-        ?role,
-        tls = cfg.tls_enabled,
-        "starting mouse-rs for {}x{} screen",
-        local_dims.0,
-        local_dims.1,
-    );
-
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?;
-    let cancel = CancellationToken::new();
-    let params = LinkParams::default();
-    let (link_channels, engine_link) = EngineLink::new();
-
-    match role {
-        Role::Server => {
-            let (cap_tx, cap_rx) = unbounded_channel();
-            // Pass the configured lock/return hotkey so the Windows capture failsafe
-            // can self-release suppression on it (the Linux backend ignores it).
-            let (capture, suppressor) =
-                start_capture(cap_tx, NamedKey::from_name(&cfg.lock_hotkey))?;
-            let (clip_route, clipboard) = setup_clipboard(&cfg, &engine_link.to_peer);
-
-            let cfg_link = cfg.clone();
-            let cfg_engine = cfg.clone();
-            let c1 = cancel.clone();
-            let c2 = cancel.clone();
-            runtime.block_on(async move {
-                spawn_ctrl_c(cancel.clone());
-                let mut link = tokio::spawn(run_server(cfg_link, params, c1, link_channels));
-                let mut engine = tokio::spawn(run_server_engine(
-                    cfg_engine,
-                    local_dims,
-                    engine_link,
-                    suppressor,
-                    cap_rx,
-                    c2,
-                    clip_route,
-                ));
-                // Whichever side ends first (engine exit/panic, or link shutdown),
-                // cancel the other so block_on returns promptly; then await it so the
-                // engine has dropped suppression before the off-reactor teardown.
-                tokio::select! {
-                    _ = &mut link => { cancel.cancel(); let _ = engine.await; }
-                    _ = &mut engine => { cancel.cancel(); let _ = link.await; }
-                }
-            });
-
-            // Off-reactor teardown: release the X grab and join the capture thread.
-            capture.stop();
-            if let Some(c) = clipboard {
-                c.stop();
-            }
-        }
-        Role::Client => {
-            let injector = Injector::spawn(new_injector()?)?;
-            let inject_tx = injector.sender();
-            let (clip_route, clipboard) = setup_clipboard(&cfg, &engine_link.to_peer);
-
-            let cfg_link = cfg.clone();
-            let cfg_engine = cfg.clone();
-            let c1 = cancel.clone();
-            let c2 = cancel.clone();
-            runtime.block_on(async move {
-                spawn_ctrl_c(cancel.clone());
-                let mut link = tokio::spawn(run_client(cfg_link, params, c1, link_channels));
-                let mut engine = tokio::spawn(run_client_engine(
-                    cfg_engine,
-                    local_dims,
-                    engine_link,
-                    inject_tx,
-                    c2,
-                    clip_route,
-                ));
-                // Whichever side ends first (engine exit/panic, or link shutdown),
-                // cancel the other so block_on returns promptly; then await it so the
-                // injector has flushed ReleaseAll before the off-reactor teardown.
-                tokio::select! {
-                    _ = &mut link => { cancel.cancel(); let _ = engine.await; }
-                    _ = &mut engine => { cancel.cancel(); let _ = link.await; }
-                }
-            });
-
-            // Off-reactor teardown: release any held keys/buttons, join the thread.
-            injector.shutdown();
-            if let Some(c) = clipboard {
-                c.stop();
-            }
-        }
     }
+}
 
-    // Bounded drop so a stray blocking task can never hang process exit.
-    runtime.shutdown_timeout(Duration::from_secs(2));
+/// The CLI subcommand forces the role, overriding the config's `role` field.
+fn force_role(mut cfg: Config, role: Role) -> Config {
+    cfg.role = role;
+    cfg
+}
+
+#[cfg(feature = "gui")]
+fn launch_gui(cfg: Config) -> anyhow::Result<()> {
+    if let Err(e) = gui::launch(cfg) {
+        // A headless box (no display) can't open the panel — point at the subcommands.
+        tracing::error!(
+            "could not open the control panel ({e}); on a headless machine run \
+             `mouse-rs server` or `mouse-rs client`"
+        );
+    }
     Ok(())
 }
 
-/// Detect the live screen size and reconcile it with config.
-fn resolve_dims(cfg: &mut Config) -> (i32, i32) {
-    match screen_size() {
-        Ok((w, h)) => {
-            if (w, h) != (cfg.screen_width, cfg.screen_height) {
-                tracing::warn!(
-                    "config screen {}x{} differs from detected {w}x{h}; using detected",
-                    cfg.screen_width,
-                    cfg.screen_height
-                );
-            }
-            cfg.screen_width = w;
-            cfg.screen_height = h;
-            (w, h)
-        }
-        Err(e) => {
-            tracing::warn!(
-                "could not detect screen size ({e}); using config {}x{}",
-                cfg.screen_width,
-                cfg.screen_height
-            );
-            (cfg.screen_width, cfg.screen_height)
-        }
-    }
-}
-
-/// Spawn the clipboard-sync thread if enabled, returning the sender the engine uses
-/// to route received `Clipboard` messages into it, plus the handle kept for teardown.
-/// `to_peer` is cloned so the sync thread can push local clipboard changes to the peer.
-fn setup_clipboard(
-    cfg: &Config,
-    to_peer: &tokio::sync::mpsc::UnboundedSender<Message>,
-) -> (Option<ClipboardRoute>, Option<ClipboardSync>) {
-    if !cfg.clipboard_sync {
-        return (None, None);
-    }
-    let (tx, rx) = std::sync::mpsc::channel();
-    let connected = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let sync = ClipboardSync::spawn(to_peer.clone(), rx, connected.clone());
-    (Some(ClipboardRoute { tx, connected }), Some(sync))
-}
-
-/// Cancel the token on Ctrl-C so a Stop request tears everything down promptly.
-fn spawn_ctrl_c(cancel: CancellationToken) {
-    tokio::spawn(async move {
-        if tokio::signal::ctrl_c().await.is_ok() {
-            tracing::info!("Ctrl-C received; stopping");
-            cancel.cancel();
-        }
-    });
+#[cfg(not(feature = "gui"))]
+fn launch_gui(_cfg: Config) -> anyhow::Result<()> {
+    tracing::info!("built without the `gui` feature; use `mouse-rs server` or `mouse-rs client`");
+    Ok(())
 }
