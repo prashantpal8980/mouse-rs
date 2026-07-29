@@ -410,6 +410,44 @@ cargo test -p mouse-core net::tests::read_io_drop_is_recoverable_malformed_is_fa
 
 ---
 
+## 6c. Tray menu — test it over D-Bus, not by clicking the panel
+
+On Linux the tray is a **StatusNotifierItem**, so its menu lives on D-Bus rather than in the
+window. Don't hunt for the icon's pixel coordinates in the panel — drive the menu directly.
+This exercises the real path (`dbusmenu` → `muda` → `MenuEvent` → `tray::poll` → the app),
+and it can't miss and click something else on a live desktop.
+
+```sh
+# 1. Find the item (the name carries the PID) and its menu object path.
+busctl --user get-property org.kde.StatusNotifierWatcher /StatusNotifierWatcher \
+  org.kde.StatusNotifierWatcher RegisteredStatusNotifierItems     # -> ":1.108/org/ayatana/…"
+busctl --user get-property :1.108 /org/ayatana/NotificationItem/tray_icon_tray_app_<PID>_1 \
+  org.kde.StatusNotifierItem Menu
+
+# 2. Enumerate the menu (ids + labels + enabled/visible).
+busctl --user call :1.108 <menu-path> com.canonical.dbusmenu \
+  GetLayout iias 0 3 4 label enabled visible type
+
+# 3. Activate an item by id, exactly as a click would.
+busctl --user call :1.108 <menu-path> com.canonical.dbusmenu Event isvu <id> clicked s "" 0
+```
+
+Item ids at the time of writing: **2** Open, **4** Start, **5** Stop, **7** Quit (3 and 6 are
+separators). Verify the *effect*, not the call's return: `ss -tnp | grep <peer>` for whether
+the engine is up, `xwininfo -id <wid> | grep 'Map State'` for Open, and the watcher's
+registered-items list going empty for Quit.
+
+**The panel has two X11 windows named `mouse-rs`** — the real one (600×840, `IsViewable`,
+`_NET_WM_WINDOW_TYPE_NORMAL`) and a 10×10 permanently-unmapped helper belonging to the gtk
+tray thread. `xdotool search --name mouse-rs | head -1` can return the helper, so a
+minimize/restore check on it silently proves nothing. Match on size or window type.
+
+Result of the 2026-07-29 run: Open, Start, Stop and Quit all behave; Start is idempotent
+while running (no second engine); Quit exits cleanly, closes the socket and unregisters the
+tray item, so no ghost icon is left in the panel.
+
+---
+
 ## 7. If something goes wrong
 
 | Symptom | Likely cause | Fix |

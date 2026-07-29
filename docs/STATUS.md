@@ -74,6 +74,18 @@ one-time `chmod 700 ~/.mouse_share && chmod 600 ~/.mouse_share/config.json`.
 
 mouse-rs never persists TLS material — the self-signed cert is generated in memory per run.
 
+## Tray menu (validated 2026-07-29)
+
+Open / Start / Stop / Quit all work, driven over D-Bus rather than by clicking the panel —
+see TESTING.md §6c for the commands. Start is a no-op while the engine is already running,
+and Quit exits cleanly: socket closed, process gone, tray item unregistered from the
+watcher, so the panel is left with no ghost icon.
+
+One cosmetic leak, in the `tray-icon` dependency rather than our code: each run writes
+`/run/user/1000/tray-icon/tray-icon-<pid>-1-0.png` and never removes it on exit, so the
+files accumulate one per run. They're tiny and live on tmpfs (gone at logout), so this is
+noted rather than fixed.
+
 ## Panel fixes from UI testing (2026-07-29)
 
 Two issues that UI testing turned up, both now closed:
