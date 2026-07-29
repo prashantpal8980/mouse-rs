@@ -142,15 +142,30 @@ impl App {
     }
 
     fn start_engine(&mut self) {
-        self.feedback = match self.cfg.save(&Config::default_path()) {
-            Ok(()) => "started".into(),
-            Err(e) => format!("(saved with error: {e})"),
+        // Starting persists the current settings, so a later headless or at-login run uses
+        // exactly what the panel was showing. That write is logged because the user didn't
+        // ask for it: an unannounced rewrite of the file holding `shared_secret` should at
+        // least be visible afterwards.
+        let path = Config::default_path();
+        self.feedback = match self.cfg.save(&path) {
+            Ok(()) => {
+                tracing::info!("saved config to {} (implicit, on Start)", path.display());
+                "started".into()
+            }
+            Err(e) => {
+                tracing::warn!("could not save config to {}: {e}", path.display());
+                format!("(saved with error: {e})")
+            }
         };
         self.engine = Some(EngineHandle::start(self.cfg.clone()));
     }
 
     fn stop_engine(&mut self) {
         if let Some(e) = &self.engine {
+            // Without this line a deliberate Stop and a crash look identical in the log,
+            // which is the worst possible ambiguity for a tool whose symptom is
+            // "my keyboard went dead".
+            tracing::info!("stop requested from the panel");
             e.request_stop();
         }
         self.feedback = "stopping…".into();
@@ -175,12 +190,17 @@ impl App {
                 }
                 // Clear a handle whose engine thread has exited on its own.
                 if self.engine.as_ref().is_some_and(|e| !e.is_running()) {
+                    // Logged so the log shows sharing actually ending, not just the request.
+                    // A Stop leaves "stop requested" then this; an unexpected engine death
+                    // leaves only this, which is the distinction worth being able to make.
+                    tracing::info!("engine stopped; sharing is off");
                     self.engine = None;
                 }
                 // Keep the tray tooltip reflecting live status.
                 if let Some(t) = &self.tray {
                     let snap = self.engine.as_ref().map(|e| e.status());
-                    t.set_tooltip(&tray_tooltip(self.running(), snap.as_ref()));
+                    let running = self.running();
+                    t.set_state(&tray_tooltip(running, snap.as_ref()), running);
                 }
                 // Act on tray menu clicks (the tray can't touch the engine/window itself).
                 let mut want_open = false;
@@ -201,7 +221,15 @@ impl App {
                     return self.update(Message::Quit);
                 }
                 if want_open {
-                    return iced::window::latest().and_then(iced::window::gain_focus);
+                    return iced::window::latest().and_then(|id| {
+                        // Un-minimize *before* focusing. On Windows `gain_focus` is
+                        // `SetForegroundWindow`, which does nothing to a minimized window —
+                        // so tray Open silently did nothing, and with `start_minimized` on
+                        // there was no way to reach the panel at all. X11 window managers
+                        // happen to map on activate, which is why this only showed on
+                        // Windows.
+                        iced::window::minimize(id, false).chain(iced::window::gain_focus(id))
+                    });
                 }
             }
             Message::ThemePicked(t) => self.theme = t,
@@ -226,11 +254,19 @@ impl App {
                 match res {
                     Ok(()) => {
                         self.autostart_on = v;
+                        // This writes outside our own config — a registry value on Windows,
+                        // a desktop file on Linux — so it gets a log line either way. It's
+                        // the kind of change a user later swears they never made.
+                        tracing::info!(
+                            "{} the start-at-login entry",
+                            if v { "added" } else { "removed" }
+                        );
                         self.feedback =
                             if v { "will start at login".into() } else { "removed from login".into() };
                     }
                     Err(e) => {
                         self.autostart_on = crate::autostart::is_enabled();
+                        tracing::warn!("start-at-login change failed: {e}");
                         self.feedback = format!("autostart failed: {e}");
                     }
                 }
@@ -325,9 +361,16 @@ impl App {
             }
             Message::Stop => self.stop_engine(),
             Message::SaveConfig => {
-                self.feedback = match self.cfg.save(&Config::default_path()) {
-                    Ok(()) => "saved".into(),
-                    Err(e) => format!("save failed: {e}"),
+                let path = Config::default_path();
+                self.feedback = match self.cfg.save(&path) {
+                    Ok(()) => {
+                        tracing::info!("saved config to {}", path.display());
+                        "saved".into()
+                    }
+                    Err(e) => {
+                        tracing::warn!("could not save config to {}: {e}", path.display());
+                        format!("save failed: {e}")
+                    }
                 };
             }
             Message::Quit => {

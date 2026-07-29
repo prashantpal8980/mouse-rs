@@ -17,9 +17,83 @@ cursor freeze) by construction.
 | 6 | **iced** control panel + tray GUI | ✅ done — 6 themes, status hero, tabs, profiles, clipboard history, live tray tooltip |
 | 7 | auto-reconnect + packaging | ✅ reconnect **hardware-validated**; `scripts/package.sh` (Win zip + Linux tar, bundled libxdo) |
 
-**Verification status:** 76 tests pass; clippy clean (`-D warnings`) and release builds link
-on BOTH `x86_64-unknown-linux-gnu` and `x86_64-pc-windows-gnu` (plus the headless
-`--no-default-features` build).
+**Verification status:** 77 tests pass; clippy clean (`-D warnings`, `--all-targets`) on BOTH
+`x86_64-unknown-linux-gnu` and `x86_64-pc-windows-gnu`, and all three builds link (Linux GUI,
+Windows GUI, headless `--no-default-features`).
+
+> **Build trap:** `cargo build -p mouse --release --no-default-features` writes to the *same*
+> path as the GUI build, `target/release/mouse-rs`. Running it leaves a headless binary where
+> the GUI one was, and the next bare launch logs "built without the `gui` feature" and exits.
+> Rebuild with default features afterwards. `scripts/package.sh` avoids this by renaming its
+> headless output.
+
+## Windows hardware report (2026-07-30) — what it found
+
+A full server-side pass on the laptop (Windows 11, 1920x1080 @ 125% DPI, non-elevated).
+Everything below was **verified on real Windows**, not inferred.
+
+Passed: build hash match, config parse, panel opens and renders with no visual defects at
+125% scaling, **log file created at the documented path with the panel's displayed path
+matching on disk**, panel Start → unattended Kali connect, tray icon present (behind the `^`
+chevron), tray menu contents, tray Start/Stop/Quit, **start-at-login registry write / removal
+/ rewrite**, auto-connect on launch, edge crossing and keyboard suppression.
+
+**Unattended reconnect is now proven four times** across three trigger types: panel Start
+4.19 s, tray Start 6.08 s, auto-connect on relaunch 13.77 s, plus 8.51 s on the previous
+build headless. Zero interaction on the Kali side in every case. The spread tracks Kali's
+retry cadence, not a fault.
+
+The Run-key value written was `"C:\Users\prade\mouse-rs\mouse-rs.exe"` — absolute, correctly
+quoted, pointing at the running binary. Toggle off removed it; toggle on rewrote it
+byte-identically. **The cross-compiled registry code works on real Windows.**
+
+Six defects it found, all now fixed — see "Fixes from the Windows report" below. Two open
+items it also raised:
+
+- **Auto-connect takes ~23 s to be useful at logon** — ~8.8 s from logger init to sharing
+  arming (GUI/wgpu init runs first), then ~14 s to peer connect. Not a defect, but if the
+  point of auto-connect is a usable machine at login, that window is longer than it looks.
+- **The panel exposes zero UI Automation descendants** — no accessibility tree at all, so
+  screen readers can't see any control and UI automation can't drive it (the tray menu, being
+  native Win32, *is* fully enumerable). This is an iced/wgpu property rather than our code,
+  but it blocks both accessibility and any future automated UI testing, and it is worth
+  deciding about deliberately before shipping.
+
+## Fixes from the Windows report (2026-07-30)
+
+1. **Tray `Open mouse-rs` did nothing (Windows only).** The handler was `gain_focus` alone,
+   which on Windows is `SetForegroundWindow` — it does nothing to a *minimized* window, and
+   the report's `rect L=-32000 T=-32000` (Windows' canonical minimized position) proved the
+   window never came back. Combined with `start_minimized` there was no way to reach the
+   panel at all. Now un-minimizes first, then focuses. This passed on Linux precisely because
+   X11 window managers map on activate — a platform difference the Linux test could not have
+   caught.
+2. **`config.json` was rewritten with no explicit Save, non-atomically.** `start_engine()`
+   saves so a later headless or at-login run matches the panel, which is defensible — but
+   `Config::save` used truncate-in-place, so a crash mid-write would have left a truncated
+   config and **destroyed `shared_secret`**, the one value in there that cannot be
+   re-derived. Saves now go to a sibling temp file, `sync_all`, then rename over the target
+   (atomic on both platforms), and the implicit save is logged since the user didn't ask for
+   it.
+3. **Docs pointed at a "General" tab that does not exist.** It is the **Connection** tab, and
+   Startup/Log file sit at its bottom behind a scroll. A tester who doesn't scroll reports the
+   toggles as missing.
+4. **Log was silent on the state transitions.** `Stop` produced zero lines, so a deliberate
+   stop and a crash were indistinguishable — the worst ambiguity for a tool whose symptom is
+   "my keyboard went dead". Now logged: stop requested, engine stopped, config saved (explicit
+   and implicit), and start-at-login entry added/removed. `peer disconnected` was already
+   logged but only fires on a link event, which is why Stop looked silent.
+5. **Tray items were never greyed** — `Stop` selectable while stopped, `Start` while running,
+   disagreeing with the panel. `Start`/`Stop` now track the engine. `MenuItem` holds a
+   `RefCell` and is neither `Send` nor `Sync`, so the items are only ever touched on the
+   thread that built them: the gtk thread polls shared state on Linux, Windows applies it
+   inline from the UI thread.
+6. **`DIAG_*` counters stripped** (see the keyboard section).
+
+Verified on Linux over D-Bus: `Start` reports `enabled=false` while running and `true` while
+stopped, `Stop` the inverse; tray `Open` still restores a minimized panel; and the new log
+lines appear in order (`saved config … (implicit, on Start)` → `stop requested from the
+panel` → `engine stopped; sharing is off`). **The Windows side of all six is untested.**
 
 ## Hardware status (two-machine runs, Jul 27–28)
 
@@ -56,10 +130,18 @@ With both fixed, the first long uninterrupted session showed keyboard and mouse 
 working correctly. Fix #1 was likely always sound; we simply never got a clean session in
 which to observe it.
 
-⚠️ **Temporary diagnostics are still compiled in** — `DIAG_*` counters and a once-per-second
-`kbd_diag` line in `crates/mouse-input/src/windows.rs` (~line 913). They only print while
-suppressing (i.e. while control is on the peer). **Remove them** once the keyboard has held
-up across a few days of normal use.
+✅ **The `DIAG_*` counters and the `kbd_diag` line are gone** (removed 2026-07-30). They had
+done their job: the 2026-07-29 Windows run captured 222 samples across seven crossings and
+settled the question. The decisive evidence — worth keeping even though the code is gone —
+is that during the one crossing with substantial typing, `kbd_swallowed` climbed 0 → 231
+while `kbd_passed_to_windows` stayed **frozen at 53** for the whole 128-second remote
+session, with `kbd_borrow_fail = 0` at every sample. Zero keystrokes leaked while remote.
+
+A naive read of the other six crossings looks like suppression failing (`swallowed = 0`),
+and it isn't: `kbd_passed_to_windows` only ever increments on the *first* diag line of a
+crossing, so those keystrokes were accumulated during the preceding **local** interval,
+where passing them through is correct. If these counters are ever reinstated, read them
+that way.
 
 ## Secret handling on disk (2026-07-28)
 
@@ -79,7 +161,8 @@ mouse-rs never persists TLS material — the self-signed cert is generated in me
 
 Headless `server`/`client` runs keep coloured stdout logs. A **GUI launch logs to a file**
 instead — `~/.mouse_share/mouse-rs.log`, beside `config.json`, shown in the panel under
-**General → Log file**.
+**Connection → Log file** (at the bottom of that tab, below `Listen port` — it needs a
+scroll, and a tester who doesn't scroll reports the Startup toggles as missing).
 
 This exists because a GUI launch has no terminal: on Windows `main` calls `FreeConsole()`
 before tracing initialises, so stdout goes nowhere and a user reporting "it stopped working"

@@ -80,7 +80,9 @@ log file next to the config:
 Get-Content $env:USERPROFILE\.mouse_share\mouse-rs.log -Tail 30
 ```
 
-The panel also shows that path under **General → Log file**. Check the file exists and has
+The panel also shows that path under **Connection → Log file**. Both `Startup` and
+`Log file` live at the **bottom of the Connection tab**, below `Listen port` — you must
+scroll that pane to see them. There is no "General" tab. Check the file exists and has
 content — the first line should be `logging to …\mouse-rs.log`, and you should see
 `starting mouse-rs for …` when you press Start. **If the file is missing or empty, tell me:
 that's a real bug** (this logging path is new today and has never run on Windows). Verify
@@ -127,8 +129,9 @@ This is the part I most want tested. The build writes a per-user entry to
 compiles and cross-compiles clean but **has never run on Windows**, so expect it to possibly
 fail — that's useful information, not a problem.
 
-1. In the panel's **General** tab, find the **Startup** section and turn on **Start at
-   login**. The panel reports success or an error immediately — quote it exactly.
+1. In the panel's **Connection** tab, **scroll to the bottom** to find the **Startup**
+   section, and turn on **Start at login**. The panel reports success or an error
+   immediately — quote it exactly.
 2. Verify the registry entry actually landed:
 
 ```powershell

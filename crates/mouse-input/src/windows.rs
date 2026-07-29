@@ -63,15 +63,6 @@ use crate::{CaptureSignal, InputCapture, InputError, InputInjector};
 /// which `LLMHF_INJECTED` cannot tell apart). ASCII "mousRS".
 const INJECT_MAGIC: usize = 0x6D6F_7573_5253;
 
-// --- Diagnostics (temporary): counters on the keyboard/mouse hot paths, logged once
-// a second by the pump while suppressing, so a hardware run reveals exactly why keys
-// leak (hook not firing vs. grabbed-false vs. swallowed-but-Windows-ignores = UIPI). ---
-static DIAG_KBD_SEEN: AtomicU64 = AtomicU64::new(0);
-static DIAG_KBD_SWALLOWED: AtomicU64 = AtomicU64::new(0);
-static DIAG_KBD_BORROW_FAIL: AtomicU64 = AtomicU64::new(0);
-static DIAG_MOUSE_HOOK: AtomicU64 = AtomicU64::new(0);
-static DIAG_RAW: AtomicU64 = AtomicU64::new(0);
-
 // ---------------------------------------------------------------------------
 // Virtual-key constants (stable Win32 values; defined locally for a compact,
 // version-independent table).
@@ -701,7 +692,6 @@ unsafe fn handle_raw_input(hri: HRAWINPUT) {
     if raw.header.dwType != RIM_TYPEMOUSE {
         return;
     }
-    DIAG_RAW.fetch_add(1, Ordering::Relaxed);
     let m = &raw.data.mouse;
     let (flags, lx, ly) = (m.usFlags, m.lLastX, m.lLastY);
     RAW_STATE.with(|cell| {
@@ -774,7 +764,6 @@ unsafe extern "system" fn mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) 
     if code != HC_ACTION as i32 {
         return CallNextHookEx(std::mem::zeroed(), code, wparam, lparam);
     }
-    DIAG_MOUSE_HOOK.fetch_add(1, Ordering::Relaxed);
     let swallow = HOOK_STATE.with(|cell| {
         let mut guard = match cell.try_borrow_mut() {
             Ok(g) => g,
@@ -797,12 +786,10 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARA
     if code != HC_ACTION as i32 {
         return CallNextHookEx(std::mem::zeroed(), code, wparam, lparam);
     }
-    DIAG_KBD_SEEN.fetch_add(1, Ordering::Relaxed);
     let swallow = HOOK_STATE.with(|cell| {
         let mut guard = match cell.try_borrow_mut() {
             Ok(g) => g,
             Err(_) => {
-                DIAG_KBD_BORROW_FAIL.fetch_add(1, Ordering::Relaxed);
                 return false;
             }
         };
@@ -813,7 +800,6 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARA
         state.on_key(info)
     });
     if swallow {
-        DIAG_KBD_SWALLOWED.fetch_add(1, Ordering::Relaxed);
         1
     } else {
         CallNextHookEx(std::mem::zeroed(), code, wparam, lparam)
@@ -889,7 +875,6 @@ fn capture_loop(
     // Pump: wake on input or every ~8ms (so toggles/stop and the heartbeat are
     // honoured even with no input), drain messages so the hooks fire, reconcile.
     let mut msg: MSG = unsafe { std::mem::zeroed() };
-    let mut last_diag = std::time::Instant::now();
     'pump: loop {
         unsafe {
             MsgWaitForMultipleObjectsEx(0, std::ptr::null(), 8, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
@@ -908,26 +893,6 @@ fn capture_loop(
             break;
         }
         reconcile(&suppress, &sink);
-        // Diagnostics: once a second while suppressing, dump the keyboard-hook counters
-        // so a hardware run shows whether keys are being seen / swallowed / leaked.
-        if suppress.load(Ordering::SeqCst) && last_diag.elapsed() >= Duration::from_secs(1) {
-            last_diag = std::time::Instant::now();
-            let grabbed = HOOK_STATE.with(|c| c.borrow().as_ref().map(|s| s.grabbed).unwrap_or(false));
-            let seen = DIAG_KBD_SEEN.load(Ordering::Relaxed);
-            let swallowed = DIAG_KBD_SWALLOWED.load(Ordering::Relaxed);
-            tracing::info!(
-                target: "kbd_diag",
-                grabbed,
-                suppress = true,
-                kbd_seen = seen,
-                kbd_swallowed = swallowed,
-                kbd_passed_to_windows = seen - swallowed,
-                kbd_borrow_fail = DIAG_KBD_BORROW_FAIL.load(Ordering::Relaxed),
-                mouse_hook_calls = DIAG_MOUSE_HOOK.load(Ordering::Relaxed),
-                raw_samples = DIAG_RAW.load(Ordering::Relaxed),
-                "keyboard diagnostics"
-            );
-        }
     }
 
     unsafe {
@@ -1200,7 +1165,7 @@ mod tests {
 
     #[test]
     fn wheel_delta_decoding() {
-        assert_eq!(wheel_delta((WHEEL_DELTA as u32) << 16), 1);
+        assert_eq!(wheel_delta(WHEEL_DELTA << 16), 1);
         assert_eq!(wheel_delta(((-(WHEEL_DELTA as i32)) as u32) << 16 & 0xFFFF_0000), -1);
         // High-resolution sub-notch still yields a 1-step floor.
         assert_eq!(wheel_delta(40u32 << 16), 1);

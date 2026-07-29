@@ -208,22 +208,46 @@ impl Config {
         }
         let json = serde_json::to_string_pretty(self).map_err(ConfigError::Parse)?;
 
-        let mut opts = std::fs::OpenOptions::new();
-        opts.write(true).create(true).truncate(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
+        // Write a sibling temp file, flush it to disk, then rename over the target. The
+        // rename is atomic on both platforms (`MoveFileEx` with REPLACE_EXISTING on
+        // Windows), so a reader sees either the old config or the new one and never a
+        // half-written file. This matters more than it looks: the GUI saves on every Start,
+        // not just when the user presses Save, and the previous truncate-in-place would
+        // have destroyed `shared_secret` if the process died mid-write — losing the one
+        // value in here that cannot be re-derived.
+        let tmp = path.with_extension(format!("tmp{}", std::process::id()));
+
+        let write_tmp = || -> std::io::Result<()> {
+            let mut opts = std::fs::OpenOptions::new();
+            opts.write(true).create(true).truncate(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(0o600);
+            }
+            let mut f = opts.open(&tmp)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                // A leftover temp from a previous run may exist with a laxer mode.
+                f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            }
+            f.write_all(json.as_bytes())?;
+            // Durability before the rename: without this the rename can land while the
+            // contents are still only in the page cache, so a power loss leaves an empty
+            // config where a valid one used to be.
+            f.sync_all()
+        };
+
+        if let Err(e) = write_tmp() {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(ConfigError::Io(e));
         }
-        let mut f = opts.open(path).map_err(ConfigError::Io)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            // Tighten an already-existing file before the secret lands in it.
-            f.set_permissions(std::fs::Permissions::from_mode(0o600))
-                .map_err(ConfigError::Io)?;
+        if let Err(e) = std::fs::rename(&tmp, path) {
+            // The original file is still intact; drop the temp rather than leaving litter.
+            let _ = std::fs::remove_file(&tmp);
+            return Err(ConfigError::Io(e));
         }
-        f.write_all(json.as_bytes()).map_err(ConfigError::Io)?;
         Ok(())
     }
 
@@ -417,6 +441,37 @@ mod tests {
         let mode = std::fs::metadata(&lax).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "overwritten config must be tightened to 0600, got {mode:o}");
         assert!(std::fs::read_to_string(&lax).unwrap().contains("hunter2"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The GUI saves on every Start, so this path runs constantly. It must replace the file
+    /// atomically and leave no temp files behind — a stray `config.tmp1234` beside the real
+    /// config would also be a second copy of the secret on disk.
+    #[test]
+    fn save_replaces_atomically_and_leaves_no_temp_files() {
+        let dir = std::env::temp_dir().join(format!("mouse-rs-atomic-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("config.json");
+
+        let first = Config { name: "one".into(), shared_secret: "s1".into(), ..Default::default() };
+        first.save(&path).unwrap();
+
+        let second = Config { name: "two".into(), shared_secret: "s2".into(), ..Default::default() };
+        second.save(&path).unwrap();
+
+        // The replacement won, completely — no merged or truncated remnant of the first.
+        let back = Config::load(&path).unwrap();
+        assert_eq!(back.name, "two");
+        assert_eq!(back.shared_secret, "s2");
+
+        let strays: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n != "config.json")
+            .collect();
+        assert!(strays.is_empty(), "temp files left behind: {strays:?}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
