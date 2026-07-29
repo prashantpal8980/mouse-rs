@@ -17,8 +17,9 @@ cursor freeze) by construction.
 | 6 | **iced** control panel + tray GUI | ✅ done — 6 themes, status hero, tabs, profiles, clipboard history, live tray tooltip |
 | 7 | auto-reconnect + packaging | ✅ reconnect **hardware-validated**; `scripts/package.sh` (Win zip + Linux tar, bundled libxdo) |
 
-**Verification status:** 72 tests pass; clippy clean (`-D warnings`) and release builds link
-on BOTH `x86_64-unknown-linux-gnu` and `x86_64-pc-windows-gnu`.
+**Verification status:** 76 tests pass; clippy clean (`-D warnings`) and release builds link
+on BOTH `x86_64-unknown-linux-gnu` and `x86_64-pc-windows-gnu` (plus the headless
+`--no-default-features` build).
 
 ## Hardware status (two-machine runs, Jul 27–28)
 
@@ -73,6 +74,35 @@ Regression test: `config::tests::saved_config_is_owner_only_even_when_overwritin
 one-time `chmod 700 ~/.mouse_share && chmod 600 ~/.mouse_share/config.json`.
 
 mouse-rs never persists TLS material — the self-signed cert is generated in memory per run.
+
+## Logging (2026-07-29)
+
+Headless `server`/`client` runs keep coloured stdout logs. A **GUI launch logs to a file**
+instead — `~/.mouse_share/mouse-rs.log`, beside `config.json`, shown in the panel under
+**General → Log file**.
+
+This exists because a GUI launch has no terminal: on Windows `main` calls `FreeConsole()`
+before tracing initialises, so stdout goes nowhere and a user reporting "it stopped working"
+had literally nothing to send. It matters more than it sounds for a product we intend to
+sell — logs are the whole support story.
+
+- **Size-capped at 2 MB with one previous generation** (`mouse-rs.log.1`), so worst case is
+  ~4 MB. Not optional: `windows.rs` still emits a once-per-second diagnostic line while
+  control is on the peer, which is a few MB a day unbounded.
+- **Appends** across launches — the panel gets opened and closed constantly, and truncating
+  each time would discard the session that just misbehaved.
+- **0600 on Unix**, matching the config hardening; the log carries hostnames and addresses.
+- **Default filter puts the graphics stack at warn** (`DEFAULT_FILTER` in `logging.rs`).
+  A single launch was writing ~4.5 KB of pretty-printed `WindowAttributes`, adapter
+  enumerations and surface-format lists, burying the two lines a user actually needs.
+  Measured 4478 → 879 bytes with the two key lines visible. `RUST_LOG` still overrides.
+- Falls back to stdout if the file can't be opened — a read-only home should degrade the
+  logs, not stop the app starting.
+
+Verified on Linux by launching with stdout sent to `/dev/null`: the file appeared at 0600 and
+captured startup plus `connected to server 'laptop'`. Four tests cover rotation, append,
+location and permissions. **The Windows side of this is untested** — it's the platform the
+fix is for.
 
 ## Tray menu (validated 2026-07-29)
 

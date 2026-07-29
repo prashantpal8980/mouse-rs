@@ -11,6 +11,7 @@
 use mouse_core::{Config, Role};
 use tokio_util::sync::CancellationToken;
 
+mod logging;
 mod run;
 
 #[cfg(feature = "gui")]
@@ -24,22 +25,21 @@ mod tray;
 
 fn main() -> anyhow::Result<()> {
     let sub = std::env::args().nth(1);
+    let is_gui = matches!(sub.as_deref(), None | Some("gui"));
 
     // On Windows the binary stays a *console* subsystem app so `server`/`client` run in
     // the foreground with logs and Ctrl-C. For a GUI launch we instead drop the console
     // up-front, so the control panel doesn't carry a console window behind it.
     #[cfg(all(windows, feature = "gui"))]
-    if matches!(sub.as_deref(), None | Some("gui")) {
+    if is_gui {
         // SAFETY: FreeConsole takes no arguments and only detaches this process from its
         // own console; harmless (returns 0) if there isn't one.
         unsafe { windows_sys::Win32::System::Console::FreeConsole() };
     }
 
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
-        )
-        .init();
+    // Must follow the FreeConsole above: a GUI launch has no console left to log to, so it
+    // logs to a file instead (see `logging`). Headless runs keep stdout.
+    logging::init(is_gui && cfg!(feature = "gui"));
 
     let cfg = Config::load_or_default();
 

@@ -27,8 +27,8 @@ Invoke-WebRequest -Uri http://192.168.137.2:8000/mouse-rs.exe -OutFile $HOME\mou
 
 Verify the download — it must match exactly:
 
-- size: `11008512` bytes
-- SHA256: `7D90332CBD6F2449BBCAA9B9450D10732450A000655E4E37DF0B17EE9B3CD036`
+- size: `11035648` bytes
+- SHA256: `D21F717C836A1E699F9F5DEDF8477A568ED4072D684471ACF8E111B09182DF77`
 
 ```powershell
 Get-FileHash $HOME\mouse-rs\mouse-rs.exe -Algorithm SHA256
@@ -72,17 +72,23 @@ cd $HOME\mouse-rs
 - **Do not run elevated.** The keyboard path was validated in a non-elevated shell and I
   want to keep testing that same configuration.
 
-**Known gap — in GUI mode this build produces no logs on Windows.** It drops the console
-(`FreeConsole`) before logging starts, so PowerShell will show nothing. To get logs anyway,
-try redirecting to a file, which should survive the console being dropped:
+**PowerShell will show no output** — a GUI launch drops the console (`FreeConsole`) so the
+panel doesn't drag a console window behind it. That's expected. Instead, this build writes a
+log file next to the config:
 
 ```powershell
-$env:RUST_LOG="info"; .\mouse-rs.exe *> $HOME\mouse-rs\gui.log
+Get-Content $env:USERPROFILE\.mouse_share\mouse-rs.log -Tail 30
 ```
 
-Then check whether `gui.log` actually has content. **If it is empty, tell me — that is a
-real finding**, not something for you to work around. It means Windows GUI users have no
-diagnostics at all, which I need to fix.
+The panel also shows that path under **General → Log file**. Check the file exists and has
+content — the first line should be `logging to …\mouse-rs.log`, and you should see
+`starting mouse-rs for …` when you press Start. **If the file is missing or empty, tell me:
+that's a real bug** (this logging path is new today and has never run on Windows). Verify
+the path shown in the panel matches where the file actually is.
+
+For a verbose graphics trace if something renders wrong: `$env:RUST_LOG="debug"` before
+launching — the default filter keeps the wgpu/winit startup noise at warn so the log stays
+readable.
 
 Report what you see: does the panel window open, is it readable and responsive, and **is
 there a tray icon** in the notification area? On Windows the icon may be hidden behind the
@@ -145,7 +151,8 @@ Do **not** reboot to test autostart unless I ask — tell me the registry state 
 
 Give me:
 1. Whether the Kali client reconnected unattended, and what the panel's status showed
-2. Whether `gui.log` captured anything, or was empty
+2. Whether `%USERPROFILE%\.mouse_share\mouse-rs.log` exists and has sensible content, and
+   whether the path shown in the panel matches it
 3. Anything that errored, hung, rendered wrong, or looked ugly — verbatim, don't summarize
    away detail. Screenshots of the panel are welcome if you can take them.
 4. The exact registry value string from step 5

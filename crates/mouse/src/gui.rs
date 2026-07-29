@@ -98,6 +98,9 @@ struct App {
     /// One-shot latch for the `autoconnect` / `start_minimized` launch actions, so they
     /// fire once on the first tick and never again (e.g. after a manual Stop).
     launch_done: bool,
+    /// Where this run is logging. Shown in the panel because a GUI launch has no console —
+    /// without it the user has nothing to send when reporting a problem.
+    log_path: String,
 }
 
 impl App {
@@ -119,6 +122,7 @@ impl App {
             tray: crate::tray::spawn("mouse-rs — stopped"),
             autostart_on: crate::autostart::is_enabled(),
             launch_done: false,
+            log_path: crate::logging::log_path().display().to_string(),
             cfg,
         };
         app.sync_buffers();
@@ -521,12 +525,21 @@ impl App {
         ]
         .spacing(12.0);
 
+        // The panel has no console behind it, so name the log file here — otherwise a user
+        // hitting a problem has nothing to look at and nothing to send.
+        let logs = column![
+            field_label(p, "Log file"),
+            text(&self.log_path).size(11.0).color(p.txt3),
+        ]
+        .spacing(6.0);
+
         card(p, column![
             labeled(p, "Machine name", input(p, "this-machine", &self.cfg.name, Message::NameChanged)),
             field_label(p, "Role"),
             role,
             net,
             startup,
+            logs,
         ]
         .spacing(14.0))
     }
