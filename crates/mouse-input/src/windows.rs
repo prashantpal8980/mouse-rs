@@ -42,8 +42,9 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL, MOUSEINPUT,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetCursorPos,
-    GetSystemMetrics, MsgWaitForMultipleObjectsEx, PeekMessageW, PostThreadMessageW, RegisterClassW,
+    CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClassNameW,
+    GetCursorPos, GetForegroundWindow, GetSystemMetrics, GetWindowTextW, GetWindowThreadProcessId,
+    MsgWaitForMultipleObjectsEx, PeekMessageW, PostThreadMessageW, RegisterClassW,
     SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, UnregisterClassW, HC_ACTION,
     HWND_MESSAGE, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, LLKHF_UP, MSG, MSLLHOOKSTRUCT,
     MWMO_INPUTAVAILABLE, PM_REMOVE, QS_ALLINPUT, SM_CXSCREEN, SM_CXVIRTUALSCREEN, SM_CYSCREEN,
@@ -454,6 +455,15 @@ struct HookState {
     sink: UnboundedSender<CaptureSignal>,
     return_vk: u16,
     last_cursor: Option<(i32, i32)>,
+    /// Per-remote-session keyboard accounting, reset each time suppression engages.
+    /// Exists to answer one question from real use: keys occasionally stay on this
+    /// machine after the cursor has crossed, and nothing in the log said why.
+    kbd_swallowed: u64,
+    kbd_leaked: u64,
+    /// When suppression engaged, so a leak can be reported as an offset from the
+    /// crossing. Leaks bunched in the first few milliseconds mean the grab hadn't
+    /// landed yet; leaks spread through the session mean something else.
+    grabbed_at: Option<std::time::Instant>,
 }
 
 thread_local! {
@@ -515,6 +525,20 @@ impl HookState {
     /// Handle a keyboard hook event. Returns `true` to swallow it.
     fn on_key(&mut self, info: &KBDLLHOOKSTRUCT) -> bool {
         if !self.grabbed {
+            // Not suppressing. Normally correct — but if the engine has *asked* for
+            // suppression and the grab hasn't been reconciled yet, this keystroke is
+            // about to land on the wrong machine. That is the leak users report as
+            // "the mouse crossed but my typing stayed here", and it was previously
+            // invisible, so say so loudly and name the reason.
+            if self.suppress.load(Ordering::SeqCst) && info.flags & LLKHF_UP == 0 {
+                self.kbd_leaked += 1;
+                tracing::warn!(
+                    vk = format_args!("0x{:02x}", info.vkCode),
+                    reason = "suppress_requested_but_not_grabbed",
+                    leak_n = self.kbd_leaked,
+                    "KEYBOARD LEAK: keystroke stayed on this machine"
+                );
+            }
             return false; // keys flow to local apps while not suppressing
         }
         let pressed = info.flags & LLKHF_UP == 0;
@@ -532,6 +556,18 @@ impl HookState {
             let _ = self
                 .sink
                 .send(CaptureSignal::Input(InputEvent::Key { key, pressed }));
+        } else if pressed {
+            // Swallowed locally but not representable on the wire: the key reaches
+            // neither machine. Silent before; indistinguishable from a leak to a user.
+            self.kbd_leaked += 1;
+            tracing::warn!(
+                vk = format_args!("0x{vk:02x}"),
+                reason = "no_wire_mapping",
+                "KEYBOARD LEAK: key swallowed here but not sent to the peer"
+            );
+        }
+        if pressed {
+            self.kbd_swallowed += 1;
         }
         true // swallow while suppressing
     }
@@ -849,6 +885,9 @@ fn capture_loop(
             sink: sink.clone(),
             return_vk,
             last_cursor: None,
+            kbd_swallowed: 0,
+            kbd_leaked: 0,
+            grabbed_at: None,
         });
     });
 
@@ -875,6 +914,12 @@ fn capture_loop(
     // Pump: wake on input or every ~8ms (so toggles/stop and the heartbeat are
     // honoured even with no input), drain messages so the hooks fire, reconcile.
     let mut msg: MSG = unsafe { std::mem::zeroed() };
+    // Low-level hook callbacks are delivered on THIS thread during this pump. If a single
+    // iteration takes longer than Windows' LowLevelHooksTimeout (~300 ms by default), the
+    // OS stops waiting and **skips the hook entirely** — the keystroke goes straight to the
+    // local app and we never even see it, so no leak counter can catch it. Timing the loop
+    // is the only way to observe that case from inside the process.
+    let mut last_tick = std::time::Instant::now();
     'pump: loop {
         unsafe {
             MsgWaitForMultipleObjectsEx(0, std::ptr::null(), 8, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
@@ -892,6 +937,17 @@ fn capture_loop(
         if stop.load(Ordering::SeqCst) {
             break;
         }
+        // 150 ms is half the default hook timeout: close enough to matter, far enough
+        // above the 8 ms wait that normal scheduling jitter stays quiet.
+        let gap = last_tick.elapsed();
+        if gap >= Duration::from_millis(150) && suppress.load(Ordering::SeqCst) {
+            tracing::warn!(
+                stalled_ms = gap.as_millis(),
+                "capture pump stalled while suppressing — Windows may have SKIPPED the \
+                 keyboard hook, letting keystrokes reach this machine"
+            );
+        }
+        last_tick = std::time::Instant::now();
         reconcile(&suppress, &sink);
     }
 
@@ -910,6 +966,34 @@ fn capture_loop(
 /// Reconcile the engine's requested suppression against the actual grabbed state,
 /// snapshotting held modifiers on the rising edge. No cursor warp is needed: motion
 /// comes from Raw Input, which is independent of the (now merely frozen) cursor.
+/// Describe the window that currently has keyboard focus: title, class and owning pid.
+///
+/// Logged when suppression engages because of a field report that keystrokes are not
+/// shared *specifically when the mouse-rs panel itself is the focused window* — this is
+/// what turns that observation into evidence rather than a hunch. Reading it is safe from
+/// the pump thread: all three calls are non-blocking and touch no shared state.
+fn foreground_desc() -> String {
+    unsafe {
+        let hwnd = GetForegroundWindow();
+        if hwnd.is_null() {
+            return "<none>".into();
+        }
+        let mut title = [0u16; 96];
+        let n = GetWindowTextW(hwnd, title.as_mut_ptr(), title.len() as i32);
+        let title = String::from_utf16_lossy(&title[..n.max(0) as usize]);
+        let mut class = [0u16; 64];
+        let n = GetClassNameW(hwnd, class.as_mut_ptr(), class.len() as i32);
+        let class = String::from_utf16_lossy(&class[..n.max(0) as usize]);
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(hwnd, &mut pid);
+        let own = pid == std::process::id();
+        format!(
+            "'{title}' class={class} pid={pid}{}",
+            if own { " (THIS IS OUR OWN PANEL)" } else { "" }
+        )
+    }
+}
+
 fn reconcile(suppress: &Arc<AtomicBool>, sink: &UnboundedSender<CaptureSignal>) {
     let want = suppress.load(Ordering::SeqCst);
     HOOK_STATE.with(|cell| {
@@ -919,9 +1003,41 @@ fn reconcile(suppress: &Arc<AtomicBool>, sink: &UnboundedSender<CaptureSignal>) 
         };
         if want && !state.grabbed {
             state.grabbed = true;
+            state.kbd_swallowed = 0;
+            state.kbd_leaked = 0;
+            state.grabbed_at = Some(std::time::Instant::now());
+            // One line per crossing, not per second: which window held focus when we
+            // took over the keyboard. If leaks correlate with our own panel being
+            // focused, this is the line that proves it.
+            tracing::info!(
+                focus = %foreground_desc(),
+                "keyboard grabbed (control moved to the peer)"
+            );
             emit_held_modifiers(sink);
         } else if !want && state.grabbed {
             state.grabbed = false;
+            let ms = state
+                .grabbed_at
+                .take()
+                .map(|t| t.elapsed().as_millis())
+                .unwrap_or(0);
+            // Summary instead of a running counter: enough to spot a leak after the
+            // fact, cheap enough to always be on.
+            if state.kbd_leaked > 0 {
+                tracing::warn!(
+                    swallowed = state.kbd_swallowed,
+                    leaked = state.kbd_leaked,
+                    remote_ms = ms,
+                    "keyboard released — SOME KEYS LEAKED to this machine"
+                );
+            } else {
+                tracing::info!(
+                    swallowed = state.kbd_swallowed,
+                    leaked = 0,
+                    remote_ms = ms,
+                    "keyboard released (no leaks)"
+                );
+            }
         }
     });
 }

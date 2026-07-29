@@ -1,0 +1,340 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>mouse-rs — what's broken, what I fixed, what I can't see yet</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#0b1020; --bg2:#121a30; --bg3:#18223d; --inset:#0d1428;
+  --line:#243354; --line2:#31436b;
+  --txt:#e8eefc; --txt2:#a9b8d6; --txt3:#5f6d8a;
+  --accent:#38d6e6; --accent2:#6a7bff;
+  --good:#37e0a0; --warn:#ffcf5c; --danger:#ff6b7a;
+}
+body{background:var(--bg);color:var(--txt);
+  font:15px/1.6 system-ui,-apple-system,"Segoe UI",sans-serif;padding:28px 18px 90px}
+.wrap{max-width:1000px;margin:0 auto}
+h1{font-size:30px;letter-spacing:-.4px;margin-bottom:6px}
+h2{font-size:21px;margin:44px 0 6px;padding-top:22px;border-top:1px solid var(--line)}
+h2:first-of-type{border-top:0}
+.sub{color:var(--txt2);margin-bottom:8px}
+.lede{color:var(--txt2);font-size:16px;max-width:76ch;margin-bottom:18px}
+code{font-family:ui-monospace,"Cascadia Code",Consolas,monospace;font-size:.88em;
+  background:var(--inset);border:1px solid var(--line);border-radius:4px;padding:1px 5px}
+pre{background:var(--inset);border:1px solid var(--line);border-radius:8px;
+  padding:12px 14px;overflow-x:auto;font-family:ui-monospace,Consolas,monospace;
+  font-size:12.5px;line-height:1.5;color:var(--txt2)}
+.card{background:var(--bg2);border:1px solid var(--line);border-radius:12px;
+  padding:18px 20px;margin:14px 0}
+.card.crit{border-color:#5e2230;background:linear-gradient(180deg,#1a1020,#121a30)}
+.tag{display:inline-block;font-size:11px;font-weight:700;letter-spacing:.6px;
+  text-transform:uppercase;padding:3px 9px;border-radius:999px;vertical-align:middle}
+.t-fixed{background:rgba(55,224,160,.14);color:var(--good);border:1px solid rgba(55,224,160,.35)}
+.t-open{background:rgba(255,207,92,.14);color:var(--warn);border:1px solid rgba(255,207,92,.35)}
+.t-crit{background:rgba(255,107,122,.16);color:var(--danger);border:1px solid rgba(255,107,122,.4)}
+.t-miss{background:rgba(106,123,255,.16);color:#9aa7ff;border:1px solid rgba(106,123,255,.4)}
+.t-unk{background:rgba(95,109,138,.18);color:var(--txt2);border:1px solid var(--line2)}
+.bugtitle{display:flex;gap:10px;align-items:baseline;flex-wrap:wrap;margin-bottom:4px}
+.bugtitle h3{font-size:17.5px}
+.who{font-size:12px;color:var(--txt3)}
+/* two-machine diagram */
+.rig{display:flex;align-items:stretch;gap:0;margin:16px 0;flex-wrap:wrap}
+.box{flex:1 1 190px;min-width:170px;background:var(--inset);border:1px solid var(--line2);
+  border-radius:10px;padding:12px 14px}
+.box.hot{border-color:var(--accent);box-shadow:0 0 0 1px rgba(56,214,230,.25) inset}
+.box.bad{border-color:var(--danger)}
+.box h4{font-size:11px;letter-spacing:1px;color:var(--txt3);text-transform:uppercase;margin-bottom:6px}
+.box .nm{font-size:15px;font-weight:600}
+.box .mt{font-size:12px;color:var(--txt3)}
+.arrow{flex:0 0 74px;display:flex;flex-direction:column;align-items:center;
+  justify-content:center;color:var(--accent);font-size:22px;gap:2px}
+.arrow small{font-size:10.5px;color:var(--txt3);text-align:center;line-height:1.3}
+.arrow.broken{color:var(--danger)}
+/* before/after */
+.ba{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin:14px 0}
+@media(max-width:720px){.ba{grid-template-columns:1fr}}
+.ba>div{border-radius:10px;padding:12px 14px;border:1px solid var(--line)}
+.was{background:rgba(255,107,122,.05);border-color:rgba(255,107,122,.3)}
+.now{background:rgba(55,224,160,.05);border-color:rgba(55,224,160,.3)}
+.ba h5{font-size:11px;letter-spacing:1px;text-transform:uppercase;margin-bottom:6px}
+.was h5{color:var(--danger)} .now h5{color:var(--good)}
+/* fake windows */
+.win{border:1px solid var(--line2);border-radius:8px;overflow:hidden;background:var(--bg3);
+  font-size:12.5px;margin:8px 0}
+.win .bar{background:#0a0f1e;padding:6px 10px;color:var(--txt2);display:flex;
+  justify-content:space-between;border-bottom:1px solid var(--line)}
+.win .body{padding:10px 12px;color:var(--txt3)}
+.menu{background:#f4f6fb;color:#1a1f2e;border-radius:6px;padding:5px 0;width:210px;
+  box-shadow:0 6px 22px rgba(0,0,0,.5);font-size:13.5px}
+.menu div{padding:5px 14px}
+.menu .dim{color:#a9aebb}
+.menu hr{border:0;border-top:1px solid #dfe3ec;margin:4px 0}
+.stack{position:relative;height:104px;margin:10px 0}
+.stack .w{position:absolute;border:1px solid var(--line2);border-radius:7px;
+  padding:7px 10px;font-size:12px;background:var(--bg3)}
+.stack .w.front{border-color:var(--danger);background:#1b2138;z-index:3}
+.stack .w.behind{opacity:.55;z-index:1}
+table{width:100%;border-collapse:collapse;margin:12px 0;font-size:13.5px}
+th,td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--line)}
+th{color:var(--txt3);font-size:11px;letter-spacing:.8px;text-transform:uppercase;font-weight:600}
+td code{font-size:12px}
+ul{margin:8px 0 8px 20px}li{margin:5px 0;color:var(--txt2)}
+.ask{background:linear-gradient(180deg,#101a34,#0d1428);border:1px solid var(--accent2);
+  border-radius:12px;padding:16px 20px;margin:16px 0}
+.ask h4{color:var(--accent);font-size:13px;letter-spacing:.7px;text-transform:uppercase;margin-bottom:8px}
+.legend{display:flex;gap:16px;flex-wrap:wrap;margin:10px 0 4px;font-size:12.5px;color:var(--txt2)}
+.hop{display:flex;gap:10px;align-items:flex-start;margin:10px 0;padding:10px 12px;
+  background:var(--inset);border:1px solid var(--line);border-radius:8px}
+.hop .n{flex:0 0 24px;height:24px;border-radius:50%;background:var(--bg3);
+  border:1px solid var(--line2);display:flex;align-items:center;justify-content:center;
+  font-size:12px;color:var(--txt2)}
+.hop.suspect{border-color:rgba(255,207,92,.45);background:rgba(255,207,92,.05)}
+.hop .t{flex:1}
+.hop .t b{color:var(--txt);font-weight:600}
+.hop .t em{color:var(--warn);font-style:normal;font-size:12.5px}
+.note{font-size:13px;color:var(--txt3);margin-top:6px}
+</style></head>
+<body><div class="wrap">
+
+<h1>mouse-rs — the bug map</h1>
+<p class="sub">Every issue on the table right now, drawn out. Written 30 Jul 2026.</p>
+<p class="lede">You said you don't know which bugs I've been fixing. Fair — I've been describing
+them in code terms. This page shows each one as a picture of what happens, so you can tell me
+where I've misunderstood what you're seeing. <strong>Section 2 is your reports</strong>, and
+that's the part that matters most.</p>
+
+<div class="legend">
+  <span><span class="tag t-fixed">fixed</span> verified working on your laptop</span>
+  <span><span class="tag t-crit">critical</span> broken, and I can't see why yet</span>
+  <span><span class="tag t-open">open</span> real, not yet fixed</span>
+  <span><span class="tag t-miss">never built</span> feature doesn't exist</span>
+  <span><span class="tag t-unk">needs one check</span> cause not established</span>
+</div>
+
+<h2>1 — The six I fixed</h2>
+<p class="lede">These came out of the automated Windows test, not from you. All six were
+retested on your laptop and pass. Skim these; section 2 is the live stuff.</p>
+
+<div class="card">
+  <div class="bugtitle"><h3>1. The tray's "Open mouse-rs" did nothing</h3><span class="tag t-fixed">fixed</span></div>
+  <p class="who">Windows only. This is the one that could have actually trapped you.</p>
+  <div class="ba">
+    <div class="was"><h5>was</h5>
+      <p>Panel minimized → right-click tray → <em>Open mouse-rs</em> → <strong>nothing at all</strong>.
+      The window stayed parked off-screen at <code>-32000,-32000</code>.</p>
+      <div class="menu"><div>Open mouse-rs</div><hr><div>Start</div><div>Stop</div><hr><div>Quit</div></div>
+      <p class="note">Turn on "Start minimized" and there was then <strong>no way to reach the
+      panel at all</strong> — it opens hidden and the only door is locked.</p>
+    </div>
+    <div class="now"><h5>now</h5>
+      <p>Restores <em>and</em> comes to the front. Verified: <code>iconic=False
+      foreground=True</code>, held 5 seconds.</p>
+      <p class="note">Why it slipped through: I only tested on Kali, and Linux window managers
+      restore a window as a side effect of focusing it. Windows doesn't. The code was wrong the
+      whole time; Linux just hid it.</p>
+    </div>
+  </div>
+</div>
+
+<div class="card">
+  <div class="bugtitle"><h3>2. Saving your config could have destroyed your shared secret</h3><span class="tag t-fixed">fixed</span></div>
+  <p class="who">Both machines. The most dangerous of the six.</p>
+  <p>Pressing <strong>Start</strong> silently rewrote <code>config.json</code> — and it did it by
+  emptying the file first, then writing the new contents:</p>
+  <pre>OLD WAY:   [ truncate config.json to 0 bytes ]  →  [ write new contents ]
+                              ↑
+                    crash / power cut here
+                    = empty config, shared_secret GONE
+
+NEW WAY:   [ write config.json.tmp ] → [ flush to disk ] → [ atomic rename over config.json ]
+                              ↑
+                    crash anywhere here
+                    = original file untouched</pre>
+  <p>The secret is the one value in there that can't be recreated — lose it and both machines
+  stop trusting each other until you re-pair them. Retest confirmed: 7 saves, zero leftover temp
+  files, secret intact.</p>
+</div>
+
+<div class="card">
+  <div class="bugtitle"><h3>3–6. Four smaller ones</h3><span class="tag t-fixed">fixed</span></div>
+  <table>
+    <tr><th>Bug</th><th>What you'd have seen</th></tr>
+    <tr><td>Docs named a tab that doesn't exist</td><td>Instructions said "General tab" — there isn't one. Startup and Log file are at the bottom of <strong>Connection</strong>, past a scroll.</td></tr>
+    <tr><td>Log said nothing when sharing stopped</td><td>A deliberate Stop and a crash looked identical in the log. Now logs stop requested, engine stopped, config saved, login entry changed.</td></tr>
+    <tr><td>Tray menu never greyed out</td><td><code>Stop</code> was clickable while already stopped, <code>Start</code> while already running. Now they follow the real state.</td></tr>
+    <tr><td>Log spammed a diagnostic line every second</td><td>Removed — and <strong>that removal is now a problem</strong>, see 2C.</td></tr>
+  </table>
+</div>
+
+<h2>2 — What you reported</h2>
+<p class="lede">These are yours. I've checked each against the code before writing anything here.</p>
+
+<div class="card crit">
+  <div class="bugtitle"><h3>2C. The keyboard still leaks, ~1 in 10–20 crossings</h3><span class="tag t-crit">critical</span></div>
+  <p class="who">This is the most important thing on the page and I currently have no instrument to find it.</p>
+  <p>What you see: the mouse crosses to Kali, but the keyboard stays behind — you type and the
+  characters land in a <em>Windows</em> window instead.</p>
+  <div class="rig">
+    <div class="box hot"><h4>Windows laptop — server</h4><div class="nm">mouse + keyboard</div>
+      <div class="mt">grabs input, sends it on</div></div>
+    <div class="arrow"><span>→</span><small>mouse<br>arrives ✓</small></div>
+    <div class="box"><h4>Kali desktop — client</h4><div class="nm">receives input</div>
+      <div class="mt">cursor moves correctly</div></div>
+  </div>
+  <div class="rig">
+    <div class="box bad"><h4>Windows laptop — server</h4><div class="nm">keystrokes stay here</div>
+      <div class="mt">typed into a local window</div></div>
+    <div class="arrow broken"><span>⇥</span><small>keys never<br>leave ✗</small></div>
+    <div class="box"><h4>Kali desktop — client</h4><div class="nm">nothing typed</div>
+      <div class="mt">waiting</div></div>
+  </div>
+  <p>Your phrase for it — "mouse is on kali, why keyboard is on windows" — is exactly this. It's
+  one bug, not two.</p>
+  <p style="margin-top:14px"><strong>A keystroke has to survive five steps to reach Kali. A leak
+  means one of them failed, and right now the log can't tell me which:</strong></p>
+
+  <div class="hop suspect"><div class="n">1</div><div class="t"><b>Windows calls our keyboard hook</b>
+    — <em>if the hook is too slow, Windows skips it entirely and the key goes straight to the local app.</em>
+    Windows allows roughly 300 ms. This was a real bug once already, fixed by moving mouse handling
+    to its own thread. Under load it could still happen — and it would look exactly like what you
+    describe: intermittent, no pattern.</div></div>
+  <div class="hop suspect"><div class="n">2</div><div class="t"><b>The hook checks "am I suppressing?"</b>
+    — <em>the crossing flag and the hook's own state are reconciled every ~8 ms. A key pressed inside
+    that window sees "not suppressing" and passes through.</em> A prime suspect for a 1-in-15 rate.</div></div>
+  <div class="hop"><div class="n">3</div><div class="t"><b>The hook swallows the key</b> so no
+    Windows app sees it. Was proven working — 231 swallowed, 0 leaked — but that proof came from
+    counters I have since deleted.</div></div>
+  <div class="hop suspect"><div class="n">4</div><div class="t"><b>The key is sent over the network</b>
+    — <em>if the link stalls, keys can be dropped in flight while the mouse still looks fine.</em></div></div>
+  <div class="hop suspect"><div class="n">5</div><div class="t"><b>Kali injects the key</b> —
+    <em>if injection fails there, the key is lost silently and it looks identical to a leak on
+    Windows.</em> This is why logging is needed on <strong>both</strong> machines, as you said.</div></div>
+
+  <p style="margin-top:14px"><strong>Why I can't answer this today:</strong> the counters that
+  measured steps 1–3 were in the build until I removed them a few hours ago, because an automated
+  test said the keyboard was proven working. Your experience says otherwise, and you're the one
+  actually using it. Removing them was the wrong call.</p>
+</div>
+
+<div class="card">
+  <div class="bugtitle"><h3>2A. The panel sits in front of everything on Windows</h3><span class="tag t-unk">needs one check</span></div>
+  <p class="who">Windows. You click Chrome, or Alt-Tab, and mouse-rs stays on top; only minimizing gets rid of it.</p>
+  <div class="stack">
+    <div class="w behind" style="left:150px;top:30px;width:250px">Chrome — you clicked here</div>
+    <div class="w front" style="left:0;top:0;width:230px">mouse-rs — still in front</div>
+  </div>
+  <p><strong>Our code never asks for always-on-top.</strong> I checked: the window is created with
+  no level set, and on Kali it reports a normal window level.</p>
+  <p>But during yesterday's automated test, the test harness <em>deliberately pinned the panel
+  on top</em> to photograph it over a terminal, then tried to undo it. If that undo didn't stick,
+  the instance running on your laptop right now is stuck on top — and it would behave exactly
+  like this.</p>
+  <div class="ask"><h4>One thing to try before I write any code</h4>
+    <p>Quit mouse-rs from the tray and start it again. If the new window behaves normally, the
+    culprit was the test harness and there's nothing to fix. If it's <em>still</em> in front of
+    Chrome after a fresh start, it's a real bug and I'll chase it. Tell me which.</p></div>
+</div>
+
+<div class="card">
+  <div class="bugtitle"><h3>2B. Nothing tells you when a saved setting takes effect</h3><span class="tag t-open">open</span></div>
+  <p class="who">Both machines. Real gap — you're right, and it's confusing by design at the moment.</p>
+  <p>Today, settings fall into two silently different groups:</p>
+  <table>
+    <tr><th>Setting</th><th>When it actually applies</th></tr>
+    <tr><td>Theme, machine name, log path display</td><td>immediately</td></tr>
+    <tr><td>Start at login</td><td>immediately (writes to the OS on toggle)</td></tr>
+    <tr><td><strong>Edges, ports, host, secret, TLS, clipboard, hotkeys, screen size</strong></td><td><strong>only when sharing is restarted</strong> — Save alone does nothing to the live session</td></tr>
+  </table>
+  <p>So you can change your exit edge, press Save, see "saved", and the behaviour doesn't change —
+  with no hint that a restart is required. What you asked for, and what I'd build:</p>
+  <div class="win"><div class="bar"><span>mouse-rs</span><span>—  ▢  ✕</span></div>
+    <div class="body" style="color:var(--txt2)">
+      <p style="margin-bottom:8px"><strong style="color:var(--warn)">⚠ Restart needed</strong> —
+      3 changes are saved but not yet active: <em>exit edge, listen port, TLS</em>.</p>
+      <p style="font-size:12px">[ Restart sharing now ]&nbsp;&nbsp; [ Later ]</p>
+    </div></div>
+  <p class="note">Pressing "Restart sharing now" would stop and restart the engine, then confirm
+  <em>"new settings active"</em> — so you always know which state you're in. Picking "Later"
+  leaves a persistent marker on the affected fields until you do restart.</p>
+</div>
+
+<div class="card">
+  <div class="bugtitle"><h3>2D. Clipboard doesn't copy images</h3><span class="tag t-miss">never built</span></div>
+  <p class="who">Both machines. Not a bug — the feature was never written.</p>
+  <p>I checked the code rather than guessing. The network protocol <em>reserves</em> a message type
+  for images, but the clipboard code is text-only, and an arriving image message is explicitly
+  thrown away. The comment in the source says it outright:</p>
+  <pre>// Text only for now. The protocol's `ClipboardImage` is reserved for a later pass
+...
+Ok(_) => {} // ClipboardImage and any stray message: ignored for now</pre>
+  <p><strong>So no amount of logging will explain this one</strong> — there's nothing to log,
+  because nothing ever attempts it. Copying an image will do nothing until image sync is built:
+  read the image off the clipboard, size-limit it, send it, write it to the other clipboard.
+  That's a feature to schedule, not a fault to find.</p>
+  <p class="note">Worth knowing: the old Python version left a <code>clip_images</code> folder in
+  <code>.mouse_share</code>, so it may have attempted this. If image copy used to work for you
+  under the Python build, tell me — that changes it from "new feature" to "regression", and I'd
+  look at what Python did.</p>
+</div>
+
+<h2>3 — The logging you asked for</h2>
+<p class="lede">You said: make a log mechanism so we can figure out each issue without struggling.
+Here's exactly what I'd add. Nothing below is built yet — I want you to see the shape first,
+because you're the one who'll be reading the output.</p>
+
+<div class="card">
+  <h3 style="font-size:16px;margin-bottom:8px">Every leak gets a line, on the machine where it happened</h3>
+  <p>Instead of a counter you have to interpret, a leak announces itself with a reason:</p>
+  <pre>WARN  kbd LEAK  vk=0x41 'A'  reason=hook_not_suppressing  since_crossing=142ms  leak#3
+WARN  kbd LEAK  vk=0x42 'B'  reason=state_borrow_busy       since_crossing=1.2s   leak#4
+INFO  kbd state grabbed=true suppress=true  (crossing #12 → remote)
+INFO  kbd 118 keys swallowed, 0 leaked, this remote session</pre>
+  <p>The <code>reason</code> field is the whole point — it names which of the five steps failed,
+  so we stop guessing. <code>since_crossing</code> tests the timing-race theory directly: if leaks
+  cluster in the first few milliseconds after crossing, that's step 2 and I know how to fix it.</p>
+</div>
+
+<div class="card">
+  <h3 style="font-size:16px;margin-bottom:8px">Both sides count the same keys, so we can see where they vanish</h3>
+  <div class="rig">
+    <div class="box"><h4>Windows — server</h4><div class="nm">sent 118 keys</div>
+      <div class="mt">swallowed 118, leaked 0</div></div>
+    <div class="arrow"><span>→</span><small>compare<br>the counts</small></div>
+    <div class="box"><h4>Kali — client</h4><div class="nm">injected 118 keys</div>
+      <div class="mt">failed 0</div></div>
+  </div>
+  <p>Three possible readings, each pointing somewhere different:</p>
+  <ul>
+    <li><strong>Windows leaked &gt; 0</strong> → the hook failed. A Windows-side problem, steps 1–3.</li>
+    <li><strong>Windows sent 118, Kali injected 110</strong> → keys died on the network or on injection. Steps 4–5, and nothing to do with the hook.</li>
+    <li><strong>Counts match but you still saw wrong behaviour</strong> → the keys arrived and went to the wrong <em>application</em> on Kali. A different bug entirely.</li>
+  </ul>
+  <p class="note">Right now all three look identical from the outside, which is exactly why this
+  has been so annoying to pin down.</p>
+</div>
+
+<div class="card">
+  <h3 style="font-size:16px;margin-bottom:8px">Kept quiet by default, loud on demand</h3>
+  <p>The reason I deleted the old counters is that they wrote a line every second, forever. The
+  replacement:</p>
+  <ul>
+    <li><strong>Leaks are always logged</strong> — they're rare and they matter. A leak should never be silent.</li>
+    <li><strong>One summary per crossing</strong>, not one line per second: keys swallowed, keys leaked, longest hook delay.</li>
+    <li><strong>Full per-key detail only with <code>RUST_LOG=debug</code></strong> — available when hunting, absent otherwise.</li>
+  </ul>
+  <p>That gives you a log that stays small and readable but still catches a 1-in-20 event, because
+  the rare thing is the thing that always gets written.</p>
+</div>
+
+<div class="ask">
+  <h4>What I need from you</h4>
+  <ul>
+    <li><strong>2A:</strong> restart mouse-rs on the laptop — does the panel still sit in front of Chrome? That decides whether there's a bug at all.</li>
+    <li><strong>2D:</strong> did image copy ever work under the old Python version? Feature vs regression.</li>
+    <li><strong>2C:</strong> when it next leaks, note roughly what you were doing — had you just crossed, or were you already typing on Kali for a while? That single detail splits step 2 from steps 3–5.</li>
+  </ul>
+  <p style="margin-top:8px;color:var(--txt2)">And tell me if anything on this page doesn't match
+  what you're actually seeing. I'd rather redraw it than fix the wrong thing.</p>
+</div>
+
+</div></body></html>
