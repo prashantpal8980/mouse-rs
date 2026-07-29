@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+# Build the Windows exe, sync its checksum into the test prompts, and serve both
+# over the direct cable so the laptop can fetch instructions instead of having them
+# pasted.
+#
+# Usage:  scripts/serve-windows.sh [--no-build]
+#
+# The laptop then needs only a one-liner:
+#     read and follow http://192.168.137.2:8000/retest.md
+#
+# Why the checksum sync exists: the prompts embed the exe's size and SHA256 so the
+# tester can prove they got the right binary. Every rebuild changes both, and editing
+# them by hand has already gone stale twice — a tester verifying against a stale hash
+# either stops for no reason or, worse, is told to distrust a good download.
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$REPO_ROOT"
+
+# The cable, deliberately — not 0.0.0.0. wlan0 is a phone hotspot and this serves
+# unauthenticated.
+BIND_ADDR="192.168.137.2"
+PORT=8000
+SERVE_DIR="$HOME/mouse-serve"
+EXE="target/x86_64-pc-windows-gnu/release/mouse-rs.exe"
+
+if [ "${1:-}" != "--no-build" ]; then
+  echo "==> building the Windows exe"
+  # The Linux GUI links libxdo; the shim keeps the workspace building without libxdo-dev.
+  [ -d "$REPO_ROOT/.xdo-shim" ] && export RUSTFLAGS="-L $REPO_ROOT/.xdo-shim"
+  cargo build --release --target x86_64-pc-windows-gnu
+fi
+
+[ -f "$EXE" ] || { echo "no exe at $EXE" >&2; exit 1; }
+
+SIZE=$(stat -c%s "$EXE")
+SHA=$(sha256sum "$EXE" | cut -d' ' -f1 | tr 'a-f' 'A-F')
+echo "==> exe: $SIZE bytes, $SHA"
+
+# --- keep the prompts' stated checksum equal to what is actually being served ---
+for doc in docs/windows-test-prompt.md docs/windows-retest-prompt.md; do
+  [ -f "$doc" ] || continue
+  # Both lines are written by this script, so match loosely on the label and replace
+  # the whole value rather than trying to find the previous hash.
+  # Bullet form, as used by setup.md ("- size:" / "- SHA256:" on their own lines).
+  sed -i -E "s/^(- size: )\`[0-9]+\` bytes$/\1\`$SIZE\` bytes/" "$doc"
+  sed -i -E "s/^(- SHA256: )\`[A-Fa-f0-9]{64}\`\.?$/\1\`$SHA\`/" "$doc"
+  # Prose form, as used by retest.md ("size `N` bytes, SHA256" then the hash alone on the
+  # next line). The hash pattern is anchored to a whole line so it cannot also rewrite the
+  # bullet above and append a spurious full stop to it.
+  sed -i -E "s/size \`[0-9]+\` bytes, SHA256/size \`$SIZE\` bytes, SHA256/" "$doc"
+  sed -i -E "s/^\`[A-Fa-f0-9]{64}\`\.?$/\`$SHA\`./" "$doc"
+  echo "    synced $doc"
+done
+
+# --- assemble the served directory out of symlinks, so it never goes stale ---
+mkdir -p "$SERVE_DIR"
+ln -sfn "$REPO_ROOT/$EXE"                          "$SERVE_DIR/mouse-rs.exe"
+ln -sfn "$REPO_ROOT/docs/windows-retest-prompt.md" "$SERVE_DIR/retest.md"
+ln -sfn "$REPO_ROOT/docs/windows-test-prompt.md"   "$SERVE_DIR/setup.md"
+printf 'mouse-rs.exe  %s bytes\nSHA256  %s\n' "$SIZE" "$SHA" > "$SERVE_DIR/CHECKSUM.txt"
+
+# --- restart the server ---
+# Match on the port, and exclude this script's own pid so we don't kill ourselves —
+# a `pkill -f "http.server 8000"` matches the shell running it, which has bitten us.
+for pid in $(pgrep -f "http\.server $PORT" || true); do
+  [ "$pid" = "$$" ] && continue
+  kill "$pid" 2>/dev/null || true
+done
+sleep 1
+
+cd "$SERVE_DIR"
+setsid nohup python3 -m http.server "$PORT" --bind "$BIND_ADDR" \
+  > "$SERVE_DIR/serve.log" 2>&1 < /dev/null &
+disown || true
+sleep 2
+
+if curl -sf -o /dev/null "http://$BIND_ADDR:$PORT/retest.md"; then
+  cat <<EOF
+
+==> serving on http://$BIND_ADDR:$PORT/  (cable only)
+
+    http://$BIND_ADDR:$PORT/retest.md      focused retest of the six fixes
+    http://$BIND_ADDR:$PORT/setup.md       full first-time setup + test pass
+    http://$BIND_ADDR:$PORT/mouse-rs.exe   the binary ($SIZE bytes)
+    http://$BIND_ADDR:$PORT/CHECKSUM.txt
+
+    One-liner for the Windows session:
+      read and follow the instructions at http://$BIND_ADDR:$PORT/retest.md
+
+EOF
+else
+  echo "server did not come up; see $SERVE_DIR/serve.log" >&2
+  exit 1
+fi
