@@ -77,11 +77,11 @@ Save the file. When you run it, Windows **SmartScreen** may block it: click
 > Run the `.exe` from a **terminal** (cmd or PowerShell), not by double-clicking,
 > so you can see the log output. Example:
 > ```
-> mouse-rs.exe client
+> mouse-rs.exe server
 > ```
-> A bare launch with no subcommand logs
-> `no subcommand (GUI lands in Phase 6); use "server" or "client"` and exits
-> (the GUI is Phase 6, not built) — you must pass `server` or `client`.
+> A **bare launch opens the GUI control panel** (Phase 6 shipped; the binary stays a
+> console app so `server`/`client` keep foreground logs and Ctrl-C). Pass `server` or
+> `client` for the headless path.
 
 ---
 
