@@ -59,7 +59,7 @@ the echo"). Covered by 5 unit tests incl. `batched_fast_flick_to_edge_does_not_o
 Phase 1 ✅ core, 2 ✅ net, 3 ✅ Linux input + engine,
 **4 ✅ Windows input + suppression failsafe / Fn+Up fix (code-complete, pending a real
 Windows-laptop test — see `docs/phase4-windows-design.md` for the test plan)**,
-5 = clipboard, 6 = egui+tray UI, 7 = reconnect/packaging. Both backends implement the
+5 = clipboard, 6 = iced+tray UI, 7 = reconnect/packaging. Both backends implement the
 same `InputInjector`/`InputCapture` traits, so the engine is unchanged across them.
 
 ## Build

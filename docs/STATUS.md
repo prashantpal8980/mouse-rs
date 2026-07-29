@@ -5,62 +5,137 @@ keyboard/mouse between a Kali/X11 desktop and a Windows laptop over a LAN. Fixes
 Python version's three bugs (stale "connected" state, Stop/Reload hangs, Fn+Up
 cursor freeze) by construction.
 
-## Where we are (as of 2026-06-26)
+## Where we are (as of 2026-07-28)
 
 | Phase | What | State |
 |---|---|---|
 | 1 | Cargo workspace, config, protocol, HMAC auth | ✅ done, tested |
-| 2 | Async link: rustls TLS (ring), heartbeat liveness, CancellationToken Stop | ✅ done, tested |
-| 3 | Linux/X11 input + the edge-crossing engine | ✅ done, tested (live loopback) |
-| 4 | Windows input backend + Fn+Up suppression failsafe | ✅ code-complete — **needs laptop test** |
-| 5 | Clipboard sync (text) | ✅ code-complete — **needs 2-machine test** |
-| 6 | egui + tray GUI | ✅ control panel, tray (live tooltip), status, Quit, profiles, detect-screen, clipboard history |
-| 7 | auto-reconnect + packaging | ✅ reconnect + `scripts/package.sh` (Win zip + Linux tar, bundled libxdo) |
+| 2 | Async link: rustls TLS (ring), heartbeat liveness, CancellationToken Stop | ✅ done, **hardware-validated** |
+| 3 | Linux/X11 input + the edge-crossing engine | ✅ done, **hardware-validated** |
+| 4 | Windows input backend (Raw Input capture + SendInput inject) | ✅ done, **mouse hardware-validated**; keyboard see below |
+| 5 | Clipboard sync (text) | ✅ code-complete — **still needs a deliberate 2-machine pass** |
+| 6 | **iced** control panel + tray GUI | ✅ done — 6 themes, status hero, tabs, profiles, clipboard history, live tray tooltip |
+| 7 | auto-reconnect + packaging | ✅ reconnect **hardware-validated**; `scripts/package.sh` (Win zip + Linux tar, bundled libxdo) |
 
-**Verification status:** 56 tests pass; clippy clean and release builds link on BOTH
-`x86_64-unknown-linux-gnu` and `x86_64-pc-windows-gnu`. Phases 1–3 are also validated
-by a live loopback run. Phases 4 and 5 are the two things that can only be validated
-on real hardware (the Windows laptop) — see "Next" below.
+**Verification status:** 72 tests pass; clippy clean (`-D warnings`) and release builds link
+on BOTH `x86_64-unknown-linux-gnu` and `x86_64-pc-windows-gnu`.
+
+## Hardware status (two-machine runs, Jul 27–28)
+
+Real layout in use: **Windows laptop = server** (has the keyboard/mouse),
+**Kali desktop = client**. Note this is the *opposite* of the earlier Phase-4 test
+layout, which is why the Windows **capture** path took most of the late bug-fixing.
+
+- ✅ **Mouse sharing works flawlessly** — 1:1 tracking, corners reachable, return-by-edge.
+  This came from replacing the cursor-position model with **Raw Input** (`WM_INPUT`),
+  which gives true device deltas immune to edge clamping and pointer acceleration.
+- ✅ **Keyboard works** — validated 2026-07-28 over a long stable session, non-elevated
+  PowerShell. See "The keyboard story" below; diagnostics are still compiled in.
+- ✅ **Auto-reconnect validated on hardware** — the Kali client sat retrying against a
+  server that wasn't speaking its protocol yet, then connected on its own the moment the
+  real server came up. No manual restart. This is F4 from the runbook, now closed.
+- ⬜ **Clipboard (C1–C9) not yet deliberately exercised** on hardware.
+
+## The keyboard story (read this before touching `windows.rs`)
+
+Two separate faults were tangled together, which is why it looked intermittent:
+
+1. **Hook starvation (fixed 2026-07-27).** The `WM_INPUT` mouse stream was processed on
+   the same thread as the low-level keyboard hook. Fast mouse movement blew the hook's
+   ~300 ms `LowLevelHooksTimeout`, so Windows skipped it and keys leaked to local apps.
+   Fix: Raw Input moved to its own dedicated thread (`spawn_raw_input_thread`), leaving
+   the hook thread doing only trivial work.
+2. **Sessions dying underneath the test (fixed 2026-07-28).** `net.rs` classified *every*
+   session read error as `ProtocolError`, which `is_recoverable()` treats as fatal — so a
+   server restart (which arrives as a TCP reset) permanently stopped the client's
+   reconnect loop. A dead link looks exactly like "my keys stayed on the laptop", so this
+   masked whether fix #1 had actually worked.
+
+With both fixed, the first long uninterrupted session showed keyboard and mouse both
+working correctly. Fix #1 was likely always sound; we simply never got a clean session in
+which to observe it.
+
+⚠️ **Temporary diagnostics are still compiled in** — `DIAG_*` counters and a once-per-second
+`kbd_diag` line in `crates/mouse-input/src/windows.rs` (~line 913). They only print while
+suppressing (i.e. while control is on the peer). **Remove them** once the keyboard has held
+up across a few days of normal use.
+
+## Secret handling on disk (2026-07-28)
+
+`Config::save` writes **0600 inside a 0700 directory** on Unix — `config.json` and every
+profile carry `shared_secret` in the clear, and that secret is what authorises a peer to
+inject keystrokes, so it must not be readable by other local users. Both the create mode
+*and* an explicit permission set are applied **before** any bytes are written: `mode()`
+alone only governs newly-created files, so an existing 0644 config would otherwise keep its
+world-readable mode and leak the new secret. Windows relies on inherited ACLs.
+Regression test: `config::tests::saved_config_is_owner_only_even_when_overwriting_a_lax_file`
+(verified to fail against the old `fs::write`). Files created before this change need a
+one-time `chmod 700 ~/.mouse_share && chmod 600 ~/.mouse_share/config.json`.
+
+mouse-rs never persists TLS material — the self-signed cert is generated in memory per run.
+
+## Panel fixes from UI testing (2026-07-29)
+
+Two issues that UI testing turned up, both now closed:
+
+- **Layout tab warned on nothing.** `exit_edge = left` with `entry_edge = left` saved
+  silently, even though leaving through one edge can only mean arriving through the facing
+  one — any other pairing stacks the two screens on top of each other. The Layout tab now
+  shows an inline warning naming the edge that would be coherent. It **warns rather than
+  blocks**: the setting is a physical-desk description, and refusing to save someone's
+  unusual arrangement is worse than telling them it looks wrong. Backed by
+  `Edge::opposite()` (`config.rs`) and `config::tests::edges_oppose_and_round_trip`.
+- **Profile messages showed the typed name, not the written one.** Saving `../../pwned`
+  correctly wrote `pwned.json` (the sanitizer has always held), but the panel then echoed
+  the raw string *and* set the dropdown selection to it — so the selection pointed at a
+  profile that did not exist, and a following Delete reported the traversal string back.
+  Fixed at the source in `SaveProfileAs`, which now uses `sanitize_profile_name`'s result
+  for both the message and the selection. The path-traversal guard itself was never
+  bypassed; this was the display and selection lying about it.
 
 ## Crate layout
 - `crates/mouse-core` — config, `Message` protocol + codec, HMAC auth, TLS, async `net` link.
 - `crates/mouse-input` — `InputInjector`/`InputCapture` traits; `linux.rs` (X11/XTEST),
-  `windows.rs` (SendInput + LL hooks + 4-layer failsafe), shared `motion.rs`.
+  `windows.rs` (Raw Input capture + SendInput inject + LL hooks for suppression),
+  `motion.rs` (X11-only warp bookkeeping).
 - `crates/mouse-engine` — Local↔Remote edge-crossing state machine (`server.rs`/`client.rs`),
-  injector thread, `ClipboardRoute` wiring.
-- `crates/mouse-clipboard` — arboard-based text clipboard sync thread (loop-free).
-- `crates/mouse` — the `mouse-rs` binary (`server`/`client` subcommands; GUI = Phase 6).
+  injector thread, `hotkey.rs` combo parsing, `status.rs`, `ClipboardRoute` wiring.
+- `crates/mouse-clipboard` — arboard-based text clipboard sync thread (loop-free) + history.
+- `crates/mouse` — the `mouse-rs` binary: `server`/`client` CLI + the iced GUI
+  (`gui.rs`, `ui_theme.rs`, `tray.rs`) behind the default-on `gui` feature.
 
-## How each tricky thing was de-risked (all untestable-locally work)
+## How each tricky thing was de-risked
 - Every phase that couldn't be run here got an adversarial workflow/review; findings
   were fixed and re-verified. Key catches: the motion over-count bug (Phase 3), the
   ShiftR-extended + watchdog defects (Phase 4), the clipboard disconnected-queue bug
   (Phase 5). See `docs/engine-resume.md` and `docs/phase4-windows-design.md`.
+- The two bugs reviews *didn't* catch were both `#[cfg(windows)]` capture code that had
+  never executed, and a network error path no in-repo test reproduced (a graceful test
+  shutdown yields a clean EOF, not the RST a real process-kill produces). Lesson: code
+  that can't run locally stays unproven no matter how many reviews it survives.
 
 ## Build / run
 ```
 . ~/.cargo/env
+export RUSTFLAGS="-L /home/kalip/mouse-rs/.xdo-shim"   # only needed if libxdo-dev is absent
 cargo test --workspace
 cargo clippy --workspace --all-targets
 # Windows exe (mingw + libx11 already on the Kali box):
-cargo build --release --target x86_64-pc-windows-gnu   # -> target/x86_64-pc-windows-gnu/release/mouse-rs.exe
+cargo build -p mouse --release --target x86_64-pc-windows-gnu
+#   -> target/x86_64-pc-windows-gnu/release/mouse-rs.exe
 ```
-Config is the SAME `~/.mouse_share/config.json` as the Python app (role `server`/`client`).
-Run headless: `mouse-rs server` (Kali) / `mouse-rs client` (laptop). Linux must be X11.
+The GUI build links `libxdo` (via the tray). The **headless** build
+(`--no-default-features`) needs neither libxdo nor gtk and is fully self-contained.
 
-## Next (pick up here tomorrow)
-1. **(recommended) Two-machine test of Phases 4 + 5** before adding more — they're the
-   only un-hardware-tested code. Test plans: Fn+Up freeze, Ctrl+C composition, DPI,
-   hotkey escape (`docs/phase4-windows-design.md`); clipboard copy/paste both ways +
-   no echo loop + sync-on-reconnect. Deploy via a Kali `python -m http.server` the
-   laptop pulls (the Python-era workflow).
-2. **Phase 6 ✅ DONE** — detect-screen display + Detect button, network profiles
-   (save/load/delete under `~/.mouse_share/profiles/`), clipboard-history view, live
-   tray tooltip. (Remaining nicety: console double-click flash on Windows.)
-3. **Phase 7 ✅ DONE** — auto-reconnect (client retries with exponential backoff 1s→15s
-   after any recoverable drop, and before the server is up; `cfg.reconnect`, default on)
-   + `scripts/package.sh` (Windows zip + Linux tarball, slim headless build, bundled
-   libxdo). See `docs/PACKAGING.md`.
-4. **Hardware retest** — F1–F4 in `docs/TESTING.md` (frozen-cursor, close=quit, combo
-   hotkey, auto-reconnect) need the two-machine run; the first three are off-box paths.
-5. **Image clipboard** — finish the deferred `ClipboardImage` path (RGBA<->PNG + cap).
+Config is the SAME `~/.mouse_share/config.json` as the Python app (role `server`/`client`).
+Run headless: `mouse-rs server` / `mouse-rs client`. Bare `mouse-rs` opens the GUI.
+Linux must be X11.
+
+## Next
+1. **Soak the keyboard** through normal daily use. If it holds, strip the `DIAG_*`
+   counters and the `kbd_diag` line from `windows.rs` and cut a clean release build.
+2. **Clipboard pass (C1–C9)** in `docs/TESTING.md` §5 — the one feature never deliberately
+   exercised on two machines.
+3. **Image clipboard** — finish the deferred `ClipboardImage` path (RGBA<->PNG + cap).
+4. **Console double-click flash** on Windows — the last cosmetic nicety.
+5. **Product work** (see the commercial goal): installers, code signing, auto-update.

@@ -28,9 +28,11 @@ watchdog that force-releases suppression (3).
 
 ```
 crates/
-  mouse-core/   platform-agnostic: config, protocol, auth, async net link
-  mouse/        the binary: CLI + (later) egui control panel + tray
-  (mouse-input) OS input capture/injection behind a trait — added in Phase 3/4
+  mouse-core/       platform-agnostic: config, protocol, auth, async net link
+  mouse-input/      OS input capture/injection behind a trait (X11/XTEST, Raw Input+SendInput)
+  mouse-engine/     the Local↔Remote edge-crossing state machine
+  mouse-clipboard/  text clipboard sync thread (loop-free) + history
+  mouse/            the binary: CLI + the iced control panel + tray
 ```
 
 The network link is async (tokio); OS input hooks run on dedicated native threads
@@ -52,12 +54,15 @@ cargo test                                         # run the test suite
 ## Roadmap
 
 - [x] Phase 1 — workspace, config, protocol, auth, cross-compile
-- [ ] Phase 2 — network core: TLS, heartbeat, cancellation
-- [ ] Phase 3 — Linux input (X11 / XTEST)
-- [ ] Phase 4 — Windows input + suppression failsafe
-- [ ] Phase 5 — clipboard sync
-- [ ] Phase 6 — egui control panel + tray
-- [ ] Phase 7 — reconnect, packaging, parity
+- [x] Phase 2 — network core: TLS, heartbeat, cancellation
+- [x] Phase 3 — Linux input (X11 / XTEST)
+- [x] Phase 4 — Windows input (Raw Input capture) + suppression failsafe
+- [x] Phase 5 — clipboard sync (text; images deferred)
+- [x] Phase 6 — iced control panel + tray
+- [x] Phase 7 — auto-reconnect, packaging
+
+Mouse, keyboard and auto-reconnect are validated on real two-machine hardware.
+See `docs/STATUS.md` for the current state and `docs/TESTING.md` for the runbook.
 
 ## License
 

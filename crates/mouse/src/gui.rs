@@ -9,7 +9,7 @@ use iced::widget::{
 };
 use iced::{Alignment, Element, Length, Subscription, Task};
 
-use mouse_core::{Config, Edge, Role};
+use mouse_core::{sanitize_profile_name, Config, Edge, Role};
 use mouse_engine::StatusSnapshot;
 use mouse_input::screen_size;
 
@@ -50,6 +50,9 @@ enum Message {
     TlsToggled(bool),
     ClipboardToggled(bool),
     ReconnectToggled(bool),
+    AutostartToggled(bool),
+    AutoconnectToggled(bool),
+    StartMinimizedToggled(bool),
     LockHotkeyChanged(String),
     ReturnHotkeyChanged(String),
     ServerHostChanged(String),
@@ -89,6 +92,12 @@ struct App {
     screen_h_s: String,
     /// The system tray (kept alive; pushes live tooltip). `None` if unavailable.
     tray: Option<crate::tray::TrayHandle>,
+    /// Live state of the OS login entry — read from the OS at boot, not from `cfg`,
+    /// because the user may have removed it outside the app.
+    autostart_on: bool,
+    /// One-shot latch for the `autoconnect` / `start_minimized` launch actions, so they
+    /// fire once on the first tick and never again (e.g. after a manual Stop).
+    launch_done: bool,
 }
 
 impl App {
@@ -108,6 +117,8 @@ impl App {
             screen_h_s: cfg.screen_height.to_string(),
             // Spawn the tray here — boot runs on the UI thread, which Windows requires.
             tray: crate::tray::spawn("mouse-rs — stopped"),
+            autostart_on: crate::autostart::is_enabled(),
+            launch_done: false,
             cfg,
         };
         app.sync_buffers();
@@ -144,6 +155,20 @@ impl App {
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::Tick => {
+                // Launch behaviour, once. Done on the first tick rather than in `new()`
+                // because the window doesn't exist yet at construction time, so there is
+                // nothing to minimize; and starting the engine here keeps the Start path
+                // identical to the button's.
+                if !self.launch_done {
+                    self.launch_done = true;
+                    if self.cfg.autoconnect && !self.running() {
+                        self.start_engine();
+                    }
+                    if self.cfg.start_minimized {
+                        return iced::window::latest()
+                            .and_then(|id| iced::window::minimize(id, true));
+                    }
+                }
                 // Clear a handle whose engine thread has exited on its own.
                 if self.engine.as_ref().is_some_and(|e| !e.is_running()) {
                     self.engine = None;
@@ -188,6 +213,26 @@ impl App {
             Message::TlsToggled(v) => self.cfg.tls_enabled = v,
             Message::ClipboardToggled(v) => self.cfg.clipboard_sync = v,
             Message::ReconnectToggled(v) => self.cfg.reconnect = v,
+            Message::AutostartToggled(v) => {
+                // This one touches the OS, not just `cfg`, so it takes effect immediately
+                // (no Save needed) and reports the real outcome. On failure we re-read the
+                // actual state rather than trusting the toggle, so the UI can't claim an
+                // entry exists when the write was refused.
+                let res = if v { crate::autostart::enable() } else { crate::autostart::disable() };
+                match res {
+                    Ok(()) => {
+                        self.autostart_on = v;
+                        self.feedback =
+                            if v { "will start at login".into() } else { "removed from login".into() };
+                    }
+                    Err(e) => {
+                        self.autostart_on = crate::autostart::is_enabled();
+                        self.feedback = format!("autostart failed: {e}");
+                    }
+                }
+            }
+            Message::AutoconnectToggled(v) => self.cfg.autoconnect = v,
+            Message::StartMinimizedToggled(v) => self.cfg.start_minimized = v,
             Message::LockHotkeyChanged(s) => self.cfg.lock_hotkey = s,
             Message::ReturnHotkeyChanged(s) => self.cfg.return_hotkey = s,
             Message::ServerHostChanged(s) => self.cfg.server_host = s,
@@ -256,7 +301,11 @@ impl App {
             Message::SaveProfileAs => {
                 self.feedback = match self.cfg.save_profile(&self.profile_name_input) {
                     Ok(()) => {
-                        let saved = self.profile_name_input.trim().to_string();
+                        // Report — and select — the name the file was actually written
+                        // under, not what was typed: `../../pwned` lands as `pwned`, and a
+                        // raw pick would leave the dropdown pointing at no real profile.
+                        let saved = sanitize_profile_name(&self.profile_name_input)
+                            .unwrap_or_else(|| self.profile_name_input.trim().to_string());
                         self.profiles = Config::list_profiles();
                         self.profile_pick = Some(saved.clone());
                         self.profile_name_input.clear();
@@ -461,21 +510,61 @@ impl App {
             .spacing(12.0)
         };
 
+        // Hands-off start at login. The three are deliberately independent: the OS
+        // launches the panel (Start at login), the panel brings the link up by itself
+        // (Auto-connect), and it stays out of the way while doing so (Start minimized).
+        let startup = column![
+            field_label(p, "Startup"),
+            toggle_row(p, "Start at login", self.autostart_hint(), self.autostart_on, Message::AutostartToggled),
+            toggle_row(p, "Auto-connect on launch", "begin sharing as soon as the panel opens", self.cfg.autoconnect, Message::AutoconnectToggled),
+            toggle_row(p, "Start minimized", "open out of the way, into the tray/taskbar", self.cfg.start_minimized, Message::StartMinimizedToggled),
+        ]
+        .spacing(12.0);
+
         card(p, column![
             labeled(p, "Machine name", input(p, "this-machine", &self.cfg.name, Message::NameChanged)),
             field_label(p, "Role"),
             role,
             net,
+            startup,
         ]
         .spacing(14.0))
     }
 
+    /// Sub-label for the Start-at-login toggle: says where the entry actually lives, so
+    /// the setting is auditable rather than magic.
+    fn autostart_hint(&self) -> &'static str {
+        if cfg!(windows) {
+            "adds a per-user entry under the Windows Run key"
+        } else {
+            "adds ~/.config/autostart/mouse-rs.desktop"
+        }
+    }
+
     fn tab_layout(&self, p: Palette) -> Element<'_, Message> {
+        // Leaving through one edge means arriving through the facing one; anything else
+        // puts the two screens on top of each other, so say so instead of saving it silently.
+        let want = self.cfg.exit_edge.opposite();
+        let edge_warning: Element<'_, Message> = if self.cfg.entry_edge == want {
+            Space::new().height(0.0).into()
+        } else {
+            text(format!(
+                "⚠ Leaving at the {} edge should bring the cursor in at the {} edge of the other screen — {} will feel like the screens overlap.",
+                self.cfg.exit_edge.label(),
+                want.label(),
+                self.cfg.entry_edge.label(),
+            ))
+            .size(11.0)
+            .color(p.warn)
+            .into()
+        };
+
         card(p, column![
             field_label(p, "Exit edge — this machine leaves here"),
             edge_picker(p, self.cfg.exit_edge, Message::ExitEdgePicked),
             field_label(p, "Entry edge — client appears here"),
             edge_picker(p, self.cfg.entry_edge, Message::EntryEdgePicked),
+            edge_warning,
             field_label(p, "Screen size (px)"),
             row![
                 input(p, "1920", &self.screen_w_s, Message::ScreenWChanged),

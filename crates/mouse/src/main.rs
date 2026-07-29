@@ -14,6 +14,8 @@ use tokio_util::sync::CancellationToken;
 mod run;
 
 #[cfg(feature = "gui")]
+mod autostart;
+#[cfg(feature = "gui")]
 mod gui;
 #[cfg(feature = "gui")]
 mod ui_theme;

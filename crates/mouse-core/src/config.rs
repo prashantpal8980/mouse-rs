@@ -26,6 +26,29 @@ pub enum Edge {
     Bottom,
 }
 
+impl Edge {
+    /// The edge facing this one. Two screens sit side by side, so leaving through one
+    /// edge means arriving through its opposite: any other pairing places the machines
+    /// on top of each other and makes the crossing ambiguous.
+    pub fn opposite(self) -> Edge {
+        match self {
+            Edge::Left => Edge::Right,
+            Edge::Right => Edge::Left,
+            Edge::Top => Edge::Bottom,
+            Edge::Bottom => Edge::Top,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Edge::Left => "left",
+            Edge::Right => "right",
+            Edge::Top => "top",
+            Edge::Bottom => "bottom",
+        }
+    }
+}
+
 fn default_true() -> bool {
     true
 }
@@ -82,6 +105,15 @@ pub struct Config {
     #[serde(default = "default_true")]
     pub reconnect: bool,
 
+    /// Control-panel startup behaviour, for a hands-off start at login (the GUI is
+    /// launched by the autostart entry, then brings the link up by itself).
+    /// Names match the Python build's config so an existing file carries over.
+    #[serde(default)]
+    pub autoconnect: bool,
+    /// Open the control panel minimized rather than in the foreground.
+    #[serde(default)]
+    pub start_minimized: bool,
+
     pub exit_edge: Edge,
     pub entry_edge: Edge,
 
@@ -109,6 +141,8 @@ impl Default for Config {
             server_host: "192.168.1.50".into(),
             server_port: default_port(),
             reconnect: true,
+            autoconnect: false,
+            start_minimized: false,
             exit_edge: Edge::Left,
             entry_edge: Edge::Right,
             screen_width: 1920,
@@ -153,12 +187,43 @@ impl Config {
     }
 
     /// Write to a path (pretty JSON, no BOM), creating parent dirs.
+    ///
+    /// The file holds `shared_secret` in the clear, and that secret is what authorises a
+    /// peer to inject keystrokes — so on Unix it is written **owner-only (0600)** inside an
+    /// owner-only (0700) directory. Both the create mode and an explicit permission set are
+    /// applied *before* any bytes are written: `mode()` alone only governs newly created
+    /// files, so a config that already exists as 0644 would otherwise keep its old,
+    /// world-readable mode and leak the new secret. Windows uses its inherited ACLs.
     pub fn save(&self, path: &Path) -> Result<(), ConfigError> {
+        use std::io::Write;
+
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(ConfigError::Io)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                // Best-effort: a pre-existing dir we don't own shouldn't fail the save.
+                let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+            }
         }
         let json = serde_json::to_string_pretty(self).map_err(ConfigError::Parse)?;
-        std::fs::write(path, json).map_err(ConfigError::Io)?;
+
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut f = opts.open(path).map_err(ConfigError::Io)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            // Tighten an already-existing file before the secret lands in it.
+            f.set_permissions(std::fs::Permissions::from_mode(0o600))
+                .map_err(ConfigError::Io)?;
+        }
+        f.write_all(json.as_bytes()).map_err(ConfigError::Io)?;
         Ok(())
     }
 
@@ -308,6 +373,52 @@ mod tests {
         assert_eq!(sanitize_profile_name("a/b\\c").as_deref(), Some("abc"));
         assert_eq!(sanitize_profile_name(""), None);
         assert_eq!(sanitize_profile_name("/// "), None);
+    }
+
+    /// The layout warning keys off this, so a wrong pairing here would silently
+    /// approve the nonsensical exit=left/entry=left case it exists to catch.
+    #[test]
+    fn edges_oppose_and_round_trip() {
+        assert_eq!(Edge::Left.opposite(), Edge::Right);
+        assert_eq!(Edge::Top.opposite(), Edge::Bottom);
+        for e in [Edge::Left, Edge::Right, Edge::Top, Edge::Bottom] {
+            assert_eq!(e.opposite().opposite(), e);
+            assert_ne!(e.opposite(), e);
+        }
+    }
+
+    /// The config carries `shared_secret` in the clear, so it must never be readable by
+    /// other local users. Covers both a fresh write and — the case that actually leaks —
+    /// overwriting a file that already exists with a permissive mode.
+    #[cfg(unix)]
+    #[test]
+    fn saved_config_is_owner_only_even_when_overwriting_a_lax_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("mouse-rs-perm-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cfg = Config { shared_secret: "hunter2".into(), ..Default::default() };
+
+        // Fresh file.
+        let fresh = dir.join("fresh.json");
+        cfg.save(&fresh).unwrap();
+        let mode = std::fs::metadata(&fresh).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "fresh config must be 0600, got {mode:o}");
+
+        // Parent directory must not be listable by others either.
+        let dmode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(dmode, 0o700, "config dir must be 0700, got {dmode:o}");
+
+        // Pre-existing world-readable file: the old mode must not survive the save.
+        let lax = dir.join("lax.json");
+        std::fs::write(&lax, "{}").unwrap();
+        std::fs::set_permissions(&lax, std::fs::Permissions::from_mode(0o644)).unwrap();
+        cfg.save(&lax).unwrap();
+        let mode = std::fs::metadata(&lax).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "overwritten config must be tightened to 0600, got {mode:o}");
+        assert!(std::fs::read_to_string(&lax).unwrap().contains("hunter2"));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

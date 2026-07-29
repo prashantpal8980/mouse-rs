@@ -10,6 +10,6 @@ pub mod net;
 pub mod protocol;
 pub mod tls;
 
-pub use config::{Config, Edge, Role};
+pub use config::{sanitize_profile_name, Config, Edge, Role};
 pub use net::{run_client, run_server, DisconnectReason, LinkChannels, LinkEvent, LinkParams};
 pub use protocol::{Button, Message, MessageCodec, PROTOCOL_VERSION};

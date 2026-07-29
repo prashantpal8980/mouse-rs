@@ -85,7 +85,7 @@ Requires an X11 session (not Wayland) on Linux.
 WHAT'S HERE
   mouse-rs-headless   Slim, fully self-contained binary (no GUI). RECOMMENDED for a
                       dedicated server/client. No extra packages needed.
-  mouse-rs            The same tool plus the egui control panel + system tray.
+  mouse-rs            The same tool plus the iced control panel + system tray.
   run-gui.sh          Launches mouse-rs with the bundled libxdo on LD_LIBRARY_PATH.
   lib/libxdo.so.3     Bundled (only the GUI needs it).
   config.example.json Sample config.

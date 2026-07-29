@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=mouse_share
+Comment=Share mouse/keyboard and clipboard between machines
+Exec=/home/kalip/mouse/scripts/mouse_share.sh
+Icon=input-mouse
+Terminal=false
+Categories=Utility;Network;
+X-GNOME-Autostart-enabled=true

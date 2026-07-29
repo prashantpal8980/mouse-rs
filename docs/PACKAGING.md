@@ -21,8 +21,10 @@ Output:
   no tray. **Fully self-contained**: Linux ≈ 3.3 MB (only libc + libX11/libXtst, which
   any X11 session has); Windows ≈ 2.9 MB. This is the recommended build for a dedicated
   server/client. The `gui` cargo feature is default-on, so `--no-default-features` opts out.
-- **GUI** (default features) — adds egui + the system tray. Linux ≈ 9 MB, Windows ≈ 6.5 MB.
-  - **Windows GUI exe is self-contained** (only standard Win32 DLLs incl. OPENGL32).
+- **GUI** (default features) — adds the iced control panel + the system tray.
+  Linux ≈ 14.2 MB, Windows ≈ 10.5 MB. (Both grew when the GUI moved from egui to iced,
+  which brings the wgpu renderer with a tiny-skia software fallback.)
+  - **Windows GUI exe is self-contained** (only standard Win32 DLLs).
   - **Linux GUI** links `libxdo.so.3` (via the tray's libappindicator) plus needs gtk3 +
     libayatana-appindicator at runtime. The tarball **bundles `libxdo.so.3`** and ships
     `run-gui.sh`, which puts it on `LD_LIBRARY_PATH` — so users only need the distro's

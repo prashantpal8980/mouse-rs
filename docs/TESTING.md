@@ -3,6 +3,16 @@
 This is the single authoritative runbook for validating `mouse-rs` on real
 hardware: a **Kali desktop** (X11) and a **Windows laptop** on the same LAN.
 
+> **Where this stands (2026-07-28).** Mouse sharing, keyboard, and auto-reconnect are all
+> validated on hardware in the **Windows=server / Kali=client** layout (the real day-to-day
+> setup). Still unexercised on two machines: the clipboard suite (§5) and F2/F3 in §6b.
+> Current state lives in `docs/STATUS.md`; this file is the procedure.
+>
+> Note that §4's Windows tests are written for the **opposite** layout (Kali=server,
+> Windows=client) because they exercise Windows as the *injector*. Windows as the
+> *capturer* is §6b F1/F5 — and that path is where nearly all the late bugs lived, since
+> it had never executed until the first Windows=server run.
+
 ---
 
 ## 1. What we're testing & why
@@ -32,9 +42,15 @@ Stop/Ctrl-C hanging, and the Fn+Up freeze on Windows).
 
 ```bash
 cd /home/kalip/mouse-rs
-cargo build --release                                   # linux-gnu  -> target/release/mouse-rs
-cargo build --release --target x86_64-pc-windows-gnu    # -> target/x86_64-pc-windows-gnu/release/mouse-rs.exe
+. ~/.cargo/env
+export RUSTFLAGS="-L /home/kalip/mouse-rs/.xdo-shim"    # only if libxdo-dev isn't installed
+cargo build -p mouse --release                                   # -> target/release/mouse-rs
+cargo build -p mouse --release --target x86_64-pc-windows-gnu    # -> target/x86_64-pc-windows-gnu/release/mouse-rs.exe
 ```
+
+The GUI build links `libxdo` (via the tray). If `libxdo-dev` isn't installed, the
+`.xdo-shim` symlink + that `RUSTFLAGS` line satisfies the linker; `scripts/package.sh`
+creates the shim automatically. A headless build (`--no-default-features`) needs neither.
 
 Resulting binaries:
 - Kali server: `/home/kalip/mouse-rs/target/release/mouse-rs`
@@ -335,26 +351,62 @@ cancel asserted `< 900 ms`).
 
 ---
 
-## 6b. New since the last hardware run (Phase 6/7) — must-retest
+## 6b. Late fixes (Phase 6/7 + the Jul 27–28 hardware run)
 
-These four are code-complete and pass the in-repo tests, but the first three
-exercise **Windows-only** or **desktop-only** paths that cannot be verified off the
-laptop. Run each and record pass/fail. **Your real layout is Windows=server /
-Kali=client**, so set these in the matching config.
+**Your real layout is Windows=server / Kali=client**, so set these in the matching
+config. Status as of 2026-07-28 is recorded per row — re-run any row you touch code for.
 
-| ID | Test | Action | Expected (the fix) |
-|----|------|--------|--------------------|
-| **F1** | **Frozen-cursor / full reach (Windows=server capture)** | Make Windows the server. Cross to the Kali client and sweep the mouse across the **entire** client screen — corner to corner, slow and fast. | Client cursor reaches **every** part of the screen 1:1 with hand motion. **No** "stuck in a small central box", **no** acceleration/runaway, **no** drift while idle. (Fix: `windows.rs` forwards `pt − frozen`, the swallowed-centre delta, not the X11 previous-event delta.) If the cursor *accelerates* the further you move, the freeze-by-swallow assumption failed — report it; that's the one risk I couldn't test. |
-| **F2** | **Close = quit (Kali/Xfce GUI)** | Launch the GUI (`mouse-rs` with no subcommand) on Kali. Click the window **✕**. Then separately try the tray **Quit**. | App **exits** both ways (process gone, `pgrep mouse-rs` empty). It does **not** vanish into a tray you can't get back (the stranded-window bug). Tray **Open** raises/focuses the window while it's still running. |
-| **F3** | **Combo return hotkey** | Set `return_hotkey` (e.g. `ctrl+win+alt+esc`) **in the server config** (Windows, in your layout). Cross to the client, then press the full combo. | Control snaps back to the server (`returned to local` in the server log); the cursor is local again. Single-key **Scroll Lock** (`lock_hotkey`) still also returns. Partial combos (missing a modifier) do nothing. |
-| **F4** | **Auto-reconnect** | With `reconnect:true` on the client (default; checkbox in GUI Client section): connect, then on the server `killall -9 mouse-rs` (or stop+restart it). Leave the client running. Restart the server ~5–15 s later. | Client does **not** exit on the drop — it logs `disconnected…` once, then retries with backoff (1 s→15 s) and **reconnects on its own** when the server returns (`connected to server …` again), no manual client restart. Also: start the client **before** the server — it should keep polling and connect once the server appears. Wrong `shared_secret` still **stops** (no retry storm). |
+| ID | Test | Action | Expected (the fix) | Status |
+|----|------|--------|--------------------|--------|
+| **F1** | **Full reach / 1:1 motion (Windows=server capture)** | Make Windows the server. Cross to the Kali client and sweep the mouse across the **entire** client screen — corner to corner, slow and fast. | Client cursor reaches **every** part of the screen 1:1 with hand motion. **No** "stuck in a small central box", **no** corner jam, **no** acceleration/runaway, **no** drift while idle. (Fix: motion now comes from **Raw Input** `WM_INPUT` — true device deltas, immune to Windows' edge clamping and pointer ballistics. The old "freeze the cursor and send `pt − frozen`" model was removed; it inferred motion from cursor *position*, which is exactly what clamping and acceleration distort.) | ✅ **PASS** 2026-07-27 |
+| **F2** | **Close = quit (Kali/Xfce GUI)** | Launch the GUI (`mouse-rs` with no subcommand) on Kali. Click the window **✕** (or Alt+F4). Then separately try the **Quit** button. | App **exits** both ways (process gone, `pgrep mouse-rs` empty), exit code **0**, no panic, and the peer socket is released. It does **not** vanish into a tray you can't get back (the stranded-window bug). | ✅ **PASS** 2026-07-28 — ✕ and Quit button, engine idle *and* connected, on both the Vulkan and GL backends |
+| **F3** | **Combo return hotkey** | Set `return_hotkey` (e.g. `ctrl+win+alt+esc`) **in the server config** (Windows, in your layout). Cross to the client, then press the full combo. | Control snaps back to the server (`returned to local` in the server log); the cursor is local again. Single-key **Scroll Lock** (`lock_hotkey`) still also returns. Partial combos (missing a modifier) do nothing. | ⬜ untested on hardware |
+| **F4** | **Auto-reconnect** | With `reconnect:true` on the client (default; checkbox in GUI Client section): connect, then on the server `killall -9 mouse-rs` (or stop+restart it). Leave the client running. Restart the server ~5–15 s later. | Client does **not** exit on the drop — it logs `disconnected…` once, then retries with backoff (1 s→15 s) and **reconnects on its own** when the server returns (`connected to server …` again), no manual client restart. Also: start the client **before** the server — it should keep polling and connect once the server appears. Wrong `shared_secret` still **stops** (no retry storm). | ✅ **PASS** 2026-07-28 |
+| **F5** | **Keyboard reaches the peer** | Cross to the client and type continuously for ~30 s while also moving the mouse fast. Include **Alt+Tab** and modifier combos. | Every keystroke lands on the **client**, none leak to local apps on the server. In particular, fast mouse motion must not starve the keyboard. (Two fixes: Raw Input moved to its **own thread** so the LL keyboard hook always meets Windows' ~300 ms `LowLevelHooksTimeout`; and the reconnect fix below, since a silently-dead link looks identical to "keys stayed local".) | ✅ **PASS** 2026-07-28, non-elevated |
+
+> **F2 — do NOT test the ✕ with `xdotool windowclose`.** That command *destroys* the X window
+> outright; it does not send `WM_DELETE_WINDOW` the way a real ✕ click does. Yanking the window
+> out from under the renderer produces two convincing-but-fake failures: on the Vulkan backend
+> wgpu panics in `Surface::configure` ("Surface does not support the adapter's queue family",
+> abort/exit 134), and on the GL backend nothing panics so the process simply strands with only
+> its 10×10 tray window left. Both look exactly like the old stranded-window bug and neither is
+> real. Use **Alt+F4** (goes through the window manager) or click the decoration, and verify the
+> target window is focused first so the keystroke can't land elsewhere.
+>
+> **F5 caveat — keep an eye on it.** This was intermittent for two days and the two
+> contributing faults were only separated late. It passed a long uninterrupted session in
+> a *normal* (non-admin) PowerShell. If keys ever leak again, the prime suspect is **UIPI**:
+> a non-elevated low-level keyboard hook cannot suppress keys headed for an elevated or
+> system window (the Alt+Tab switcher among them). The test for that is to run the server
+> **as Administrator** and see if the leak stops; the fix would be shipping an admin
+> manifest (`requestedExecutionLevel level="requireAdministrator"`).
+>
+> Diagnostics for exactly this are **still compiled in**: a `kbd_diag` line prints once a
+> second — but **only while control is on the peer** — with `grabbed`, `kbd_seen`,
+> `kbd_swallowed`, `kbd_passed_to_windows`, `kbd_borrow_fail`, `mouse_hook_calls`,
+> `raw_samples`. Read them as: `kbd_seen` flat while typing → hook not firing;
+> `kbd_seen` rising but `kbd_swallowed` flat with `grabbed=false` → gate desync;
+> both rising with keys still leaking → UIPI. Note the lines go to the **console of the
+> server process**, so a double-clicked GUI (no console) shows nothing.
 
 In-repo confirmation of F4 (run on Kali):
 ```bash
 cargo test -p mouse-core net::tests::client_reconnects_after_server_restart -- --nocapture
 cargo test -p mouse-core net::tests::client_keeps_retrying_until_server_appears -- --nocapture
 cargo test -p mouse-core net::tests::client_stops_when_reconnect_disabled -- --nocapture
+cargo test -p mouse-core net::tests::read_io_drop_is_recoverable_malformed_is_fatal -- --nocapture
 ```
+
+> The last one is the **regression test for the bug that defeated auto-reconnect** for two
+> days: the read loop wrapped *every* session error as `ProtocolError`, which
+> `is_recoverable()` treats as fatal — so a real server restart (which arrives as a TCP
+> reset, i.e. `CodecError::Io`) permanently stopped the retry loop. `classify_read_error()`
+> now splits `Io` (recoverable → reconnect) from `Json` (malformed → genuinely fatal).
+>
+> **Why the pre-existing F4 tests missed it:** a graceful in-test shutdown yields a clean
+> EOF (`PeerClosed`, already on the recoverable list), never the RST that killing a real
+> process produces. Worth remembering when writing the next network test — simulate the
+> *ugly* failure, not just the polite one.
 
 ---
 
@@ -368,6 +420,9 @@ cargo test -p mouse-core net::tests::client_stops_when_reconnect_disabled -- --n
 | Cursor won't cross | crossing not armed, or wrong edges | Move **inward first** to arm, then to the edge; confirm `exit_edge`/`entry_edge` are opposing and match physical layout |
 | WARN `input grab refused (another grab active?); staying local` | a menu/drag/locker holds an X grab on Kali | Close the menu/drag, retry the cross |
 | Cursor jams in a corner / lands off by ~1.5× (Windows) | DPI awareness not applied | Confirm 150% test (W7); ensure you're running the built `.exe` (`PER_MONITOR_AWARE_V2` set at startup) |
+| **Keys stay on the server while the mouse works fine** | Two known causes, and they look identical | (a) The link died silently — check for a `disconnected…` line; the mouse "working" may just be local cursor motion. (b) LL keyboard hook starved or blocked: watch the `kbd_diag` counters (§6b F5). If it only happens with an elevated window focused, it's UIPI — run the server as Administrator to confirm |
+| **Client stops retrying and exits after the server restarts** | The `ProtocolError` misclassification (fixed 2026-07-28) | Make sure you're on a build after the `classify_read_error()` fix; a TCP reset must map to `DisconnectReason::Io`, not `ProtocolError`. Symptom is a *single* `disconnected` line with no subsequent retry attempts |
+| **No `kbd_diag` lines anywhere** | Looking in the wrong place, or control isn't handed over | They print to the **console of the server process** only, and only **while control is on the peer**. A double-clicked GUI has no console (it calls `FreeConsole`). Run `mouse-rs.exe server` from a terminal and cross over before looking |
 | Double / echoed motion, cursor jitter | warp-echo absorption regressed | Check W5; with `INJECT_MAGIC` working there's no echo. Spurious ~half-screen jumps on fast flicks = echo not absorbed |
 | Keys stuck after exit/disconnect | release-all failsafe not reached | Should auto-release on exit/disconnect (`ReleaseAll`, threads joined within the 500 ms bound). If stuck, re-run and Ctrl-C cleanly |
 | Clipboard not syncing | `clipboard_sync:false`, backend missing, empty/oversized text | Set `clipboard_sync:true` both sides; check for `clipboard unavailable...` WARN; text only, ≤1 MiB, non-empty |

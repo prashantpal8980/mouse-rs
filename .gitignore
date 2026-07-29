@@ -4,3 +4,5 @@
 .DS_Store
 /dist
 /.xdo-shim
+# Generated UI-test report (screenshots inlined, ~330 KB). Findings live in docs/STATUS.md.
+/ui-test
