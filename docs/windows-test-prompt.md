@@ -147,16 +147,43 @@ rather than fixing them.
 
 Do **not** reboot to test autostart unless I ask — tell me the registry state and I'll decide.
 
-## Step 6 — report back
+## Step 6 — write the report to a file and upload it (do NOT print it in chat)
 
-Give me:
-1. Whether the Kali client reconnected unattended, and what the panel's status showed
-2. Whether `%USERPROFILE%\.mouse_share\mouse-rs.log` exists and has sensible content, and
+**Do not paste the report, logs, or command output into our conversation.** Write everything
+to files and upload them to the Kali box over the cable. There is a receive endpoint waiting:
+
+```powershell
+# Write the report first.
+$report = "$HOME\mouse-rs\windows-report.md"
+# ... write your findings into $report ...
+
+# Then upload it, plus the log and any screenshots.
+Invoke-WebRequest -Uri http://192.168.137.2:8001/windows-report.md -Method PUT -InFile $report
+Invoke-WebRequest -Uri http://192.168.137.2:8001/mouse-rs.log     -Method PUT -InFile $env:USERPROFILE\.mouse_share\mouse-rs.log
+# Screenshots are welcome — PNG uploads the same way and I can view them:
+Invoke-WebRequest -Uri http://192.168.137.2:8001/panel.png -Method PUT -InFile $HOME\mouse-rs\panel.png
+```
+
+Each upload replies `saved <name> (<n> bytes)`. `Invoke-WebRequest http://192.168.137.2:8001/`
+lists what has arrived, so you can confirm before finishing. If a PUT fails, tell me the
+error — the endpoint may have been stopped — and don't fall back to pasting.
+
+Filenames: use plain names like `windows-report.md`, `mouse-rs.log`, `panel-general.png`.
+Don't worry about overwriting; just tell me what you uploaded.
+
+Put this in the report, in full detail — long is fine now that it's a file, not chat:
+
+1. Whether the Kali client connected unattended, and what the panel's status showed
+2. Whether `%USERPROFILE%\.mouse_share\mouse-rs.log` exists with sensible content, and
    whether the path shown in the panel matches it
-3. Anything that errored, hung, rendered wrong, or looked ugly — verbatim, don't summarize
-   away detail. Screenshots of the panel are welcome if you can take them.
+3. Anything that errored, hung, rendered wrong, or looked ugly — **verbatim**, don't
+   summarize away detail; include full error text and any stack traces
 4. The exact registry value string from step 5
-5. Tray menu results
+5. Tray menu results, item by item
+6. Screenshots of each panel tab if you can take them
+
+Then in chat, give me **only a short summary — 10 lines maximum**: what passed, what failed,
+and the names of the files you uploaded. I'll read the detail from the files myself.
 
 Be precise about what you actually observed versus what you inferred. If something didn't
 work, say so plainly — a negative result here is exactly what I'm after. Don't try to fix
