@@ -138,7 +138,10 @@ impl Default for Config {
             return_hotkey: String::new(),
             listen_host: default_listen_host(),
             listen_port: default_port(),
-            server_host: "192.168.1.50".into(),
+            // Deliberately empty: a hardcoded example address looks exactly like a
+            // configured one, so "restore defaults" used to hand back a plausible
+            // wrong answer. Empty is honest, and the panel offers Detect.
+            server_host: String::new(),
             server_port: default_port(),
             reconnect: true,
             autoconnect: false,

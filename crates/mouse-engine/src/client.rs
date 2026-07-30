@@ -44,6 +44,13 @@ pub async fn run_client_engine(
     // entry band, so entering (which lands on that very edge) doesn't bounce back.
     let mut armed = false;
     let (mut vx, mut vy) = (0i32, 0i32);
+    // Per-crossing accounting of what the peer actually sent us. The field report is
+    // "the mouse crosses but the keyboard doesn't", and until now neither end could say
+    // whether the keystrokes were never captured on the server or were captured, sent,
+    // and then lost here. Motion and keys arrive on the same connection through the same
+    // `active` gate, so `moves>0, keys=0` localises the fault to the server's capture,
+    // and `keys>0` localises it to injection or window focus on this machine.
+    let (mut moves, mut keys) = (0u64, 0u64);
 
     loop {
         tokio::select! {
@@ -67,13 +74,17 @@ pub async fn run_client_engine(
                         vy = cy;
                         active = true;
                         armed = false;
+                        moves = 0;
+                        keys = 0;
                         set_status_engaged(&status, true);
+                        tracing::info!("peer took control, entry ({cx},{cy})");
                     }
                     Message::Leave => {
                         inject.send(InjectCmd::ReleaseAll);
                         active = false;
                         armed = false;
                         set_status_engaged(&status, false);
+                        report_crossing(moves, keys);
                     }
                     Message::MouseMove { dx, dy } if active => {
                         // saturating_add so a malformed/hostile peer delta can't
@@ -81,6 +92,7 @@ pub async fn run_client_engine(
                         let (nx, ny) = clamp(vx.saturating_add(dx), vy.saturating_add(dy));
                         vx = nx;
                         vy = ny;
+                        moves += 1;
                         inject.send(InjectCmd::Apply(InputEvent::MouseMove { dx, dy }));
                         if !in_edge_band(entry_edge, vx, vy, w, h, threshold) {
                             armed = true;
@@ -101,6 +113,15 @@ pub async fn run_client_engine(
                     // Other input events (button/scroll/key) while active.
                     other if active => {
                         if let Some(ev) = InputEvent::from_message(&other) {
+                            if let InputEvent::Key { key, pressed } = &ev {
+                                keys += 1;
+                                // First few only: enough to prove keys arrive and to see
+                                // which ones, without the per-second spam that got the
+                                // old kbd_diag counters deleted.
+                                if keys <= 8 {
+                                    tracing::info!(?key, pressed, n = keys, "key received from peer");
+                                }
+                            }
                             inject.send(InjectCmd::Apply(ev));
                         }
                     }
@@ -140,6 +161,22 @@ pub async fn run_client_engine(
                 }
             }
         }
+    }
+}
+
+/// Summarise a finished crossing. The `moves>0, keys=0` case is called out explicitly
+/// because that is the reported bug, and naming it in the log saves reading counters.
+fn report_crossing(moves: u64, keys: u64) {
+    if moves > 0 && keys == 0 {
+        tracing::warn!(
+            moves,
+            keys = 0,
+            "peer released control — MOTION ARRIVED BUT NO KEYS. The keystrokes were \
+             never sent by the server, so they were not captured there (this machine \
+             received nothing to inject)."
+        );
+    } else {
+        tracing::info!(moves, keys, "peer released control");
     }
 }
 

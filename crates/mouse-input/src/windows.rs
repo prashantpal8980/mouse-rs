@@ -10,11 +10,19 @@
 //!   forward it to the engine instead, mirroring the X11 grab/warp design.
 //!
 //! Fn+Up freeze fix (the Python bug): the hook callbacks do strictly O(1),
-//! non-blocking, allocation-free, lock-free work and return in microseconds, so
-//! Windows never times them out and silently removes the hook. Four failsafe
-//! layers guarantee input can never stay frozen — see [`watchdog`] and
+//! non-blocking, lock-free work and return in microseconds, so Windows never times
+//! them out and silently removes the hook. (They allocate only on the rising edge of
+//! a crossing — once per crossing, in [`HookState::begin_grab`] — never per event.)
+//! Four failsafe layers guarantee input can never stay frozen — see [`watchdog`] and
 //! [`keyboard_proc`] (the return hotkey self-releases suppression in-callback,
 //! with no dependency on the network or engine being healthy).
+//!
+//! **Nothing on the pump thread may block, and that includes logging.** `tracing` here
+//! writes to a file shared with the GUI thread, so diagnostics are handed to a separate
+//! thread through a channel — see [`DiagEvent`]. A hook thread that stalls past
+//! `LowLevelHooksTimeout` is skipped by the OS, and the keystroke it should have
+//! captured is delivered to the local app instead: the "keyboard didn't follow the
+//! mouse" bug.
 
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -26,10 +34,12 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows_sys::Win32::System::Threading::GetCurrentThreadId;
+use windows_sys::Win32::System::Threading::{
+    GetCurrentThread, GetCurrentThreadId, SetThreadPriority, THREAD_PRIORITY_TIME_CRITICAL,
+};
 use windows_sys::Win32::UI::Input::{
     GetRawInputData, RegisterRawInputDevices, HRAWINPUT, MOUSE_MOVE_ABSOLUTE, RAWINPUT,
-    RAWINPUTDEVICE, RAWINPUTHEADER, RIDEV_INPUTSINK, RID_INPUT, RIM_TYPEMOUSE,
+    RAWINPUTDEVICE, RAWINPUTHEADER, RIDEV_INPUTSINK, RID_INPUT, RIM_TYPEKEYBOARD, RIM_TYPEMOUSE,
 };
 use windows_sys::Win32::UI::HiDpi::{
     SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
@@ -45,7 +55,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClassNameW,
     GetCursorPos, GetForegroundWindow, GetSystemMetrics, GetWindowTextW, GetWindowThreadProcessId,
     MsgWaitForMultipleObjectsEx, PeekMessageW, PostThreadMessageW, RegisterClassW,
-    SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, UnregisterClassW, HC_ACTION,
+    SetForegroundWindow, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx,
+    UnregisterClassW, HC_ACTION,
     HWND_MESSAGE, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, LLKHF_UP, MSG, MSLLHOOKSTRUCT,
     MWMO_INPUTAVAILABLE, PM_REMOVE, QS_ALLINPUT, SM_CXSCREEN, SM_CXVIRTUALSCREEN, SM_CYSCREEN,
     SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, WH_KEYBOARD_LL, WH_MOUSE_LL,
@@ -446,6 +457,53 @@ impl InputInjector for WinInjector {
 // ---------------------------------------------------------------------------
 
 /// State shared between the pump loop and the hook callbacks. Lives in a
+/// A diagnostic observed on the hook pump thread, to be *logged somewhere else*.
+///
+/// Nothing on that thread may block, and `tracing` here writes to a file
+/// (`~/.mouse_share/mouse-rs.log`) that the GUI thread also writes to. A blocking
+/// write — or contention on the writer's lock — stalls the pump, and a stalled pump
+/// is precisely what makes Windows skip the keyboard hook and drop the keystroke on
+/// this machine. Logging the leak must not be able to cause the leak, so the pump
+/// only ever hands the event off through this (non-blocking, unbounded) channel and
+/// a dedicated thread does the I/O.
+enum DiagEvent {
+    Grabbed {
+        focus: String,
+    },
+    Released {
+        swallowed: u64,
+        leaked: u64,
+        remote_ms: u128,
+        /// OS invocations of the keyboard hook during this crossing, and how many of
+        /// those fell through without deciding. Together with `swallowed` these say
+        /// exactly where a lost keystroke went.
+        hook_calls: u64,
+        hook_bails: u64,
+        /// Physical key-downs seen via Raw Input during the crossing — the independent
+        /// witness that makes `hook_calls == 0` interpretable.
+        raw_keys: u64,
+        /// See [`MOUSE_HOOK_CALLS`] — the discriminator between a keyboard-specific
+        /// failure and a thread-wide one.
+        mouse_calls: u64,
+    },
+    Leak {
+        vk: u16,
+        reason: &'static str,
+        n: u64,
+    },
+    Stalled {
+        ms: u128,
+        rearmed: bool,
+    },
+    Rearmed {
+        ok: bool,
+    },
+    FocusHandedOff {
+        ok: bool,
+        to: String,
+    },
+}
+
 /// `thread_local` because low-level hook callbacks are dispatched by the OS *on
 /// the installing thread* (during its message pump), so the procs and the loop are
 /// the same thread — no lock, no global pointer.
@@ -464,6 +522,14 @@ struct HookState {
     /// crossing. Leaks bunched in the first few milliseconds mean the grab hadn't
     /// landed yet; leaks spread through the session mean something else.
     grabbed_at: Option<std::time::Instant>,
+    /// Values of [`KBD_HOOK_CALLS`] / [`KBD_HOOK_BAILS`] when this crossing began, so
+    /// the released summary can report per-crossing deltas rather than run totals.
+    calls_at_grab: u64,
+    bails_at_grab: u64,
+    raw_keys_at_grab: u64,
+    mouse_calls_at_grab: u64,
+    /// Hand-off to the diagnostics thread; see [`DiagEvent`]. Never log inline here.
+    diag: std::sync::mpsc::Sender<DiagEvent>,
 }
 
 thread_local! {
@@ -471,6 +537,36 @@ thread_local! {
 }
 
 impl HookState {
+    /// Take the rising edge of suppression exactly once: reset the per-crossing
+    /// accounting, report which window had focus, and snapshot the modifiers that were
+    /// already held so the peer starts the crossing in the same modifier state.
+    ///
+    /// Called from the hook procs as well as from [`reconcile`], because the procs now
+    /// act on the live `suppress` flag: if only the ~8 ms reconcile tick did this, a key
+    /// pressed immediately after the crossing would be forwarded *before* the held-
+    /// modifier snapshot, and the peer would see (say) a bare `c` ahead of the Ctrl that
+    /// was meant to modify it. Idempotent — whichever caller gets there first wins.
+    fn begin_grab(&mut self) {
+        if self.grabbed {
+            return;
+        }
+        self.grabbed = true;
+        self.kbd_swallowed = 0;
+        self.kbd_leaked = 0;
+        self.grabbed_at = Some(std::time::Instant::now());
+        self.calls_at_grab = KBD_HOOK_CALLS.load(Ordering::Relaxed);
+        self.bails_at_grab = KBD_HOOK_BAILS.load(Ordering::Relaxed);
+        self.raw_keys_at_grab = RAW_KEY_DOWNS.load(Ordering::Relaxed);
+        self.mouse_calls_at_grab = MOUSE_HOOK_CALLS.load(Ordering::Relaxed);
+        // Formatted here (the three Win32 calls are non-blocking — `GetWindowTextW` on
+        // another process's window reads the caption without sending WM_GETTEXT, by
+        // design) but written to the log by the diag thread.
+        let _ = self.diag.send(DiagEvent::Grabbed {
+            focus: foreground_desc(),
+        });
+        emit_held_modifiers(&self.sink);
+    }
+
     /// Handle a mouse hook event. Returns `true` to swallow it.
     ///
     /// The hook is used only to (a) freeze the local cursor and block local clicks
@@ -482,11 +578,18 @@ impl HookState {
         // Ignore our own injected events (the injector stamps INJECT_MAGIC); swallow
         // them while grabbed so an echo never leaks. The server no longer injects, so
         // this is just defence in depth.
+        // Live read, for the same reason as `on_key`: the reconciled flag lags the
+        // engine's request by up to a tick, and a click landing in that gap hits the
+        // local window instead of the peer.
+        let grabbed = self.suppress.load(Ordering::SeqCst);
         if info.dwExtraInfo == INJECT_MAGIC {
-            return self.grabbed;
+            return grabbed;
+        }
+        if grabbed {
+            self.begin_grab();
         }
 
-        if self.grabbed {
+        if grabbed {
             match message {
                 // Motion is swallowed here (freezes the local cursor) but read from Raw
                 // Input, not from `pt` — so edge clamping / acceleration can't distort it.
@@ -524,23 +627,17 @@ impl HookState {
 
     /// Handle a keyboard hook event. Returns `true` to swallow it.
     fn on_key(&mut self, info: &KBDLLHOOKSTRUCT) -> bool {
-        if !self.grabbed {
-            // Not suppressing. Normally correct — but if the engine has *asked* for
-            // suppression and the grab hasn't been reconciled yet, this keystroke is
-            // about to land on the wrong machine. That is the leak users report as
-            // "the mouse crossed but my typing stayed here", and it was previously
-            // invisible, so say so loudly and name the reason.
-            if self.suppress.load(Ordering::SeqCst) && info.flags & LLKHF_UP == 0 {
-                self.kbd_leaked += 1;
-                tracing::warn!(
-                    vk = format_args!("0x{:02x}", info.vkCode),
-                    reason = "suppress_requested_but_not_grabbed",
-                    leak_n = self.kbd_leaked,
-                    "KEYBOARD LEAK: keystroke stayed on this machine"
-                );
-            }
+        // Decide from the engine's *live* request, not from `grabbed`. `grabbed` is
+        // reconciled on the pump's ~8 ms tick, so between the engine asking for
+        // suppression and the tick landing there was a window in which this proc still
+        // reported "not suppressing" and let the keystroke through to the local app —
+        // the "mouse crossed but my typing stayed here" report. Reading the atomic here
+        // is O(1) and closes that window by construction rather than narrowing it.
+        if !self.suppress.load(Ordering::SeqCst) {
             return false; // keys flow to local apps while not suppressing
         }
+        // Snapshot held modifiers before forwarding anything, if we got here first.
+        self.begin_grab();
         let pressed = info.flags & LLKHF_UP == 0;
         let extended = info.flags & LLKHF_EXTENDED != 0;
         let vk = info.vkCode as u16;
@@ -560,11 +657,11 @@ impl HookState {
             // Swallowed locally but not representable on the wire: the key reaches
             // neither machine. Silent before; indistinguishable from a leak to a user.
             self.kbd_leaked += 1;
-            tracing::warn!(
-                vk = format_args!("0x{vk:02x}"),
-                reason = "no_wire_mapping",
-                "KEYBOARD LEAK: key swallowed here but not sent to the peer"
-            );
+            let _ = self.diag.send(DiagEvent::Leak {
+                vk,
+                reason: "no_wire_mapping",
+                n: self.kbd_leaked,
+            });
         }
         if pressed {
             self.kbd_swallowed += 1;
@@ -639,13 +736,33 @@ unsafe fn create_raw_input_window(hinstance: windows_sys::Win32::Foundation::HIN
         std::ptr::null(),
     );
     if !hwnd.is_null() {
-        let rid = RAWINPUTDEVICE {
-            usUsagePage: 0x01, // generic desktop
-            usUsage: 0x02,     // mouse
-            dwFlags: RIDEV_INPUTSINK,
-            hwndTarget: hwnd,
-        };
-        if RegisterRawInputDevices(&rid, 1, std::mem::size_of::<RAWINPUTDEVICE>() as u32) == 0 {
+        // Mouse for motion; keyboard purely as an **independent witness**. Raw Input is
+        // delivered by a different mechanism from low-level hooks, so it still reports
+        // keystrokes when the keyboard hook is dead. Without it, `hook_calls == 0` is
+        // ambiguous — a hook the OS never called and a crossing where the user simply
+        // typed nothing produce identical counters, and that ambiguity has already led
+        // to over-reading a leak rate. It cannot *suppress* (only a hook can), so this
+        // is diagnosis, not a second capture path.
+        let rids = [
+            RAWINPUTDEVICE {
+                usUsagePage: 0x01, // generic desktop
+                usUsage: 0x02,     // mouse
+                dwFlags: RIDEV_INPUTSINK,
+                hwndTarget: hwnd,
+            },
+            RAWINPUTDEVICE {
+                usUsagePage: 0x01, // generic desktop
+                usUsage: 0x06,     // keyboard
+                dwFlags: RIDEV_INPUTSINK,
+                hwndTarget: hwnd,
+            },
+        ];
+        if RegisterRawInputDevices(
+            rids.as_ptr(),
+            rids.len() as u32,
+            std::mem::size_of::<RAWINPUTDEVICE>() as u32,
+        ) == 0
+        {
             tracing::warn!("RegisterRawInputDevices failed; falling back to no motion");
         }
     } else {
@@ -725,6 +842,17 @@ unsafe fn handle_raw_input(hri: HRAWINPUT) {
     if got == 0 || got == u32::MAX {
         return;
     }
+    if raw.header.dwType == RIM_TYPEKEYBOARD {
+        // Witness only — never forwarded and never suppressed. Counts key-down events
+        // so a crossing can distinguish "the hook was dead" from "nothing was typed".
+        const WM_KEYDOWN_MSG: u32 = 0x0100;
+        const WM_SYSKEYDOWN_MSG: u32 = 0x0104;
+        let msg = raw.data.keyboard.Message;
+        if msg == WM_KEYDOWN_MSG || msg == WM_SYSKEYDOWN_MSG {
+            RAW_KEY_DOWNS.fetch_add(1, Ordering::Relaxed);
+        }
+        return;
+    }
     if raw.header.dwType != RIM_TYPEMOUSE {
         return;
     }
@@ -800,6 +928,7 @@ unsafe extern "system" fn mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) 
     if code != HC_ACTION as i32 {
         return CallNextHookEx(std::mem::zeroed(), code, wparam, lparam);
     }
+    MOUSE_HOOK_CALLS.fetch_add(1, Ordering::Relaxed);
     let swallow = HOOK_STATE.with(|cell| {
         let mut guard = match cell.try_borrow_mut() {
             Ok(g) => g,
@@ -818,18 +947,50 @@ unsafe extern "system" fn mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) 
     }
 }
 
+/// Times the OS has actually invoked the keyboard hook, counted before any state is
+/// touched, and times it was invoked but bailed out without deciding.
+///
+/// These exist because "the hook was never called" and "the hook was called but could
+/// not reach its state and fell through" produce the *identical* user-visible result —
+/// the keystroke goes to the local app — and were previously *both* silent. Without
+/// separating them, a leak cannot be attributed: one means the OS removed or skipped
+/// the hook, the other means our own code let the key past. Plain atomics, so counting
+/// costs nothing on the hot path and needs no thread-local.
+static KBD_HOOK_CALLS: AtomicU64 = AtomicU64::new(0);
+static KBD_HOOK_BAILS: AtomicU64 = AtomicU64::new(0);
+
+/// Physical key-down events seen via Raw Input, which does not depend on the hook.
+/// This is the control variable: `RAW_KEY_DOWNS` rising while `KBD_HOOK_CALLS` stays at
+/// zero is proof the hook is dead, and only that combination justifies calling it a leak.
+static RAW_KEY_DOWNS: AtomicU64 = AtomicU64::new(0);
+
+/// OS invocations of the *mouse* low-level hook. Both hooks live on the same thread and
+/// are installed and re-armed together, so this is the field that separates the last two
+/// explanations: if the mouse hook is called during a crossing where the keyboard hook is
+/// not, the fault is specific to `WH_KEYBOARD_LL`; if both are zero, nothing on that
+/// thread is being called and the fault is thread- or process-wide. Mouse *motion*
+/// working proves nothing here — motion comes from Raw Input, not from this hook.
+static MOUSE_HOOK_CALLS: AtomicU64 = AtomicU64::new(0);
+
 unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if code != HC_ACTION as i32 {
         return CallNextHookEx(std::mem::zeroed(), code, wparam, lparam);
     }
+    KBD_HOOK_CALLS.fetch_add(1, Ordering::Relaxed);
     let swallow = HOOK_STATE.with(|cell| {
         let mut guard = match cell.try_borrow_mut() {
             Ok(g) => g,
             Err(_) => {
+                // Re-entered while the state was already borrowed. Falling through
+                // hands the key to the local app — a leak — so make it countable.
+                KBD_HOOK_BAILS.fetch_add(1, Ordering::Relaxed);
                 return false;
             }
         };
         let Some(state) = guard.as_mut() else {
+            // Called on a thread with no hook state (or after teardown). Same leak,
+            // different cause; both must be visible.
+            KBD_HOOK_BAILS.fetch_add(1, Ordering::Relaxed);
             return false;
         };
         let info = &*(lparam as *const KBDLLHOOKSTRUCT);
@@ -875,8 +1036,22 @@ fn capture_loop(
     stop: Arc<AtomicBool>,
     heartbeat: Arc<AtomicU64>,
     return_vk: u16,
+    diag: std::sync::mpsc::Sender<DiagEvent>,
 ) -> Result<(), InputError> {
     ensure_dpi_aware();
+
+    // Windows delivers low-level hook callbacks on this thread and gives them only
+    // `LowLevelHooksTimeout` (~300 ms) to return; miss that and the OS skips the hook,
+    // handing the keystroke straight to the local app. This thread therefore must run
+    // ahead of everything else in the process — including the GUI's wgpu rendering,
+    // which is the one thing here heavy enough to starve it. Time-critical is
+    // affordable because the loop is idle-waiting almost always: it blocks in
+    // `MsgWaitForMultipleObjectsEx` and does O(1) work per wake.
+    unsafe {
+        if SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL) == 0 {
+            tracing::warn!("could not raise capture thread priority; hook may be starved");
+        }
+    }
 
     HOOK_STATE.with(|cell| {
         *cell.borrow_mut() = Some(HookState {
@@ -888,12 +1063,17 @@ fn capture_loop(
             kbd_swallowed: 0,
             kbd_leaked: 0,
             grabbed_at: None,
+            calls_at_grab: 0,
+            bails_at_grab: 0,
+            raw_keys_at_grab: 0,
+            mouse_calls_at_grab: 0,
+            diag: diag.clone(),
         });
     });
 
     let hinstance = unsafe { GetModuleHandleW(std::ptr::null()) };
-    let h_mouse = unsafe { SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_proc), hinstance, 0) };
-    let h_kbd = unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_proc), hinstance, 0) };
+    let mut h_mouse = unsafe { SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_proc), hinstance, 0) };
+    let mut h_kbd = unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_proc), hinstance, 0) };
     let installed = !is_null_hhook(h_mouse) && !is_null_hhook(h_kbd);
     if !installed {
         if !is_null_hhook(h_mouse) {
@@ -915,11 +1095,48 @@ fn capture_loop(
     // honoured even with no input), drain messages so the hooks fire, reconcile.
     let mut msg: MSG = unsafe { std::mem::zeroed() };
     // Low-level hook callbacks are delivered on THIS thread during this pump. If a single
-    // iteration takes longer than Windows' LowLevelHooksTimeout (~300 ms by default), the
-    // OS stops waiting and **skips the hook entirely** — the keystroke goes straight to the
-    // local app and we never even see it, so no leak counter can catch it. Timing the loop
-    // is the only way to observe that case from inside the process.
+    // iteration takes longer than Windows' LowLevelHooksTimeout (~300 ms by default), then
+    // on Windows 7 and later **the OS silently removes the hook** — it is not merely
+    // skipped for that one keystroke, it never fires again. Nothing reports this: the pump
+    // afterwards runs perfectly cleanly, `SetWindowsHookEx` gave us a handle that is now
+    // meaningless, and there is no API to ask whether a hook is still alive.
+    //
+    // That is the "keyboard didn't follow the mouse" bug. It is intermittent because it
+    // needs one unlucky 300 ms hiccup; it lasts for the rest of the run because removal is
+    // permanent; and the mouse keeps crossing because motion comes from Raw Input on a
+    // different thread, which is unaffected. Reacting to a *concurrently observed* stall is
+    // useless — by the time anything is noticed the hook is long gone.
+    //
+    // So the hooks are re-installed unconditionally: once at the start of every crossing
+    // (a fresh hook per crossing is the property that actually matters), and periodically
+    // while suppressing in case one dies mid-crossing. Re-installing costs a single API
+    // call and is harmless when the hook was alive.
     let mut last_tick = std::time::Instant::now();
+    let mut prev_suppress = false;
+    let mut last_rearm = std::time::Instant::now();
+    // The most recent foreground window belonging to *another* process, and the window of
+    // ours we took foreground from, so it can be handed back on return.
+    //
+    // Why this exists — the root cause of the "keyboard doesn't follow the mouse" bug:
+    // when the foreground window belongs to **this** process, Windows does not deliver
+    // `WH_KEYBOARD_LL` callbacks to us. Measured across two runs: every crossing made with
+    // another process focused had a live hook (14 and 56 callbacks); every crossing made
+    // with our own panel focused had `hook_calls=0` while Raw Input counted up to 93 real
+    // keystrokes. The keys then land in our own panel — which is exactly what the user
+    // sees, typing into the control panel while the mouse is on the peer.
+    //
+    // It is invisible to every other check: the hook installs successfully, the pump is
+    // healthy, no stall is reported, and re-installing changes nothing, because the hook
+    // was never broken — it is simply not being called.
+    //
+    // The remedy is to stop being the foreground process for the duration of a crossing.
+    // Handing foreground to the window the user was last on is also what they'd expect:
+    // control has moved to the other machine, so the panel has no reason to hold focus.
+    let mut last_foreign_fg: HWND = std::ptr::null_mut();
+    let mut yielded_from: HWND = std::ptr::null_mut();
+    /// How often to re-arm while control is on the peer. Short enough that a mid-crossing
+    /// removal costs a couple of keystrokes rather than the whole session.
+    const REARM_INTERVAL: Duration = Duration::from_millis(1000);
     'pump: loop {
         unsafe {
             MsgWaitForMultipleObjectsEx(0, std::ptr::null(), 8, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
@@ -938,17 +1155,61 @@ fn capture_loop(
             break;
         }
         // 150 ms is half the default hook timeout: close enough to matter, far enough
-        // above the 8 ms wait that normal scheduling jitter stays quiet.
+        // above the 8 ms wait that normal scheduling jitter stays quiet. Purely
+        // diagnostic now — the repair below no longer waits to catch a stall.
         let gap = last_tick.elapsed();
-        if gap >= Duration::from_millis(150) && suppress.load(Ordering::SeqCst) {
-            tracing::warn!(
-                stalled_ms = gap.as_millis(),
-                "capture pump stalled while suppressing — Windows may have SKIPPED the \
-                 keyboard hook, letting keystrokes reach this machine"
-            );
+        let want = suppress.load(Ordering::SeqCst);
+        if gap >= Duration::from_millis(150) && want {
+            let _ = diag.send(DiagEvent::Stalled {
+                ms: gap.as_millis(),
+                rearmed: true,
+            });
         }
         last_tick = std::time::Instant::now();
-        reconcile(&suppress, &sink);
+
+        // Re-arm on the rising edge of a crossing, and then once a second for as long as
+        // control stays on the peer. The rising edge is the important one: it guarantees
+        // every crossing begins with a hook the OS has definitely not removed.
+        // Track the last foreground window that isn't ours, so there is somewhere to hand
+        // focus back to. Cheap enough for the 8 ms tick: two non-blocking calls.
+        let fg = unsafe { GetForegroundWindow() };
+        let fg_is_ours = !fg.is_null() && {
+            let mut pid = 0u32;
+            unsafe { GetWindowThreadProcessId(fg, &mut pid) };
+            pid == std::process::id()
+        };
+        if !fg.is_null() && !fg_is_ours {
+            last_foreign_fg = fg;
+        }
+
+        let crossing_started = want && !prev_suppress;
+        if crossing_started && fg_is_ours {
+            if last_foreign_fg.is_null() {
+                let _ = diag.send(DiagEvent::FocusHandedOff { ok: false, to: String::new() });
+            } else {
+                let ok = unsafe { SetForegroundWindow(last_foreign_fg) } != 0;
+                if ok {
+                    yielded_from = fg;
+                }
+                let _ = diag.send(DiagEvent::FocusHandedOff {
+                    ok,
+                    to: describe_window(last_foreign_fg),
+                });
+            }
+        }
+        // Control came back: return foreground to whatever of ours had it, so the hand-off
+        // is invisible to the user rather than silently rearranging their windows.
+        if !want && prev_suppress && !yielded_from.is_null() {
+            unsafe { SetForegroundWindow(yielded_from) };
+            yielded_from = std::ptr::null_mut();
+        }
+        if crossing_started || (want && last_rearm.elapsed() >= REARM_INTERVAL) {
+            rearm_hooks(hinstance, &mut h_mouse, &mut h_kbd, &diag, crossing_started);
+            last_rearm = std::time::Instant::now();
+        }
+        prev_suppress = want;
+
+        reconcile(&suppress);
     }
 
     unsafe {
@@ -972,6 +1233,23 @@ fn capture_loop(
 /// shared *specifically when the mouse-rs panel itself is the focused window* — this is
 /// what turns that observation into evidence rather than a hunch. Reading it is safe from
 /// the pump thread: all three calls are non-blocking and touch no shared state.
+/// Short description of an arbitrary window, for the focus hand-off log.
+fn describe_window(hwnd: HWND) -> String {
+    unsafe {
+        if hwnd.is_null() {
+            return "<none>".into();
+        }
+        let mut title = [0u16; 96];
+        let n = GetWindowTextW(hwnd, title.as_mut_ptr(), title.len() as i32);
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(hwnd, &mut pid);
+        format!(
+            "'{}' pid={pid}",
+            String::from_utf16_lossy(&title[..n.max(0) as usize])
+        )
+    }
+}
+
 fn foreground_desc() -> String {
     unsafe {
         let hwnd = GetForegroundWindow();
@@ -994,27 +1272,19 @@ fn foreground_desc() -> String {
     }
 }
 
-fn reconcile(suppress: &Arc<AtomicBool>, sink: &UnboundedSender<CaptureSignal>) {
+fn reconcile(suppress: &Arc<AtomicBool>) {
     let want = suppress.load(Ordering::SeqCst);
     HOOK_STATE.with(|cell| {
         let mut guard = cell.borrow_mut();
         let Some(state) = guard.as_mut() else {
             return;
         };
-        if want && !state.grabbed {
-            state.grabbed = true;
-            state.kbd_swallowed = 0;
-            state.kbd_leaked = 0;
-            state.grabbed_at = Some(std::time::Instant::now());
-            // One line per crossing, not per second: which window held focus when we
-            // took over the keyboard. If leaks correlate with our own panel being
-            // focused, this is the line that proves it.
-            tracing::info!(
-                focus = %foreground_desc(),
-                "keyboard grabbed (control moved to the peer)"
-            );
-            emit_held_modifiers(sink);
-        } else if !want && state.grabbed {
+        if want {
+            // Normally the hook procs have already done this on the first event after
+            // the crossing; this covers a crossing with no input at all yet, so the
+            // engine still learns the modifier state promptly.
+            state.begin_grab();
+        } else if state.grabbed {
             state.grabbed = false;
             let ms = state
                 .grabbed_at
@@ -1023,21 +1293,23 @@ fn reconcile(suppress: &Arc<AtomicBool>, sink: &UnboundedSender<CaptureSignal>) 
                 .unwrap_or(0);
             // Summary instead of a running counter: enough to spot a leak after the
             // fact, cheap enough to always be on.
-            if state.kbd_leaked > 0 {
-                tracing::warn!(
-                    swallowed = state.kbd_swallowed,
-                    leaked = state.kbd_leaked,
-                    remote_ms = ms,
-                    "keyboard released — SOME KEYS LEAKED to this machine"
-                );
-            } else {
-                tracing::info!(
-                    swallowed = state.kbd_swallowed,
-                    leaked = 0,
-                    remote_ms = ms,
-                    "keyboard released (no leaks)"
-                );
-            }
+            let _ = state.diag.send(DiagEvent::Released {
+                swallowed: state.kbd_swallowed,
+                leaked: state.kbd_leaked,
+                remote_ms: ms,
+                hook_calls: KBD_HOOK_CALLS
+                    .load(Ordering::Relaxed)
+                    .saturating_sub(state.calls_at_grab),
+                hook_bails: KBD_HOOK_BAILS
+                    .load(Ordering::Relaxed)
+                    .saturating_sub(state.bails_at_grab),
+                raw_keys: RAW_KEY_DOWNS
+                    .load(Ordering::Relaxed)
+                    .saturating_sub(state.raw_keys_at_grab),
+                mouse_calls: MOUSE_HOOK_CALLS
+                    .load(Ordering::Relaxed)
+                    .saturating_sub(state.mouse_calls_at_grab),
+            });
         }
     });
 }
@@ -1102,6 +1374,157 @@ fn watchdog(
     }
 }
 
+/// Re-install both low-level hooks, replacing any the OS has silently removed.
+///
+/// Must run on the pump thread — a hook belongs to the thread that installed it. The
+/// replacement is installed **first** and the old handle dropped only on success, so a
+/// failed re-install leaves the existing hook in place rather than leaving us with none.
+/// The brief overlap is harmless: the new hook sits at the front of the chain and
+/// swallows without calling on, so the old one simply never sees an event.
+fn rearm_hooks(
+    hinstance: windows_sys::Win32::Foundation::HINSTANCE,
+    h_mouse: &mut windows_sys::Win32::UI::WindowsAndMessaging::HHOOK,
+    h_kbd: &mut windows_sys::Win32::UI::WindowsAndMessaging::HHOOK,
+    diag: &std::sync::mpsc::Sender<DiagEvent>,
+    report: bool,
+) {
+    let mut ok = true;
+    let fresh_kbd = unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_proc), hinstance, 0) };
+    if is_null_hhook(fresh_kbd) {
+        ok = false;
+    } else {
+        unsafe { UnhookWindowsHookEx(*h_kbd) };
+        *h_kbd = fresh_kbd;
+    }
+    let fresh_mouse = unsafe { SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_proc), hinstance, 0) };
+    if is_null_hhook(fresh_mouse) {
+        ok = false;
+    } else {
+        unsafe { UnhookWindowsHookEx(*h_mouse) };
+        *h_mouse = fresh_mouse;
+    }
+    // Only announce the per-crossing re-arm, not the once-a-second upkeep: one line per
+    // crossing is evidence, one line per second is the `kbd_diag` spam we deleted before.
+    if report {
+        let _ = diag.send(DiagEvent::Rearmed { ok });
+    }
+}
+
+/// Drain [`DiagEvent`]s and write them to the log. Runs on its own thread so that the
+/// file I/O — which can block on the writer's lock, contended with the GUI thread —
+/// happens nowhere near the hook pump. Exits when the pump drops its sender.
+fn diag_loop(rx: std::sync::mpsc::Receiver<DiagEvent>) {
+    while let Ok(evt) = rx.recv() {
+        match evt {
+            DiagEvent::Grabbed { focus } => {
+                tracing::info!(focus = %focus, "keyboard grabbed (control moved to the peer)");
+            }
+            DiagEvent::Released {
+                swallowed,
+                leaked,
+                remote_ms,
+                hook_calls,
+                hook_bails,
+                raw_keys,
+                mouse_calls,
+            } => {
+                // The three-way verdict the whole investigation turns on. Stated in
+                // words, because the counters alone have repeatedly been misread.
+                if hook_calls == 0 && raw_keys > 0 {
+                    // Raw Input saw real keystrokes while the hook was never invoked.
+                    // This is the leak, proven — not inferred from a silent counter.
+                    tracing::warn!(
+                        swallowed,
+                        hook_calls = 0,
+                        raw_keys,
+                        mouse_calls,
+                        remote_ms,
+                        "keyboard released — THE OS NEVER CALLED OUR KEYBOARD HOOK. \
+                         Raw Input saw {raw_keys} keystrokes that the hook never got; \
+                         every one of them went to this machine. mouse_calls={mouse_calls} \
+                         (0 = nothing on that thread is being called; >0 = keyboard-specific)"
+                    );
+                } else if hook_calls == 0 {
+                    tracing::info!(
+                        remote_ms,
+                        "keyboard released (nothing was typed on this crossing)"
+                    );
+                } else if hook_bails > 0 {
+                    tracing::warn!(
+                        swallowed,
+                        hook_calls,
+                        hook_bails,
+                        remote_ms,
+                        "keyboard released — THE HOOK RAN BUT FELL THROUGH. Our own code let \
+                         keystrokes past; this is a bug on this side, not an OS removal."
+                    );
+                } else if leaked > 0 {
+                    tracing::warn!(
+                        swallowed,
+                        leaked,
+                        hook_calls,
+                        remote_ms,
+                        "keyboard released — SOME KEYS LEAKED to this machine"
+                    );
+                } else {
+                    // raw_keys on the healthy path too, so a *partial* loss is visible:
+                    // hook_calls far below raw_keys means some keystrokes were missed even
+                    // though the hook was alive, which the total-loss check cannot catch.
+                    tracing::info!(
+                        swallowed,
+                        leaked = 0,
+                        hook_calls,
+                        raw_keys,
+                        mouse_calls,
+                        remote_ms,
+                        "keyboard released (no leaks)"
+                    );
+                }
+            }
+            DiagEvent::Leak { vk, reason, n } => {
+                tracing::warn!(
+                    vk = format_args!("0x{vk:02x}"),
+                    reason,
+                    leak_n = n,
+                    "KEYBOARD LEAK: key swallowed here but not sent to the peer"
+                );
+            }
+            DiagEvent::FocusHandedOff { ok, to } => {
+                if ok {
+                    tracing::info!(
+                        to = %to,
+                        "our own window had focus at the crossing; handed foreground to \
+                         another process so the keyboard hook is delivered"
+                    );
+                } else {
+                    tracing::warn!(
+                        "our own window had focus at the crossing and foreground could NOT \
+                         be handed off — expect keystrokes to stay on this machine"
+                    );
+                }
+            }
+            DiagEvent::Rearmed { ok } => {
+                if ok {
+                    tracing::info!("keyboard + mouse hooks re-armed for this crossing");
+                } else {
+                    tracing::warn!(
+                        "could not re-install a low-level hook — if the OS had already \
+                         removed it, input will not be captured this crossing"
+                    );
+                }
+            }
+            DiagEvent::Stalled { ms, rearmed } => {
+                tracing::warn!(
+                    stalled_ms = ms,
+                    rearmed,
+                    "capture pump stalled while suppressing — Windows may have SKIPPED the \
+                     keyboard hook, letting keystrokes reach this machine"
+                );
+            }
+        }
+    }
+}
+
 /// Drop suppression and tell the engine to revert to Local. Used by the watchdog's
 /// failsafe paths; setting the shared flag false also unfreezes input via the pump
 /// (or the OS hook-bypass if the pump is dark).
@@ -1161,11 +1584,17 @@ impl WinCapture {
             heartbeat.clone(),
             thread_id.clone(),
         );
+        // Diagnostics are logged off the pump thread; see `DiagEvent`.
+        let (diag_tx, diag_rx) = std::sync::mpsc::channel();
+        let _ = std::thread::Builder::new()
+            .name("win-capture-diag".into())
+            .spawn(move || diag_loop(diag_rx));
+
         let join = std::thread::Builder::new()
             .name("win-capture".into())
             .spawn(move || {
                 tid2.store(unsafe { GetCurrentThreadId() }, Ordering::SeqCst);
-                if let Err(e) = capture_loop(sink, s2, st2, hb2, return_vk) {
+                if let Err(e) = capture_loop(sink, s2, st2, hb2, return_vk, diag_tx) {
                     tracing::error!("win capture loop ended: {e}");
                 }
             })

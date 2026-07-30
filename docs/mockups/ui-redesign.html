@@ -1,0 +1,308 @@
+<meta charset="utf-8">
+<title>mouse-rs — control panel redesign</title>
+<style>
+  :root{
+    --bg:#0b0f17; --card:#121826; --card2:#161d2e; --line:#1f2937;
+    --txt:#e6edf7; --txt2:#9fb0c8; --txt3:#6b7c96;
+    --accent:#38bdf8; --accent2:#6366f1; --ok:#34d399; --warn:#fbbf24; --danger:#f87171;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--txt);
+    font:14px/1.55 ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+    padding:32px 20px 72px}
+  .wrap{max-width:1160px;margin:0 auto}
+  h1{font-size:24px;margin:0 0 6px;letter-spacing:-.02em}
+  .sub{color:var(--txt2);margin:0 0 28px;max-width:70ch}
+  h2{font-size:15px;margin:34px 0 12px;color:var(--txt);letter-spacing:.02em}
+  h2 .n{color:var(--txt3);font-weight:400;margin-right:6px}
+  p{color:var(--txt2)}
+  .note{color:var(--txt3);font-size:12.5px;max-width:78ch}
+  code{background:#0d1420;border:1px solid var(--line);border-radius:4px;padding:1px 5px;font-size:12px}
+
+  .cols{display:flex;gap:26px;flex-wrap:wrap;align-items:flex-start}
+  .col{flex:1 1 320px;min-width:300px}
+  .caption{font-size:12px;color:var(--txt3);margin:0 0 8px;text-transform:uppercase;letter-spacing:.08em}
+  .caption b{color:var(--danger);font-weight:600}
+  .caption i{color:var(--ok);font-style:normal;font-weight:600}
+
+  /* ---- panel chrome ---- */
+  .panel{width:100%;max-width:390px;background:var(--bg);border:1px solid var(--line);
+    border-radius:12px;overflow:hidden;box-shadow:0 18px 40px -18px #000}
+  .titlebar{display:flex;align-items:center;justify-content:center;position:relative;
+    padding:7px 10px;background:#0e1420;border-bottom:1px solid var(--line);font-size:12px;color:var(--txt2)}
+  .titlebar .dots{position:absolute;right:9px;display:flex;gap:5px}
+  .dot{width:9px;height:9px;border-radius:50%;background:#26324a}
+  .body{padding:13px}
+
+  .hdr{display:flex;align-items:center;gap:9px;margin-bottom:11px}
+  .logo{font-size:17px;font-weight:600;letter-spacing:-.01em}
+  .pill{margin-left:auto;font-size:11px;padding:4px 9px;border-radius:99px;
+    background:#06281f;color:var(--ok);border:1px solid #10493a;white-space:nowrap}
+  .kebab{width:26px;height:26px;border-radius:7px;border:1px solid var(--line);background:var(--card);
+    color:var(--txt2);display:grid;place-items:center;font-size:14px;cursor:default}
+  .sw{display:flex;gap:5px}
+  .sw i{width:15px;height:15px;border-radius:50%;display:block}
+
+  .card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:11px}
+
+  /* big hero (current) */
+  .hero-big{height:196px;display:flex;flex-direction:column;gap:9px;justify-content:center}
+  .machines{display:flex;align-items:center;gap:11px;justify-content:center}
+  .mbox{flex:1;border:1px solid #24314a;border-radius:9px;padding:16px 8px;text-align:center;
+    font-size:10px;color:var(--txt3);letter-spacing:.09em}
+  .mbox.on{border-color:var(--accent);box-shadow:0 0 0 1px #38bdf833, 0 0 20px -6px #38bdf8aa}
+  .mname{font-size:13px;color:var(--txt);letter-spacing:0;margin-top:9px}
+  .mmeta{font-size:10.5px;color:var(--txt3);letter-spacing:0}
+
+  /* compact hero (proposed) */
+  .hero-sm{display:flex;align-items:center;gap:11px}
+  .chip{display:flex;align-items:center;gap:8px;background:var(--card2);border:1px solid #24314a;
+    border-radius:9px;padding:8px 11px;flex:1;min-width:0}
+  .chip.on{border-color:var(--accent);box-shadow:0 0 0 1px #38bdf826}
+  .chip .nm{font-size:12.5px;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .chip .mt{font-size:10.5px;color:var(--txt3);margin-left:auto;white-space:nowrap}
+  .arrow{color:var(--accent);font-size:15px;flex:0 0 auto}
+  .live{margin-top:9px;font-size:12px;color:var(--accent);display:flex;align-items:center;gap:6px}
+  .live .d{width:6px;height:6px;border-radius:50%;background:var(--accent);flex:0 0 auto}
+
+  .tabs{display:flex;gap:5px;margin:11px 0}
+  .tab{font-size:11.5px;padding:6px 11px;border-radius:8px;color:var(--txt2);
+    border:1px solid transparent;white-space:nowrap}
+  .tab.on{background:linear-gradient(135deg,var(--accent),var(--accent2));color:#07111d;font-weight:600}
+
+  .field{margin-bottom:10px}
+  .lbl{font-size:11px;color:var(--txt2);margin-bottom:4px}
+  .inp{background:#0d1420;border:1px solid var(--line);border-radius:8px;padding:8px 10px;
+    font-size:12.5px;color:var(--txt)}
+  .row{display:flex;gap:7px;align-items:center}
+  .row .inp{flex:1}
+  .seg{display:flex;gap:5px}
+  .seg span{flex:1;text-align:center;font-size:11.5px;padding:7px;border-radius:8px;
+    border:1px solid var(--line);color:var(--txt2)}
+  .seg span.on{background:linear-gradient(135deg,var(--accent),var(--accent2));color:#07111d;
+    border-color:transparent;font-weight:600}
+
+  .toggle{display:flex;align-items:center;gap:9px;padding:7px 0}
+  .toggle .t{width:32px;height:18px;border-radius:99px;background:#1e2942;position:relative;flex:0 0 auto}
+  .toggle .t.on{background:var(--accent)}
+  .toggle .t::after{content:"";position:absolute;top:2px;left:2px;width:14px;height:14px;border-radius:50%;
+    background:#0b0f17}
+  .toggle .t.on::after{left:auto;right:2px;background:#052131}
+  .toggle .tx{font-size:12px}
+  .toggle .tx small{display:block;color:var(--txt3);font-size:10.5px}
+
+  .btn{font-size:12px;padding:8px 12px;border-radius:8px;border:1px solid var(--line);
+    background:var(--card2);color:var(--txt2);white-space:nowrap}
+  .btn.primary{background:linear-gradient(135deg,var(--accent),var(--accent2));color:#07111d;
+    border-color:transparent;font-weight:600}
+  .btn.danger{background:#2a1116;border-color:#5b2230;color:#fca5a5}
+  .btn.sm{font-size:11px;padding:6px 9px}
+
+  .footer{display:flex;align-items:center;gap:6px;margin-top:11px;padding-top:11px;
+    border-top:1px solid var(--line);flex-wrap:wrap}
+  .fb{font-size:11px;color:var(--txt3);flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .clipped{position:relative}
+  .clipped::after{content:"cut off at normal width";position:absolute;right:-6px;top:50%;
+    transform:translateY(-50%);font-size:9.5px;color:var(--danger);background:#2a1116;
+    border:1px solid #5b2230;padding:2px 5px;border-radius:5px;white-space:nowrap}
+
+  .flag{display:inline-flex;align-items:center;gap:5px;background:#2a1116;border:1px solid #5b2230;
+    color:#fca5a5;font-size:10.5px;padding:2px 7px;border-radius:99px;margin-left:6px}
+  .good{background:#06281f;border-color:#10493a;color:var(--ok)}
+
+  .menu{width:212px;background:var(--card);border:1px solid var(--line);border-radius:10px;
+    padding:6px;box-shadow:0 18px 40px -18px #000}
+  .mi{font-size:12px;padding:7px 9px;border-radius:7px;color:var(--txt2);display:flex;gap:8px;align-items:center}
+  .mi.sep{border-top:1px solid var(--line);margin-top:5px;padding-top:9px}
+  .mi .k{margin-left:auto;color:var(--txt3);font-size:10.5px}
+  .mi.danger{color:#fca5a5}
+
+  table{border-collapse:collapse;width:100%;font-size:13px;margin-top:6px}
+  th,td{text-align:left;padding:7px 9px;border-bottom:1px solid var(--line);vertical-align:top}
+  th{color:var(--txt3);font-weight:600;font-size:11px;text-transform:uppercase;letter-spacing:.06em}
+  td b{color:var(--txt)}
+  .scroll{overflow-x:auto}
+</style>
+
+<div class="wrap">
+  <h1>Control panel — layout redesign</h1>
+  <p class="sub">Three problems from the screenshot: the footer holds eight controls and drops
+  <b>Stop</b> and <b>Quit</b> at normal width, the status hero eats roughly a third of the window,
+  and everyday settings like <em>Start at login</em> sit below the fold. The aim is fewer things
+  competing for attention, not more screens.</p>
+
+  <h2><span class="n">1.</span> Side by side</h2>
+  <div class="cols">
+
+    <!-- ================= CURRENT ================= -->
+    <div class="col">
+      <p class="caption">Now — <b>8 controls in the footer</b></p>
+      <div class="panel">
+        <div class="titlebar">mouse-rs <span class="dots"><i class="dot"></i><i class="dot"></i><i class="dot"></i></span></div>
+        <div class="body">
+          <div class="hdr">
+            <span class="logo">mouse-rs</span>
+            <span style="font-size:9.5px;color:var(--txt3);letter-spacing:.1em">THEME</span>
+            <span class="sw">
+              <i style="background:#38bdf8"></i><i style="background:#f59e0b"></i><i style="background:#ec4899"></i>
+              <i style="background:#22c55e"></i><i style="background:#94a3b8"></i><i style="background:#8b5cf6"></i>
+            </span>
+            <span class="pill">connected — laptop</span>
+          </div>
+
+          <div class="card hero-big">
+            <div style="font-size:11.5px;color:var(--accent)">← controlled by laptop</div>
+            <div class="machines">
+              <div class="mbox on">CLIENT<div class="mname">kali-desktop</div><div class="mmeta">client · 1440×900</div></div>
+              <span class="arrow">⇄</span>
+              <div class="mbox">SERVER<div class="mname">laptop</div><div class="mmeta">server · 1920×1080</div></div>
+            </div>
+          </div>
+
+          <div class="tabs">
+            <span class="tab on">Connection</span><span class="tab">Layout</span>
+            <span class="tab">Security</span><span class="tab">Clipboard</span>
+          </div>
+
+          <div class="card">
+            <div class="field"><div class="lbl">Machine name</div><div class="inp">kali-desktop</div></div>
+            <div class="field"><div class="lbl">Role</div>
+              <div class="seg"><span>Server · has mouse</span><span class="on">Client · receives</span></div></div>
+            <div class="field"><div class="lbl">Server host / IP</div>
+              <div class="row"><div class="inp">192.168.137.1</div><span class="btn sm">Detect</span></div></div>
+            <div style="font-size:11px;color:var(--txt3);border-top:1px dashed var(--line);
+                 padding-top:7px;margin-top:3px">
+              ↓ below the fold: port · auto-reconnect · start at login · auto-connect ·
+              start minimized · log path
+            </div>
+          </div>
+
+          <div class="footer" style="gap:5px">
+            <span class="inp" style="font-size:11px;padding:6px 9px">profile ▾</span>
+            <span class="btn sm">Load</span><span class="btn sm">Delete</span>
+            <span class="inp" style="font-size:11px;padding:6px 9px;flex:1">save as…</span>
+            <span class="btn sm">Save as</span>
+          </div>
+          <div class="footer clipped" style="margin-top:6px;border-top:0;padding-top:0">
+            <span class="btn sm">Restore defaults</span><span class="btn sm">Save</span>
+            <span class="btn sm primary">Start</span>
+            <span class="btn sm" style="opacity:.35">Stop</span>
+            <span class="btn sm danger" style="opacity:.35">Quit</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ================= PROPOSED ================= -->
+    <div class="col">
+      <p class="caption">Proposed — <i>2 controls in the footer</i></p>
+      <div class="panel">
+        <div class="titlebar">mouse-rs <span class="dots"><i class="dot"></i><i class="dot"></i><i class="dot"></i></span></div>
+        <div class="body">
+          <div class="hdr">
+            <span class="logo">mouse-rs</span>
+            <span class="pill">connected</span>
+            <span class="kebab">⋯</span>
+          </div>
+
+          <div class="card">
+            <div class="hero-sm">
+              <div class="chip on"><span class="nm">kali-desktop</span><span class="mt">1440×900</span></div>
+              <span class="arrow">⇄</span>
+              <div class="chip"><span class="nm">laptop</span><span class="mt">1920×1080</span></div>
+            </div>
+            <div class="live"><span class="d"></span> controlled by laptop</div>
+          </div>
+
+          <div class="tabs">
+            <span class="tab on">Connection</span><span class="tab">Layout</span>
+            <span class="tab">Security</span><span class="tab">Startup</span>
+          </div>
+
+          <div class="card">
+            <div class="field"><div class="lbl">Role</div>
+              <div class="seg"><span>Server · has mouse</span><span class="on">Client · receives</span></div></div>
+            <div class="field"><div class="lbl">Server host / IP</div>
+              <div class="row"><div class="inp">192.168.137.1</div><span class="btn sm">Detect</span></div></div>
+            <div class="field"><div class="lbl">Server port</div><div class="inp">24800</div></div>
+            <div class="toggle"><span class="t on"></span>
+              <span class="tx">Auto-reconnect<small>retry until the server appears</small></span></div>
+          </div>
+
+          <div class="footer">
+            <span class="fb">restarted — new settings active</span>
+            <span class="btn">Save</span>
+            <span class="btn primary">Stop sharing</span>
+          </div>
+        </div>
+      </div>
+
+      <p class="note" style="margin-top:12px">The hero drops from ~196 px to ~74 px and still
+      answers the only live question — which machine has the mouse and keyboard right now.
+      Everything rare moves behind <code>⋯</code>.</p>
+    </div>
+  </div>
+
+  <h2><span class="n">2.</span> The overflow menu</h2>
+  <div class="cols">
+    <div style="flex:0 0 auto">
+      <div class="menu">
+        <div class="mi">🎨 Appearance<span class="k">6 themes</span></div>
+        <div class="mi">🗂 Profiles<span class="k">▸</span></div>
+        <div class="mi">📄 Open log file</div>
+        <div class="mi sep danger">↺ Restore defaults</div>
+        <div class="mi danger">⏻ Quit mouse-rs<span class="k">Alt+F4</span></div>
+      </div>
+    </div>
+    <div class="col" style="flex:1 1 380px">
+      <p>Everything moved out of the footer is either rare or destructive, and neither belongs
+      next to the primary action.</p>
+      <table>
+        <tr><th>Was</th><th>Now</th><th>Why</th></tr>
+        <tr><td><b>Load / Delete / Save as</b> + profile box</td><td>⋯ → Profiles</td>
+            <td>Four controls for something used once a month, permanently occupying the busiest row.</td></tr>
+        <tr><td><b>Restore defaults</b></td><td>⋯ → Restore defaults</td>
+            <td>Destructive and rare. Sitting beside <b>Save</b> invites the misclick that reset your config.</td></tr>
+        <tr><td><b>Quit</b></td><td>⋯ → Quit</td>
+            <td>The window ✕ already quits, so the button was a duplicate of a control that never disappears.</td></tr>
+        <tr><td><b>Start</b> + <b>Stop</b></td><td>One <b>Start/Stop sharing</b> button</td>
+            <td>They are mutually exclusive; one is always greyed. A single toggle halves the row and always reads as the thing you can do.</td></tr>
+        <tr><td>Theme swatches in the header</td><td>⋯ → Appearance</td>
+            <td>Six colour dots at the top of every screen, next to the one status you actually read.</td></tr>
+      </table>
+      <p class="note">Footer goes from <b>8 controls to 2</b>, so <b>Stop</b> can no longer be pushed off
+      the edge at normal width — the bug visible in the screenshot.</p>
+    </div>
+  </div>
+
+  <h2><span class="n">3.</span> Tabs regrouped, so nothing everyday is below the fold</h2>
+  <div class="scroll">
+    <table>
+      <tr><th>Tab</th><th>Now</th><th>Proposed</th></tr>
+      <tr><td><b>Connection</b></td>
+          <td>machine name, role, host, port, auto-reconnect, start at login, auto-connect,
+              start minimized, log path <span class="flag">9 fields — scrolls</span></td>
+          <td>role, host + Detect, port, auto-reconnect <span class="flag good">4 — fits</span></td></tr>
+      <tr><td><b>Layout</b></td><td>edges, screen size</td><td>unchanged</td></tr>
+      <tr><td><b>Security</b></td><td>secret, TLS</td><td>unchanged</td></tr>
+      <tr><td><b>Startup</b> <span class="flag good">new</span></td><td>—</td>
+          <td>machine name, start at login, auto-connect, start minimized, log path</td></tr>
+      <tr><td><b>Clipboard</b></td><td>sync toggle, history</td>
+          <td>folds into <b>Security</b>, or stays if you prefer five tabs</td></tr>
+    </table>
+  </div>
+  <p class="note">The startup group is the one you said you have to scroll for. It is its own
+  concern — how the app behaves at login — and shares nothing with picking a peer address, so
+  splitting it removes the scroll rather than just reordering it.</p>
+
+  <h2><span class="n">4.</span> Open questions</h2>
+  <table>
+    <tr><th>#</th><th>Question</th><th>My suggestion</th></tr>
+    <tr><td>Q1</td><td>Keep <b>Clipboard</b> as its own tab, or fold it into Security?</td>
+        <td>Fold it in — four tabs read more calmly than five, and clipboard is two controls.</td></tr>
+    <tr><td>Q2</td><td>Should the compact hero stay visible on every tab, or only when connected?</td>
+        <td>Always visible. It is the one thing that answers "where is my keyboard right now".</td></tr>
+    <tr><td>Q3</td><td>Window size — keep 600×840?</td>
+        <td>Narrower and shorter is now possible: ~560×720 with no scrolling on any tab.</td></tr>
+  </table>
+</div>

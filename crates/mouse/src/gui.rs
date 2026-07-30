@@ -4,8 +4,11 @@
 //! quits the app. The look (6 themes, status hero, animated toggles) lives in
 //! [`crate::ui_theme`]; the system tray in [`crate::tray`].
 
+use std::sync::{Arc, Mutex};
+
 use iced::widget::{
-    button, column, container, pick_list, row, scrollable, text, text_input, toggler, Space,
+    button, column, container, mouse_area, pick_list, row, scrollable, stack, text, text_input,
+    toggler, Space,
 };
 use iced::{Alignment, Element, Length, Subscription, Task};
 
@@ -23,16 +26,24 @@ enum Tab {
     Layout,
     Security,
     Clipboard,
+    Startup,
 }
 
 impl Tab {
-    const ALL: [Tab; 4] = [Tab::Connection, Tab::Layout, Tab::Security, Tab::Clipboard];
+    const ALL: [Tab; 5] = [
+        Tab::Connection,
+        Tab::Layout,
+        Tab::Security,
+        Tab::Clipboard,
+        Tab::Startup,
+    ];
     fn label(self) -> &'static str {
         match self {
             Tab::Connection => "Connection",
             Tab::Layout => "Layout",
             Tab::Security => "Security",
             Tab::Clipboard => "Clipboard",
+            Tab::Startup => "Startup",
         }
     }
 }
@@ -72,7 +83,50 @@ enum Message {
     Start,
     Stop,
     SaveConfig,
+    RestartNow,
+    RestartLater,
+    RestoreDefaults,
+    DetectServers,
+    ServerPicked(String),
+    ListenHostPicked(String),
+    ToggleMenu,
+    CloseMenu,
     Quit,
+}
+
+/// Settings the running engine read at startup and will not notice changing underneath
+/// it. Editing any of these while sharing is live leaves the panel showing one thing and
+/// the session doing another — the gap the restart prompt exists to close.
+///
+/// Deliberately a list of (label, comparison) rather than a `PartialEq` on `Config`:
+/// the user needs to be told *which* settings are stale, and theme/log-path/start-at-login
+/// changes must not trigger a prompt because they already apply immediately.
+fn pending_restart_changes(live: &Config, now: &Config) -> Vec<&'static str> {
+    let mut v = Vec::new();
+    let mut chk = |differs: bool, label: &'static str| {
+        if differs {
+            v.push(label);
+        }
+    };
+    chk(live.name != now.name, "machine name");
+    chk(live.role != now.role, "role");
+    chk(live.shared_secret != now.shared_secret, "shared secret");
+    chk(live.tls_enabled != now.tls_enabled, "TLS");
+    chk(live.clipboard_sync != now.clipboard_sync, "clipboard sync");
+    chk(live.lock_hotkey != now.lock_hotkey, "lock hotkey");
+    chk(live.return_hotkey != now.return_hotkey, "return hotkey");
+    chk(live.listen_host != now.listen_host, "listen host");
+    chk(live.listen_port != now.listen_port, "listen port");
+    chk(live.server_host != now.server_host, "server host");
+    chk(live.server_port != now.server_port, "server port");
+    chk(live.reconnect != now.reconnect, "auto-reconnect");
+    chk(live.exit_edge != now.exit_edge, "exit edge");
+    chk(live.entry_edge != now.entry_edge, "entry edge");
+    chk(
+        live.screen_width != now.screen_width || live.screen_height != now.screen_height,
+        "screen size",
+    );
+    v
 }
 
 struct App {
@@ -101,6 +155,38 @@ struct App {
     /// Where this run is logging. Shown in the panel because a GUI launch has no console —
     /// without it the user has nothing to send when reporting a problem.
     log_path: String,
+    /// The config the *running* engine was started with. `None` when stopped. Compared
+    /// against `saved_cfg` to tell the user which saved settings are not yet active —
+    /// without it, Save reports success and silently changes nothing about the live
+    /// session.
+    live_cfg: Option<Config>,
+    /// The last config actually written to disk. The restart prompt is measured against
+    /// **this**, not against `cfg`: `cfg` changes on every keystroke in a text field, so
+    /// comparing it would pop the warning while the user is still typing and before they
+    /// have committed to anything. From the user's point of view nothing has been saved
+    /// yet, so nothing can be pending.
+    saved_cfg: Config,
+    /// Set by "Later": collapses the restart prompt to a compact marker rather than
+    /// hiding it, so the panel never goes back to looking up-to-date while it isn't.
+    restart_hint_dismissed: bool,
+    /// Result slot for the background subnet sweep. The scan does blocking TCP connects,
+    /// so it runs on its own thread and the UI picks the answer up on the next tick —
+    /// the panel must stay responsive while it works.
+    scan: Arc<Mutex<ScanState>>,
+    /// Addresses found by the last sweep, offered as a pick list.
+    found_servers: Vec<String>,
+    /// Whether the overflow (⋯) menu is open. Everything rare or destructive lives there,
+    /// so the footer can hold only the two actions used constantly — the old footer packed
+    /// in eight and pushed Stop and Quit off the edge at normal window width.
+    menu_open: bool,
+}
+
+#[derive(Default)]
+enum ScanState {
+    #[default]
+    Idle,
+    Running,
+    Done(Vec<String>),
 }
 
 impl App {
@@ -123,6 +209,12 @@ impl App {
             autostart_on: crate::autostart::is_enabled(),
             launch_done: false,
             log_path: crate::logging::log_path().display().to_string(),
+            live_cfg: None,
+            restart_hint_dismissed: false,
+            scan: Arc::new(Mutex::new(ScanState::Idle)),
+            found_servers: Vec::new(),
+            menu_open: false,
+            saved_cfg: cfg.clone(),
             cfg,
         };
         app.sync_buffers();
@@ -158,6 +250,20 @@ impl App {
             }
         };
         self.engine = Some(EngineHandle::start(self.cfg.clone()));
+        // Start writes the file too, so both baselines move together and the panel opens
+        // a session with nothing pending.
+        self.live_cfg = Some(self.cfg.clone());
+        self.saved_cfg = self.cfg.clone();
+        self.restart_hint_dismissed = false;
+    }
+
+    /// Settings **saved** but not yet picked up by the running engine. Unsaved edits are
+    /// deliberately excluded — see `saved_cfg`.
+    fn pending_changes(&self) -> Vec<&'static str> {
+        match (&self.live_cfg, self.running()) {
+            (Some(live), true) => pending_restart_changes(live, &self.saved_cfg),
+            _ => Vec::new(),
+        }
     }
 
     fn stop_engine(&mut self) {
@@ -195,6 +301,36 @@ impl App {
                     // leaves only this, which is the distinction worth being able to make.
                     tracing::info!("engine stopped; sharing is off");
                     self.engine = None;
+                    // No live session, so nothing can be stale against it.
+                    self.live_cfg = None;
+                    self.restart_hint_dismissed = false;
+                }
+                // Collect a finished network sweep.
+                let finished = {
+                    let mut g = self.scan.lock().unwrap();
+                    if let ScanState::Done(list) = &*g {
+                        let list = list.clone();
+                        *g = ScanState::Idle;
+                        Some(list)
+                    } else {
+                        None
+                    }
+                };
+                if let Some(list) = finished {
+                    self.feedback = match list.len() {
+                        0 => format!(
+                            "no machine found listening on port {} — check the other machine is running and on the same network",
+                            self.cfg.server_port
+                        ),
+                        1 => format!("found {}", list[0]),
+                        n => format!("found {n} machines — pick one"),
+                    };
+                    // A single hit is almost certainly the peer; fill it in rather than
+                    // making the user re-type what was just discovered.
+                    if let [only] = list.as_slice() {
+                        self.cfg.server_host = only.clone();
+                    }
+                    self.found_servers = list;
                 }
                 // Keep the tray tooltip reflecting live status.
                 if let Some(t) = &self.tray {
@@ -233,7 +369,10 @@ impl App {
                 }
             }
             Message::ThemePicked(t) => self.theme = t,
-            Message::TabPicked(t) => self.tab = t,
+            Message::TabPicked(t) => {
+                self.tab = t;
+                self.menu_open = false;
+            }
             Message::NameChanged(s) => self.cfg.name = s,
             Message::RolePicked(r) => self.cfg.role = r,
             Message::SecretChanged(s) => self.cfg.shared_secret = s,
@@ -365,6 +504,12 @@ impl App {
                 self.feedback = match self.cfg.save(&path) {
                     Ok(()) => {
                         tracing::info!("saved config to {}", path.display());
+                        // Only now do the edits count as committed, which is what the
+                        // restart prompt is measured against.
+                        self.saved_cfg = self.cfg.clone();
+                        // A fresh save is a fresh mismatch: show the prompt again rather
+                        // than staying dismissed from a previous round of changes.
+                        self.restart_hint_dismissed = false;
                         "saved".into()
                     }
                     Err(e) => {
@@ -373,7 +518,81 @@ impl App {
                     }
                 };
             }
+            Message::RestartNow => {
+                // Stop, then start: `start_engine` re-saves and re-baselines `live_cfg`,
+                // so the prompt clears itself and the confirmation is truthful.
+                let names = self.pending_changes().join(", ");
+                self.stop_engine();
+                self.engine = None;
+                self.start_engine();
+                self.feedback = if names.is_empty() {
+                    "sharing restarted".into()
+                } else {
+                    format!("restarted — new settings active ({names})")
+                };
+            }
+            Message::RestartLater => {
+                self.restart_hint_dismissed = true;
+            }
+            Message::ToggleMenu => self.menu_open = !self.menu_open,
+            Message::CloseMenu => self.menu_open = false,
+            Message::DetectServers => {
+                let already_running =
+                    matches!(*self.scan.lock().unwrap(), ScanState::Running);
+                if !already_running {
+                    *self.scan.lock().unwrap() = ScanState::Running;
+                    self.feedback = "scanning this machine's networks…".into();
+                    let slot = self.scan.clone();
+                    let port = self.cfg.server_port;
+                    std::thread::spawn(move || {
+                        // 300 ms per host: long enough for a switch on a LAN, short
+                        // enough that a full /24 finishes in a couple of seconds.
+                        let found = mouse_core::discover::scan_for_servers(
+                            port,
+                            std::time::Duration::from_millis(300),
+                        );
+                        let list = found.into_iter().map(|ip| ip.to_string()).collect();
+                        *slot.lock().unwrap() = ScanState::Done(list);
+                    });
+                }
+            }
+            Message::ServerPicked(host) => {
+                self.cfg.server_host = host;
+            }
+            Message::ListenHostPicked(host) => {
+                self.cfg.listen_host = host;
+            }
+            Message::RestoreDefaults => {
+                self.menu_open = false;
+                // Resets *preferences*, never facts about this machine. Wiping the name,
+                // the screen size or the secret is not "restoring defaults", it is losing
+                // information the user cannot retype from memory:
+                //
+                //   * shared secret — must match the other machine; clearing it breaks the
+                //     pairing with no way to recover the old value.
+                //   * screen size — the default 1920x1080 is wrong on any other display and
+                //     silently corrupts edge geometry, so re-detect it instead.
+                //   * machine name — an identity the peer displays, not a setting.
+                //
+                // Applied to the form only; the file is untouched until Save, so this stays
+                // reviewable and abandonable.
+                let (secret, name) = (self.cfg.shared_secret.clone(), self.cfg.name.clone());
+                let (w, h) = screen_size()
+                    .unwrap_or((self.cfg.screen_width, self.cfg.screen_height));
+                self.cfg = Config {
+                    shared_secret: secret,
+                    name,
+                    screen_width: w,
+                    screen_height: h,
+                    ..Config::default()
+                };
+                self.sync_buffers();
+                self.feedback = format!(
+                    "defaults restored — kept your name, secret and screen ({w}×{h}); press Save to apply"
+                );
+            }
             Message::Quit => {
+                self.menu_open = false;
                 if let Some(e) = &self.engine {
                     e.request_stop();
                 }
@@ -407,101 +626,177 @@ impl App {
         let running = self.running();
         let snap = self.engine.as_ref().map(|e| e.status());
 
-        let content = column![
+        let mut content = column![
             self.header(p, running, snap.as_ref()),
             self.hero(p, running, snap.as_ref()),
-            self.tab_bar(p),
+        ]
+        .spacing(12.0)
+        .padding(16.0);
+        if let Some(banner) = self.restart_banner(p) {
+            content = content.push(banner);
+        }
+        let content = content.push(self.tab_bar(p)).push(
             scrollable(container(self.tab_body(p, running)).padding([4.0, 2.0]))
                 .height(Length::Fill),
-            self.footer(p, running),
-        ]
-        .spacing(14.0)
-        .padding(18.0);
+        ).push(self.footer(p, running));
 
-        container(content)
+        let page: Element<'_, Message> = container(content)
             .style(move |_| ui_theme::root(p))
             .width(Length::Fill)
             .height(Length::Fill)
-            .into()
+            .into();
+
+        if !self.menu_open {
+            return page;
+        }
+        // The menu floats over the page, right-aligned under the ⋯ button. The full-size
+        // `mouse_area` beneath it closes the menu on any click elsewhere, which is what
+        // makes it behave like a menu rather than a panel that has to be dismissed by
+        // pressing the same button again.
+        let dismiss = mouse_area(
+            container(Space::new())
+                .width(Length::Fill)
+                .height(Length::Fill),
+        )
+        .on_press(Message::CloseMenu);
+
+        let floating = container(
+            column![
+                Space::new().height(52.0),
+                container(self.overflow_menu(p)).align_right(Length::Fill),
+            ]
+        )
+        .padding([0.0, 16.0])
+        .width(Length::Fill)
+        .height(Length::Fill);
+
+        stack![page, dismiss, floating].into()
+    }
+
+    /// "Restart needed" prompt: the panel's only honest answer to "did my change take
+    /// effect?". Saving a setting the engine already read does nothing to the live
+    /// session, and the previous behaviour — reporting "saved" and changing nothing —
+    /// gave no way to tell the two states apart.
+    ///
+    /// Dismissing with "Later" collapses it to a one-line marker rather than hiding it,
+    /// because the mismatch is still real after dismissal.
+    fn restart_banner(&self, p: Palette) -> Option<Element<'_, Message>> {
+        let pending = self.pending_changes();
+        if pending.is_empty() {
+            return None;
+        }
+        let n = pending.len();
+        let list = pending.join(", ");
+        let summary = format!(
+            "{n} change{} saved but not yet active: {list}.",
+            if n == 1 { "" } else { "s" }
+        );
+
+        if self.restart_hint_dismissed {
+            // Compact persistent marker.
+            return Some(
+                container(
+                    text(format!("⚠ {summary}  (restart to apply)"))
+                        .size(12.0)
+                        .style(move |_| iced::widget::text::Style { color: Some(p.warn) }),
+                )
+                .padding([6.0, 10.0])
+                .style(move |_| ui_theme::card(p))
+                .width(Length::Fill)
+                .into(),
+            );
+        }
+
+        Some(
+            container(
+                column![
+                    text("⚠ Restart needed")
+                        .size(14.0)
+                        .style(move |_| iced::widget::text::Style { color: Some(p.warn) }),
+                    text(summary).size(12.0),
+                    row![
+                        button(text("Restart sharing now").size(12.0))
+                            .style(ui_theme::primary(p))
+                            .padding([8.0, 12.0])
+                            .on_press(Message::RestartNow),
+                        button(text("Later").size(12.0))
+                            .style(ui_theme::ghost(p))
+                            .padding([8.0, 12.0])
+                            .on_press(Message::RestartLater),
+                    ]
+                    .spacing(8.0),
+                ]
+                .spacing(8.0),
+            )
+            .padding([10.0, 12.0])
+            .style(move |_| ui_theme::card(p))
+            .width(Length::Fill)
+            .into(),
+        )
     }
 
     // ---------- header ----------
 
     fn header(&self, p: Palette, running: bool, snap: Option<&StatusSnapshot>) -> Element<'_, Message> {
-        let mut swatches = row![].spacing(6.0).align_y(Alignment::Center);
-        swatches = swatches.push(text("THEME").size(10.0).color(p.txt3));
-        for t in Theme6::ALL {
-            let base = t.palette();
-            swatches = swatches.push(
-                button(Space::new().width(18.0).height(18.0))
-                    .style(ui_theme::swatch(p, base, t == self.theme))
-                    .padding(0.0)
-                    .on_press(Message::ThemePicked(t)),
-            );
-        }
-
         let (pill_fill, pill_txt, label) = status_pill(p, running, snap);
         let status = container(text(label).size(12.0).color(pill_txt))
             .style(move |_| ui_theme::pill(pill_fill, pill_txt))
             .padding([4.0, 10.0]);
 
+        // Theme swatches used to sit here — six colour dots directly beside the one line
+        // of status a user actually reads. They live in the ⋯ menu now.
         row![
             text("mouse-rs").size(22.0).color(p.txt),
             Space::new().width(Length::Fill),
-            swatches,
             status,
+            button(text("⋯").size(16.0).color(p.txt2))
+                .style(ui_theme::ghost(p))
+                .padding([6.0, 12.0])
+                .on_press(Message::ToggleMenu),
         ]
-        .spacing(12.0)
+        .spacing(10.0)
         .align_y(Alignment::Center)
         .into()
     }
 
     // ---------- status hero ----------
 
+    /// One row of two machine chips plus the live control line.
+    ///
+    /// The previous hero was two large boxes and took roughly a third of the window to say
+    /// what this says in ~70px. It answers the only question that changes moment to moment —
+    /// which machine currently has the mouse and keyboard — so it stays on every tab.
     fn hero(&self, p: Palette, running: bool, snap: Option<&StatusSnapshot>) -> Element<'_, Message> {
         let engaged = snap.map(|s| s.connected && s.engaged).unwrap_or(false);
         let server_side = self.cfg.role == Role::Server;
 
-        // Local machine card; the peer card from the live snapshot.
-        let local = machine_card(
+        let local = machine_chip(
             p,
             &self.cfg.name,
-            if server_side { "server" } else { "client" },
             &format!("{}×{}", self.cfg.screen_width, self.cfg.screen_height),
-            // active = we currently hold control locally (not engaged yet, or we're the
-            // client being controlled means the server side is the active one instead)
             !engaged || !server_side,
         );
         let (peer_name, peer_res) = match snap {
             Some(s) if s.connected => (s.peer.clone(), format!("{}×{}", s.peer_w, s.peer_h)),
             _ => ("waiting…".to_string(), "—".to_string()),
         };
-        let peer = machine_card(
-            p,
-            &peer_name,
-            if server_side { "client" } else { "server" },
-            &peer_res,
-            engaged && server_side,
-        );
+        let peer = machine_chip(p, &peer_name, &peer_res, engaged && server_side);
 
         let link = text(if running { "⇄" } else { "—" })
-            .size(24.0)
+            .size(18.0)
             .color(if running { p.accent } else { p.txt3 });
 
-        let badge_txt = hero_line(running, self.cfg.role, snap);
-        let badge = text(badge_txt).size(12.0).color(if running { p.good } else { p.txt3 });
-
         let body = column![
-            badge,
-            row![local, container(link).center_y(Length::Fill), peer]
-                .spacing(14.0)
-                .align_y(Alignment::Center),
+            row![local, link, peer].spacing(10.0).align_y(Alignment::Center),
+            text(hero_line(running, self.cfg.role, snap))
+                .size(12.0)
+                .color(if running { p.accent } else { p.txt3 }),
         ]
-        .spacing(14.0);
+        .spacing(8.0);
 
         container(body)
             .style(move |_| ui_theme::hero(p))
-            .padding(20.0)
+            .padding(12.0)
             .width(Length::Fill)
             .into()
     }
@@ -529,6 +824,7 @@ impl App {
             Tab::Layout => self.tab_layout(p),
             Tab::Security => self.tab_security(p),
             Tab::Clipboard => self.tab_clipboard(p),
+            Tab::Startup => self.tab_startup(p),
         }
     }
 
@@ -543,25 +839,82 @@ impl App {
         .spacing(6.0);
 
         let net = if server_side {
+            // Real addresses of this machine, so the bind address is chosen rather than
+            // typed from memory.
+            let local = mouse_core::discover::listen_candidates();
+            let picked = local
+                .iter()
+                .find(|c| **c == self.cfg.listen_host)
+                .cloned();
             column![
                 labeled(p, "Listen host", input(p, "0.0.0.0", &self.cfg.listen_host, Message::ListenHostChanged)),
+                labeled(
+                    p,
+                    "This machine's addresses",
+                    pick_list(local, picked, Message::ListenHostPicked)
+                        .width(Length::Fill)
+                        .padding([10.0, 12.0])
+                        .text_size(13.0),
+                ),
                 labeled(p, "Listen port", input(p, "24800", &self.listen_port_s, Message::ListenPortChanged)),
             ]
             .spacing(12.0)
         } else {
-            column![
-                labeled(p, "Server host / IP", input(p, "192.168.1.50", &self.cfg.server_host, Message::ServerHostChanged)),
-                labeled(p, "Server port", input(p, "24800", &self.server_port_s, Message::ServerPortChanged)),
-                toggle_row(p, "Auto-reconnect", "retry with backoff until the server appears", self.cfg.reconnect, Message::ReconnectToggled),
+            let scanning = matches!(*self.scan.lock().unwrap(), ScanState::Running);
+            let detect = button(
+                text(if scanning { "Scanning…" } else { "Detect" }).size(13.0),
+            )
+            .style(ui_theme::ghost(p))
+            .padding([9.0, 14.0]);
+            let detect = if scanning { detect } else { detect.on_press(Message::DetectServers) };
+
+            let mut col = column![
+                labeled(
+                    p,
+                    "Server host / IP",
+                    row![
+                        input(p, "press Detect, or type the other machine's IP", &self.cfg.server_host, Message::ServerHostChanged),
+                        detect,
+                    ]
+                    .spacing(8.0)
+                    .align_y(Alignment::Center),
+                ),
             ]
-            .spacing(12.0)
+            .spacing(12.0);
+
+            // Only offered once a sweep has actually found something — an empty picker
+            // would imply the feature is broken rather than that nothing answered.
+            if !self.found_servers.is_empty() {
+                let picked = self
+                    .found_servers
+                    .iter()
+                    .find(|c| **c == self.cfg.server_host)
+                    .cloned();
+                col = col.push(labeled(
+                    p,
+                    "Found on your network",
+                    pick_list(self.found_servers.clone(), picked, Message::ServerPicked)
+                        .width(Length::Fill)
+                        .padding([10.0, 12.0])
+                        .text_size(13.0),
+                ));
+            }
+
+            col.push(labeled(p, "Server port", input(p, "24800", &self.server_port_s, Message::ServerPortChanged)))
+                .push(toggle_row(p, "Auto-reconnect", "retry with backoff until the server appears", self.cfg.reconnect, Message::ReconnectToggled))
         };
 
-        // Hands-off start at login. The three are deliberately independent: the OS
-        // launches the panel (Start at login), the panel brings the link up by itself
-        // (Auto-connect), and it stays out of the way while doing so (Start minimized).
+        card(p, column![field_label(p, "Role"), role, net].spacing(14.0))
+    }
+
+    /// How the app behaves at login, plus profiles. Split out of Connection because it is a
+    /// different question — how this machine starts the app, not how it reaches the peer —
+    /// and because Connection had grown to nine fields and had to be scrolled.
+    fn tab_startup(&self, p: Palette) -> Element<'_, Message> {
+        // The three are deliberately independent: the OS launches the panel (Start at
+        // login), the panel brings the link up by itself (Auto-connect), and it stays out
+        // of the way while doing so (Start minimized).
         let startup = column![
-            field_label(p, "Startup"),
             toggle_row(p, "Start at login", self.autostart_hint(), self.autostart_on, Message::AutostartToggled),
             toggle_row(p, "Auto-connect on launch", "begin sharing as soon as the panel opens", self.cfg.autoconnect, Message::AutoconnectToggled),
             toggle_row(p, "Start minimized", "open out of the way, into the tray/taskbar", self.cfg.start_minimized, Message::StartMinimizedToggled),
@@ -578,11 +931,9 @@ impl App {
 
         card(p, column![
             labeled(p, "Machine name", input(p, "this-machine", &self.cfg.name, Message::NameChanged)),
-            field_label(p, "Role"),
-            role,
-            net,
             startup,
             logs,
+            self.profiles_section(p),
         ]
         .spacing(14.0))
     }
@@ -650,9 +1001,12 @@ impl App {
             field_label(p, "Shared secret — identical on both machines"),
             secret,
             toggle_row(p, "Encrypt link (TLS)", "rustls, self-signed cert", self.cfg.tls_enabled, Message::TlsToggled),
-            toggle_row(p, "Sync clipboard", "copy here, paste there", self.cfg.clipboard_sync, Message::ClipboardToggled),
-            labeled(p, "Return hotkey (server)", input(p, "ctrl+win+alt+esc", &self.cfg.return_hotkey, Message::ReturnHotkeyChanged)),
             labeled(p, "Lock / cross hotkey", input(p, "scroll_lock", &self.cfg.lock_hotkey, Message::LockHotkeyChanged)),
+            text("Single key. Always returns control, even if the network or engine has wedged.")
+                .size(11.0).color(p.txt3),
+            labeled(p, "Return hotkey (server)", input(p, "ctrl+win+alt+esc", &self.cfg.return_hotkey, Message::ReturnHotkeyChanged)),
+            text("Optional combo, matched on whichever machine is the server. Empty = none.")
+                .size(11.0).color(p.txt3),
         ]
         .spacing(14.0))
     }
@@ -680,63 +1034,122 @@ impl App {
                 }
             }
         }
-        card(p, column![field_label(p, "Clipboard history — newest first"), list].spacing(12.0))
+        card(p, column![
+            toggle_row(p, "Sync clipboard", "copy here, paste there — text and images", self.cfg.clipboard_sync, Message::ClipboardToggled),
+            field_label(p, "Clipboard history — newest first"),
+            list,
+        ]
+        .spacing(12.0))
     }
 
     // ---------- profiles + footer ----------
 
+    /// Two controls, and only two. The old footer carried eight — profile picker, Load,
+    /// Delete, save-as box, Save as, Restore defaults, Save, Start, Stop and Quit — which
+    /// overflowed at normal window width and silently pushed Stop and Quit off the edge.
+    /// Everything rare or destructive is in the ⋯ menu; Start and Stop are one toggle
+    /// because they are mutually exclusive and one was always greyed out.
     fn footer(&self, p: Palette, running: bool) -> Element<'_, Message> {
-        let start = button(text(if running { "Running" } else { "Start" }).size(14.0))
-            .style(ui_theme::primary(p))
-            .padding([12.0, 22.0]);
-        let start = if running { start } else { start.on_press(Message::Start) };
+        let run = if running {
+            button(text("Stop sharing").size(14.0))
+                .style(ui_theme::danger(p))
+                .padding([12.0, 20.0])
+                .on_press(Message::Stop)
+        } else {
+            button(text("Start sharing").size(14.0))
+                .style(ui_theme::primary(p))
+                .padding([12.0, 20.0])
+                .on_press(Message::Start)
+        };
 
-        let stop = button(text("Stop").size(14.0))
-            .style(ui_theme::danger(p))
-            .padding([12.0, 18.0]);
-        let stop = if running { stop.on_press(Message::Stop) } else { stop };
-
-        let save = button(text("Save").size(13.0))
-            .style(ui_theme::ghost(p))
-            .padding([11.0, 14.0])
-            .on_press(Message::SaveConfig);
-
-        let quit = button(text("Quit").size(13.0))
-            .style(ui_theme::danger(p))
-            .padding([11.0, 14.0])
-            .on_press(Message::Quit);
-
-        column![
-            self.profiles_row(p),
-            row![
-                text(&self.feedback).size(12.0).color(p.txt3),
-                Space::new().width(Length::Fill),
-                save,
-                start,
-                stop,
-                quit,
-            ]
-            .spacing(8.0)
-            .align_y(Alignment::Center),
-        ]
-        .spacing(10.0)
-        .into()
-    }
-
-    fn profiles_row(&self, p: Palette) -> Element<'_, Message> {
-        let picker = pick_list(self.profiles.clone(), self.profile_pick.clone(), Message::ProfilePicked)
-            .placeholder("profile")
-            .padding(8.0)
-            .width(150.0);
         row![
-            picker,
-            button(text("Load").size(12.0)).style(ui_theme::ghost(p)).padding([8.0, 12.0]).on_press(Message::LoadProfile),
-            button(text("Delete").size(12.0)).style(ui_theme::ghost(p)).padding([8.0, 12.0]).on_press(Message::DeleteProfile),
-            input(p, "save as…", &self.profile_name_input, Message::ProfileNameChanged).width(140.0),
-            button(text("Save as").size(12.0)).style(ui_theme::ghost(p)).padding([8.0, 12.0]).on_press(Message::SaveProfileAs),
+            text(&self.feedback).size(12.0).color(p.txt3),
+            Space::new().width(Length::Fill),
+            button(text("Save").size(13.0))
+                .style(ui_theme::ghost(p))
+                .padding([11.0, 16.0])
+                .on_press(Message::SaveConfig),
+            run,
         ]
         .spacing(8.0)
         .align_y(Alignment::Center)
+        .into()
+    }
+
+    /// The ⋯ menu: appearance, profiles, and the destructive actions.
+    fn overflow_menu(&self, p: Palette) -> Element<'_, Message> {
+        let mut swatches = row![].spacing(6.0).align_y(Alignment::Center);
+        for t in Theme6::ALL {
+            let base = t.palette();
+            swatches = swatches.push(
+                button(Space::new().width(18.0).height(18.0))
+                    .style(ui_theme::swatch(p, base, t == self.theme))
+                    .padding(0.0)
+                    .on_press(Message::ThemePicked(t)),
+            );
+        }
+
+        let item = |label: &'static str, msg: Message, danger: bool| {
+            button(text(label).size(12.5).color(if danger { p.danger } else { p.txt2 }))
+                .style(ui_theme::ghost(p))
+                .padding([9.0, 11.0])
+                .width(Length::Fill)
+                .on_press(msg)
+        };
+
+        container(
+            column![
+                text("APPEARANCE").size(10.0).color(p.txt3),
+                swatches,
+                item("Profiles…", Message::TabPicked(Tab::Startup), false),
+                item("Restore defaults", Message::RestoreDefaults, true),
+                item("Quit mouse-rs", Message::Quit, true),
+            ]
+            .spacing(8.0),
+        )
+        .style(move |_| ui_theme::card(p))
+        .padding(10.0)
+        .width(210.0)
+        .into()
+    }
+
+    /// Profiles, with the sentence that was missing. The feature shipped as an unlabelled
+    /// dropdown and three buttons in the footer, and the owner had never worked out what it
+    /// was for — so the explanation is part of the control, not a docs problem.
+    fn profiles_section(&self, p: Palette) -> Element<'_, Message> {
+        let picker = pick_list(self.profiles.clone(), self.profile_pick.clone(), Message::ProfilePicked)
+            .placeholder(if self.profiles.is_empty() { "no profiles saved yet" } else { "choose a profile" })
+            .padding(8.0)
+            .width(Length::Fill);
+
+        column![
+            field_label(p, "Profiles"),
+            text(
+                "A named snapshot of every setting on this page — peer address, edges, screen \
+                 size, hotkeys, secret. Save one per setup (say \"desk\" and \"travel\") and switch \
+                 without retyping. Loading one fills the form; press Save to keep it."
+            )
+            .size(11.0)
+            .color(p.txt3),
+            row![
+                picker,
+                button(text("Load").size(12.0)).style(ui_theme::ghost(p)).padding([8.0, 12.0]).on_press(Message::LoadProfile),
+                button(text("Delete").size(12.0)).style(ui_theme::ghost(p)).padding([8.0, 12.0]).on_press(Message::DeleteProfile),
+            ]
+            .spacing(8.0)
+            .align_y(Alignment::Center),
+            row![
+                input(p, "name this setup…", &self.profile_name_input, Message::ProfileNameChanged),
+                button(text("Save as").size(12.0)).style(ui_theme::ghost(p)).padding([8.0, 12.0]).on_press(Message::SaveProfileAs),
+            ]
+            .spacing(8.0)
+            .align_y(Alignment::Center),
+            // Said plainly because a profile is as sensitive as the config file itself.
+            text("Stored in ~/.mouse_share/profiles/. They include the shared secret.")
+                .size(10.5)
+                .color(p.txt3),
+        ]
+        .spacing(8.0)
         .into()
     }
 }
@@ -837,19 +1250,19 @@ fn edge_picker(p: Palette, current: Edge, on_pick: impl Fn(Edge) -> Message + Co
         .into()
 }
 
-fn machine_card(p: Palette, name: &str, role: &str, res: &str, active: bool) -> Element<'static, Message> {
-    let screen = container(text(role.to_uppercase()).size(10.0).color(p.txt3))
-        .style(move |_| if active { ui_theme::well_active(p) } else { ui_theme::well(p) })
-        .center_x(Length::Fill)
-        .center_y(70.0)
-        .width(Length::Fill);
-    column![
-        screen,
-        text(name.to_string()).size(14.0).color(p.txt),
-        text(format!("{role} · {res}")).size(11.0).color(p.txt3),
-    ]
-    .spacing(6.0)
-    .align_x(Alignment::Center)
+/// One machine in the hero: name on the left, resolution on the right, highlighted when
+/// that machine currently owns the input.
+fn machine_chip(p: Palette, name: &str, res: &str, active: bool) -> Element<'static, Message> {
+    container(
+        row![
+            text(name.to_string()).size(13.0).color(p.txt),
+            Space::new().width(Length::Fill),
+            text(res.to_string()).size(11.0).color(p.txt3),
+        ]
+        .align_y(Alignment::Center),
+    )
+    .style(move |_| if active { ui_theme::well_active(p) } else { ui_theme::well(p) })
+    .padding([9.0, 11.0])
     .width(Length::Fill)
     .into()
 }
@@ -920,7 +1333,105 @@ pub fn launch(cfg: Config) -> anyhow::Result<()> {
         .title("mouse-rs")
         .subscription(App::subscription)
         .theme(App::theme)
-        .window_size(iced::Size::new(600.0, 840.0))
+        .window_size(iced::Size::new(560.0, 720.0))
         .run()
         .map_err(|e| anyhow::anyhow!("control panel: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Changing a setting the engine already read must be reported, or the panel says
+    /// "saved" while the live session keeps using the old value — the exact confusion
+    /// this prompt exists to remove.
+    #[test]
+    fn restart_needed_lists_only_the_settings_that_changed() {
+        let live = Config::default();
+        let mut now = live.clone();
+        assert!(pending_restart_changes(&live, &now).is_empty(), "identical configs are clean");
+
+        now.listen_port = live.listen_port.wrapping_add(1);
+        now.tls_enabled = !live.tls_enabled;
+        let pending = pending_restart_changes(&live, &now);
+        assert_eq!(pending, vec!["TLS", "listen port"]);
+    }
+
+    /// Settings that take effect immediately must NOT raise a restart prompt — a prompt
+    /// that cries wolf for the theme picker would be ignored when it matters.
+    #[test]
+    fn immediate_settings_do_not_ask_for_a_restart() {
+        let live = Config::default();
+        let mut now = live.clone();
+        now.autoconnect = !live.autoconnect;
+        now.start_minimized = !live.start_minimized;
+        assert!(
+            pending_restart_changes(&live, &now).is_empty(),
+            "launch-time-only settings must not demand a restart of a running session"
+        );
+    }
+
+    /// The prompt says "saved but not yet active", so it must be measured against what
+    /// was actually saved. Comparing against the live edit buffer made it appear while
+    /// the user was still typing, before they had saved anything — which reads as the
+    /// panel warning about a change the user has not made yet.
+    #[test]
+    fn typing_without_saving_is_not_pending() {
+        let running_engine_cfg = Config::default();
+        let saved = running_engine_cfg.clone();
+
+        // The user is midway through editing the port field; nothing is committed.
+        let mut being_edited = saved.clone();
+        being_edited.listen_port = 9999;
+
+        assert!(
+            pending_restart_changes(&running_engine_cfg, &saved).is_empty(),
+            "unsaved edits must not raise the restart prompt"
+        );
+        // ...and once they press Save, that same change is pending.
+        assert_eq!(
+            pending_restart_changes(&running_engine_cfg, &being_edited),
+            vec!["listen port"]
+        );
+    }
+
+    /// "Restore defaults" must not destroy facts about this machine. It reset the name to
+    /// a generic default and the screen to 1920x1080 on a 1440x900 display, which silently
+    /// corrupts edge geometry — the user cannot retype what was auto-detected.
+    #[test]
+    fn restoring_defaults_keeps_identity_and_hardware_facts() {
+        let cfg = Config {
+            name: "kali-desktop".into(),
+            shared_secret: "a-real-secret".into(),
+            screen_width: 1440,
+            screen_height: 900,
+            exit_edge: Edge::Right, // a preference, should be reset
+            ..Config::default()
+        };
+
+        // Mirrors the handler: preferences reset, machine facts carried over.
+        let restored = Config {
+            shared_secret: cfg.shared_secret.clone(),
+            name: cfg.name.clone(),
+            screen_width: cfg.screen_width,
+            screen_height: cfg.screen_height,
+            ..Config::default()
+        };
+
+        assert_eq!(restored.name, "kali-desktop");
+        assert_eq!(restored.shared_secret, "a-real-secret");
+        assert_eq!((restored.screen_width, restored.screen_height), (1440, 900));
+        assert_eq!(restored.exit_edge, Config::default().exit_edge, "preferences do reset");
+    }
+
+    /// Screen size is two fields but one user-facing setting; reporting it twice would
+    /// misstate the count in "N changes saved but not yet active".
+    #[test]
+    fn screen_size_counts_as_one_change() {
+        let live = Config::default();
+        let mut now = live.clone();
+        now.screen_width += 100;
+        now.screen_height += 100;
+        assert_eq!(pending_restart_changes(&live, &now), vec!["screen size"]);
+    }
 }

@@ -38,7 +38,9 @@ SHA=$(sha256sum "$EXE" | cut -d' ' -f1 | tr 'a-f' 'A-F')
 echo "==> exe: $SIZE bytes, $SHA"
 
 # --- keep the prompts' stated checksum equal to what is actually being served ---
-for doc in docs/windows-test-prompt.md docs/windows-retest-prompt.md; do
+for doc in docs/windows-test-prompt.md docs/windows-retest-prompt.md \
+           docs/windows-leak-hunt-prompt.md docs/windows-paired-test-prompt.md \
+           docs/windows-update-prompt.md; do
   [ -f "$doc" ] || continue
   # Both lines are written by this script, so match loosely on the label and replace
   # the whole value rather than trying to find the previous hash.
@@ -58,6 +60,9 @@ mkdir -p "$SERVE_DIR"
 ln -sfn "$REPO_ROOT/$EXE"                          "$SERVE_DIR/mouse-rs.exe"
 ln -sfn "$REPO_ROOT/docs/windows-retest-prompt.md" "$SERVE_DIR/retest.md"
 ln -sfn "$REPO_ROOT/docs/windows-test-prompt.md"   "$SERVE_DIR/setup.md"
+ln -sfn "$REPO_ROOT/docs/windows-leak-hunt-prompt.md" "$SERVE_DIR/leak-hunt.md"
+ln -sfn "$REPO_ROOT/docs/windows-paired-test-prompt.md" "$SERVE_DIR/paired.md"
+ln -sfn "$REPO_ROOT/docs/windows-update-prompt.md" "$SERVE_DIR/update.md"
 printf 'mouse-rs.exe  %s bytes\nSHA256  %s\n' "$SIZE" "$SHA" > "$SERVE_DIR/CHECKSUM.txt"
 
 # --- restart the server ---
@@ -80,13 +85,16 @@ if curl -sf -o /dev/null "http://$BIND_ADDR:$PORT/retest.md"; then
 
 ==> serving on http://$BIND_ADDR:$PORT/  (cable only)
 
+    http://$BIND_ADDR:$PORT/update.md      install the current build  <-- standing prompt
+    http://$BIND_ADDR:$PORT/paired.md      paired foreground/background test
+    http://$BIND_ADDR:$PORT/leak-hunt.md   the keyboard-leak hunt
     http://$BIND_ADDR:$PORT/retest.md      focused retest of the six fixes
     http://$BIND_ADDR:$PORT/setup.md       full first-time setup + test pass
     http://$BIND_ADDR:$PORT/mouse-rs.exe   the binary ($SIZE bytes)
     http://$BIND_ADDR:$PORT/CHECKSUM.txt
 
     One-liner for the Windows session:
-      read and follow the instructions at http://$BIND_ADDR:$PORT/retest.md
+      read and follow the instructions at http://$BIND_ADDR:$PORT/update.md
 
 EOF
 else

@@ -6,9 +6,11 @@
 //! via a single last-content guard: whatever we last applied-from-peer or
 //! broadcast-from-local is remembered, so re-reading it never echoes back.
 //!
-//! Text only for now. The protocol's `ClipboardImage` is reserved for a later pass
-//! (it needs RGBA<->PNG conversion and size capping); image messages received now
-//! are simply ignored.
+//! Text and images. Images travel as base64 PNG (`Message::ClipboardImage`), encoded
+//! from and decoded to the RGBA8 that both OS clipboards speak. They are polled less
+//! often than text and capped in both dimensions and encoded size, because reading an
+//! image off the clipboard is orders of magnitude more expensive than reading text and
+//! this process is also carrying live mouse and keyboard input.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -80,22 +82,149 @@ const POLL_INTERVAL: Duration = Duration::from_millis(500);
 /// mouse/keyboard latency). ~1 MiB of text is already far beyond normal use.
 const MAX_TEXT_BYTES: usize = 1024 * 1024;
 
-/// A minimal text-clipboard backend, abstracted so the sync logic is testable
-/// without a real OS clipboard.
-trait TextClipboard {
+/// Cap on the encoded PNG we will send. The frame codec allows 8 MiB; staying well
+/// under it keeps a large screenshot from adding latency to mouse and keyboard, which
+/// share this link.
+const MAX_IMAGE_BYTES: usize = 4 * 1024 * 1024;
+
+/// Cap on raw pixels, checked *before* decoding or encoding. 4096×4096 is 64 MiB of
+/// RGBA — beyond that, the conversion itself costs more time than a clipboard sync is
+/// worth, and a hostile or corrupt peer message could otherwise ask us to allocate
+/// gigabytes.
+const MAX_IMAGE_PIXELS: usize = 4096 * 4096;
+
+/// Poll the clipboard for an *image* only every Nth tick. Reading an image means the
+/// OS hands over (and we copy) a full uncompressed bitmap; doing that twice a second
+/// forever would burn measurable CPU in a process that must never be slow. Text stays
+/// on the fast tick because reading it is trivially cheap.
+const IMAGE_POLL_EVERY: u32 = 4; // 4 × 500 ms = every 2 s
+
+/// An RGBA8 image — the common currency between the OS clipboard and the PNG codec.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RgbaImage {
+    w: usize,
+    h: usize,
+    bytes: Vec<u8>,
+}
+
+/// A minimal clipboard backend, abstracted so the sync logic is testable without a
+/// real OS clipboard.
+trait SystemClipboard {
     /// Current clipboard text, or `None` if empty / not text / unavailable.
     fn read_text(&mut self) -> Option<String>;
     /// Set the clipboard text; returns whether it succeeded.
     fn write_text(&mut self, text: &str) -> bool;
+    /// Current clipboard image as RGBA8, or `None` if the clipboard holds no image.
+    fn read_image(&mut self) -> Option<RgbaImage>;
+    /// Set the clipboard image; returns whether it succeeded.
+    fn write_image(&mut self, img: &RgbaImage) -> bool;
 }
 
-impl TextClipboard for arboard::Clipboard {
+impl SystemClipboard for arboard::Clipboard {
     fn read_text(&mut self) -> Option<String> {
         self.get_text().ok()
     }
     fn write_text(&mut self, text: &str) -> bool {
         self.set_text(text.to_owned()).is_ok()
     }
+    fn read_image(&mut self) -> Option<RgbaImage> {
+        let img = self.get_image().ok()?;
+        Some(RgbaImage {
+            w: img.width,
+            h: img.height,
+            bytes: img.bytes.into_owned(),
+        })
+    }
+    fn write_image(&mut self, img: &RgbaImage) -> bool {
+        self.set_image(arboard::ImageData {
+            width: img.w,
+            height: img.h,
+            bytes: std::borrow::Cow::Borrowed(&img.bytes),
+        })
+        .is_ok()
+    }
+}
+
+/// A cheap fingerprint of a clipboard image, used only to answer "is this the same
+/// image I last sent or applied?" — the loop-free guard that `last` provides for text.
+///
+/// Deliberately samples rather than hashing every byte: this runs on a poll and the
+/// buffers are tens of megabytes. A collision would mean a genuinely new image is
+/// mistaken for the current one and not synced — benign and recoverable by re-copying,
+/// which is why sampling is an acceptable trade for keeping the poll O(1). Dimensions
+/// and length are included, so only images agreeing on size *and* every sampled window
+/// can collide.
+fn image_key(img: &RgbaImage) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    img.w.hash(&mut h);
+    img.h.hash(&mut h);
+    img.bytes.len().hash(&mut h);
+    const WINDOW: usize = 4096;
+    let n = img.bytes.len();
+    for start in [0, n / 3, 2 * n / 3, n.saturating_sub(WINDOW)] {
+        let end = (start + WINDOW).min(n);
+        if start < end {
+            img.bytes[start..end].hash(&mut h);
+        }
+    }
+    h.finish()
+}
+
+/// Encode RGBA8 as PNG. `None` if the image is outside the caps or the encoder fails.
+fn encode_png(img: &RgbaImage) -> Option<Vec<u8>> {
+    if img.w == 0 || img.h == 0 || img.w.checked_mul(img.h)? > MAX_IMAGE_PIXELS {
+        return None;
+    }
+    if img.bytes.len() != img.w.checked_mul(img.h)?.checked_mul(4)? {
+        return None; // not the RGBA8 we were promised
+    }
+    let mut out = Vec::new();
+    {
+        let mut enc = png::Encoder::new(&mut out, img.w as u32, img.h as u32);
+        enc.set_color(png::ColorType::Rgba);
+        enc.set_depth(png::BitDepth::Eight);
+        let mut writer = enc.write_header().ok()?;
+        writer.write_image_data(&img.bytes).ok()?;
+    }
+    Some(out)
+}
+
+/// Decode a PNG to RGBA8. Accepts the colour types a peer might plausibly send, not
+/// just the RGBA we ourselves write. `None` on anything malformed or oversized — this
+/// parses data that arrived over the network, so it must never panic or over-allocate.
+fn decode_png(data: &[u8]) -> Option<RgbaImage> {
+    let mut dec = png::Decoder::new(data);
+    dec.set_transformations(png::Transformations::normalize_to_color8() | png::Transformations::EXPAND);
+    let mut reader = dec.read_info().ok()?;
+    let (w, h) = {
+        let info = reader.info();
+        (info.width as usize, info.height as usize)
+    };
+    if w == 0 || h == 0 || w.checked_mul(h)? > MAX_IMAGE_PIXELS {
+        return None;
+    }
+    let mut buf = vec![0u8; reader.output_buffer_size()];
+    let frame = reader.next_frame(&mut buf).ok()?;
+    let src = &buf[..frame.buffer_size()];
+    let bytes: Vec<u8> = match frame.color_type {
+        png::ColorType::Rgba => src.to_vec(),
+        png::ColorType::Rgb => src.chunks_exact(3).flat_map(|p| [p[0], p[1], p[2], 255]).collect(),
+        png::ColorType::Grayscale => src.iter().flat_map(|&v| [v, v, v, 255]).collect(),
+        png::ColorType::GrayscaleAlpha => {
+            src.chunks_exact(2).flat_map(|p| [p[0], p[0], p[0], p[1]]).collect()
+        }
+        _ => return None, // indexed should have been expanded; anything else is unexpected
+    };
+    if bytes.len() != w.checked_mul(h)?.checked_mul(4)? {
+        return None;
+    }
+    Some(RgbaImage { w, h, bytes })
+}
+
+/// How an image is shown in the clipboard history (which is a list of strings).
+fn image_label(img: &RgbaImage, encoded: usize) -> String {
+    format!("[image {}×{}, {} KB]", img.w, img.h, encoded.div_ceil(1024))
 }
 
 /// Owns the clipboard-sync thread. Dropping or calling [`ClipboardSync::stop`]
@@ -170,8 +299,11 @@ fn run(
 
     // Seed with the current content so we don't broadcast the pre-existing clipboard
     // on startup. `last` is whatever we most recently applied-from-peer or
-    // broadcast-from-local — the anchor that makes the sync loop-free.
+    // broadcast-from-local — the anchor that makes the sync loop-free. `last_img` is
+    // the same anchor for images, kept as a fingerprint rather than the bitmap itself.
     let mut last = clipboard.read_text().filter(|t| !t.is_empty());
+    let mut last_img = clipboard.read_image().as_ref().map(image_key);
+    let mut tick: u32 = 0;
 
     loop {
         // Apply a received clipboard update if one arrived; this recv is also the
@@ -184,7 +316,14 @@ fn run(
                     }
                 }
             }
-            Ok(_) => {} // ClipboardImage and any stray message: ignored for now
+            Ok(Message::ClipboardImage { data, w, h }) => {
+                if let Some(label) = apply_remote_image(&mut clipboard, &mut last_img, &data, w, h) {
+                    if let Some(hist) = &history {
+                        hist.record(label, true);
+                    }
+                }
+            }
+            Ok(_) => {} // stray message for this thread: ignore
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break, // engine dropped the sender
         }
@@ -201,6 +340,17 @@ fn run(
                     h.record(sent, false);
                 }
             }
+            // Images on the slow tick — see `IMAGE_POLL_EVERY`. When the clipboard holds
+            // text rather than an image the read fails fast, so the expensive path only
+            // runs when there is actually an image to copy.
+            tick = tick.wrapping_add(1);
+            if tick % IMAGE_POLL_EVERY == 0 {
+                if let Some(sent) = poll_local_image(&mut clipboard, &mut last_img, &to_peer) {
+                    if let Some(h) = &history {
+                        h.record(sent, false);
+                    }
+                }
+            }
         }
     }
 }
@@ -208,7 +358,7 @@ fn run(
 /// Apply a clipboard value received from the peer, unless it's what we already have
 /// (which would mean it originated here and came back — don't reapply). Returns true
 /// if a new value was actually written (so the caller can record it in history).
-fn apply_remote<C: TextClipboard>(clipboard: &mut C, last: &mut Option<String>, text: String) -> bool {
+fn apply_remote<C: SystemClipboard>(clipboard: &mut C, last: &mut Option<String>, text: String) -> bool {
     if last.as_deref() == Some(text.as_str()) {
         return false;
     }
@@ -224,7 +374,7 @@ fn apply_remote<C: TextClipboard>(clipboard: &mut C, last: &mut Option<String>, 
 /// Forward a local clipboard change to the peer, unless it's what we last set/sent
 /// (which would echo a value the peer already has). Returns the forwarded text (so the
 /// caller can record it in history), or `None` if nothing was sent.
-fn poll_local<C: TextClipboard>(
+fn poll_local<C: SystemClipboard>(
     clipboard: &mut C,
     last: &mut Option<String>,
     to_peer: &UnboundedSender<Message>,
@@ -241,6 +391,77 @@ fn poll_local<C: TextClipboard>(
     *last = Some(text.clone());
     let _ = to_peer.send(Message::Clipboard { text: text.clone() });
     Some(text)
+}
+
+/// Apply an image received from the peer. Returns a history label if a new image was
+/// actually written, `None` if it was rejected or is what we already have.
+///
+/// `w`/`h` come off the wire alongside the PNG; they are treated as a claim to be
+/// checked against what the PNG actually decodes to, not as trusted dimensions.
+fn apply_remote_image<C: SystemClipboard>(
+    clipboard: &mut C,
+    last_img: &mut Option<u64>,
+    data: &str,
+    w: i32,
+    h: i32,
+) -> Option<String> {
+    use base64::Engine as _;
+    let raw = base64::engine::general_purpose::STANDARD.decode(data).ok()?;
+    if raw.len() > MAX_IMAGE_BYTES {
+        tracing::debug!("received clipboard image of {} bytes exceeds cap; ignoring", raw.len());
+        return None;
+    }
+    let img = decode_png(&raw).or_else(|| {
+        tracing::debug!("received clipboard image could not be decoded; ignoring");
+        None
+    })?;
+    if w > 0 && h > 0 && (img.w != w as usize || img.h != h as usize) {
+        tracing::debug!(
+            "clipboard image dimensions {}×{} disagree with the declared {w}×{h}; ignoring",
+            img.w,
+            img.h
+        );
+        return None;
+    }
+    let key = image_key(&img);
+    if *last_img == Some(key) {
+        return None; // originated here and came back
+    }
+    if !clipboard.write_image(&img) {
+        tracing::debug!("clipboard image set failed");
+        return None;
+    }
+    *last_img = Some(key);
+    Some(image_label(&img, raw.len()))
+}
+
+/// Forward a local clipboard image to the peer, unless it's what we last set/sent.
+/// Returns a history label if something was sent.
+fn poll_local_image<C: SystemClipboard>(
+    clipboard: &mut C,
+    last_img: &mut Option<u64>,
+    to_peer: &UnboundedSender<Message>,
+) -> Option<String> {
+    use base64::Engine as _;
+    let img = clipboard.read_image()?; // no image on the clipboard: nothing to do
+    let key = image_key(&img);
+    if *last_img == Some(key) {
+        return None;
+    }
+    // Remember it either way: a rejected image must not be re-encoded every poll.
+    *last_img = Some(key);
+    let png = encode_png(&img)?;
+    if png.len() > MAX_IMAGE_BYTES {
+        tracing::debug!("local clipboard image is {} bytes encoded; not syncing", png.len());
+        return None;
+    }
+    let label = image_label(&img, png.len());
+    let _ = to_peer.send(Message::ClipboardImage {
+        data: base64::engine::general_purpose::STANDARD.encode(&png),
+        w: img.w as i32,
+        h: img.h as i32,
+    });
+    Some(label)
 }
 
 /// Join `handle`, but never block longer than `timeout`: detach a wedged backend
@@ -265,8 +486,9 @@ mod tests {
     #[derive(Default)]
     struct Fake {
         content: Option<String>,
+        image: Option<RgbaImage>,
     }
-    impl TextClipboard for Fake {
+    impl SystemClipboard for Fake {
         fn read_text(&mut self) -> Option<String> {
             self.content.clone()
         }
@@ -274,6 +496,122 @@ mod tests {
             self.content = Some(text.to_owned());
             true
         }
+        fn read_image(&mut self) -> Option<RgbaImage> {
+            self.image.clone()
+        }
+        fn write_image(&mut self, img: &RgbaImage) -> bool {
+            self.image = Some(img.clone());
+            true
+        }
+    }
+
+    /// A solid-colour RGBA image, with `seed` mixed into every pixel so different
+    /// seeds differ everywhere (not just in a corner the fingerprint might miss).
+    fn img(w: usize, h: usize, seed: u8) -> RgbaImage {
+        let bytes = (0..w * h)
+            .flat_map(|i| {
+                let v = seed.wrapping_add(i as u8);
+                [v, v.wrapping_mul(3), v.wrapping_mul(7), 255]
+            })
+            .collect();
+        RgbaImage { w, h, bytes }
+    }
+
+    fn b64(data: &[u8]) -> String {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD.encode(data)
+    }
+
+    #[test]
+    fn png_roundtrip_preserves_the_image_exactly() {
+        // Clipboard images must survive the wire unchanged — a lossy or misordered
+        // channel conversion would silently corrupt every screenshot.
+        let original = img(32, 24, 5);
+        let encoded = encode_png(&original).expect("encode");
+        let decoded = decode_png(&encoded).expect("decode");
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn applied_remote_image_is_not_echoed_back() {
+        // The loop-free invariant, for images: an image we received and applied must
+        // not be re-sent when the next poll reads it back off the clipboard.
+        let (tx, mut rx) = unbounded_channel();
+        let mut cb = Fake::default();
+        let mut last_img = None;
+        let source = img(16, 16, 9);
+        let png = encode_png(&source).unwrap();
+
+        assert!(apply_remote_image(&mut cb, &mut last_img, &b64(&png), 16, 16).is_some());
+        assert_eq!(cb.image.as_ref(), Some(&source));
+        // The poll now reads back exactly what we just applied.
+        assert_eq!(poll_local_image(&mut cb, &mut last_img, &tx), None);
+        assert!(rx.try_recv().is_err(), "applied image must not echo back to the peer");
+    }
+
+    #[test]
+    fn a_new_local_image_is_sent_once() {
+        let (tx, mut rx) = unbounded_channel();
+        let mut cb = Fake {
+            image: Some(img(8, 8, 1)),
+            ..Default::default()
+        };
+        let mut last_img = None;
+
+        assert!(poll_local_image(&mut cb, &mut last_img, &tx).is_some());
+        match rx.try_recv() {
+            Ok(Message::ClipboardImage { w, h, data }) => {
+                assert_eq!((w, h), (8, 8));
+                assert_eq!(decode_png(&{
+                    use base64::Engine as _;
+                    base64::engine::general_purpose::STANDARD.decode(&data).unwrap()
+                }), Some(img(8, 8, 1)));
+            }
+            other => panic!("expected a ClipboardImage, got {other:?}"),
+        }
+        // Unchanged clipboard: no repeat send on the next poll.
+        assert_eq!(poll_local_image(&mut cb, &mut last_img, &tx), None);
+        assert!(rx.try_recv().is_err());
+
+        // A genuinely different image does go out.
+        cb.image = Some(img(8, 8, 200));
+        assert!(poll_local_image(&mut cb, &mut last_img, &tx).is_some());
+        assert!(rx.try_recv().is_ok());
+    }
+
+    #[test]
+    fn malformed_and_oversized_images_are_rejected_not_applied() {
+        // This decodes attacker-reachable data off the network: it must refuse
+        // cleanly rather than panic, over-allocate, or write junk to the clipboard.
+        let mut cb = Fake::default();
+        let mut last_img = None;
+
+        assert_eq!(apply_remote_image(&mut cb, &mut last_img, "not base64!!", 4, 4), None);
+        assert_eq!(apply_remote_image(&mut cb, &mut last_img, &b64(b"not a png"), 4, 4), None);
+        assert_eq!(apply_remote_image(&mut cb, &mut last_img, "", 0, 0), None);
+
+        // A valid PNG whose real dimensions contradict the declared ones is refused:
+        // trusting the header over the payload is how buffer-size bugs start.
+        let png = encode_png(&img(8, 8, 3)).unwrap();
+        assert_eq!(apply_remote_image(&mut cb, &mut last_img, &b64(&png), 4096, 4096), None);
+
+        assert!(cb.image.is_none(), "nothing should have reached the clipboard");
+        assert_eq!(last_img, None);
+    }
+
+    #[test]
+    fn an_image_too_large_to_encode_is_not_retried_every_poll() {
+        // Over-cap images must be remembered as "seen", otherwise every poll re-encodes
+        // a huge bitmap forever — burning CPU in the process that carries live input.
+        let (tx, _rx) = unbounded_channel();
+        let mut cb = Fake {
+            // Wider than MAX_IMAGE_PIXELS allows, so encode_png refuses it.
+            image: Some(RgbaImage { w: 5000, h: 5000, bytes: Vec::new() }),
+            ..Default::default()
+        };
+        let mut last_img = None;
+        assert_eq!(poll_local_image(&mut cb, &mut last_img, &tx), None);
+        assert!(last_img.is_some(), "the rejected image must still be fingerprinted");
     }
 
     #[test]
@@ -340,7 +678,7 @@ mod tests {
     #[test]
     fn empty_clipboard_is_ignored() {
         let (tx, mut rx) = unbounded_channel();
-        let mut cb = Fake { content: Some(String::new()) };
+        let mut cb = Fake { content: Some(String::new()), ..Default::default() };
         let mut last = None;
         poll_local(&mut cb, &mut last, &tx);
         assert!(rx.try_recv().is_err());

@@ -1,0 +1,448 @@
+<meta charset="utf-8">
+<title>mouse-rs — clickable prototype</title>
+<style>
+  /* ---------- themes (the app's six) ---------- */
+  .t-midnight{--bg:#0b0f17;--card:#121826;--card2:#161d2e;--line:#1f2937;--txt:#e6edf7;--txt2:#9fb0c8;--txt3:#6b7c96;--a1:#38bdf8;--a2:#6366f1;--ok:#34d399;--warn:#fbbf24;--dgr:#f87171;--ink:#07111d}
+  .t-oxide  {--bg:#100d0a;--card:#1a1511;--card2:#201a14;--line:#2e2620;--txt:#f2ebe3;--txt2:#c4b3a2;--txt3:#8a7867;--a1:#f59e0b;--a2:#ea580c;--ok:#84cc16;--warn:#fbbf24;--dgr:#f87171;--ink:#1a1000}
+  .t-synth  {--bg:#120a1c;--card:#1c1029;--card2:#231334;--line:#33204a;--txt:#f3e9ff;--txt2:#c4a9e0;--txt3:#8e6fb0;--a1:#e879f9;--a2:#8b5cf6;--ok:#4ade80;--warn:#fbbf24;--dgr:#fb7185;--ink:#1a0524}
+  .t-matrix {--bg:#050b07;--card:#0b1710;--card2:#0f1e15;--line:#1b3324;--txt:#ddf7e6;--txt2:#8fc9a5;--txt3:#5d8f6f;--a1:#22c55e;--a2:#15803d;--ok:#4ade80;--warn:#fbbf24;--dgr:#f87171;--ink:#03150a}
+  .t-nord   {--bg:#2e3440;--card:#3b4252;--card2:#434c5e;--line:#4c566a;--txt:#eceff4;--txt2:#c3ccdb;--txt3:#8d97ab;--a1:#88c0d0;--a2:#5e81ac;--ok:#a3be8c;--warn:#ebcb8b;--dgr:#bf616a;--ink:#22272f}
+  .t-paper  {--bg:#f6f7f9;--card:#ffffff;--card2:#f0f2f6;--line:#dde1e8;--txt:#1b2430;--txt2:#55637a;--txt3:#8592a6;--a1:#2563eb;--a2:#4f46e5;--ok:#15803d;--warn:#b45309;--dgr:#b91c1c;--ink:#ffffff}
+
+  *{box-sizing:border-box}
+  body{margin:0;background:#0a0d13;color:#c9d4e4;
+    font:14px/1.5 ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+    padding:26px 18px 60px;display:flex;flex-direction:column;align-items:center;gap:16px}
+  .stagebar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;justify-content:center;
+    font-size:12px;color:#7d8ba1}
+  .stagebar button{font:inherit;font-size:12px;background:#141a26;color:#c9d4e4;
+    border:1px solid #232c3d;border-radius:7px;padding:6px 11px;cursor:pointer}
+  .stagebar button.on{background:#1d2739;border-color:#38bdf8;color:#e6edf7}
+  .hint{font-size:12px;color:#6b7686;max-width:60ch;text-align:center}
+
+  /* ---------- panel ---------- */
+  .panel{background:var(--bg);color:var(--txt);border:1px solid var(--line);border-radius:12px;
+    overflow:hidden;box-shadow:0 24px 60px -24px #000;display:flex;flex-direction:column;
+    transition:width .18s ease,height .18s ease}
+  .titlebar{display:flex;align-items:center;justify-content:center;position:relative;padding:8px;
+    background:var(--card);border-bottom:1px solid var(--line);font-size:12px;color:var(--txt2);flex:0 0 auto}
+  .titlebar .dots{position:absolute;right:10px;display:flex;gap:6px}
+  .dot{width:10px;height:10px;border-radius:50%;background:var(--line)}
+  .body{padding:14px;display:flex;flex-direction:column;gap:11px;flex:1;min-height:0}
+
+  .hdr{display:flex;align-items:center;gap:9px;flex:0 0 auto}
+  .logo{font-size:18px;font-weight:600;letter-spacing:-.01em}
+  .pill{margin-left:auto;font-size:11px;padding:5px 10px;border-radius:99px;
+    background:color-mix(in srgb,var(--ok) 14%,transparent);color:var(--ok);
+    border:1px solid color-mix(in srgb,var(--ok) 34%,transparent);white-space:nowrap}
+  .pill.off{background:var(--card2);color:var(--txt3);border-color:var(--line)}
+  .kebab{width:30px;height:30px;border-radius:8px;border:1px solid var(--line);background:var(--card);
+    color:var(--txt2);display:grid;place-items:center;font-size:15px;cursor:pointer;flex:0 0 auto}
+  .kebab:hover{border-color:var(--a1);color:var(--txt)}
+
+  .card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px}
+
+  .hero{display:flex;align-items:center;gap:10px}
+  .chip{display:flex;align-items:center;gap:8px;background:var(--card2);border:1px solid var(--line);
+    border-radius:9px;padding:9px 11px;flex:1;min-width:0}
+  .chip.on{border-color:var(--a1);box-shadow:0 0 0 1px color-mix(in srgb,var(--a1) 22%,transparent)}
+  .chip .nm{font-size:12.5px;font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .chip .mt{font-size:10.5px;color:var(--txt3);margin-left:auto;white-space:nowrap}
+  .arrow{color:var(--a1);font-size:16px;flex:0 0 auto}
+  .live{margin-top:9px;font-size:12px;color:var(--a1);display:flex;align-items:center;gap:7px}
+  .live .d{width:6px;height:6px;border-radius:50%;background:var(--a1);animation:pulse 1.6s infinite}
+  .live.idle{color:var(--txt3)} .live.idle .d{background:var(--txt3);animation:none}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.25}}
+
+  .tabs{display:flex;gap:5px;flex:0 0 auto}
+  .tab{font-size:11.5px;padding:7px 12px;border-radius:8px;color:var(--txt2);border:1px solid transparent;
+    cursor:pointer;white-space:nowrap;background:none;font-family:inherit}
+  .tab:hover{color:var(--txt)}
+  .tab.on{background:linear-gradient(135deg,var(--a1),var(--a2));color:var(--ink);font-weight:600}
+
+  .scrollarea{flex:1;min-height:0;overflow-y:auto;padding-right:2px}
+  .scrollarea::-webkit-scrollbar{width:7px}
+  .scrollarea::-webkit-scrollbar-thumb{background:var(--line);border-radius:9px}
+
+  .field{margin-bottom:11px}
+  .field:last-child{margin-bottom:0}
+  .lbl{font-size:11px;color:var(--txt2);margin-bottom:5px}
+  input.inp,select.inp{width:100%;background:color-mix(in srgb,var(--bg) 70%,var(--card));
+    border:1px solid var(--line);border-radius:8px;padding:9px 11px;font-size:12.5px;color:var(--txt);
+    font-family:inherit;outline:none}
+  input.inp:focus,select.inp:focus{border-color:var(--a1)}
+  .row{display:flex;gap:7px;align-items:center}
+  .row .inp{flex:1}
+
+  .seg{display:flex;gap:5px}
+  .seg button{flex:1;text-align:center;font-size:11.5px;padding:9px 6px;border-radius:8px;
+    border:1px solid var(--line);color:var(--txt2);background:none;cursor:pointer;font-family:inherit}
+  .seg button.on{background:linear-gradient(135deg,var(--a1),var(--a2));color:var(--ink);
+    border-color:transparent;font-weight:600}
+
+  .toggle{display:flex;align-items:center;gap:10px;padding:8px 0;cursor:pointer}
+  .toggle .t{width:34px;height:19px;border-radius:99px;background:var(--line);position:relative;flex:0 0 auto;
+    transition:background .15s}
+  .toggle .t.on{background:var(--a1)}
+  .toggle .t::after{content:"";position:absolute;top:2.5px;left:2.5px;width:14px;height:14px;border-radius:50%;
+    background:var(--bg);transition:transform .15s}
+  .toggle .t.on::after{transform:translateX(15px)}
+  .toggle .tx{font-size:12.5px}
+  .toggle .tx small{display:block;color:var(--txt3);font-size:10.5px}
+
+  /* Edge picker drawn as the screen itself, with a strip on each edge — the shape
+     tells you what it means without a legend. */
+  .screen{position:relative;height:104px;border:1px solid var(--line);border-radius:10px;
+    background:color-mix(in srgb,var(--bg) 55%,var(--card));display:grid;place-items:center}
+  .screen .cap{font-size:12px;color:var(--txt3);pointer-events:none}
+  .edge{position:absolute;background:var(--line);border:0;border-radius:99px;cursor:pointer;
+    padding:0;transition:background .12s}
+  .edge:hover{background:var(--txt3)}
+  .edge.on{background:linear-gradient(180deg,var(--a1),var(--a2))}
+  .edge.top,.edge.bottom{height:7px;width:74px;left:50%;transform:translateX(-50%)}
+  .edge.on.top,.edge.on.bottom{background:linear-gradient(90deg,var(--a1),var(--a2))}
+  .edge.left,.edge.right{width:7px;height:52px;top:50%;transform:translateY(-50%)}
+  .edge.top{top:9px} .edge.bottom{bottom:9px}
+  .edge.left{left:9px} .edge.right{right:9px}
+
+  .btn{font-size:12px;padding:9px 13px;border-radius:8px;border:1px solid var(--line);
+    background:var(--card2);color:var(--txt2);white-space:nowrap;cursor:pointer;font-family:inherit}
+  .btn:hover{border-color:var(--a1);color:var(--txt)}
+  .btn.primary{background:linear-gradient(135deg,var(--a1),var(--a2));color:var(--ink);
+    border-color:transparent;font-weight:600}
+  .btn.stop{background:color-mix(in srgb,var(--dgr) 16%,transparent);
+    border-color:color-mix(in srgb,var(--dgr) 40%,transparent);color:var(--dgr);font-weight:600}
+  .btn.sm{font-size:11px;padding:7px 10px}
+
+  .footer{display:flex;align-items:center;gap:8px;padding-top:11px;border-top:1px solid var(--line);
+    flex:0 0 auto}
+  .fb{font-size:11px;color:var(--txt3);flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;
+    white-space:nowrap}
+
+  /* restart banner */
+  .banner{background:color-mix(in srgb,var(--warn) 10%,var(--card));
+    border:1px solid color-mix(in srgb,var(--warn) 34%,transparent);border-radius:10px;padding:11px 12px;
+    flex:0 0 auto}
+  .banner .h{font-size:12.5px;color:var(--warn);font-weight:600;margin-bottom:3px}
+  .banner .s{font-size:11.5px;color:var(--txt2);margin-bottom:9px}
+  .banner .mini{font-size:11px;color:var(--warn)}
+
+  /* overflow menu */
+  .menuwrap{position:relative}
+  .menu{position:absolute;right:0;top:36px;width:214px;background:var(--card);border:1px solid var(--line);
+    border-radius:10px;padding:6px;box-shadow:0 20px 44px -18px #000;z-index:40}
+  .mi{font-size:12px;padding:8px 10px;border-radius:7px;color:var(--txt2);display:flex;gap:9px;
+    align-items:center;cursor:pointer;background:none;border:0;width:100%;text-align:left;font-family:inherit}
+  .mi:hover{background:var(--card2);color:var(--txt)}
+  .mi .k{margin-left:auto;color:var(--txt3);font-size:10.5px}
+  .mi.sep{border-top:1px solid var(--line);margin-top:5px;padding-top:9px;border-radius:0 0 7px 7px}
+  .mi.danger{color:var(--dgr)}
+  .swatches{display:flex;gap:6px;padding:8px 10px 4px;flex-wrap:wrap}
+  .swatches button{width:19px;height:19px;border-radius:50%;border:2px solid transparent;cursor:pointer;padding:0}
+  .swatches button.on{border-color:var(--txt)}
+  .hidden{display:none!important}
+  .sub{font-size:10.5px;color:var(--txt3);padding:2px 10px 6px}
+</style>
+
+<div class="stagebar">
+  <span>Window:</span>
+  <button id="sz1" class="on" onclick="setSize(560,720,this)">560 × 720 (proposed)</button>
+  <button id="sz2" onclick="setSize(600,840,this)">600 × 840 (current)</button>
+  <button onclick="setSize(520,660,this)">520 × 660 (small)</button>
+  <span style="margin-left:14px">Clipboard tab:</span>
+  <button id="clipT" onclick="toggleClipTab(this)">its own tab</button>
+</div>
+<div class="hint">Everything below is clickable — tabs, the <b>⋯</b> menu, themes, toggles, Detect,
+Save, and Start/Stop. Change a setting then press <b>Save</b> while sharing is running to see the
+restart prompt.</div>
+
+<div class="panel t-midnight" id="panel" style="width:560px;height:720px">
+  <div class="titlebar">mouse-rs<span class="dots"><i class="dot"></i><i class="dot"></i><i class="dot"></i></span></div>
+  <div class="body">
+
+    <div class="hdr">
+      <span class="logo">mouse-rs</span>
+      <span class="pill" id="pill">connected</span>
+      <div class="menuwrap">
+        <button class="kebab" onclick="toggleMenu(event)">⋯</button>
+        <div class="menu hidden" id="menu">
+          <div class="sub">APPEARANCE</div>
+          <div class="swatches" id="swatches"></div>
+          <button class="mi" onclick="openProfiles()">🗂 Profiles<span class="k">▸</span></button>
+          <button class="mi" onclick="say('log opened: ~/.mouse_share/mouse-rs.log')">📄 Open log file</button>
+          <button class="mi sep danger" onclick="restoreDefaults()">↺ Restore defaults</button>
+          <button class="mi danger" onclick="say('would quit mouse-rs')">⏻ Quit<span class="k">Alt+F4</span></button>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="hero">
+        <div class="chip on" id="chipA"><span class="nm">kali-desktop</span><span class="mt">1440×900</span></div>
+        <span class="arrow">⇄</span>
+        <div class="chip" id="chipB"><span class="nm">laptop</span><span class="mt">1920×1080</span></div>
+      </div>
+      <div class="live" id="live"><span class="d"></span> <span id="liveTxt">controlled by laptop</span></div>
+    </div>
+
+    <div class="banner hidden" id="banner">
+      <div class="h">⚠ Restart needed</div>
+      <div class="s" id="bannerTxt">1 change saved but not yet active.</div>
+      <div class="row">
+        <button class="btn primary sm" onclick="restartNow()">Restart sharing now</button>
+        <button class="btn sm" onclick="later()">Later</button>
+      </div>
+    </div>
+    <div class="banner hidden" id="mini"><span class="mini" id="miniTxt"></span></div>
+
+    <div class="tabs" id="tabs"></div>
+
+    <div class="scrollarea"><div class="card" id="tabbody"></div></div>
+
+    <div class="footer">
+      <span class="fb" id="fb">ready</span>
+      <button class="btn" onclick="save()">Save</button>
+      <button class="btn primary" id="runBtn" onclick="toggleRun()">Stop sharing</button>
+    </div>
+  </div>
+</div>
+
+<script>
+const THEMES = [
+  ['midnight','#38bdf8'],['oxide','#f59e0b'],['synth','#e879f9'],
+  ['matrix','#22c55e'],['nord','#88c0d0'],['paper','#2563eb']
+];
+
+const S = {
+  theme:'midnight', tab:'Connection', running:true, controlled:true,
+  clipFolded:false, savedDiff:[], dismissed:false, found:[], scanning:false, profiles:[],
+  cfg:{ name:'kali-desktop', role:'client', host:'192.168.137.1', port:'24800',
+        listenHost:'0.0.0.0', listenPort:'24800', reconnect:true, tls:true, clip:true,
+        secret:'Uu5v9kQ2mT7xR4pL8nZ1cV6bY3wS5dF0gH', showSecret:false,
+        lockHotkey:'scroll_lock', returnHotkey:'ctrl+win+alt+esc', exit:'left', entry:'right',
+        w:'1440', h:'900', login:true, autoconnect:true, minimized:false },
+  live:null,
+};
+S.live = {...S.cfg};
+
+// settings that only apply on restart
+const RESTART_KEYS = {role:'role',host:'server host',port:'server port',listenHost:'listen host',
+  listenPort:'listen port',reconnect:'auto-reconnect',tls:'TLS',clip:'clipboard sync',
+  secret:'shared secret',exit:'exit edge',entry:'entry edge',name:'machine name',
+  lockHotkey:'lock hotkey',returnHotkey:'return hotkey'};
+
+const $ = id => document.getElementById(id);
+const say = m => { $('fb').textContent = m; };
+
+function setSize(w,h,btn){ const p=$('panel'); p.style.width=w+'px'; p.style.height=h+'px';
+  document.querySelectorAll('.stagebar button').forEach(b=>{ if(b.textContent.includes('×')) b.classList.remove('on')});
+  btn.classList.add('on'); }
+function toggleClipTab(btn){ S.clipFolded=!S.clipFolded;
+  btn.textContent = S.clipFolded ? 'folded into Security' : 'its own tab';
+  if(!S.clipFolded && S.tab==='Security') S.tab='Security'; render(); }
+
+function toggleMenu(e){ e.stopPropagation(); $('menu').classList.toggle('hidden'); }
+document.addEventListener('click',()=>$('menu').classList.add('hidden'));
+$('menu').addEventListener('click',e=>e.stopPropagation());
+
+function setTheme(t){ S.theme=t; $('panel').className='panel t-'+t; renderSwatches(); }
+function renderSwatches(){
+  $('swatches').innerHTML = THEMES.map(([n,c])=>
+    `<button style="background:${c}" class="${S.theme===n?'on':''}" title="${n}" onclick="setTheme('${n}')"></button>`).join('');
+}
+
+function tabsList(){
+  const t = ['Connection','Layout','Security'];
+  if(!S.clipFolded) t.push('Clipboard');
+  t.push('Startup');
+  return t;
+}
+function renderTabs(){
+  $('tabs').innerHTML = tabsList().map(t=>
+    `<button class="tab ${S.tab===t?'on':''}" onclick="S.tab='${t}';render()">${t}</button>`).join('');
+}
+
+function set(k,v){ S.cfg[k]=v; render(); }
+function toggle(k){ S.cfg[k]=!S.cfg[k]; render(); }
+
+function field(label,inner){ return `<div class="field"><div class="lbl">${label}</div>${inner}</div>`; }
+function toggleRow(k,title,sub){
+  return `<div class="toggle" onclick="toggle('${k}')"><span class="t ${S.cfg[k]?'on':''}"></span>
+    <span class="tx">${title}<small>${sub}</small></span></div>`;
+}
+function inp(k,ph){ return `<input class="inp" value="${S.cfg[k]}" placeholder="${ph||''}"
+  oninput="S.cfg['${k}']=this.value">`; }
+
+function tabBody(){
+  const c=S.cfg;
+  if(S.tab==='Connection'){
+    const isServer = c.role==='server';
+    let h = field('Role',`<div class="seg">
+      <button class="${isServer?'on':''}" onclick="set('role','server')">Server · has mouse</button>
+      <button class="${!isServer?'on':''}" onclick="set('role','client')">Client · receives</button></div>`);
+    if(isServer){
+      h += field('Listen host',`<div class="row">${inp('listenHost')}</div>`);
+      h += field("This machine's addresses",
+        `<select class="inp" onchange="set('listenHost',this.value)">
+           <option>0.0.0.0</option><option>192.168.137.2</option><option>10.99.78.242</option></select>`);
+      h += field('Listen port',inp('listenPort'));
+    } else {
+      h += field('Server host / IP',`<div class="row">${inp('host','press Detect, or type the peer IP')}
+        <button class="btn sm" onclick="detect()">${S.scanning?'Scanning…':'Detect'}</button></div>`);
+      if(S.found.length) h += field('Found on your network',
+        `<select class="inp" onchange="set('host',this.value)">${S.found.map(f=>`<option ${f===c.host?'selected':''}>${f}</option>`).join('')}</select>`);
+      h += field('Server port',inp('port'));
+      h += toggleRow('reconnect','Auto-reconnect','retry with backoff until the server appears');
+    }
+    return h;
+  }
+  if(S.tab==='Layout'){
+    const pick=(k)=>`<div class="screen">
+        <button class="edge top ${c[k]==='top'?'on':''}"       onclick="set('${k}','top')"    title="top"></button>
+        <button class="edge left ${c[k]==='left'?'on':''}"     onclick="set('${k}','left')"   title="left"></button>
+        <span class="cap">screen</span>
+        <button class="edge right ${c[k]==='right'?'on':''}"   onclick="set('${k}','right')"  title="right"></button>
+        <button class="edge bottom ${c[k]==='bottom'?'on':''}" onclick="set('${k}','bottom')" title="bottom"></button>
+      </div>`;
+    const OPP={left:'right',right:'left',top:'bottom',bottom:'top'};
+    const want=OPP[c.exit];
+    // Leaving through one edge should mean arriving through the facing one; anything else
+    // makes the screens feel overlapped. Warn rather than save it silently.
+    const warn = c.entry===want ? '' :
+      `<div style="font-size:11px;color:var(--warn);margin-top:-4px;margin-bottom:11px">
+        ⚠ Leaving at the ${c.exit} edge should bring the cursor in at the ${want} edge of the
+        other screen — ${c.entry} will feel like the screens overlap.</div>`;
+    return field('Exit edge — this machine leaves here', pick('exit'))
+      + field('Entry edge — client appears here', pick('entry'))
+      + warn
+      + field('Screen size (px)',`<div class="row">${inp('w')}<span style="color:var(--txt3)">×</span>${inp('h')}
+        <button class="btn sm" onclick="say('detected 1440 × 900')">Detect</button></div>`)
+      + `<div style="font-size:11px;color:var(--txt3);margin-top:-4px">
+          The engine re-detects this on Start; edit only to override.</div>`;
+  }
+  if(S.tab==='Security'){
+    const shown = S.cfg.showSecret ? S.cfg.secret : '•'.repeat(Math.min(34,S.cfg.secret.length));
+    let h = field('Shared secret — must match on both machines',
+      `<div class="row">
+         <input class="inp" value="${shown}" ${S.cfg.showSecret?'':'readonly'}
+                oninput="S.cfg.secret=this.value">
+         <button class="btn sm" onclick="toggle('showSecret')">${S.cfg.showSecret?'Hide':'Show'}</button>
+         <button class="btn sm" onclick="say('new secret generated')">Generate</button>
+       </div>`)
+      + toggleRow('tls','Encrypt link (TLS)','recommended — on by default')
+      + field('Lock / cross hotkey',
+          `${inp('lockHotkey','scroll_lock')}
+           <div style="font-size:10.5px;color:var(--txt3);margin-top:4px">
+             Single key. Always returns control, even if the network or engine has wedged.</div>`)
+      + field('Return hotkey (server)',
+          `${inp('returnHotkey','ctrl+win+alt+esc')}
+           <div style="font-size:10.5px;color:var(--txt3);margin-top:4px">
+             Optional combo. Matched on whichever machine is the server; leave empty for none.</div>`);
+    if(S.clipFolded) h += toggleRow('clip','Sync clipboard','share copied text and images both ways');
+    return h;
+  }
+  if(S.tab==='Clipboard'){
+    return toggleRow('clip','Clipboard sync','share copied text and images both ways')
+      + field('Recent transfers',
+        `<div style="font-size:11.5px;color:var(--txt3);line-height:1.9">
+          ↓ [image 1920×1080, 245 KB]<br>↑ https://example.com/some/link<br>↓ kubectl get pods -A</div>`);
+  }
+  // Startup
+  const profiles = `
+    <div style="border-top:1px solid var(--line);margin-top:14px;padding-top:12px">
+      <div class="lbl" style="font-size:12px;color:var(--txt)">Profiles</div>
+      <div style="font-size:11px;color:var(--txt3);margin:2px 0 9px;line-height:1.5">
+        A profile is a named snapshot of <em>every</em> setting on this page — peer address,
+        edges, screen size, hotkeys, secret. Save one per setup (say <b>desk</b> and
+        <b>travel</b>) and switch without retyping anything. Loading one replaces the form;
+        press Save to keep it.
+      </div>
+      <div class="row">
+        <select class="inp" ${S.profiles.length?'':'disabled'}>
+          ${S.profiles.length ? S.profiles.map(n=>`<option>${n}</option>`).join('')
+                              : '<option>no profiles saved yet</option>'}
+        </select>
+        <button class="btn sm" onclick="say('loaded profile')">Load</button>
+        <button class="btn sm" onclick="say('deleted profile')">Delete</button>
+      </div>
+      <div class="row" style="margin-top:7px">
+        <input class="inp" placeholder="name this setup…" id="pname">
+        <button class="btn sm" onclick="addProfile()">Save as</button>
+      </div>
+      <div style="font-size:10.5px;color:var(--txt3);margin-top:7px">
+        Stored in <code style="font-size:10px">~/.mouse_share/profiles/</code>, one file per
+        profile. They include the shared secret, so treat them like the config itself.
+      </div>
+    </div>`;
+  return field('Machine name',inp('name'))
+    + toggleRow('login','Start at login','launch the panel when you sign in')
+    + toggleRow('autoconnect','Auto-connect','bring the link up without pressing Start')
+    + toggleRow('minimized','Start minimized','open to the tray instead of the foreground')
+    + field('Log file',`<div style="font-size:11px;color:var(--txt3);word-break:break-all">
+        ~/.mouse_share/mouse-rs.log</div>`)
+    + profiles;
+}
+
+function detect(){
+  if(S.scanning) return;
+  S.scanning=true; say("scanning this machine's networks…"); render();
+  setTimeout(()=>{ S.scanning=false; S.found=['192.168.137.1']; S.cfg.host='192.168.137.1';
+    say('found 192.168.137.1'); render(); },1200);
+}
+
+function diff(){ if(!S.running) return [];
+  return Object.keys(RESTART_KEYS).filter(k=>S.cfg[k]!==S.live[k]).map(k=>RESTART_KEYS[k]); }
+
+function save(){ S.savedDiff = diff(); S.dismissed=false;
+  say(S.savedDiff.length?'saved':'saved'); render(); }
+function later(){ S.dismissed=true; render(); }
+function restartNow(){ const n=S.savedDiff.join(', '); S.live={...S.cfg}; S.savedDiff=[]; S.dismissed=false;
+  say(n?`restarted — new settings active (${n})`:'sharing restarted'); render(); }
+function toggleRun(){ S.running=!S.running;
+  if(S.running){ S.live={...S.cfg}; S.savedDiff=[]; S.controlled=true; say('started'); }
+  else { S.savedDiff=[]; say('stopped'); }
+  render(); }
+function restoreDefaults(){ $('menu').classList.add('hidden');
+  S.cfg={...S.cfg, role:'server', host:'', port:'24800', listenHost:'0.0.0.0', listenPort:'24800',
+    reconnect:true, tls:true, clip:true, exit:'left', entry:'right', login:false,
+    autoconnect:false, minimized:false};
+  say('defaults restored — kept your name, secret and screen (1440×900); press Save to apply'); render(); }
+function openProfiles(){ $('menu').classList.add('hidden'); S.tab='Startup'; render();
+  say('Profiles are at the bottom of the Startup tab'); }
+function addProfile(){ const el=document.getElementById('pname');
+  const n=(el&&el.value.trim())||'desk';
+  if(!S.profiles.includes(n)) S.profiles.push(n);
+  say(`saved profile "${n}"`); render(); }
+
+function render(){
+  renderTabs(); renderSwatches();
+  $('tabbody').innerHTML = tabBody();
+
+  $('pill').textContent = S.running ? 'connected' : 'stopped';
+  $('pill').className = 'pill' + (S.running?'':' off');
+  $('runBtn').textContent = S.running ? 'Stop sharing' : 'Start sharing';
+  $('runBtn').className = 'btn ' + (S.running ? 'stop' : 'primary');
+
+  $('chipA').className = 'chip' + (S.running && S.controlled ? '' : ' on');
+  $('chipB').className = 'chip' + (S.running && S.controlled ? ' on' : '');
+  $('live').className = 'live' + (S.running?'':' idle');
+  $('liveTxt').textContent = S.running
+    ? (S.controlled ? 'controlled by laptop' : 'this machine has the mouse and keyboard')
+    : 'sharing is off';
+
+  const pend = S.savedDiff;
+  const showFull = pend.length && !S.dismissed;
+  const showMini = pend.length && S.dismissed;
+  $('banner').classList.toggle('hidden', !showFull);
+  $('mini').classList.toggle('hidden', !showMini);
+  if(pend.length){
+    const txt = `${pend.length} change${pend.length>1?'s':''} saved but not yet active: ${pend.join(', ')}.`;
+    $('bannerTxt').textContent = txt;
+    $('miniTxt').textContent = '⚠ ' + txt + '  (restart to apply)';
+  }
+}
+try { setTheme('midnight'); render(); }
+catch(err){ document.getElementById('tabbody').innerHTML =
+  '<pre style="color:#f87171;font-size:11px;white-space:pre-wrap">'+err.stack+'</pre>'; }
+document.querySelector('.hero').addEventListener('click',()=>{ if(S.running){S.controlled=!S.controlled; render();} });
+</script>
