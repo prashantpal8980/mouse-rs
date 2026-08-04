@@ -14,7 +14,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::geometry::in_edge_band;
 use crate::injector::{InjectCmd, InjectorTx};
-use crate::status::{set_status_connected, set_status_disconnected, set_status_engaged};
+use crate::status::{set_crossed, set_status_connected, set_status_disconnected, set_status_engaged};
 use crate::{set_clipboard_connected, ClipboardRoute, EngineLink};
 
 /// Run the client engine until cancelled (or the link shuts down).
@@ -31,6 +31,7 @@ pub async fn run_client_engine(
         mut from_peer,
         mut events,
         status,
+        health,
     } = link;
 
     let entry_edge = cfg.entry_edge;
@@ -77,6 +78,7 @@ pub async fn run_client_engine(
                         moves = 0;
                         keys = 0;
                         set_status_engaged(&status, true);
+                        set_crossed(&health, true);
                         tracing::info!("peer took control, entry ({cx},{cy})");
                     }
                     Message::Leave => {
@@ -84,6 +86,7 @@ pub async fn run_client_engine(
                         active = false;
                         armed = false;
                         set_status_engaged(&status, false);
+                        set_crossed(&health, false);
                         report_crossing(moves, keys);
                     }
                     Message::MouseMove { dx, dy } if active => {
@@ -101,6 +104,7 @@ pub async fn run_client_engine(
                             active = false;
                             armed = false;
                             set_status_engaged(&status, false);
+                        set_crossed(&health, false);
                         }
                     }
                     // Clipboard sync is independent of who owns input: hand it to the

@@ -80,6 +80,10 @@ enum Message {
     ClipCacheGbChanged(String),
     ClipInlineKbChanged(String),
     ClipMaxFilesChanged(String),
+    ClipPersistToggled(bool),
+    ClipQuickSecsChanged(String),
+    BulkPauseToggled(bool),
+    BulkRateChanged(String),
     ReconnectToggled(bool),
     AutostartToggled(bool),
     AutoconnectToggled(bool),
@@ -214,6 +218,8 @@ struct App {
     clip_cache_gb_s: String,
     clip_inline_kb_s: String,
     clip_max_files_s: String,
+    clip_quick_s: String,
+    bulk_rate_s: String,
 }
 
 /// Bytes → whole MB for display. The panel talks in MB because that is the unit the
@@ -278,6 +284,8 @@ impl App {
             clip_cache_gb_s: String::new(),
             clip_inline_kb_s: String::new(),
             clip_max_files_s: String::new(),
+            clip_quick_s: String::new(),
+            bulk_rate_s: String::new(),
             saved_cfg: cfg.clone(),
             cfg,
         };
@@ -298,6 +306,8 @@ impl App {
         self.clip_auto_mb_s = (self.cfg.clipboard_auto_transfer_max / (1024 * 1024)).to_string();
         self.clip_inline_kb_s = (self.cfg.clipboard_inline_image_max / 1024).max(1).to_string();
         self.clip_max_files_s = self.cfg.clipboard_max_files_per_copy.to_string();
+        self.clip_quick_s = self.cfg.clipboard_quick_send_secs.to_string();
+        self.bulk_rate_s = self.cfg.bulk_rate_limit_mbps.to_string();
         self.clip_cache_gb_s =
             (self.cfg.clipboard_cache_budget / (1024 * 1024 * 1024)).max(1).to_string();
         self.bulk_port_s = if self.cfg.bulk_port == 0 {
@@ -540,12 +550,30 @@ impl App {
                 }
                 self.clip_max_files_s = s;
             }
+            Message::ClipPersistToggled(v) => self.cfg.clipboard_persist_history = v,
+            Message::ClipQuickSecsChanged(s) => {
+                // 0 is meaningful: it turns the shortcut off entirely.
+                if let Ok(v) = s.trim().parse::<u32>() {
+                    self.cfg.clipboard_quick_send_secs = v;
+                }
+                self.clip_quick_s = s;
+            }
+            Message::BulkPauseToggled(v) => self.cfg.bulk_pause_while_crossed = v,
+            Message::BulkRateChanged(s) => {
+                // 0 means adapt automatically, which is the default.
+                if let Ok(v) = s.trim().parse::<u32>() {
+                    self.cfg.bulk_rate_limit_mbps = v;
+                }
+                self.bulk_rate_s = s;
+            }
             Message::ClipCacheGbChanged(s) => {
                 if let Ok(v) = s.trim().parse::<u64>() {
                     self.cfg.clipboard_cache_budget = v.max(1) * 1024 * 1024 * 1024;
                 }
                 self.clip_inline_kb_s = (self.cfg.clipboard_inline_image_max / 1024).max(1).to_string();
         self.clip_max_files_s = self.cfg.clipboard_max_files_per_copy.to_string();
+        self.clip_quick_s = self.cfg.clipboard_quick_send_secs.to_string();
+        self.bulk_rate_s = self.cfg.bulk_rate_limit_mbps.to_string();
         self.clip_cache_gb_s = s;
             }
             Message::BulkPortChanged(s) => {
@@ -1379,6 +1407,13 @@ impl App {
             .color(p.txt3),
             toggle_row(
                 p,
+                "Keep history after restart",
+                "convenient — but clipboard contents, including anything you copied that was private, are written to your disk",
+                self.cfg.clipboard_persist_history,
+                Message::ClipPersistToggled
+            ),
+            toggle_row(
+                p,
                 "Advanced settings",
                 "size limits, memory budget, what gets synced",
                 self.clip_advanced,
@@ -1436,6 +1471,39 @@ impl App {
                     ))
                     .size(11.0)
                     .color(if img_cost > 128 * 1024 * 1024 { p.warn } else { p.txt3 }),
+                    labeled(
+                        p,
+                        "Don't ask if it'll take under (seconds)",
+                        input(p, "3", &self.clip_quick_s, Message::ClipQuickSecsChanged)
+                    ),
+                    text(if self.cfg.clipboard_quick_send_secs == 0 {
+                        "0 — the size limit alone decides.".to_string()
+                    } else {
+                        format!(
+                            "On a fast link a big file lands in a moment, so asking is noise. Measured from real transfers, so it still asks on a slow one. Currently {}.",
+                            match self.engine.as_ref().and_then(|e| e.measured_throughput()) {
+                                Some(bps) => format!("measuring ~{}/s", human_bytes(bps as usize)),
+                                None => "no measurement yet, so it always asks".to_string(),
+                            }
+                        )
+                    })
+                    .size(11.0)
+                    .color(p.txt3),
+                    toggle_row(
+                        p,
+                        "Pause transfers while I'm on the other machine",
+                        "protects the moment lag is most noticeable",
+                        self.cfg.bulk_pause_while_crossed,
+                        Message::BulkPauseToggled
+                    ),
+                    labeled(
+                        p,
+                        "Transfer speed limit (MB/s, 0 = automatic)",
+                        input(p, "0", &self.bulk_rate_s, Message::BulkRateChanged)
+                    ),
+                    text("Automatic watches your mouse latency and backs off by itself. Pin a number if you'd rather decide.")
+                        .size(11.0)
+                        .color(p.txt3),
                     toggle_row(
                         p,
                         "Separate lane for large transfers",

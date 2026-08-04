@@ -85,9 +85,23 @@ pub(crate) fn set_status_disconnected(s: &Option<StatusHandle>) {
     }
 }
 
-/// Update whether input is currently crossing, if a status handle is wired in.
+/// Update whether input is currently crossing.
+///
+/// Two sinks, deliberately independent: the UI's status handle (absent headless) and
+/// the shared link health the bulk lane paces against (present in both builds, because
+/// a headless session still must not stutter under a transfer).
 pub(crate) fn set_status_engaged(s: &Option<StatusHandle>, engaged: bool) {
     if let Some(s) = s {
         s.set_engaged(engaged);
+    }
+}
+
+/// Tell the bulk lane whether the user is currently driving the other machine.
+pub(crate) fn set_crossed(
+    h: &Option<std::sync::Arc<mouse_core::bulk::LinkHealth>>,
+    crossed: bool,
+) {
+    if let Some(h) = h {
+        h.set_crossed(crossed);
     }
 }

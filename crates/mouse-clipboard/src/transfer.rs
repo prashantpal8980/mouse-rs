@@ -37,6 +37,21 @@ use crate::cache::{self, BlobCache};
 use crate::files::FileList;
 use crate::{ClipStatus, ClipboardHistory, FileSet};
 
+/// The "don't ask if it'll be quick" rule, with the measurement it depends on.
+#[derive(Clone, Copy)]
+pub struct QuickSend {
+    /// Threshold in seconds. 0 disables the shortcut.
+    pub secs: f64,
+    /// Measured bytes per second, or 0 if nothing has finished yet.
+    pub bps: u64,
+}
+
+impl QuickSend {
+    fn estimate_secs(&self, bytes: u64) -> Option<f64> {
+        (self.bps > 0).then(|| bytes as f64 / self.bps as f64)
+    }
+}
+
 /// What a bulk transfer is carrying, sent once in the `Begin` frame.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BlobMeta {
@@ -218,15 +233,37 @@ impl Transfers {
     ///
     /// `Ready` when we already hold every hash — which is the dedup win: copying
     /// something back that came from here costs nothing at all.
-    pub fn initial_status(&self, set: &FileSet, auto_limit: u64) -> ClipStatus {
+    pub fn initial_status(
+        &self,
+        set: &FileSet,
+        auto_limit: u64,
+        quick: Option<QuickSend>,
+    ) -> ClipStatus {
         if set.files.iter().all(|f| self.cache.contains(&f.hash)) {
             return ClipStatus::Ready;
         }
-        if set.total_bytes() <= auto_limit {
-            ClipStatus::Remote
-        } else {
-            ClipStatus::NeedsConsent
+        let total = set.total_bytes();
+        if total <= auto_limit {
+            return ClipStatus::Remote;
         }
+        // Over the size limit, but if we can *measure* that it will be done in a few
+        // seconds, asking is noise. On a gigabit cable a 100 MB file lands in about a
+        // second; on a hotspot the same file does not, and the prompt still appears.
+        if let Some(q) = quick {
+            if q.secs > 0.0 {
+                if let Some(est) = q.estimate_secs(total) {
+                    if est <= q.secs {
+                        tracing::info!(
+                            bytes = total,
+                            est_secs = est,
+                            "over the ask limit, but quick enough on this link to just fetch"
+                        );
+                        return ClipStatus::Remote;
+                    }
+                }
+            }
+        }
+        ClipStatus::NeedsConsent
     }
 
     /// Ask the peer for everything in `set` that we do not already hold.
@@ -565,7 +602,7 @@ mod tests {
         fs::write(&a, vec![7u8; 4096]).unwrap();
         let set = t.describe_local(&FileList { paths: vec![a] }, "kali", 10_000).unwrap();
         // Tiny auto-limit, so only the cache hit can explain a Ready verdict.
-        assert_eq!(t.initial_status(&set, 1), ClipStatus::Ready);
+        assert_eq!(t.initial_status(&set, 1, None), ClipStatus::Ready);
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -582,8 +619,8 @@ mod tests {
             }],
             origin: "laptop".into(),
         };
-        assert_eq!(t.initial_status(&set, 1024 * 1024), ClipStatus::NeedsConsent);
-        assert_eq!(t.initial_status(&set, 200 * 1024 * 1024), ClipStatus::Remote);
+        assert_eq!(t.initial_status(&set, 1024 * 1024, None), ClipStatus::NeedsConsent);
+        assert_eq!(t.initial_status(&set, 200 * 1024 * 1024, None), ClipStatus::Remote);
         let _ = fs::remove_dir_all(&root);
     }
 

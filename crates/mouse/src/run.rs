@@ -6,7 +6,7 @@
 use std::time::Duration;
 
 use mouse_clipboard::{ClipCommandRx, ClipboardHistory, ClipboardSettings, ClipboardSync, HistoryLimits};
-use mouse_core::bulk::{BulkChannels, BulkServer, LinkHealth};
+use mouse_core::bulk::{BulkChannels, BulkServer, BulkSettings, LinkHealth};
 use mouse_core::net::{run_client, run_server, LinkParams};
 use mouse_core::protocol::Message;
 use mouse_core::{Config, Role};
@@ -29,6 +29,7 @@ pub fn run_blocking(
     status: Option<StatusHandle>,
     clip_history: Option<ClipboardHistory>,
     clip_commands: Option<ClipCommandRx>,
+    health: Option<std::sync::Arc<LinkHealth>>,
 ) -> anyhow::Result<()> {
     // Use the real screen size for edge geometry and the handshake, so crossing
     // math matches the surface the OS actually clamps the cursor against.
@@ -50,11 +51,16 @@ pub fn run_blocking(
     // Shared view of input-link latency. The input pump writes its heartbeat
     // round-trip here and the bulk lane paces against it, so a big transfer backs off
     // from the very thing it would otherwise damage.
-    let health = LinkHealth::new();
-    let mut bulk_wiring = setup_bulk(&cfg);
+    //
+    // Taken from the caller when there is one: the panel reads throughput off the same
+    // object, and two instances would mean it watches one nothing ever writes to.
+    let health = health.unwrap_or_default();
+    let mut bulk_wiring = setup_bulk(&cfg, health.clone());
     let (link_channels, mut engine_link) = EngineLink::new();
     // Wire the UI's status sink in (the headless CLI passes `None`).
     engine_link.status = status;
+    // And the shared health, so crossings pause the bulk lane in *both* builds.
+    engine_link.health = Some(health.clone());
 
     match cfg.role {
         Role::Server => {
@@ -80,7 +86,7 @@ pub fn run_blocking(
             // lanes share one port and one listener.
             let separate_bulk_port = bulk_port(&cfg) != cfg.listen_port;
             let bulk_server = match bulk_wiring.channels.take() {
-                Some(ch) => BulkServer::enabled(ch, health.clone()),
+                Some(ch) => BulkServer::enabled(ch, health.clone(), bulk_settings(&cfg)),
                 None => BulkServer::disabled(),
             };
             let (shared_bulk, extra_bulk) = if separate_bulk_port {
@@ -209,6 +215,10 @@ pub struct EngineHandle {
     status: StatusHandle,
     clip_history: ClipboardHistory,
     clip_commands: mouse_clipboard::ClipboardCommander,
+    /// Whether the owner asked for the history to survive a restart.
+    persist: bool,
+    cache_dir: String,
+    health: std::sync::Arc<LinkHealth>,
 }
 
 #[cfg(feature = "gui")]
@@ -219,7 +229,20 @@ impl EngineHandle {
         let c = cancel.clone();
         let status = StatusHandle::new();
         let s = status.clone();
+        let health = LinkHealth::new();
+        let health_for_engine = health.clone();
         let clip_history = ClipboardHistory::with_limits(clipboard_limits(&cfg));
+        if cfg.clipboard_persist_history {
+            let cache = mouse_clipboard::cache::BlobCache::new(if cfg.cache_dir.trim().is_empty() {
+                mouse_clipboard::cache::BlobCache::default_root()
+            } else {
+                std::path::PathBuf::from(&cfg.cache_dir)
+            })
+            .ok();
+            clip_history.load(&history_path(), cache.as_ref());
+        }
+        let persist = cfg.clipboard_persist_history;
+        let cache_dir = cfg.cache_dir.clone();
         let ch = clip_history.clone();
         // The panel keeps the sending half so it can ask for an entry to be put back on
         // the clipboard; the receiving half goes to the clipboard thread, which is the
@@ -228,8 +251,15 @@ impl EngineHandle {
         let thread = std::thread::Builder::new()
             .name("engine".into())
             .spawn(move || {
-                if let Err(e) = run_blocking(cfg, c, false, Some(s), Some(ch), Some(clip_command_rx))
-                {
+                if let Err(e) = run_blocking(
+                    cfg,
+                    c,
+                    false,
+                    Some(s),
+                    Some(ch),
+                    Some(clip_command_rx),
+                    Some(health_for_engine),
+                ) {
                     tracing::error!("engine exited with error: {e}");
                 }
             })
@@ -240,6 +270,9 @@ impl EngineHandle {
             status,
             clip_history,
             clip_commands,
+            persist,
+            cache_dir,
+            health,
         }
     }
 
@@ -286,6 +319,12 @@ impl EngineHandle {
         self.clip_history.remove(id);
     }
 
+    /// Measured bulk throughput, so the panel can say what the quick-send rule is
+    /// actually working from rather than implying a number we do not have.
+    pub fn measured_throughput(&self) -> Option<u64> {
+        self.health.throughput_bps()
+    }
+
     /// Drop every entry the user has not pinned.
     pub fn clipboard_clear(&self) {
         self.clip_history.clear();
@@ -295,6 +334,20 @@ impl EngineHandle {
 #[cfg(feature = "gui")]
 impl Drop for EngineHandle {
     fn drop(&mut self) {
+        // Written on the way out rather than on every copy: this is clipboard content,
+        // and rewriting it per keystroke would both cost I/O and widen the window in
+        // which a copied password sits in a file.
+        if self.persist {
+            let cache = mouse_clipboard::cache::BlobCache::new(if self.cache_dir.trim().is_empty() {
+                mouse_clipboard::cache::BlobCache::default_root()
+            } else {
+                std::path::PathBuf::from(&self.cache_dir)
+            })
+            .ok();
+            if let Err(e) = self.clip_history.save(&history_path(), cache.as_ref()) {
+                tracing::warn!("could not save clipboard history: {e}");
+            }
+        }
         self.cancel.cancel();
         if let Some(t) = self.thread.take() {
             // The engine's own teardown is bounded (≤ ~2s), so this join is bounded too.
@@ -384,7 +437,26 @@ struct BulkWiring {
 /// The cache is opened here rather than in the clipboard thread so a failure — a
 /// read-only home, a full disk — is reported once at startup and simply leaves file
 /// transfer switched off, instead of failing on every copy.
-fn setup_bulk(cfg: &Config) -> BulkWiring {
+fn bulk_settings(cfg: &Config) -> BulkSettings {
+    BulkSettings {
+        pause_while_crossed: cfg.bulk_pause_while_crossed,
+        // 0 means "adapt", which is what protects the mouse automatically.
+        rate_cap: match cfg.bulk_rate_limit_mbps {
+            0 => None,
+            m => Some(m as u64 * 1024 * 1024),
+        },
+    }
+}
+
+/// Where the saved clipboard history lives.
+pub fn history_path() -> std::path::PathBuf {
+    Config::default_path()
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join("history.json")
+}
+
+fn setup_bulk(cfg: &Config, health: std::sync::Arc<LinkHealth>) -> BulkWiring {
     if !cfg.bulk_enabled {
         return BulkWiring { channels: None, link: None };
     }
@@ -409,6 +481,7 @@ fn setup_bulk(cfg: &Config) -> BulkWiring {
             to_bulk: out_tx,
             from_bulk: in_rx,
             cache,
+            health,
         }),
     }
 }
@@ -426,6 +499,7 @@ async fn run_bulk_client_forever(
     health: std::sync::Arc<LinkHealth>,
 ) {
     let port = bulk_port(&cfg);
+    let settings = bulk_settings(&cfg);
     let mut backoff = params.reconnect_initial;
     loop {
         if cancel.is_cancelled() {
@@ -438,6 +512,7 @@ async fn run_bulk_client_forever(
             &cancel,
             ch,
             &health,
+            settings,
         )
         .await
         {
@@ -478,6 +553,8 @@ fn clipboard_settings(cfg: &Config) -> ClipboardSettings {
         machine: Box::leak(cfg.name.clone().into_boxed_str()),
         inline_image_max: cfg.clipboard_inline_image_max.max(1),
         max_files_per_copy: cfg.clipboard_max_files_per_copy.max(1),
+        quick_send_secs: cfg.clipboard_quick_send_secs as f64,
+        persist_history: cfg.clipboard_persist_history,
     }
 }
 

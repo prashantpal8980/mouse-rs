@@ -17,7 +17,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::geometry::{entry_point, in_edge_band, is_opposing};
 use crate::hotkey::{self, Hotkey};
-use crate::status::{set_status_connected, set_status_disconnected, set_status_engaged};
+use crate::status::{set_crossed, set_status_connected, set_status_disconnected, set_status_engaged};
 use crate::{set_clipboard_connected, ClipboardRoute, EngineLink};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -44,6 +44,7 @@ pub async fn run_server_engine(
         mut from_peer,
         mut events,
         status,
+        health,
     } = link;
 
     let exit_edge = cfg.exit_edge;
@@ -111,13 +112,14 @@ pub async fn run_server_engine(
                                 cross_armed = false;
                                 held_mods = 0; // fresh modifier state per crossing
                                 set_status_engaged(&status, true);
+                        set_crossed(&health, true);
                                 tracing::info!("crossed to remote, entry ({ex},{ey})");
                             }
                         }
                     }
                     (CaptureSignal::Input(ev), State::Remote) => {
                         if check_return(&ev, &mut held_mods, &lock_hk, &return_hk) {
-                            return_to_local(&to_peer, &suppress, &mut state, &mut cross_armed, &status, &mut held_mods);
+                            return_to_local(&to_peer, &suppress, &mut state, &mut cross_armed, &status, &health, &mut held_mods);
                         } else {
                             let _ = to_peer.send(ev.to_message());
                         }
@@ -132,7 +134,7 @@ pub async fn run_server_engine(
                     // (never-taken) suppression, and returns to Local. Harmless if we're
                     // already Local (a redundant Leave the client ignores when inactive).
                     (CaptureSignal::SuppressRejected, _) => {
-                        return_to_local(&to_peer, &suppress, &mut state, &mut cross_armed, &status, &mut held_mods);
+                        return_to_local(&to_peer, &suppress, &mut state, &mut cross_armed, &status, &health, &mut held_mods);
                     }
                 }
             }
@@ -177,7 +179,7 @@ pub async fn run_server_engine(
                     // The peer pushed back through its entry edge.
                     Some(Message::LeaveRequest) => {
                         if state == State::Remote {
-                            return_to_local(&to_peer, &suppress, &mut state, &mut cross_armed, &status, &mut held_mods);
+                            return_to_local(&to_peer, &suppress, &mut state, &mut cross_armed, &status, &health, &mut held_mods);
                         }
                     }
                     // Clipboard sync lives off the input path: hand it to the
@@ -195,12 +197,14 @@ pub async fn run_server_engine(
 }
 
 /// Hand control back to the local machine: release suppression and tell the peer.
+#[allow(clippy::too_many_arguments)]
 fn return_to_local(
     to_peer: &UnboundedSender<Message>,
     suppress: &Suppressor,
     state: &mut State,
     cross_armed: &mut bool,
     status: &Option<crate::status::StatusHandle>,
+    health: &Option<std::sync::Arc<mouse_core::bulk::LinkHealth>>,
     held_mods: &mut u8,
 ) {
     suppress.set(false);
@@ -209,6 +213,7 @@ fn return_to_local(
     *cross_armed = false;
     *held_mods = 0; // every path out of Remote clears modifier tracking
     set_status_engaged(status, false);
+    set_crossed(health, false);
     tracing::info!("returned to local");
 }
 

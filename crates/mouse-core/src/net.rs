@@ -1202,6 +1202,7 @@ mod tests {
         let bulk = BulkServer::enabled(
             crate::bulk::BulkChannels { outgoing: bulk_out_rx, incoming: bulk_in_tx },
             health.clone(),
+            crate::bulk::BulkSettings::default(),
         );
 
         let server = tokio::spawn(run_server(

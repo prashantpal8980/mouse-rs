@@ -49,6 +49,11 @@ pub struct EngineLink {
     /// The binary sets this after `new()`; the engine updates it on connect/
     /// disconnect and edge crossings.
     pub status: Option<status::StatusHandle>,
+    /// Optional shared link health. The engine sets `crossed` on it as control moves
+    /// between machines, which is what lets the bulk lane stand down at exactly the
+    /// moment latency is felt. Independent of `status` on purpose: this must work in
+    /// the headless build too, where there is no UI to observe.
+    pub health: Option<std::sync::Arc<mouse_core::bulk::LinkHealth>>,
 }
 
 /// Wiring the binary hands the engine for clipboard sync. The engine routes
@@ -90,6 +95,7 @@ impl EngineLink {
                 from_peer: from_rx,
                 events: ev_rx,
                 status: None,
+                health: None,
             },
         )
     }

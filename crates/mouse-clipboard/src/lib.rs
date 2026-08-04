@@ -23,6 +23,8 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+use std::io::Write as _;
+
 use tokio::sync::mpsc::UnboundedSender;
 
 use mouse_core::protocol::Message;
@@ -514,10 +516,12 @@ pub struct BulkLink {
     pub from_bulk: Receiver<mouse_core::bulk::BulkFrame>,
     /// Where transferred contents are kept.
     pub cache: Arc<cache::BlobCache>,
+    /// Shared link measurements, for the "will this be quick?" question.
+    pub health: Arc<mouse_core::bulk::LinkHealth>,
 }
 
 /// The clipboard-thread half of the user's settings.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ClipboardSettings {
     pub sync_text: bool,
     pub sync_images: bool,
@@ -540,6 +544,10 @@ pub struct ClipboardSettings {
     /// Most files one copy may include, so a stray click on a huge folder does not
     /// commit the machine to hashing a million files.
     pub max_files_per_copy: usize,
+    /// Skip the prompt when a transfer is measured to finish this fast. 0 disables it.
+    pub quick_send_secs: f64,
+    /// Keep history across restarts.
+    pub persist_history: bool,
 }
 
 impl Default for ClipboardSettings {
@@ -555,6 +563,8 @@ impl Default for ClipboardSettings {
             machine: "this machine",
             inline_image_max: DEFAULT_INLINE_IMAGE_MAX,
             max_files_per_copy: DEFAULT_MAX_FILES_PER_COPY,
+            quick_send_secs: 3.0,
+            persist_history: false,
         }
     }
 }
@@ -798,13 +808,14 @@ fn run(
     } else {
         None
     };
-    let (mut transfers, to_bulk, from_bulk) = match bulk {
+    let (mut transfers, to_bulk, from_bulk, health) = match bulk {
         Some(b) => (
             Some(transfer::Transfers::new(b.cache)),
             Some(b.to_bulk),
             Some(b.from_bulk),
+            Some(b.health),
         ),
-        None => (None, None, None),
+        None => (None, None, None, None),
     };
     let mut tick: u32 = 0;
 
@@ -857,7 +868,14 @@ fn run(
             Ok(Message::ClipboardFiles { files: refs, origin }) if settings.sync_files => {
                 if let (Some(t), Some(h)) = (transfers.as_mut(), history.as_ref()) {
                     let set = Arc::new(FileSet { files: refs, origin });
-                    let status = t.initial_status(&set, settings.auto_transfer_max);
+                    let status = t.initial_status(
+                        &set,
+                        settings.auto_transfer_max,
+                        Some(transfer::QuickSend {
+                            secs: settings.quick_send_secs,
+                            bps: health.as_ref().and_then(|h| h.throughput_bps()).unwrap_or(0),
+                        }),
+                    );
                     tracing::info!(
                         count = set.files.len(),
                         bytes = set.total_bytes(),
@@ -1672,6 +1690,118 @@ mod tests {
     }
 
     #[test]
+    fn history_survives_a_restart_when_the_owner_asked_for_it() {
+        let dir = std::env::temp_dir().join(format!("mouse-rs-persist-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cache = cache::BlobCache::new(dir.join("cache")).unwrap();
+        let path = dir.join("history.json");
+
+        let h = ClipboardHistory::new();
+        h.record_text(txt("first"), false);
+        let pinned = h.record_text(txt("keep me"), true).unwrap();
+        h.toggle_pin(pinned);
+        let png = encode_png(&img(8, 8, 2), 4096).unwrap();
+        h.record_image(Arc::new(png.clone()), 8, 8, true);
+        h.save(&path, Some(&cache)).expect("save");
+
+        // A fresh process.
+        let back = ClipboardHistory::new();
+        back.load(&path, Some(&cache));
+        let m = back.meta();
+        assert_eq!(m.len(), 3, "everything came back");
+        assert_eq!(m[0].preview, "image 8×8, 1 KB", "newest first, order preserved");
+        assert!(m.iter().any(|e| e.preview == "keep me" && e.pinned), "pins survive too");
+
+        // And the restored image is genuinely usable, not just a label — the exact
+        // defect this whole feature started from.
+        let img_id = m[0].id;
+        match back.payload(img_id) {
+            Some(ClipPayload::Image { png: got, .. }) => assert_eq!(*got, png),
+            other => panic!("expected the pixels back, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_saved_image_whose_pixels_were_evicted_is_dropped_not_restored_dead() {
+        let dir = std::env::temp_dir().join(format!("mouse-rs-persist2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cache = cache::BlobCache::new(dir.join("cache")).unwrap();
+        let path = dir.join("history.json");
+
+        let h = ClipboardHistory::new();
+        let png = encode_png(&img(8, 8, 5), 4096).unwrap();
+        h.record_image(Arc::new(png.clone()), 8, 8, true);
+        h.record_text(txt("text is fine"), false);
+        h.save(&path, Some(&cache)).unwrap();
+
+        // The cache is cleared between runs; a row pointing at nothing is worse than
+        // no row, because clicking it would silently do nothing.
+        std::fs::remove_file(cache.blob_path(&cache::hash_bytes(&png))).unwrap();
+        let back = ClipboardHistory::new();
+        back.load(&path, Some(&cache));
+        let m = back.meta();
+        assert_eq!(m.len(), 1);
+        assert_eq!(m[0].preview, "text is fine");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn quick_send_uses_a_measurement_and_never_a_guess() {
+        let dir = std::env::temp_dir().join(format!("mouse-rs-quick-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cache = Arc::new(cache::BlobCache::new(dir.clone()).unwrap());
+        let t = transfer::Transfers::new(cache);
+        let set = FileSet {
+            files: vec![FileRef {
+                name: "big.iso".into(),
+                size: 100 * 1024 * 1024,
+                hash: "e".repeat(64),
+                source_path: None,
+                rel: String::new(),
+            }],
+            origin: "laptop".into(),
+        };
+        let limit = 1024 * 1024;
+
+        // No measurement yet: it must ask rather than assume the link is fast.
+        assert_eq!(
+            t.initial_status(&set, limit, Some(transfer::QuickSend { secs: 3.0, bps: 0 })),
+            ClipStatus::NeedsConsent
+        );
+        // Gigabit: 100 MB in about a second, so asking is noise.
+        assert_eq!(
+            t.initial_status(
+                &set,
+                limit,
+                Some(transfer::QuickSend { secs: 3.0, bps: 110 * 1024 * 1024 })
+            ),
+            ClipStatus::Remote
+        );
+        // Hotspot: the same file takes 20 s, so it still asks.
+        assert_eq!(
+            t.initial_status(
+                &set,
+                limit,
+                Some(transfer::QuickSend { secs: 3.0, bps: 5 * 1024 * 1024 })
+            ),
+            ClipStatus::NeedsConsent
+        );
+        // And 0 turns the shortcut off entirely, even on a fast link.
+        assert_eq!(
+            t.initial_status(
+                &set,
+                limit,
+                Some(transfer::QuickSend { secs: 0.0, bps: 110 * 1024 * 1024 })
+            ),
+            ClipStatus::NeedsConsent
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_small_image_stays_on_the_input_lane() {
         // A screenshot that crosses in milliseconds must not pay for a round trip.
         let (tx, mut rx) = unbounded_channel();
@@ -1767,4 +1897,165 @@ mod tests {
         assert_eq!(poll_local(&mut cb, &mut last, &tx, set()).as_deref().map(|s| s.as_str()), Some("out"));
         assert!(poll_local(&mut cb, &mut last, &tx, set()).is_none(), "unchanged -> None");
     }
+}
+
+// ----------------------------------------------------------------------------
+// Persistence
+// ----------------------------------------------------------------------------
+
+/// One entry as it is written to disk.
+///
+/// Text is stored inline. Images and files are stored **by hash**, because their
+/// contents are already in the blob cache and duplicating them into a JSON file would
+/// double the disk cost of every screenshot.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct StoredEntry {
+    pinned: bool,
+    incoming: bool,
+    #[serde(default)]
+    text: Option<String>,
+    #[serde(default)]
+    image: Option<StoredImage>,
+    #[serde(default)]
+    files: Option<StoredFiles>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct StoredImage {
+    hash: String,
+    w: usize,
+    h: usize,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct StoredFiles {
+    files: Vec<FileRef>,
+    origin: String,
+}
+
+impl ClipboardHistory {
+    /// Write the history to `path`, oldest last, so it can be restored on next launch.
+    ///
+    /// Called on shutdown rather than on every change: this is clipboard content, and
+    /// rewriting it to disk on every copy would both cost I/O and widen the window in
+    /// which a password sits in a file.
+    #[allow(clippy::needless_borrows_for_generic_args)]
+    pub fn save(&self, path: &std::path::Path, cache: Option<&cache::BlobCache>) -> std::io::Result<()> {
+        let Ok(g) = self.inner.lock() else {
+            return Ok(()); // a poisoned lock is not worth failing shutdown over
+        };
+        let mut out = Vec::new();
+        for e in g.entries.iter() {
+            let stored = match &e.payload {
+                ClipPayload::Text(t) => StoredEntry {
+                    pinned: e.pinned,
+                    incoming: e.incoming,
+                    text: Some((**t).clone()),
+                    image: None,
+                    files: None,
+                },
+                ClipPayload::Image { png, w, h } => {
+                    // Park the pixels in the cache so the JSON stays small; without a
+                    // cache there is nowhere to put them, so the entry is skipped
+                    // rather than written as something that cannot be restored.
+                    let Some(c) = cache else { continue };
+                    let hash = cache::hash_bytes(png);
+                    if !c.contains(&hash) {
+                        let Ok(mut f) = c.open_partial(&hash) else { continue };
+                        if f.write_all(png).is_err() {
+                            continue;
+                        }
+                        drop(f);
+                        if c.finish(&hash).is_err() {
+                            continue;
+                        }
+                    }
+                    StoredEntry {
+                        pinned: e.pinned,
+                        incoming: e.incoming,
+                        text: None,
+                        image: Some(StoredImage { hash, w: *w, h: *h }),
+                        files: None,
+                    }
+                }
+                ClipPayload::Files(set) => StoredEntry {
+                    pinned: e.pinned,
+                    incoming: e.incoming,
+                    text: None,
+                    image: None,
+                    files: Some(StoredFiles {
+                        files: set.files.clone(),
+                        origin: set.origin.clone(),
+                    }),
+                },
+            };
+            out.push(stored);
+        }
+        let json = serde_json::to_vec_pretty(&out)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        // Same atomic write the config uses: a crash mid-write must not leave a
+        // truncated file where a valid one was.
+        let tmp = path.with_extension("tmp");
+        {
+            let mut f = std::fs::File::create(&tmp)?;
+            f.write_all(&json)?;
+            f.sync_all()?;
+        }
+        std::fs::rename(&tmp, path)?;
+        restrict_permissions(path);
+        tracing::info!(count = out.len(), "clipboard history saved");
+        Ok(())
+    }
+
+    /// Restore a saved history. Entries whose content no longer exists are dropped
+    /// rather than restored as rows that cannot do anything.
+    pub fn load(&self, path: &std::path::Path, cache: Option<&cache::BlobCache>) {
+        let Ok(raw) = std::fs::read(path) else { return };
+        let Ok(stored): Result<Vec<StoredEntry>, _> = serde_json::from_slice(&raw) else {
+            tracing::warn!("saved clipboard history could not be read; starting empty");
+            return;
+        };
+        let mut restored = 0usize;
+        // Oldest first, so pushing to the front rebuilds the original order.
+        for s in stored.into_iter().rev() {
+            let id = if let Some(t) = s.text {
+                self.record_text(Arc::new(t), s.incoming)
+            } else if let Some(img) = s.image {
+                match cache.and_then(|c| std::fs::read(c.blob_path(&img.hash)).ok()) {
+                    Some(png) => self.record_image(Arc::new(png), img.w, img.h, s.incoming),
+                    None => continue, // the pixels were evicted; the row would be dead
+                }
+            } else if let Some(f) = s.files {
+                let set = Arc::new(FileSet { files: f.files, origin: f.origin });
+                let status = match cache {
+                    Some(c) if set.files.iter().all(|f| c.contains(&f.hash)) => ClipStatus::Ready,
+                    _ => ClipStatus::Remote,
+                };
+                self.record_files(set, s.incoming, status)
+            } else {
+                None
+            };
+            if let Some(id) = id {
+                if s.pinned {
+                    self.toggle_pin(id);
+                }
+                restored += 1;
+            }
+        }
+        if restored > 0 {
+            tracing::info!(count = restored, "clipboard history restored");
+        }
+    }
+}
+
+/// Best-effort 0600 on the history file. It can hold anything the user copied, so it
+/// gets the same treatment as the config that holds the shared secret.
+fn restrict_permissions(path: &std::path::Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+    #[cfg(not(unix))]
+    let _ = path;
 }

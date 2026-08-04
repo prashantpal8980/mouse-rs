@@ -51,11 +51,13 @@ fn main() -> anyhow::Result<()> {
             None,
             None,
             None,
+            None,
         ),
         Some("client") => run::run_blocking(
             force_role(cfg, Role::Client),
             CancellationToken::new(),
             true,
+            None,
             None,
             None,
             None,

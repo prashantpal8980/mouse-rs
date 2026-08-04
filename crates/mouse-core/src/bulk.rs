@@ -203,6 +203,10 @@ pub struct LinkHealth {
     /// Set while the user is actively driving the other machine. Latency is felt most
     /// keenly here, so the bulk lane stands down entirely.
     crossed: AtomicBool,
+    /// Bytes per second observed on the last completed bulk transfer, or 0 if none has
+    /// finished yet. Used to answer "will this be quick?" with a measurement rather
+    /// than a guess — round-trip time says nothing about bandwidth.
+    throughput_bps: AtomicU64,
 }
 
 impl LinkHealth {
@@ -238,6 +242,35 @@ impl LinkHealth {
 
     pub fn crossed(&self) -> bool {
         self.crossed.load(Ordering::Relaxed)
+    }
+
+    /// Record what a finished transfer actually achieved.
+    pub fn record_throughput(&self, bytes: u64, elapsed: Duration) {
+        let secs = elapsed.as_secs_f64();
+        if bytes == 0 || secs <= 0.0 {
+            return;
+        }
+        // Smoothed, so one unusually fast or slow transfer does not swing the estimate.
+        let sample = (bytes as f64 / secs) as u64;
+        let prev = self.throughput_bps.load(Ordering::Relaxed);
+        let next = if prev == 0 { sample } else { (prev * 3 + sample) / 4 };
+        self.throughput_bps.store(next, Ordering::Relaxed);
+    }
+
+    /// Measured bulk throughput, or `None` if nothing has finished yet.
+    pub fn throughput_bps(&self) -> Option<u64> {
+        match self.throughput_bps.load(Ordering::Relaxed) {
+            0 => None,
+            v => Some(v),
+        }
+    }
+
+    /// How long `bytes` would take at the measured rate. `None` until we have a
+    /// measurement — guessing here would either nag about fast transfers or silently
+    /// start slow ones.
+    pub fn estimate_secs(&self, bytes: u64) -> Option<f64> {
+        let bps = self.throughput_bps()?;
+        Some(bytes as f64 / bps as f64)
     }
 
     pub fn latest_us(&self) -> u64 {
@@ -279,6 +312,24 @@ pub const MAX_RATE_BYTES_PER_SEC: u64 = 512 * 1024 * 1024;
 const START_RATE_BYTES_PER_SEC: u64 = 2 * 1024 * 1024;
 /// How much to add per healthy step (additive increase).
 const RATE_STEP_BYTES_PER_SEC: u64 = 1024 * 1024;
+
+/// How the owner wants the bulk lane to behave.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BulkSettings {
+    /// Stand down entirely while the user is driving the other machine.
+    pub pause_while_crossed: bool,
+    /// A fixed rate in bytes per second, or `None` to adapt to measured latency.
+    pub rate_cap: Option<u64>,
+}
+
+impl Default for BulkSettings {
+    fn default() -> Self {
+        BulkSettings {
+            pause_while_crossed: true,
+            rate_cap: None,
+        }
+    }
+}
 
 /// Decides how fast the bulk lane may send, from [`LinkHealth`].
 ///
@@ -369,6 +420,7 @@ pub enum BulkServer {
     Enabled {
         channels: Arc<tokio::sync::Mutex<Option<BulkChannels>>>,
         health: Arc<LinkHealth>,
+        settings: BulkSettings,
     },
 }
 
@@ -377,10 +429,15 @@ impl BulkServer {
         BulkServer::Disabled
     }
 
-    pub fn enabled(channels: BulkChannels, health: Arc<LinkHealth>) -> BulkServer {
+    pub fn enabled(
+        channels: BulkChannels,
+        health: Arc<LinkHealth>,
+        settings: BulkSettings,
+    ) -> BulkServer {
         BulkServer::Enabled {
             channels: Arc::new(tokio::sync::Mutex::new(Some(channels))),
             health,
+            settings,
         }
     }
 
@@ -391,13 +448,14 @@ impl BulkServer {
         framed: Framed<LinkStream, MessageCodec>,
         cancel: &CancellationToken,
     ) {
-        let BulkServer::Enabled { channels, health } = self else {
+        let BulkServer::Enabled { channels, health, settings } = self else {
             tracing::debug!("a peer asked for the bulk lane, but it is disabled here");
             return;
         };
         let framed = into_bulk_framed(framed);
         let channels = channels.clone();
         let health = health.clone();
+        let settings = *settings;
         let cancel = cancel.clone();
         tokio::spawn(async move {
             // One bulk session at a time. A second connection means the peer
@@ -407,7 +465,7 @@ impl BulkServer {
             let mut guard = channels.lock().await;
             let Some(ch) = guard.as_mut() else { return };
             tracing::info!("bulk lane connected");
-            bulk_pump(framed, ch, &cancel, &health).await;
+            bulk_pump(framed, ch, &cancel, &health, settings).await;
             tracing::info!("bulk lane closed");
         });
     }
@@ -435,11 +493,17 @@ async fn bulk_pump(
     ch: &mut BulkChannels,
     cancel: &CancellationToken,
     health: &Arc<LinkHealth>,
+    settings: BulkSettings,
 ) {
     use futures::{SinkExt, StreamExt};
     let (mut sink, mut stream) = framed.split();
-    // Rate is re-evaluated per frame from the input link's own latency.
-    let mut pacer = Pacer::new(health.clone(), None);
+    // Rate is re-evaluated per frame from the input link's own latency, unless the
+    // owner has pinned it.
+    let mut pacer = Pacer::new(health.clone(), settings.rate_cap);
+    // Bytes and time for the current transfer, so a finished one leaves behind a real
+    // throughput measurement rather than an assumption.
+    let mut sent_bytes: u64 = 0;
+    let mut started: Option<tokio::time::Instant> = None;
 
     loop {
         tokio::select! {
@@ -459,6 +523,19 @@ async fn bulk_pump(
             out = ch.outgoing.recv() => match out {
                 None => return,
                 Some(frame) => {
+                    if matches!(frame, BulkFrame::Begin { .. }) {
+                        sent_bytes = 0;
+                        started = Some(tokio::time::Instant::now());
+                    }
+                    // Standing down while the user is driving the other machine: that is
+                    // the moment latency is felt, and it costs the transfer a few
+                    // seconds it will not miss.
+                    while pacer.should_pause(settings.pause_while_crossed) {
+                        tokio::select! {
+                            _ = cancel.cancelled() => return,
+                            _ = tokio::time::sleep(Duration::from_millis(120)) => {}
+                        }
+                    }
                     // Hold the paced rate *before* writing, so the delay is spent idle
                     // rather than inside a socket write we could no longer interrupt.
                     let bytes = frame.payload_len();
@@ -472,6 +549,7 @@ async fn bulk_pump(
                             }
                         }
                     }
+                    let is_end = matches!(frame, BulkFrame::End { .. });
                     let sent = tokio::select! {
                         _ = cancel.cancelled() => return,
                         r = sink.send(frame) => r,
@@ -479,6 +557,12 @@ async fn bulk_pump(
                     if let Err(e) = sent {
                         tracing::warn!("bulk send failed: {e}");
                         return;
+                    }
+                    sent_bytes += bytes as u64;
+                    if is_end {
+                        if let Some(t0) = started.take() {
+                            health.record_throughput(sent_bytes, t0.elapsed());
+                        }
                     }
                 }
             },
@@ -490,6 +574,7 @@ async fn bulk_pump(
 ///
 /// Failure here is not fatal to anything: the input link carries on, and the app falls
 /// back to sending large items inline. A machine with no bulk lane is slower, not broken.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_bulk_client(
     cfg: &crate::config::Config,
     port: u16,
@@ -497,11 +582,12 @@ pub async fn run_bulk_client(
     cancel: &CancellationToken,
     ch: &mut BulkChannels,
     health: &Arc<LinkHealth>,
+    settings: BulkSettings,
 ) -> Result<(), String> {
     let framed = crate::net::connect_and_handshake(cfg, port, crate::protocol::Lane::Bulk, handshake_timeout, cancel)
         .await?;
     tracing::info!("bulk lane connected to {}:{}", cfg.server_host, port);
-    bulk_pump(into_bulk_framed(framed), ch, cancel, health).await;
+    bulk_pump(into_bulk_framed(framed), ch, cancel, health, settings).await;
     Ok(())
 }
 

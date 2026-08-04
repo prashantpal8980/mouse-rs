@@ -95,6 +95,9 @@ fn default_inline_image() -> usize {
 fn default_max_files() -> usize {
     10_000
 }
+fn default_quick_send() -> u32 {
+    3
+}
 
 /// On-disk configuration. Field names match the Python version exactly.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -167,6 +170,29 @@ pub struct Config {
     /// commit the machine to hashing all of it.
     #[serde(default = "default_max_files")]
     pub clipboard_max_files_per_copy: usize,
+    /// Suspend transfers while you are driving the other machine — the moment latency
+    /// is most noticeable, and a pause the transfer will not miss.
+    #[serde(default = "default_true")]
+    pub bulk_pause_while_crossed: bool,
+    /// Fixed transfer rate in MB/s. `0` adapts to measured input latency, which is the
+    /// default and what protects the mouse automatically.
+    #[serde(default)]
+    pub bulk_rate_limit_mbps: u32,
+    /// Skip the "this is big" prompt when the transfer is estimated to finish within
+    /// this many seconds. `0` disables the shortcut and the size limit alone decides.
+    ///
+    /// Uses *measured* throughput from a previous transfer; with no measurement yet it
+    /// does nothing, because guessing would either nag about fast copies or silently
+    /// start slow ones.
+    #[serde(default = "default_quick_send")]
+    pub clipboard_quick_send_secs: u32,
+    /// Keep clipboard history across restarts.
+    ///
+    /// Off by default, matching Windows. On means clipboard contents — possibly
+    /// passwords — are written to disk, which is the owner's call to make and is said
+    /// plainly next to the setting.
+    #[serde(default)]
+    pub clipboard_persist_history: bool,
 
     #[serde(default = "default_lock_hotkey")]
     pub lock_hotkey: String,
@@ -234,6 +260,10 @@ impl Default for Config {
             cache_dir: String::new(),
             clipboard_inline_image_max: default_inline_image(),
             clipboard_max_files_per_copy: default_max_files(),
+            bulk_pause_while_crossed: true,
+            bulk_rate_limit_mbps: 0,
+            clipboard_quick_send_secs: default_quick_send(),
+            clipboard_persist_history: false,
             lock_hotkey: default_lock_hotkey(),
             return_hotkey: String::new(),
             listen_host: default_listen_host(),
