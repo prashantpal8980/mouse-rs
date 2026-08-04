@@ -30,7 +30,10 @@ use tokio_util::codec::Framed;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::Config;
-use crate::protocol::{CodecError, Message, MessageCodec, PROTOCOL_VERSION};
+use std::sync::Arc;
+
+use crate::bulk::{BulkServer, LinkHealth};
+use crate::protocol::{CodecError, Lane, Message, MessageCodec, PROTOCOL_VERSION};
 use crate::{auth, tls};
 
 /// Tunable timing for the link. Defaults are conservative for a LAN.
@@ -191,24 +194,38 @@ fn enable_keepalive(stream: &TcpStream) {
 // ----------------------------------------------------------------------------
 
 /// Run the server side until `cancel` fires. Re-accepts after each disconnect.
-pub async fn run_server(cfg: Config, params: LinkParams, cancel: CancellationToken, mut ch: LinkChannels) {
+///
+/// `bulk` receives any connection that declares [`Lane::Bulk`]. Pass
+/// [`BulkServer::disabled`] to refuse them, which is what a build with the bulk lane
+/// turned off does.
+pub async fn run_server(
+    cfg: Config,
+    params: LinkParams,
+    cancel: CancellationToken,
+    ch: LinkChannels,
+    bulk: BulkServer,
+    health: Arc<LinkHealth>,
+) {
+    // Kept for the accept loop's own diagnostics: `ch` moves into the session task for
+    // the duration of a session, and an accept error still has to be reportable.
+    let link_events = ch.events.clone();
     let bind = format!("{}:{}", cfg.listen_host, cfg.listen_port);
     let listener = match TcpListener::bind(&bind).await {
         Ok(l) => l,
         Err(e) => {
-            let _ = ch.events.send(LinkEvent::Error(format!("bind {bind} failed: {e}")));
+            let _ = link_events.send(LinkEvent::Error(format!("bind {bind} failed: {e}")));
             return;
         }
     };
     if let Ok(addr) = listener.local_addr() {
-        let _ = ch.events.send(LinkEvent::Listening(addr));
+        let _ = link_events.send(LinkEvent::Listening(addr));
     }
 
     let acceptor = if cfg.tls_enabled {
         match tls::server_acceptor() {
             Ok(a) => Some(a),
             Err(e) => {
-                let _ = ch.events.send(LinkEvent::Error(format!("tls setup: {e}")));
+                let _ = link_events.send(LinkEvent::Error(format!("tls setup: {e}")));
                 return;
             }
         }
@@ -216,68 +233,135 @@ pub async fn run_server(cfg: Config, params: LinkParams, cancel: CancellationTok
         None
     };
 
+    // The input session runs as a *task* rather than inline, so the accept loop keeps
+    // running while a session is live. That is what lets the bulk lane connect on this
+    // same port at any moment instead of having to arrive in a particular order.
+    //
+    // `pump` itself is untouched — only the orchestration around it changed. The
+    // channels can only belong to one session at a time, so they are handed to the
+    // session task and handed back when it ends; `ch_slot` being `None` is precisely
+    // "an input session is live".
+    let mut ch_slot: Option<LinkChannels> = Some(ch);
+    let mut session: Option<tokio::task::JoinHandle<(LinkChannels, DisconnectReason)>> = None;
+    let events = link_events.clone();
+
     loop {
-        let accept = tokio::select! {
-            _ = cancel.cancelled() => return,
-            r = listener.accept() => r,
-        };
-        let (tcp, peer_addr) = match accept {
-            Ok(v) => v,
-            Err(e) => {
-                let _ = ch.events.send(LinkEvent::Error(format!("accept: {e}")));
-                continue;
-            }
-        };
-        enable_keepalive(&tcp);
-        let _ = ch.events.send(LinkEvent::Connecting(peer_addr.to_string()));
+        tokio::select! {
+            _ = cancel.cancelled() => break,
 
-        // Wrap in TLS if enabled.
-        let stream = match &acceptor {
-            Some(acc) => match timeout(params.handshake_timeout, acc.accept(tcp)).await {
-                Ok(Ok(s)) => LinkStream::ServerTls(Box::new(s)),
-                Ok(Err(e)) => {
-                    let _ = ch.events.send(LinkEvent::Error(format!("tls accept: {e}")));
-                    continue;
+            // An input session ended: take the channels back so the next client can be
+            // served, and surface the reason exactly as the inline version did.
+            joined = async { session.as_mut().expect("guarded by the `if`").await },
+                if session.is_some() =>
+            {
+                session = None;
+                match joined {
+                    Ok((returned, reason)) => {
+                        let stop = matches!(reason, DisconnectReason::Cancelled);
+                        let _ = returned.events.send(LinkEvent::Disconnected(reason));
+                        ch_slot = Some(returned);
+                        if stop {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        // The session task panicked. Without the channels back there is
+                        // no way to serve another client, so stop rather than spin.
+                        let _ = events.send(LinkEvent::Error(format!("session task failed: {e}")));
+                        break;
+                    }
                 }
-                Err(_) => {
-                    let _ = ch.events.send(LinkEvent::Error("tls accept timed out".into()));
-                    continue;
+            }
+
+            accepted = listener.accept() => {
+                let (tcp, peer_addr) = match accepted {
+                    Ok(v) => v,
+                    Err(e) => {
+                        let _ = events.send(LinkEvent::Error(format!("accept: {e}")));
+                        continue;
+                    }
+                };
+                enable_keepalive(&tcp);
+
+                // Wrap in TLS if enabled.
+                let stream = match &acceptor {
+                    Some(acc) => match timeout(params.handshake_timeout, acc.accept(tcp)).await {
+                        Ok(Ok(s)) => LinkStream::ServerTls(Box::new(s)),
+                        Ok(Err(e)) => {
+                            let _ = events.send(LinkEvent::Error(format!("tls accept: {e}")));
+                            continue;
+                        }
+                        Err(_) => {
+                            let _ = events.send(LinkEvent::Error("tls accept timed out".into()));
+                            continue;
+                        }
+                    },
+                    None => LinkStream::Plain(tcp),
+                };
+
+                let mut framed = Framed::new(stream, MessageCodec::new());
+                // Auth handshake, bounded and cancel-aware. The lane is only known once
+                // the Hello has been read, so `Connecting` is not announced until we
+                // know this is the input connection — a bulk connection is plumbing and
+                // has no business changing what the panel says.
+                let shook = tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    r = timeout(params.handshake_timeout, server_handshake(&mut framed, &cfg)) => r,
+                };
+                let (peer_name, peer_w, peer_h, lane) = match shook {
+                    Ok(Ok(v)) => v,
+                    Ok(Err(reason)) => {
+                        let _ = events.send(LinkEvent::AuthFailed(reason));
+                        continue;
+                    }
+                    Err(_) => {
+                        let _ = events.send(LinkEvent::AuthFailed("handshake timed out".into()));
+                        continue;
+                    }
+                };
+
+                match lane {
+                    Lane::Bulk => {
+                        // Bulk connections are handed off and the loop continues. A new
+                        // one replaces whatever came before: the only reason a second
+                        // arrives is that the peer reconnected it.
+                        bulk.take_server_connection(framed, &cancel);
+                    }
+                    Lane::Input => {
+                        let Some(mut owned) = ch_slot.take() else {
+                            // One input client at a time. Refusing immediately is kinder
+                            // than accepting into a queue the peer will time out on; it
+                            // retries with backoff and connects once the stale session
+                            // hits its liveness timeout.
+                            tracing::warn!(
+                                peer = %peer_name,
+                                "refusing a second input connection; one is already live"
+                            );
+                            continue;
+                        };
+                        let _ = owned.events.send(LinkEvent::Connecting(peer_addr.to_string()));
+                        let _ = owned.events.send(LinkEvent::Connected {
+                            peer: peer_name,
+                            width: peer_w,
+                            height: peer_h,
+                        });
+                        let c = cancel.clone();
+                        let h = health.clone();
+                        session = Some(tokio::spawn(async move {
+                            let reason = pump(framed, params, &c, &mut owned, &h).await;
+                            (owned, reason)
+                        }));
+                    }
                 }
-            },
-            None => LinkStream::Plain(tcp),
-        };
-
-        let mut framed = Framed::new(stream, MessageCodec::new());
-
-        // Auth handshake (server side), bounded and cancel-aware.
-        let peer_name = tokio::select! {
-            _ = cancel.cancelled() => return,
-            r = timeout(params.handshake_timeout, server_handshake(&mut framed, &cfg)) => r,
-        };
-        let (peer_name, peer_w, peer_h) = match peer_name {
-            Ok(Ok(v)) => v,
-            Ok(Err(reason)) => {
-                let _ = ch.events.send(LinkEvent::AuthFailed(reason));
-                continue;
             }
-            Err(_) => {
-                let _ = ch.events.send(LinkEvent::AuthFailed("handshake timed out".into()));
-                continue;
-            }
-        };
-
-        let _ = ch.events.send(LinkEvent::Connected {
-            peer: peer_name,
-            width: peer_w,
-            height: peer_h,
-        });
-        let reason = pump(framed, params, &cancel, &mut ch).await;
-        let stop = matches!(reason, DisconnectReason::Cancelled);
-        let _ = ch.events.send(LinkEvent::Disconnected(reason));
-        if stop {
-            return;
         }
-        // otherwise loop and accept the next client
+    }
+
+    // Cancelled: let a live session finish its own bounded teardown, then report it.
+    if let Some(handle) = session {
+        if let Ok((returned, reason)) = handle.await {
+            let _ = returned.events.send(LinkEvent::Disconnected(reason));
+        }
     }
 }
 
@@ -305,7 +389,13 @@ enum AttemptOutcome {
 /// set it keeps retrying with exponential backoff after any recoverable drop —
 /// including before the server is up — until `cancel` fires. The engine resets its
 /// crossing state on every `Connected`, so reusing this link across reconnects is safe.
-pub async fn run_client(cfg: Config, params: LinkParams, cancel: CancellationToken, mut ch: LinkChannels) {
+pub async fn run_client(
+    cfg: Config,
+    params: LinkParams,
+    cancel: CancellationToken,
+    mut ch: LinkChannels,
+    health: Arc<LinkHealth>,
+) {
     let mut backoff = params.reconnect_initial;
     // Whether we've already told the UI we're down, so repeated failed retries
     // while the server stays offline don't spam Disconnected every backoff tick.
@@ -316,7 +406,7 @@ pub async fn run_client(cfg: Config, params: LinkParams, cancel: CancellationTok
             return;
         }
 
-        match connect_once(&cfg, params, &cancel, &mut ch).await {
+        match connect_once(&cfg, params, &cancel, &mut ch, &health).await {
             AttemptOutcome::Cancelled | AttemptOutcome::Fatal => return,
             AttemptOutcome::Lost { was_connected, reason } => {
                 let recoverable = reason.is_recoverable();
@@ -355,6 +445,7 @@ async fn connect_once(
     params: LinkParams,
     cancel: &CancellationToken,
     ch: &mut LinkChannels,
+    health: &Arc<LinkHealth>,
 ) -> AttemptOutcome {
     let addr = format!("{}:{}", cfg.server_host, cfg.server_port);
     let _ = ch.events.send(LinkEvent::Connecting(addr.clone()));
@@ -415,7 +506,7 @@ async fn connect_once(
 
     let server_name = tokio::select! {
         _ = cancel.cancelled() => return AttemptOutcome::Cancelled,
-        r = timeout(params.handshake_timeout, client_handshake(&mut framed, cfg)) => r,
+        r = timeout(params.handshake_timeout, client_handshake(&mut framed, cfg, Lane::Input)) => r,
     };
     let (server_name, server_w, server_h) = match server_name {
         Ok(Ok(v)) => v,
@@ -438,13 +529,133 @@ async fn connect_once(
         width: server_w,
         height: server_h,
     });
-    let reason = pump(framed, params, cancel, ch).await;
+    let reason = pump(framed, params, cancel, ch, health).await;
     match reason {
         DisconnectReason::Cancelled => AttemptOutcome::Cancelled,
         reason => AttemptOutcome::Lost {
             was_connected: true,
             reason,
         },
+    }
+}
+
+/// A second listener that only serves the bulk lane.
+///
+/// Only used when the owner has set a bulk port different from the input one. The
+/// default (`bulk_port = 0`) shares the input listener and never calls this, so the
+/// common deployment still needs exactly one port reachable.
+pub async fn run_bulk_listener(
+    cfg: Config,
+    port: u16,
+    params: LinkParams,
+    cancel: CancellationToken,
+    bulk: BulkServer,
+) {
+    let bind = format!("{}:{}", cfg.listen_host, port);
+    let listener = match TcpListener::bind(&bind).await {
+        Ok(l) => l,
+        Err(e) => {
+            // Not fatal: the input link is untouched and the app simply has no bulk
+            // lane. Saying so is the whole value here — a silent failure would look
+            // exactly like a lane that works but never gets used.
+            tracing::warn!("bulk listener could not bind {bind}: {e}; the bulk lane is off");
+            return;
+        }
+    };
+    tracing::info!("bulk lane listening on {bind}");
+
+    let acceptor = if cfg.tls_enabled {
+        match tls::server_acceptor() {
+            Ok(a) => Some(a),
+            Err(e) => {
+                tracing::warn!("bulk listener tls setup failed: {e}; the bulk lane is off");
+                return;
+            }
+        }
+    } else {
+        None
+    };
+
+    loop {
+        let accepted = tokio::select! {
+            _ = cancel.cancelled() => return,
+            r = listener.accept() => r,
+        };
+        let Ok((tcp, _addr)) = accepted else { continue };
+        enable_keepalive(&tcp);
+
+        let stream = match &acceptor {
+            Some(acc) => match timeout(params.handshake_timeout, acc.accept(tcp)).await {
+                Ok(Ok(s)) => LinkStream::ServerTls(Box::new(s)),
+                _ => continue,
+            },
+            None => LinkStream::Plain(tcp),
+        };
+
+        let mut framed = Framed::new(stream, MessageCodec::new());
+        let shook = tokio::select! {
+            _ = cancel.cancelled() => return,
+            r = timeout(params.handshake_timeout, server_handshake(&mut framed, &cfg)) => r,
+        };
+        match shook {
+            // The same shared secret guards this port as the input one; a connection
+            // that authenticates but asks for the input lane is refused here, because
+            // input has exactly one home and it is not this listener.
+            Ok(Ok((_, _, _, Lane::Bulk))) => bulk.take_server_connection(framed, &cancel),
+            Ok(Ok((name, _, _, Lane::Input))) => {
+                tracing::warn!(peer = %name, "input connection offered to the bulk port; refused")
+            }
+            Ok(Err(reason)) => tracing::warn!("bulk handshake rejected: {reason}"),
+            Err(_) => tracing::warn!("bulk handshake timed out"),
+        }
+    }
+}
+
+/// Connect, TLS, and handshake for a *secondary* lane, returning the live connection.
+///
+/// Separate from [`connect_once`] on purpose: that function owns the input link's
+/// reconnect policy and its UI events, and neither belongs to a lane whose failure the
+/// user should never have to think about. Errors come back as a string for the caller
+/// to log and retry at its own pace.
+pub async fn connect_and_handshake(
+    cfg: &Config,
+    port: u16,
+    lane: Lane,
+    handshake_timeout: Duration,
+    cancel: &CancellationToken,
+) -> Result<Framed<LinkStream, MessageCodec>, String> {
+    let addr = format!("{}:{}", cfg.server_host, port);
+    let tcp = tokio::select! {
+        _ = cancel.cancelled() => return Err("cancelled".into()),
+        r = timeout(handshake_timeout, TcpStream::connect(&addr)) => r,
+    };
+    let tcp = match tcp {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => return Err(format!("connect {addr}: {e}")),
+        Err(_) => return Err(format!("connect {addr}: timed out")),
+    };
+    enable_keepalive(&tcp);
+
+    let stream = if cfg.tls_enabled {
+        let connector = tls::client_connector().map_err(|e| format!("tls setup: {e}"))?;
+        match timeout(handshake_timeout, connector.connect(tls::dummy_server_name(), tcp)).await {
+            Ok(Ok(s)) => LinkStream::ClientTls(Box::new(s)),
+            Ok(Err(e)) => return Err(format!("tls connect: {e}")),
+            Err(_) => return Err("tls connect timed out".into()),
+        }
+    } else {
+        LinkStream::Plain(tcp)
+    };
+
+    let mut framed = Framed::new(stream, MessageCodec::new());
+    let shook = tokio::select! {
+        _ = cancel.cancelled() => return Err("cancelled".into()),
+        r = timeout(handshake_timeout, client_handshake(&mut framed, cfg, lane)) => r,
+    };
+    match shook {
+        Ok(Ok(_)) => Ok(framed),
+        Ok(Err(e)) => Err(e),
+        Err(_) => Err("handshake timed out".into()),
     }
 }
 
@@ -455,10 +666,10 @@ async fn connect_once(
 async fn server_handshake(
     framed: &mut Framed<LinkStream, MessageCodec>,
     cfg: &Config,
-) -> Result<(String, i32, i32), String> {
+) -> Result<(String, i32, i32, Lane), String> {
     let hello = framed.next().await;
-    let (name, width, height) = match hello {
-        Some(Ok(Message::Hello { name, width, height, .. })) => (name, width, height),
+    let (name, width, height, lane) = match hello {
+        Some(Ok(Message::Hello { name, width, height, lane, .. })) => (name, width, height, lane),
         Some(Ok(other)) => return Err(format!("expected hello, got {other:?}")),
         Some(Err(e)) => return Err(format!("hello decode: {e}")),
         None => return Err("peer closed before hello".into()),
@@ -502,12 +713,13 @@ async fn server_handshake(
         .await
         .map_err(|e| format!("send auth ok: {e}"))?;
 
-    Ok((name, width, height))
+    Ok((name, width, height, lane))
 }
 
 async fn client_handshake(
     framed: &mut Framed<LinkStream, MessageCodec>,
     cfg: &Config,
+    lane: Lane,
 ) -> Result<(String, i32, i32), String> {
     framed
         .send(Message::Hello {
@@ -515,6 +727,7 @@ async fn client_handshake(
             width: cfg.screen_width,
             height: cfg.screen_height,
             version: PROTOCOL_VERSION,
+            lane,
         })
         .await
         .map_err(|e| format!("send hello: {e}"))?;
@@ -557,12 +770,17 @@ async fn pump(
     params: LinkParams,
     cancel: &CancellationToken,
     ch: &mut LinkChannels,
+    health: &Arc<LinkHealth>,
 ) -> DisconnectReason {
     let (mut sink, mut stream) = framed.split();
 
     let mut hb = interval(params.heartbeat_interval);
     hb.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut last_recv = Instant::now();
+    // When the outstanding PING went out, so the matching PONG measures a round trip.
+    // The heartbeat already exists for liveness; reading its timing costs nothing and
+    // gives the bulk lane a true measurement of the latency it must not damage.
+    let mut ping_sent: Option<Instant> = None;
 
     loop {
         tokio::select! {
@@ -577,6 +795,11 @@ async fn pump(
                 if let Err(reason) = send_cancelable(&mut sink, cancel, Message::Ping, "send ping").await {
                     return reason;
                 }
+                // Let the reference latency drift up slowly, so moving to a genuinely
+                // slower network is eventually accepted as normal rather than read as
+                // permanent congestion and throttled forever.
+                health.decay_baseline();
+                ping_sent = Some(Instant::now());
             }
 
             // Incoming frame from the peer.
@@ -591,7 +814,13 @@ async fn pump(
                                 return reason;
                             }
                         }
-                        Message::Pong => { /* liveness already refreshed */ }
+                        Message::Pong => {
+                            // Liveness is already refreshed above; the timing is what
+                            // the bulk lane paces against.
+                            if let Some(sent) = ping_sent.take() {
+                                health.record_rtt(sent.elapsed());
+                            }
+                        }
                         other => {
                             // Never blocks the read loop (unbounded). A dropped
                             // send only happens if the engine is gone → we'll be
@@ -762,6 +991,7 @@ mod tests {
                 width: 1920,
                 height: 1080,
                 version: PROTOCOL_VERSION,
+                lane: Lane::Input,
             })
             .await
             .unwrap();
@@ -791,6 +1021,8 @@ mod tests {
                 fast_params(),
                 cancel.clone(),
                 s_ch,
+                BulkServer::disabled(),
+                LinkHealth::new(),
             ));
             // Give the listener a moment to bind.
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -799,6 +1031,7 @@ mod tests {
                 fast_params(),
                 cancel.clone(),
                 c_ch,
+                LinkHealth::new(),
             ));
 
             assert!(wait_connected(&mut s_events).await, "server connect (tls={tls})");
@@ -830,9 +1063,13 @@ mod tests {
             fast_params(),
             cancel.clone(),
             s_ch,
-        ));
+                BulkServer::disabled(),
+                LinkHealth::new(),
+            ));
         tokio::time::sleep(Duration::from_millis(100)).await;
-        let client = tokio::spawn(run_client(bad_client, fast_params(), cancel.clone(), c_ch));
+        let client = tokio::spawn(run_client(bad_client, fast_params(), cancel.clone(), c_ch,
+                LinkHealth::new(),
+            ));
 
         assert!(!wait_connected(&mut c_events).await, "client must be rejected");
         // server reports an AuthFailed event
@@ -864,7 +1101,9 @@ mod tests {
             fast_params(),
             cancel.clone(),
             s_ch,
-        ));
+                BulkServer::disabled(),
+                LinkHealth::new(),
+            ));
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         let client = tokio::spawn(silent_client_after_handshake(port, "test-secret"));
@@ -900,14 +1139,17 @@ mod tests {
             LinkParams::default(), // real 2s heartbeat — cancel must not wait for it
             cancel.clone(),
             s_ch,
-        ));
+                BulkServer::disabled(),
+                LinkHealth::new(),
+            ));
         tokio::time::sleep(Duration::from_millis(100)).await;
         let client = tokio::spawn(run_client(
             test_cfg(Role::Client, port, false),
             LinkParams::default(),
             cancel.clone(),
             c_ch,
-        ));
+                LinkHealth::new(),
+            ));
 
         assert!(wait_connected(&mut s_events).await);
         assert!(wait_connected(&mut c_events).await);
@@ -926,6 +1168,143 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_hello_without_a_lane_is_still_the_input_link() {
+        // Backwards compatibility, and the reason `Lane` defaults to `Input`: a peer
+        // built before the bulk lane existed sends no `lane` field at all. If that
+        // decoded as anything else, upgrading one machine would break the pair.
+        let raw = r#"{"t":"Hello","name":"old","width":1920,"height":1080,"version":1}"#;
+        let msg: Message = serde_json::from_str(raw).expect("an older Hello must still parse");
+        match msg {
+            Message::Hello { lane, name, .. } => {
+                assert_eq!(lane, Lane::Input);
+                assert_eq!(name, "old");
+            }
+            other => panic!("expected a Hello, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn the_bulk_lane_shares_the_port_without_disturbing_input() {
+        // The whole point of the restructure: a bulk connection arrives on the *same*
+        // listener while an input session is already live, is routed by its declared
+        // lane, and neither link notices the other. Before this, the accept loop was
+        // blocked inside the input pump and the bulk connection would never be taken.
+        let port = free_port().await;
+        let cancel = CancellationToken::new();
+
+        let (s_ch, s_to, _s_from, mut s_events) = channels();
+        let (c_ch, _c_to, mut c_from, mut c_events) = channels();
+
+        // Server side of the bulk lane, so we can observe what arrives on it.
+        let (bulk_in_tx, mut bulk_in_rx) = mpsc::unbounded_channel();
+        let (_bulk_out_tx, bulk_out_rx) = mpsc::unbounded_channel();
+        let health = LinkHealth::new();
+        let bulk = BulkServer::enabled(
+            crate::bulk::BulkChannels { outgoing: bulk_out_rx, incoming: bulk_in_tx },
+            health.clone(),
+        );
+
+        let server = tokio::spawn(run_server(
+            test_cfg(Role::Server, port, false),
+            fast_params(),
+            cancel.clone(),
+            s_ch,
+            bulk,
+            health,
+        ));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let client = tokio::spawn(run_client(
+            test_cfg(Role::Client, port, false),
+            fast_params(),
+            cancel.clone(),
+            c_ch,
+            LinkHealth::new(),
+        ));
+
+        assert!(wait_connected(&mut s_events).await);
+        assert!(wait_connected(&mut c_events).await);
+
+        // Now — with the input session already running — bring up the bulk lane.
+        let cfg = test_cfg(Role::Client, port, false);
+        let framed = timeout(
+            Duration::from_secs(3),
+            connect_and_handshake(&cfg, port, Lane::Bulk, Duration::from_secs(2), &cancel),
+        )
+        .await
+        .expect("bulk handshake must not hang")
+        .expect("the server must accept a bulk connection while input is live");
+
+        // Send one bulk frame and confirm it lands on the bulk side, not the input side.
+        let mut bulk_framed = {
+            let parts = framed.into_parts();
+            let mut new = tokio_util::codec::FramedParts::new::<crate::bulk::BulkFrame>(
+                parts.io,
+                crate::bulk::BulkCodec::new(),
+            );
+            new.read_buf = parts.read_buf;
+            Framed::from_parts(new)
+        };
+        bulk_framed
+            .send(crate::bulk::BulkFrame::Chunk { transfer: 1, seq: 0, data: vec![9; 32] })
+            .await
+            .expect("send a bulk chunk");
+
+        let got = timeout(Duration::from_secs(3), bulk_in_rx.recv())
+            .await
+            .expect("a bulk frame must arrive")
+            .expect("bulk channel open");
+        assert_eq!(got, crate::bulk::BulkFrame::Chunk { transfer: 1, seq: 0, data: vec![9; 32] });
+
+        // And input still works, unaffected by the bulk traffic.
+        s_to.send(Message::MouseMove { dx: 4, dy: 4 }).unwrap();
+        let moved = timeout(Duration::from_secs(2), c_from.recv()).await.unwrap();
+        assert_eq!(moved, Some(Message::MouseMove { dx: 4, dy: 4 }));
+
+        cancel.cancel();
+        let _ = timeout(Duration::from_secs(2), server).await;
+        let _ = timeout(Duration::from_secs(2), client).await;
+    }
+
+    #[tokio::test]
+    async fn the_heartbeat_measures_a_round_trip_for_the_pacer() {
+        // The bulk lane paces against this number, so if the heartbeat ever stopped
+        // recording it the pacer would silently run wide open forever.
+        let port = free_port().await;
+        let cancel = CancellationToken::new();
+        let (s_ch, _s_to, _s_from, mut s_events) = channels();
+        let (c_ch, _c_to, _c_from, mut c_events) = channels();
+        let client_health = LinkHealth::new();
+
+        let server = tokio::spawn(run_server(
+            test_cfg(Role::Server, port, false),
+            fast_params(),
+            cancel.clone(),
+            s_ch,
+            BulkServer::disabled(),
+            LinkHealth::new(),
+        ));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let client = tokio::spawn(run_client(
+            test_cfg(Role::Client, port, false),
+            fast_params(),
+            cancel.clone(),
+            c_ch,
+            client_health.clone(),
+        ));
+
+        assert!(wait_connected(&mut s_events).await);
+        assert!(wait_connected(&mut c_events).await);
+        // Give the heartbeat a few ticks to complete a ping/pong round trip.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(client_health.latest_us() > 0, "a round trip should have been recorded");
+        assert!(client_health.baseline_us() > 0, "and it should have set a baseline");
+
+        cancel.cancel();
+        let _ = timeout(Duration::from_secs(2), server).await;
+        let _ = timeout(Duration::from_secs(2), client).await;
+    }
+
+    #[tokio::test]
     async fn app_messages_flow_across_the_link() {
         let port = free_port().await;
         let cancel = CancellationToken::new();
@@ -938,14 +1317,17 @@ mod tests {
             fast_params(),
             cancel.clone(),
             s_ch,
-        ));
+                BulkServer::disabled(),
+                LinkHealth::new(),
+            ));
         tokio::time::sleep(Duration::from_millis(100)).await;
         let client = tokio::spawn(run_client(
             test_cfg(Role::Client, port, false),
             fast_params(),
             cancel.clone(),
             c_ch,
-        ));
+                LinkHealth::new(),
+            ));
 
         assert!(wait_connected(&mut s_events).await);
         assert!(wait_connected(&mut c_events).await);
@@ -973,7 +1355,8 @@ mod tests {
             fast_params(),
             client_cancel.clone(),
             c_ch,
-        ));
+                LinkHealth::new(),
+            ));
 
         // First server: connect, confirm, then drop it.
         let s1_cancel = CancellationToken::new();
@@ -983,7 +1366,9 @@ mod tests {
             fast_params(),
             s1_cancel.clone(),
             s1_ch,
-        ));
+                BulkServer::disabled(),
+                LinkHealth::new(),
+            ));
         assert!(wait_connected(&mut s1_events).await, "server1 sees the client");
         assert!(wait_for_connect(&mut c_events, Duration::from_secs(3)).await, "initial connect");
 
@@ -1001,7 +1386,9 @@ mod tests {
             fast_params(),
             s2_cancel.clone(),
             s2_ch,
-        ));
+                BulkServer::disabled(),
+                LinkHealth::new(),
+            ));
 
         // The client reconnects on its own.
         assert!(wait_connected(&mut s2_events).await, "server2 sees the reconnect");
@@ -1026,7 +1413,9 @@ mod tests {
         cfg.reconnect = false;
 
         let (c_ch, _c_to, _c_from, _c_events) = channels();
-        let client = tokio::spawn(run_client(cfg, fast_params(), cancel.clone(), c_ch));
+        let client = tokio::spawn(run_client(cfg, fast_params(), cancel.clone(), c_ch,
+                LinkHealth::new(),
+            ));
 
         // No server is listening, so the connect fails and the client returns.
         timeout(Duration::from_secs(2), client)
@@ -1048,7 +1437,8 @@ mod tests {
             fast_params(),
             cancel.clone(),
             c_ch,
-        ));
+                LinkHealth::new(),
+            ));
 
         // Let it fail a few times first.
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -1059,7 +1449,9 @@ mod tests {
             fast_params(),
             cancel.clone(),
             s_ch,
-        ));
+                BulkServer::disabled(),
+                LinkHealth::new(),
+            ));
 
         assert!(wait_connected(&mut s_events).await, "server sees the waiting client");
         assert!(

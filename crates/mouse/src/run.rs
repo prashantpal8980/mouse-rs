@@ -6,6 +6,7 @@
 use std::time::Duration;
 
 use mouse_clipboard::{ClipCommandRx, ClipboardHistory, ClipboardSettings, ClipboardSync, HistoryLimits};
+use mouse_core::bulk::{BulkChannels, BulkServer, LinkHealth};
 use mouse_core::net::{run_client, run_server, LinkParams};
 use mouse_core::protocol::Message;
 use mouse_core::{Config, Role};
@@ -46,6 +47,10 @@ pub fn run_blocking(
         .enable_all()
         .build()?;
     let params = LinkParams::default();
+    // Shared view of input-link latency. The input pump writes its heartbeat
+    // round-trip here and the bulk lane paces against it, so a big transfer backs off
+    // from the very thing it would otherwise damage.
+    let health = LinkHealth::new();
     let (link_channels, mut engine_link) = EngineLink::new();
     // Wire the UI's status sink in (the headless CLI passes `None`).
     engine_link.status = status;
@@ -64,11 +69,40 @@ pub fn run_blocking(
             let cfg_engine = cfg.clone();
             let c1 = cancel.clone();
             let c2 = cancel.clone();
+            // With a separate bulk port the shared listener refuses bulk connections
+            // and a second listener serves them instead; with the default (0) the two
+            // lanes share one port and one listener.
+            let separate_bulk_port = bulk_port(&cfg) != cfg.listen_port;
+            let (bulk_server, _bulk_rx) = setup_bulk_server(&cfg, health.clone());
+            let (shared_bulk, extra_bulk) = if separate_bulk_port {
+                (BulkServer::disabled(), Some(bulk_server))
+            } else {
+                (bulk_server, None)
+            };
+            let cfg_bulk_listener = cfg.clone();
+            let bulk_listen_port = bulk_port(&cfg);
+            let health_link = health.clone();
             runtime.block_on(async move {
                 if install_ctrl_c {
                     spawn_ctrl_c(cancel.clone());
                 }
-                let mut link = tokio::spawn(run_server(cfg_link, params, c1, link_channels));
+                let mut link = tokio::spawn(run_server(
+                    cfg_link,
+                    params,
+                    c1,
+                    link_channels,
+                    shared_bulk,
+                    health_link,
+                ));
+                if let Some(b) = extra_bulk {
+                    tokio::spawn(mouse_core::net::run_bulk_listener(
+                        cfg_bulk_listener,
+                        bulk_listen_port,
+                        params,
+                        cancel.clone(),
+                        b,
+                    ));
+                }
                 let mut engine = tokio::spawn(run_server_engine(
                     cfg_engine,
                     local_dims,
@@ -98,13 +132,32 @@ pub fn run_blocking(
 
             let cfg_link = cfg.clone();
             let cfg_engine = cfg.clone();
+            let cfg_bulk_client = cfg.clone();
             let c1 = cancel.clone();
             let c2 = cancel.clone();
+            let (bulk_channels, _bulk_tx) = setup_bulk_client(&cfg);
+            let health_link = health.clone();
             runtime.block_on(async move {
                 if install_ctrl_c {
                     spawn_ctrl_c(cancel.clone());
                 }
-                let mut link = tokio::spawn(run_client(cfg_link, params, c1, link_channels));
+                let mut link = tokio::spawn(run_client(
+                    cfg_link,
+                    params,
+                    c1,
+                    link_channels,
+                    health_link.clone(),
+                ));
+                // The bulk lane is best-effort: it retries quietly and its failure never
+                // touches the input link. A machine without it is slower, not broken.
+                if let Some(mut bulk_ch) = bulk_channels {
+                    let cfg_bulk = cfg_bulk_client;
+                    let c3 = cancel.clone();
+                    let h = health_link.clone();
+                    tokio::spawn(async move {
+                        run_bulk_client_forever(cfg_bulk, params, c3, &mut bulk_ch, h).await;
+                    });
+                }
                 let mut engine = tokio::spawn(run_client_engine(
                     cfg_engine,
                     local_dims,
@@ -289,6 +342,104 @@ fn setup_clipboard(
         clipboard_settings(cfg),
     );
     (Some(ClipboardRoute { tx, connected }), Some(sync))
+}
+
+/// Which port the bulk lane uses. `0` means "the same one the input link is on", so
+/// the default deployment needs nothing extra opened in a firewall — the lane is
+/// declared in the handshake instead of being implied by the port.
+fn bulk_port(cfg: &Config) -> u16 {
+    match cfg.bulk_port {
+        0 => match cfg.role {
+            Role::Server => cfg.listen_port,
+            Role::Client => cfg.server_port,
+        },
+        p => p,
+    }
+}
+
+/// Server side of the bulk lane: the handle the input listener hands connections to.
+fn setup_bulk_server(
+    cfg: &Config,
+    health: std::sync::Arc<LinkHealth>,
+) -> (
+    BulkServer,
+    Option<tokio::sync::mpsc::UnboundedReceiver<mouse_core::bulk::BulkFrame>>,
+) {
+    if !cfg.bulk_enabled {
+        return (BulkServer::disabled(), None);
+    }
+    let (in_tx, in_rx) = unbounded_channel();
+    let (_out_tx, out_rx) = unbounded_channel();
+    (
+        BulkServer::enabled(
+            BulkChannels {
+                outgoing: out_rx,
+                incoming: in_tx,
+            },
+            health,
+        ),
+        Some(in_rx),
+    )
+}
+
+/// Client side of the bulk lane.
+fn setup_bulk_client(
+    cfg: &Config,
+) -> (
+    Option<BulkChannels>,
+    Option<tokio::sync::mpsc::UnboundedSender<mouse_core::bulk::BulkFrame>>,
+) {
+    if !cfg.bulk_enabled {
+        return (None, None);
+    }
+    let (in_tx, _in_rx) = unbounded_channel();
+    let (out_tx, out_rx) = unbounded_channel();
+    (
+        Some(BulkChannels {
+            outgoing: out_rx,
+            incoming: in_tx,
+        }),
+        Some(out_tx),
+    )
+}
+
+/// Keep the client's bulk lane up, retrying quietly on its own schedule.
+///
+/// Deliberately separate from the input link's reconnect policy: the bulk lane must
+/// never influence whether input is considered connected, and its failures are not
+/// something the user should have to see or act on.
+async fn run_bulk_client_forever(
+    cfg: Config,
+    params: LinkParams,
+    cancel: CancellationToken,
+    ch: &mut BulkChannels,
+    health: std::sync::Arc<LinkHealth>,
+) {
+    let port = bulk_port(&cfg);
+    let mut backoff = params.reconnect_initial;
+    loop {
+        if cancel.is_cancelled() {
+            return;
+        }
+        match mouse_core::bulk::run_bulk_client(
+            &cfg,
+            port,
+            params.handshake_timeout,
+            &cancel,
+            ch,
+            &health,
+        )
+        .await
+        {
+            Ok(()) => backoff = params.reconnect_initial,
+            Err(e) => tracing::debug!("bulk lane not available ({e}); will retry"),
+        }
+        tokio::select! {
+            _ = cancel.cancelled() => return,
+            _ = tokio::time::sleep(backoff) => {}
+        }
+        backoff = (backoff * 2).min(params.reconnect_max);
+    }
 }
 
 /// The user's history limits, straight from config.

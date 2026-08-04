@@ -10,6 +10,8 @@
   "clipboard_max_item_bytes": 5242880,
   "clipboard_memory_budget": 67108864,
   "clipboard_max_image_px": 4096,
+  "bulk_enabled": true,
+  "bulk_port": 0,
   "lock_hotkey": "scroll_lock",
   "return_hotkey": "ctrl+win+alt+esc",
 

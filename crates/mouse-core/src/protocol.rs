@@ -20,6 +20,23 @@ pub enum Button {
     Middle,
 }
 
+/// Which lane a connection is. Declared in `Hello`, so one listener can carry both and
+/// the default deployment needs no second port opened.
+///
+/// Input is the serde default on purpose: a peer built before the bulk lane existed
+/// sends no `lane` field at all, and must keep being understood as the input
+/// connection rather than rejected.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Lane {
+    /// Mouse, keyboard, heartbeat, small clipboard items. Latency-critical.
+    #[default]
+    Input,
+    /// Files and large clipboard items. Throughput-oriented, paced, and never allowed
+    /// in front of an input frame.
+    Bulk,
+}
+
 /// Every message that can cross the link.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "t")]
@@ -30,6 +47,10 @@ pub enum Message {
         width: i32,
         height: i32,
         version: u32,
+        /// Which lane this connection is opening. Absent from an older peer, which is
+        /// exactly `Lane::Input`.
+        #[serde(default)]
+        lane: Lane,
     },
     AuthChallenge {
         nonce: String, // hex-encoded
@@ -173,6 +194,7 @@ mod tests {
                 width: 2560,
                 height: 1440,
                 version: PROTOCOL_VERSION,
+                lane: Lane::Bulk,
             },
             Message::AuthChallenge { nonce: "ab".into() },
             Message::MouseMove { dx: 3, dy: -7 },

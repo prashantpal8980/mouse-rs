@@ -73,6 +73,8 @@ enum Message {
     ClipItemMbChanged(String),
     ClipMemMbChanged(String),
     ClipImagePxChanged(String),
+    BulkEnabledToggled(bool),
+    BulkPortChanged(String),
     ReconnectToggled(bool),
     AutostartToggled(bool),
     AutoconnectToggled(bool),
@@ -202,6 +204,7 @@ struct App {
     clip_item_mb_s: String,
     clip_mem_mb_s: String,
     clip_img_px_s: String,
+    bulk_port_s: String,
 }
 
 /// Bytes → whole MB for display. The panel talks in MB because that is the unit the
@@ -261,6 +264,7 @@ impl App {
             clip_item_mb_s: String::new(),
             clip_mem_mb_s: String::new(),
             clip_img_px_s: String::new(),
+            bulk_port_s: String::new(),
             saved_cfg: cfg.clone(),
             cfg,
         };
@@ -278,6 +282,11 @@ impl App {
         self.clip_item_mb_s = mb_of(self.cfg.clipboard_max_item_bytes);
         self.clip_mem_mb_s = mb_of(self.cfg.clipboard_memory_budget);
         self.clip_img_px_s = self.cfg.clipboard_max_image_px.to_string();
+        self.bulk_port_s = if self.cfg.bulk_port == 0 {
+            String::new()
+        } else {
+            self.cfg.bulk_port.to_string()
+        };
     }
 
     fn running(&self) -> bool {
@@ -490,6 +499,16 @@ impl App {
                     self.cfg.clipboard_max_image_px = v.max(1);
                 }
                 self.clip_img_px_s = s;
+            }
+            Message::BulkEnabledToggled(v) => self.cfg.bulk_enabled = v,
+            Message::BulkPortChanged(s) => {
+                // 0 (or an empty box) means "share the input link's port".
+                if s.trim().is_empty() {
+                    self.cfg.bulk_port = 0;
+                } else if let Ok(v) = s.trim().parse::<u16>() {
+                    self.cfg.bulk_port = v;
+                }
+                self.bulk_port_s = s;
             }
             Message::ReconnectToggled(v) => self.cfg.reconnect = v,
             Message::AutostartToggled(v) => {
@@ -1254,6 +1273,25 @@ impl App {
                     ))
                     .size(11.0)
                     .color(if img_cost > 128 * 1024 * 1024 { p.warn } else { p.txt3 }),
+                    toggle_row(
+                        p,
+                        "Separate lane for large transfers",
+                        "stops big items queueing in front of the mouse",
+                        self.cfg.bulk_enabled,
+                        Message::BulkEnabledToggled
+                    ),
+                    labeled(
+                        p,
+                        "Port for that lane (blank = share the main one)",
+                        input(p, "same port", &self.bulk_port_s, Message::BulkPortChanged)
+                    ),
+                    text(if self.cfg.bulk_port == 0 {
+                        "Sharing one port — nothing extra to open in a firewall.".to_string()
+                    } else {
+                        format!("Port {} must be reachable between both machines.", self.cfg.bulk_port)
+                    })
+                    .size(11.0)
+                    .color(p.txt3),
                 ]
                 .spacing(12.0),
             );

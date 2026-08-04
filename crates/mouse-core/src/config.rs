@@ -122,6 +122,18 @@ pub struct Config {
     #[serde(default = "default_clip_image_px")]
     pub clipboard_max_image_px: usize,
 
+    // --- the bulk lane ---
+    /// Carry large transfers on a second connection, so they can never queue in front
+    /// of a mouse or keyboard frame on the shared link.
+    #[serde(default = "default_true")]
+    pub bulk_enabled: bool,
+    /// Port for that second connection. **0 means "the same port as the input link"**,
+    /// which is the default and needs nothing extra opened in a firewall — the lane is
+    /// declared in the handshake instead. Set a different port if you would rather keep
+    /// the two apart.
+    #[serde(default)]
+    pub bulk_port: u16,
+
     #[serde(default = "default_lock_hotkey")]
     pub lock_hotkey: String,
     /// Optional multi-key return/escape combo, e.g. `"ctrl+win+alt+esc"`. Empty = none
@@ -179,6 +191,9 @@ impl Default for Config {
             clipboard_max_item_bytes: default_clip_item_bytes(),
             clipboard_memory_budget: default_clip_memory(),
             clipboard_max_image_px: default_clip_image_px(),
+            bulk_enabled: true,
+            // 0 = share the input link's port. Anything else is a deliberate choice.
+            bulk_port: 0,
             lock_hotkey: default_lock_hotkey(),
             return_hotkey: String::new(),
             listen_host: default_listen_host(),
