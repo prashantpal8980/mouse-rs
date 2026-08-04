@@ -69,6 +69,13 @@ pub struct Transfers {
     /// Hashes we have already asked for, so a repeated poll or a second click does not
     /// start the same download twice.
     requested: HashMap<String, u64>,
+    /// Hashes that are clipboard *images* rather than files, with their dimensions.
+    /// They take the same transfer path but are applied to the clipboard as pixels
+    /// rather than published as a path.
+    pending_images: HashMap<String, (usize, usize)>,
+    /// The hash of the most recently completed transfer, so an image can be applied
+    /// without the caller having to track transfer ids.
+    last_completed: Option<String>,
 }
 
 impl Transfers {
@@ -78,8 +85,59 @@ impl Transfers {
             incoming: HashMap::new(),
             next_id: 0,
             requested: HashMap::new(),
+            pending_images: HashMap::new(),
+            last_completed: None,
         }
     }
+
+    /// Take the hash of the transfer that just finished, if any.
+    pub fn take_last_completed(&mut self) -> Option<String> {
+        self.last_completed.take()
+    }
+
+    /// Put an encoded image into the cache so it can be fetched over the bulk lane.
+    /// Returns its hash.
+    pub fn stage_image(&self, png: &[u8]) -> Option<String> {
+        let hash = cache::hash_bytes(png);
+        if !self.cache.contains(&hash) {
+            let mut f = self.cache.open_partial(&hash).ok()?;
+            f.write_all(png).ok()?;
+            drop(f);
+            self.cache.finish(&hash).ok()?;
+        }
+        Some(hash)
+    }
+
+    /// Note that an incoming hash is an image, and ask for it unless we hold it.
+    /// Returns the bytes immediately when they are already cached.
+    pub fn want_image(
+        &mut self,
+        hash: &str,
+        w: usize,
+        h: usize,
+        to_peer: &UnboundedSender<Message>,
+    ) -> Option<Vec<u8>> {
+        if self.cache.contains(hash) {
+            return std::fs::read(self.cache.blob_path(hash)).ok();
+        }
+        if !self.requested.contains_key(hash) {
+            self.pending_images.insert(hash.to_string(), (w, h));
+            self.requested.insert(hash.to_string(), 0);
+            let offset = self.cache.partial_len(hash);
+            let _ = to_peer.send(Message::BlobRequest { hash: hash.to_string(), offset });
+            tracing::info!(hash, w, h, "requested a large clipboard image over the bulk lane");
+        }
+        None
+    }
+
+    /// If this completed hash was an image, hand back its encoded bytes and size.
+    pub fn take_completed_image(&mut self, hash: &str) -> Option<(Vec<u8>, usize, usize)> {
+        let (w, h) = self.pending_images.remove(hash)?;
+        let bytes = std::fs::read(self.cache.blob_path(hash)).ok()?;
+        Some((bytes, w, h))
+    }
+
+
 
     pub fn cache(&self) -> &Arc<BlobCache> {
         &self.cache
@@ -339,9 +397,10 @@ impl Transfers {
                 let inc = self.incoming.remove(&transfer)?;
                 drop(inc.file);
                 self.requested.remove(&inc.hash);
+                self.last_completed = Some(inc.hash.clone());
                 match self.cache.finish(&inc.hash) {
                     Ok(()) => {
-                        tracing::info!(hash = %inc.hash, bytes = inc.got, "file received and verified");
+                        tracing::info!(hash = %inc.hash, bytes = inc.got, "content received and verified");
                         inc.entry
                     }
                     Err(e) => {

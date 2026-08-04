@@ -123,6 +123,17 @@ pub enum Message {
         w: i32,
         h: i32,
     },
+    /// A clipboard image too big to put in front of a mouse packet: the description
+    /// only, with the pixels fetched over the bulk lane like a file.
+    ///
+    /// Small images stay in `ClipboardImage` — a screenshot that crosses in 5 ms does
+    /// not need the machinery, and a round trip would make it slower, not faster.
+    ClipboardImageRef {
+        hash: String,
+        w: i32,
+        h: i32,
+        size: u64,
+    },
     /// "I copied these files." Description only — no contents.
     ClipboardFiles {
         files: Vec<FileRef>,

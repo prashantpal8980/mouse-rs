@@ -818,6 +818,22 @@ fn run(
                     }
                 }
             }
+            // A large image: fetch the pixels over the bulk lane rather than letting
+            // megabytes of base64 sit in front of the next mouse packet.
+            Ok(Message::ClipboardImageRef { hash, w, h, .. }) if settings.sync_images => {
+                if let Some(t) = transfers.as_mut() {
+                    if let Some(png) = t.want_image(&hash, w.max(0) as usize, h.max(0) as usize, &to_peer)
+                    {
+                        apply_encoded_image(
+                            &mut clipboard,
+                            &mut last_img,
+                            &png,
+                            history.as_ref(),
+                            settings,
+                        );
+                    }
+                }
+            }
             // Files copied on the other machine: record the description, then decide
             // whether to fetch now, ask first, or do nothing because we already have it.
             Ok(Message::ClipboardFiles { files: refs, origin }) if settings.sync_files => {
@@ -885,7 +901,13 @@ fn run(
         if let (Some(fb), Some(t), Some(h)) = (from_bulk.as_ref(), transfers.as_mut(), history.as_ref())
         {
             while let Ok(frame) = fb.try_recv() {
-                if let Some(entry) = t.on_bulk_frame(frame, h) {
+                let entry_opt = t.on_bulk_frame(frame, h);
+                if let Some(done) = t.take_last_completed() {
+                    if let Some((png, _w, _h)) = t.take_completed_image(&done) {
+                        apply_encoded_image(&mut clipboard, &mut last_img, &png, Some(h), settings);
+                    }
+                }
+                if let Some(entry) = entry_opt {
                     if let Some(ClipPayload::Files(set)) = h.payload(entry) {
                         if t.is_complete(&set) {
                             h.set_status(entry, ClipStatus::Ready);
@@ -946,12 +968,13 @@ fn run(
             // text rather than an image the read fails fast, so the expensive path only
             // runs when there is actually an image to copy.
             if settings.sync_images && tick % IMAGE_POLL_TICKS == 0 {
-                if let Some(sent) = poll_local_image(&mut clipboard, &mut last_img, &to_peer, settings)
+                if let Some(sent) = poll_local_image(&mut clipboard, &mut last_img, &to_peer, settings, transfers.as_ref())
                 {
                     tracing::info!(
                         w = sent.w,
                         h = sent.h,
                         bytes = sent.png.len(),
+                        inline = sent.inline,
                         "clipboard image sent to the peer"
                     );
                     if let Some(h) = &history {
@@ -1112,6 +1135,9 @@ struct SyncedImage {
     png: Arc<Vec<u8>>,
     w: usize,
     h: usize,
+    /// True if the pixels travelled on the input lane, false if only a reference did
+    /// and the bulk lane carried the rest.
+    inline: bool,
 }
 
 /// Apply an image received from the peer. Returns the stored form if a new image was
@@ -1162,6 +1188,7 @@ fn apply_remote_image<C: SystemClipboard>(
         png: Arc::new(raw),
         w: img.w,
         h: img.h,
+        inline: true,
     })
 }
 
@@ -1172,6 +1199,7 @@ fn poll_local_image<C: SystemClipboard>(
     last_img: &mut Option<u64>,
     to_peer: &UnboundedSender<Message>,
     settings: ClipboardSettings,
+    transfers: Option<&transfer::Transfers>,
 ) -> Option<SyncedImage> {
     use base64::Engine as _;
     let img = clipboard.read_image()?; // no image on the clipboard: nothing to do
@@ -1182,6 +1210,13 @@ fn poll_local_image<C: SystemClipboard>(
     // Remember it either way: a rejected image must not be re-encoded every poll.
     *last_img = Some(key);
     let png = encode_png(&img, settings.max_image_px)?;
+    // Staged before the size decision so the reference path always has something to
+    // point at; staging a small image costs a hash and one file write.
+    let staged = if png.len() > INLINE_IMAGE_MAX {
+        transfers.and_then(|t| t.stage_image(&png))
+    } else {
+        None
+    };
     if png.len() > settings.max_item_bytes {
         tracing::debug!(
             bytes = png.len(),
@@ -1190,16 +1225,66 @@ fn poll_local_image<C: SystemClipboard>(
         );
         return None;
     }
-    let _ = to_peer.send(Message::ClipboardImage {
-        data: base64::engine::general_purpose::STANDARD.encode(&png),
-        w: img.w as i32,
-        h: img.h as i32,
-    });
+    // Small images stay on the input lane: they cross in a few milliseconds, and a
+    // round trip through the bulk lane would make them slower, not faster. Anything
+    // larger goes as a reference, because base64 pixels sitting in front of the next
+    // mouse packet is exactly the stall this whole lane exists to prevent.
+    let inline = png.len() <= INLINE_IMAGE_MAX || staged.is_none();
+    if inline {
+        let _ = to_peer.send(Message::ClipboardImage {
+            data: base64::engine::general_purpose::STANDARD.encode(&png),
+            w: img.w as i32,
+            h: img.h as i32,
+        });
+    } else if let Some(hash) = staged {
+        let _ = to_peer.send(Message::ClipboardImageRef {
+            hash,
+            w: img.w as i32,
+            h: img.h as i32,
+            size: png.len() as u64,
+        });
+    }
     Some(SyncedImage {
         png: Arc::new(png),
         w: img.w,
         h: img.h,
+        inline,
     })
+}
+
+/// Largest image still sent inline on the input lane.
+///
+/// 256 KB is roughly a 1080p screenshot: about 50 ms even on a weak hotspot, which is
+/// below the threshold where a pointer stutter is noticeable. Above it, the reference
+/// path costs one extra round trip and protects the input lane completely.
+const INLINE_IMAGE_MAX: usize = 256 * 1024;
+
+/// Decode an encoded PNG and put it on the clipboard, recording it in history.
+///
+/// Shared by the inline path and the bulk path so both end with identical state — in
+/// particular the same `last_img` anchor, without which a received image is read back
+/// by the next poll and echoed straight to the peer.
+fn apply_encoded_image<C: SystemClipboard>(
+    clipboard: &mut C,
+    last_img: &mut Option<u64>,
+    png: &[u8],
+    history: Option<&ClipboardHistory>,
+    settings: ClipboardSettings,
+) -> bool {
+    let Some(img) = decode_png(png, settings.max_image_px) else {
+        tracing::warn!("a received image could not be decoded");
+        return false;
+    };
+    if !clipboard.write_image(&img) {
+        tracing::warn!("could not put a received image on the clipboard");
+        return false;
+    }
+    *last_img = Some(image_key(&img));
+    tracing::info!(w = img.w, h = img.h, bytes = png.len(), "large clipboard image applied");
+    if let Some(h) = history {
+        h.record_image(Arc::new(png.to_vec()), img.w, img.h, true);
+    }
+    true
 }
 
 /// Join `handle`, but never block longer than `timeout`: detach a wedged backend
@@ -1291,7 +1376,7 @@ mod tests {
         assert!(apply_remote_image(&mut cb, &mut last_img, &b64(&png), 16, 16, set()).is_some());
         assert_eq!(cb.image.as_ref(), Some(&source));
         // The poll now reads back exactly what we just applied.
-        assert!(poll_local_image(&mut cb, &mut last_img, &tx, set()).is_none());
+        assert!(poll_local_image(&mut cb, &mut last_img, &tx, set(), None).is_none());
         assert!(rx.try_recv().is_err(), "applied image must not echo back to the peer");
     }
 
@@ -1304,7 +1389,7 @@ mod tests {
         };
         let mut last_img = None;
 
-        assert!(poll_local_image(&mut cb, &mut last_img, &tx, set()).is_some());
+        assert!(poll_local_image(&mut cb, &mut last_img, &tx, set(), None).is_some());
         match rx.try_recv() {
             Ok(Message::ClipboardImage { w, h, data }) => {
                 assert_eq!((w, h), (8, 8));
@@ -1316,12 +1401,12 @@ mod tests {
             other => panic!("expected a ClipboardImage, got {other:?}"),
         }
         // Unchanged clipboard: no repeat send on the next poll.
-        assert!(poll_local_image(&mut cb, &mut last_img, &tx, set()).is_none());
+        assert!(poll_local_image(&mut cb, &mut last_img, &tx, set(), None).is_none());
         assert!(rx.try_recv().is_err());
 
         // A genuinely different image does go out.
         cb.image = Some(img(8, 8, 200));
-        assert!(poll_local_image(&mut cb, &mut last_img, &tx, set()).is_some());
+        assert!(poll_local_image(&mut cb, &mut last_img, &tx, set(), None).is_some());
         assert!(rx.try_recv().is_ok());
     }
 
@@ -1360,7 +1445,7 @@ mod tests {
             ..Default::default()
         };
         let mut last_img = None;
-        assert!(poll_local_image(&mut cb, &mut last_img, &tx, set()).is_none());
+        assert!(poll_local_image(&mut cb, &mut last_img, &tx, set(), None).is_none());
         assert!(last_img.is_some(), "the rejected image must still be fingerprinted");
     }
 
@@ -1571,6 +1656,81 @@ mod tests {
         assert!(reuse_entry(&mut cb, &mut None, &mut None, &h, &tx, false, id, set(), None, &mut None));
         assert_eq!(cb.content.as_deref(), Some("offline"));
         assert!(rx.try_recv().is_err(), "nothing goes to a peer that isn't connected");
+    }
+
+    #[test]
+    fn a_small_image_stays_on_the_input_lane() {
+        // A screenshot that crosses in milliseconds must not pay for a round trip.
+        let (tx, mut rx) = unbounded_channel();
+        let mut cb = Fake { image: Some(img(8, 8, 1)), ..Default::default() };
+        let sent = poll_local_image(&mut cb, &mut None, &tx, set(), None).expect("sent");
+        assert!(sent.inline, "a tiny image should go inline");
+        assert!(
+            matches!(rx.try_recv(), Ok(Message::ClipboardImage { .. })),
+            "small images keep using the input lane"
+        );
+    }
+
+    #[test]
+    fn a_large_image_crosses_as_a_reference_not_as_base64() {
+        // The latent stall this lane exists to remove: megabytes of base64 sitting in
+        // front of the next mouse packet.
+        let dir = std::env::temp_dir().join(format!("mouse-rs-imgref-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cache = Arc::new(cache::BlobCache::new(dir.clone()).unwrap());
+        let t = transfer::Transfers::new(cache);
+
+        // Noise compresses poorly, so this really does exceed the inline threshold.
+        let mut big = RgbaImage { w: 700, h: 700, bytes: vec![0u8; 700 * 700 * 4] };
+        for (i, b) in big.bytes.iter_mut().enumerate() {
+            *b = ((i * 2654435761) >> 13) as u8;
+        }
+        let encoded = encode_png(&big, 4096).unwrap();
+        assert!(encoded.len() > INLINE_IMAGE_MAX, "test image must be over the threshold");
+
+        let (tx, mut rx) = unbounded_channel();
+        let mut cb = Fake { image: Some(big), ..Default::default() };
+        let sent = poll_local_image(&mut cb, &mut None, &tx, set(), Some(&t)).expect("sent");
+        assert!(!sent.inline, "a large image should go by reference");
+        match rx.try_recv() {
+            Ok(Message::ClipboardImageRef { hash, w, h, size }) => {
+                assert_eq!((w, h), (700, 700));
+                assert_eq!(size as usize, encoded.len());
+                assert!(t.cache().contains(&hash), "the pixels must be staged for fetching");
+            }
+            other => panic!("expected a ClipboardImageRef, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_image_we_already_hold_needs_no_fetch() {
+        let dir = std::env::temp_dir().join(format!("mouse-rs-imgcache-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cache = Arc::new(cache::BlobCache::new(dir.clone()).unwrap());
+        let mut t = transfer::Transfers::new(cache);
+        let png = encode_png(&img(16, 16, 4), 4096).unwrap();
+        let hash = t.stage_image(&png).expect("staged");
+
+        let (tx, mut rx) = unbounded_channel();
+        let got = t.want_image(&hash, 16, 16, &tx).expect("already cached");
+        assert_eq!(got, png);
+        assert!(rx.try_recv().is_err(), "nothing should have been requested");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn applying_a_received_image_sets_the_anchor_so_it_is_not_echoed() {
+        // Without this the next poll reads our own write back and sends it straight to
+        // the peer — the loop the `last_img` anchor exists to prevent.
+        let (tx, mut rx) = unbounded_channel();
+        let mut cb = Fake::default();
+        let mut last_img = None;
+        let png = encode_png(&img(12, 12, 6), 4096).unwrap();
+        assert!(apply_encoded_image(&mut cb, &mut last_img, &png, None, set()));
+        assert!(last_img.is_some());
+        assert!(poll_local_image(&mut cb, &mut last_img, &tx, set(), None).is_none());
+        assert!(rx.try_recv().is_err(), "an applied image must not echo back");
     }
 
     #[test]
