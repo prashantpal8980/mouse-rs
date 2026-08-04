@@ -70,6 +70,19 @@ fn default_warp_threshold() -> i32 {
 fn default_name() -> String {
     "mouse-rs".into()
 }
+/// Matches Windows' own clipboard history, so the default feels familiar.
+fn default_clip_history() -> usize {
+    25
+}
+fn default_clip_item_bytes() -> usize {
+    5 * 1024 * 1024
+}
+fn default_clip_memory() -> usize {
+    64 * 1024 * 1024
+}
+fn default_clip_image_px() -> usize {
+    4096
+}
 
 /// On-disk configuration. Field names match the Python version exactly.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -83,6 +96,32 @@ pub struct Config {
     pub tls_enabled: bool,
     #[serde(default = "default_true")]
     pub clipboard_sync: bool,
+
+    // --- clipboard manager ---
+    // Every one of these is a trade the owner is entitled to make. The panel shows what
+    // a setting costs; it does not refuse a value because the cost is high. Only knobs
+    // the code actually honours live here — a setting nothing reads is worse than no
+    // setting, because it looks like it works (see R16 in docs/UI-REQUIREMENTS.md).
+    /// Sync copied text. Off means text stays on the machine it was copied on.
+    #[serde(default = "default_true")]
+    pub clipboard_sync_text: bool,
+    /// Sync copied images.
+    #[serde(default = "default_true")]
+    pub clipboard_sync_images: bool,
+    /// How many history entries to keep before the oldest unpinned one is dropped.
+    #[serde(default = "default_clip_history")]
+    pub clipboard_history_size: usize,
+    /// Largest single item carried and kept, in bytes — text and encoded images alike.
+    #[serde(default = "default_clip_item_bytes")]
+    pub clipboard_max_item_bytes: usize,
+    /// Total memory the history may hold, in bytes.
+    #[serde(default = "default_clip_memory")]
+    pub clipboard_memory_budget: usize,
+    /// Largest accepted image edge, in pixels. Raising this is briefly expensive: an
+    /// image costs `px × px × 4` bytes of RGBA while it is encoded or decoded.
+    #[serde(default = "default_clip_image_px")]
+    pub clipboard_max_image_px: usize,
+
     #[serde(default = "default_lock_hotkey")]
     pub lock_hotkey: String,
     /// Optional multi-key return/escape combo, e.g. `"ctrl+win+alt+esc"`. Empty = none
@@ -134,6 +173,12 @@ impl Default for Config {
             shared_secret: "change-me-to-a-long-random-string".into(),
             tls_enabled: true,
             clipboard_sync: true,
+            clipboard_sync_text: true,
+            clipboard_sync_images: true,
+            clipboard_history_size: default_clip_history(),
+            clipboard_max_item_bytes: default_clip_item_bytes(),
+            clipboard_memory_budget: default_clip_memory(),
+            clipboard_max_image_px: default_clip_image_px(),
             lock_hotkey: default_lock_hotkey(),
             return_hotkey: String::new(),
             listen_host: default_listen_host(),

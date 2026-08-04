@@ -26,6 +26,22 @@ Status values: **done** · **open** · **deferred** (agreed, deliberately not no
 | R9 | Explain what **Profiles** are in the UI | **done** — description in the Startup tab |
 | R10 | **Clipboard** keeps its own tab | **done** (owner's decision, over my suggestion to fold it) |
 | R11 | Real IP detection instead of a hardcoded example address | **done** — Detect sweeps local subnets; server side lists this machine's addresses |
+| R15 | The hero must light the machine that currently has the mouse — **on both roles** | **done** (2026‑07‑31) |
+
+### R15 — the lit chip
+
+Reported as "the blue light doesn't show which device I'm on". It never could on a **client**:
+`StatusSnapshot::engaged` is role-relative — on the server it means the cursor has left for
+the peer, on the client it means the peer is driving *this* machine — and the hero used it
+without folding in the role. On a client `!engaged || !server_side` and `engaged && server_side`
+collapse to the constants `true` and `false`, so the local chip was lit permanently and the
+peer chip could never light, whichever way the mouse went. Kali is the client here, which is
+why it showed on the desktop panel.
+
+Present since the first iced panel, not introduced by the redesign — but the redesign is when
+it became visible, because R7 shrank the hero from ~196px to ~70px and dropped the
+`server`/`client` labels, leaving the highlight as the only thing left saying where control
+was. `control_is_local()` now holds the rule, with a test per role.
 
 ### R1–R4 — restart prompt
 
@@ -98,6 +114,10 @@ re-author them.
 | R12 | Clipboard transfers should be visible in the log | **open** | Text and image sync log nothing, so a clipboard failure is undiagnosable. Same instrumentation gap as the deleted `kbd_diag` counters. |
 | R13 | Panel should have an accessibility tree | **open** | iced/wgpu exposes zero UI Automation descendants, so screen readers can't see it and UI testing can't drive it. Worth a decision before shipping a paid product. |
 | R14 | Console flash when launching the GUI from Explorer | **deferred** | Cosmetic; `FreeConsole` runs after the console is allocated. |
+| R16 | The Layout tab must show only what **this machine's role** actually uses | **open** | Agreed 2026‑07‑31, never built. `client.rs:36` reads only `entry_edge`; the client engine never looks at `exit_edge`. So on the client the Exit-edge picker is a dial wired to nothing — it writes a config value no code reads — and the overlap ⚠ compares that dead value, so it can fire on a correctly-configured pair. On the client: hide Exit edge, drop the warning, relabel Entry edge as "push the cursor back in here to go home". Keep both on the server. Full reasoning in `docs/mockups/edges-explained.html`. |
+| R17 | Clipboard history is a **clipboard manager**, not a log — entries must be re-usable | **done** (2026‑08‑04) | The owner confirms this was always the intent; building it as a view-only log was a misread of the requirement, not a scope change. Entries used to be non-interactive `container`s with no `on_press`, and an image was stored as the label string `[image 800×600, 240 KB]` with the pixels discarded. Now: every row is a button that puts the item back on the clipboard and syncs it to the peer like a fresh copy; images keep their encoded PNG; repeats move to the front instead of duplicating; pin protects an entry from eviction and from Clear. |
+| R18 | Copy **any file** between machines through the clipboard, extension-agnostic | **open** | Asked for 2026‑08‑04. HTML, exe, ISO — no allow-list. Under the user's auto threshold it transfers silently; above it, a non-blocking prompt asks first. Must never degrade mouse/keyboard latency. Note this exceeds Windows' own clipboard history, which does not retain files at all. Full design in `docs/mockups/clipboard-manager-plan.html`. |
+| R19 | Every clipboard limit must be **user-configurable**, split Basic / Advanced | **partly done** (2026‑08‑04) | A slow setting the user chose deliberately is their trade to make; the software's job is to state the cost, not refuse the value. **Built:** history size (Basic); sync-text, sync-images, biggest-item MB, memory-budget MB and largest-image-edge px (Advanced), with live worst-case cost lines for the memory budget and the image limit. `MAX_TEXT_BYTES`, `MAX_IMAGE_BYTES` and `MAX_IMAGE_PIXELS` are gone as hardcoded constants. **Pending, and deliberately not added as dead knobs (see R16):** ask-before-sending threshold, skip-prompt-when-quick, keep-history-after-restart, disk budget, transfer speed limit and pause-while-crossed — all belong to the file-transfer work in R18 and arrive with it. |
 
 ---
 

@@ -23,22 +23,133 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use mouse_core::protocol::Message;
 
-/// How many recent clipboard entries the history keeps (for the GUI view).
-const HISTORY_CAP: usize = 25;
+/// Default number of entries kept. Matches Windows' own clipboard history; it is only
+/// the starting value for [`HistoryLimits::max_items`], which the user can change.
+const DEFAULT_HISTORY_ITEMS: usize = 25;
+/// Default ceiling on a single entry we will carry. Covers text and encoded images
+/// alike, so "biggest item copied automatically" is one number rather than two.
+const DEFAULT_MAX_ITEM_BYTES: usize = 5 * 1024 * 1024;
+/// Default ceiling on what the whole history may hold in memory at once.
+const DEFAULT_MEMORY_BUDGET: usize = 64 * 1024 * 1024;
+/// Default largest accepted image edge, in pixels.
+const DEFAULT_MAX_IMAGE_PX: usize = 4096;
+/// How much of an entry's text is kept for display. The preview is cloned on every
+/// panel redraw, so it is deliberately short and built once when the entry is recorded.
+const PREVIEW_CHARS: usize = 72;
 
-/// One remembered clipboard transfer.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ClipEntry {
-    pub text: String,
-    /// True if received from the peer, false if sent from this machine.
-    pub incoming: bool,
+/// The user-settable bounds on the history. Every field is a deliberate trade the
+/// owner is allowed to make; nothing here is a hard limit imposed by the code.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HistoryLimits {
+    /// How many entries to keep before the oldest unpinned one is dropped.
+    pub max_items: usize,
+    /// Largest single entry that will be stored at all.
+    pub max_item_bytes: usize,
+    /// Total memory the history may hold. Oldest unpinned entries go first.
+    pub memory_budget: usize,
 }
 
-/// A small, shared, newest-first ring of recent clipboard transfers. Cheap to clone
-/// (an `Arc`); the sync thread records into it and the GUI snapshots it.
+impl Default for HistoryLimits {
+    fn default() -> Self {
+        HistoryLimits {
+            max_items: DEFAULT_HISTORY_ITEMS,
+            max_item_bytes: DEFAULT_MAX_ITEM_BYTES,
+            memory_budget: DEFAULT_MEMORY_BUDGET,
+        }
+    }
+}
+
+/// What a history entry actually holds — the content itself, not a description of it.
+///
+/// Payloads are `Arc`ed because the panel snapshots the history on every redraw and
+/// this is the *only* copy of the item: a per-frame deep clone would cost megabytes
+/// many times a second.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ClipPayload {
+    Text(Arc<String>),
+    /// Stored as encoded PNG rather than raw pixels. That is already the form that
+    /// arrives from the peer and the form we encode to send, so keeping it costs
+    /// nothing extra — and a screenshot is roughly 20× smaller than the RGBA it
+    /// decodes to, which is the same reason Windows' own history stores PNG.
+    Image {
+        png: Arc<Vec<u8>>,
+        w: usize,
+        h: usize,
+    },
+}
+
+impl ClipPayload {
+    /// What this entry costs against the memory budget.
+    pub fn bytes(&self) -> usize {
+        match self {
+            ClipPayload::Text(t) => t.len(),
+            ClipPayload::Image { png, .. } => png.len(),
+        }
+    }
+
+    pub fn is_image(&self) -> bool {
+        matches!(self, ClipPayload::Image { .. })
+    }
+
+    /// The short, display-ready line shown in the panel.
+    fn preview(&self) -> String {
+        match self {
+            ClipPayload::Text(t) => {
+                let one_line: String = t.split_whitespace().collect::<Vec<_>>().join(" ");
+                if one_line.chars().count() > PREVIEW_CHARS {
+                    format!("{}…", one_line.chars().take(PREVIEW_CHARS).collect::<String>())
+                } else {
+                    one_line
+                }
+            }
+            ClipPayload::Image { png, w, h } => {
+                format!("image {}×{}, {} KB", w, h, png.len().div_ceil(1024))
+            }
+        }
+    }
+}
+
+/// One remembered clipboard item, with everything needed to put it back.
+#[derive(Clone, Debug)]
+pub struct ClipEntry {
+    /// Stable identity, so the panel can name an entry across redraws and reordering.
+    pub id: u64,
+    /// True if it arrived from the peer, false if it was copied on this machine.
+    pub incoming: bool,
+    /// Pinned entries are never evicted by either budget.
+    pub pinned: bool,
+    pub preview: String,
+    pub payload: ClipPayload,
+}
+
+/// The display-only view the panel works with. Deliberately carries no payload: the
+/// panel never needs the bytes, only a label and an id to act on, and keeping the
+/// bytes out of the render path means a 5 MB image can never be cloned per frame.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClipMeta {
+    pub id: u64,
+    pub incoming: bool,
+    pub pinned: bool,
+    pub is_image: bool,
+    pub preview: String,
+    pub bytes: usize,
+}
+
+#[derive(Default)]
+struct HistoryInner {
+    entries: VecDeque<ClipEntry>,
+    next_id: u64,
+    limits: HistoryLimits,
+}
+
+/// A small, shared, newest-first list of recent clipboard items. Cheap to clone (an
+/// `Arc`); the sync thread records into it and the panel reads and acts on it.
+///
+/// This is a clipboard *manager*, not a log: entries keep their content so any of them
+/// can be put back on the system clipboard later.
 #[derive(Clone, Default)]
 pub struct ClipboardHistory {
-    inner: Arc<Mutex<VecDeque<ClipEntry>>>,
+    inner: Arc<Mutex<HistoryInner>>,
 }
 
 impl ClipboardHistory {
@@ -46,58 +157,232 @@ impl ClipboardHistory {
         ClipboardHistory::default()
     }
 
-    /// Record a transfer at the front, collapsing an immediate duplicate and capping
-    /// the length. Lock poisoning is ignored (a stale view is harmless).
-    pub fn record(&self, text: String, incoming: bool) {
-        if let Ok(mut q) = self.inner.lock() {
-            if q.front().is_some_and(|e| e.text == text && e.incoming == incoming) {
-                return;
-            }
-            q.push_front(ClipEntry { text, incoming });
-            q.truncate(HISTORY_CAP);
+    pub fn with_limits(limits: HistoryLimits) -> ClipboardHistory {
+        let h = ClipboardHistory::default();
+        h.set_limits(limits);
+        h
+    }
+
+    pub fn set_limits(&self, limits: HistoryLimits) {
+        if let Ok(mut g) = self.inner.lock() {
+            g.limits = limits;
+            trim(&mut g.entries, limits);
         }
     }
 
-    /// Newest-first snapshot for display.
-    pub fn snapshot(&self) -> Vec<ClipEntry> {
+    pub fn limits(&self) -> HistoryLimits {
+        self.inner.lock().map(|g| g.limits).unwrap_or_default()
+    }
+
+    /// Record text. Returns the new entry's id, or `None` if it was rejected.
+    pub fn record_text(&self, text: Arc<String>, incoming: bool) -> Option<u64> {
+        self.record(ClipPayload::Text(text), incoming)
+    }
+
+    /// Record an image, keeping the encoded PNG so it can be pasted again later.
+    pub fn record_image(&self, png: Arc<Vec<u8>>, w: usize, h: usize, incoming: bool) -> Option<u64> {
+        self.record(ClipPayload::Image { png, w, h }, incoming)
+    }
+
+    /// Record a payload at the front. An item we already hold is *moved* to the front
+    /// rather than duplicated — the clipboard-manager behaviour, and what stops the
+    /// same text appearing twice merely because it travelled in both directions.
+    fn record(&self, payload: ClipPayload, incoming: bool) -> Option<u64> {
+        let mut g = self.inner.lock().ok()?;
+        if payload.bytes() > g.limits.max_item_bytes {
+            tracing::debug!(
+                bytes = payload.bytes(),
+                cap = g.limits.max_item_bytes,
+                "clipboard item is over the per-item limit; not kept in history"
+            );
+            return None;
+        }
+        if let Some(pos) = g.entries.iter().position(|e| e.payload == payload) {
+            let mut existing = g.entries.remove(pos)?;
+            existing.incoming = incoming;
+            let id = existing.id;
+            g.entries.push_front(existing);
+            return Some(id);
+        }
+        g.next_id += 1;
+        let id = g.next_id;
+        let preview = payload.preview();
+        g.entries.push_front(ClipEntry {
+            id,
+            incoming,
+            pinned: false,
+            preview,
+            payload,
+        });
+        let limits = g.limits;
+        trim(&mut g.entries, limits);
+        Some(id)
+    }
+
+    /// Newest-first display list for the panel.
+    pub fn meta(&self) -> Vec<ClipMeta> {
         self.inner
             .lock()
-            .map(|q| q.iter().cloned().collect())
+            .map(|g| {
+                g.entries
+                    .iter()
+                    .map(|e| ClipMeta {
+                        id: e.id,
+                        incoming: e.incoming,
+                        pinned: e.pinned,
+                        is_image: e.payload.is_image(),
+                        preview: e.preview.clone(),
+                        bytes: e.payload.bytes(),
+                    })
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
-    /// Drop all remembered entries.
+    /// How much the history is currently holding, for the panel to show the cost of
+    /// the user's own settings rather than leave them to find out later.
+    pub fn usage(&self) -> (usize, usize) {
+        self.inner
+            .lock()
+            .map(|g| (g.entries.len(), g.entries.iter().map(|e| e.payload.bytes()).sum()))
+            .unwrap_or((0, 0))
+    }
+
+    /// The content of an entry, for putting it back on the clipboard.
+    pub fn payload(&self, id: u64) -> Option<ClipPayload> {
+        let g = self.inner.lock().ok()?;
+        g.entries.iter().find(|e| e.id == id).map(|e| e.payload.clone())
+    }
+
+    /// Move an entry to the front — what re-using it should do, matching how Windows'
+    /// history treats an item you pick.
+    pub fn promote(&self, id: u64) {
+        if let Ok(mut g) = self.inner.lock() {
+            if let Some(pos) = g.entries.iter().position(|e| e.id == id) {
+                if let Some(e) = g.entries.remove(pos) {
+                    g.entries.push_front(e);
+                }
+            }
+        }
+    }
+
+    /// Toggle pinning. Returns the new state, or `None` if there is no such entry.
+    pub fn toggle_pin(&self, id: u64) -> Option<bool> {
+        let mut g = self.inner.lock().ok()?;
+        let e = g.entries.iter_mut().find(|e| e.id == id)?;
+        e.pinned = !e.pinned;
+        Some(e.pinned)
+    }
+
+    pub fn remove(&self, id: u64) {
+        if let Ok(mut g) = self.inner.lock() {
+            g.entries.retain(|e| e.id != id);
+        }
+    }
+
+    /// Drop every entry the user has not pinned. Pinning exists precisely so that
+    /// "clear" does not take something you meant to keep.
     pub fn clear(&self) {
-        if let Ok(mut q) = self.inner.lock() {
-            q.clear();
+        if let Ok(mut g) = self.inner.lock() {
+            g.entries.retain(|e| e.pinned);
         }
     }
 }
 
-/// How often the local clipboard is polled for a user change (also the upper bound
-/// on how long a received update waits before being applied).
-const POLL_INTERVAL: Duration = Duration::from_millis(500);
+/// Enforce both budgets, oldest-unpinned first.
+///
+/// If every remaining entry is pinned we stop rather than evicting one: the user
+/// asked for those to stay, and quietly overrunning a budget they set is a smaller
+/// surprise than losing something they pinned.
+fn trim(entries: &mut VecDeque<ClipEntry>, limits: HistoryLimits) {
+    while entries.len() > limits.max_items {
+        match entries.iter().rposition(|e| !e.pinned) {
+            Some(pos) => {
+                entries.remove(pos);
+            }
+            None => break,
+        }
+    }
+    let mut total: usize = entries.iter().map(|e| e.payload.bytes()).sum();
+    while total > limits.memory_budget {
+        match entries.iter().rposition(|e| !e.pinned) {
+            Some(pos) => match entries.remove(pos) {
+                Some(e) => total -= e.payload.bytes(),
+                None => break,
+            },
+            None => break,
+        }
+    }
+}
 
-/// Don't forward absurdly large text over the shared input link (it would stall
-/// mouse/keyboard latency). ~1 MiB of text is already far beyond normal use.
-const MAX_TEXT_BYTES: usize = 1024 * 1024;
+/// What the panel can ask the clipboard thread to do. Only re-use has to reach the
+/// thread — pinning, deleting and clearing touch the shared history directly, because
+/// they never talk to the OS clipboard.
+enum ClipCommand {
+    Reuse(u64),
+}
 
-/// Cap on the encoded PNG we will send. The frame codec allows 8 MiB; staying well
-/// under it keeps a large screenshot from adding latency to mouse and keyboard, which
-/// share this link.
-const MAX_IMAGE_BYTES: usize = 4 * 1024 * 1024;
+/// The panel's handle for asking that a history entry be put back on the clipboard.
+#[derive(Clone)]
+pub struct ClipboardCommander {
+    tx: std::sync::mpsc::Sender<ClipCommand>,
+}
 
-/// Cap on raw pixels, checked *before* decoding or encoding. 4096×4096 is 64 MiB of
-/// RGBA — beyond that, the conversion itself costs more time than a clipboard sync is
-/// worth, and a hostile or corrupt peer message could otherwise ask us to allocate
-/// gigabytes.
-const MAX_IMAGE_PIXELS: usize = 4096 * 4096;
+impl ClipboardCommander {
+    /// Put entry `id` back on the system clipboard (and send it to the peer, so
+    /// re-using an old entry syncs exactly like a fresh copy).
+    pub fn reuse(&self, id: u64) {
+        let _ = self.tx.send(ClipCommand::Reuse(id));
+    }
+}
 
-/// Poll the clipboard for an *image* only every Nth tick. Reading an image means the
-/// OS hands over (and we copy) a full uncompressed bitmap; doing that twice a second
-/// forever would burn measurable CPU in a process that must never be slow. Text stays
-/// on the fast tick because reading it is trivially cheap.
-const IMAGE_POLL_EVERY: u32 = 4; // 4 × 500 ms = every 2 s
+/// The receiving half, handed to the clipboard thread.
+pub struct ClipCommandRx {
+    rx: Receiver<ClipCommand>,
+}
+
+/// Build the panel → clipboard-thread command channel.
+pub fn command_channel() -> (ClipboardCommander, ClipCommandRx) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    (ClipboardCommander { tx }, ClipCommandRx { rx })
+}
+
+/// The clipboard-thread half of the user's settings.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ClipboardSettings {
+    pub sync_text: bool,
+    pub sync_images: bool,
+    /// Largest text or encoded image we will send or store.
+    pub max_item_bytes: usize,
+    /// Largest accepted image edge, in pixels.
+    pub max_image_px: usize,
+}
+
+impl Default for ClipboardSettings {
+    fn default() -> Self {
+        ClipboardSettings {
+            sync_text: true,
+            sync_images: true,
+            max_item_bytes: DEFAULT_MAX_ITEM_BYTES,
+            max_image_px: DEFAULT_MAX_IMAGE_PX,
+        }
+    }
+}
+
+/// The loop's wait quantum. Short enough that a panel command (“put this entry back on
+/// the clipboard”) is acted on while the click still feels connected to the result;
+/// long enough that an idle machine is doing nothing ten times a second. Received peer
+/// messages still wake the loop immediately — this is only the *upper* bound on a wait.
+const WAIT_TICK: Duration = Duration::from_millis(100);
+
+/// Poll the local clipboard for text every Nth tick — 500 ms, as before.
+const TEXT_POLL_TICKS: u32 = 5;
+
+/// Poll for an *image* only every Nth tick. Reading an image means the OS hands over
+/// (and we copy) a full uncompressed bitmap; doing that twice a second forever would
+/// burn measurable CPU in a process that must never be slow. Text stays on the fast
+/// tick because reading it is trivially cheap.
+const IMAGE_POLL_TICKS: u32 = 20; // 20 × 100 ms = every 2 s, as before
 
 /// An RGBA8 image — the common currency between the OS clipboard and the PNG codec.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -171,9 +456,19 @@ fn image_key(img: &RgbaImage) -> u64 {
     h.finish()
 }
 
+/// Is this image within the user's size limit?
+///
+/// Checked per-edge *and* on the total, because the total is what actually gets
+/// allocated: at 4 bytes a pixel, an image the user's limit allows on both edges is
+/// still `max_px² × 4` bytes of RGBA. Both checks run before any decode or encode, so
+/// a corrupt or hostile peer message can never talk us into a huge allocation.
+fn within_image_limit(w: usize, h: usize, max_px: usize) -> bool {
+    w > 0 && h > 0 && w <= max_px && h <= max_px && w.saturating_mul(h) <= max_px.saturating_mul(max_px)
+}
+
 /// Encode RGBA8 as PNG. `None` if the image is outside the caps or the encoder fails.
-fn encode_png(img: &RgbaImage) -> Option<Vec<u8>> {
-    if img.w == 0 || img.h == 0 || img.w.checked_mul(img.h)? > MAX_IMAGE_PIXELS {
+fn encode_png(img: &RgbaImage, max_px: usize) -> Option<Vec<u8>> {
+    if !within_image_limit(img.w, img.h, max_px) {
         return None;
     }
     if img.bytes.len() != img.w.checked_mul(img.h)?.checked_mul(4)? {
@@ -193,7 +488,7 @@ fn encode_png(img: &RgbaImage) -> Option<Vec<u8>> {
 /// Decode a PNG to RGBA8. Accepts the colour types a peer might plausibly send, not
 /// just the RGBA we ourselves write. `None` on anything malformed or oversized — this
 /// parses data that arrived over the network, so it must never panic or over-allocate.
-fn decode_png(data: &[u8]) -> Option<RgbaImage> {
+fn decode_png(data: &[u8], max_px: usize) -> Option<RgbaImage> {
     let mut dec = png::Decoder::new(data);
     dec.set_transformations(png::Transformations::normalize_to_color8() | png::Transformations::EXPAND);
     let mut reader = dec.read_info().ok()?;
@@ -201,7 +496,7 @@ fn decode_png(data: &[u8]) -> Option<RgbaImage> {
         let info = reader.info();
         (info.width as usize, info.height as usize)
     };
-    if w == 0 || h == 0 || w.checked_mul(h)? > MAX_IMAGE_PIXELS {
+    if !within_image_limit(w, h, max_px) {
         return None;
     }
     let mut buf = vec![0u8; reader.output_buffer_size()];
@@ -222,11 +517,6 @@ fn decode_png(data: &[u8]) -> Option<RgbaImage> {
     Some(RgbaImage { w, h, bytes })
 }
 
-/// How an image is shown in the clipboard history (which is a list of strings).
-fn image_label(img: &RgbaImage, encoded: usize) -> String {
-    format!("[image {}×{}, {} KB]", img.w, img.h, encoded.div_ceil(1024))
-}
-
 /// Owns the clipboard-sync thread. Dropping or calling [`ClipboardSync::stop`]
 /// tears it down (bounded, so a wedged clipboard backend can't hang Stop).
 pub struct ClipboardSync {
@@ -237,19 +527,22 @@ pub struct ClipboardSync {
 impl ClipboardSync {
     /// Spawn the sync thread. `to_peer` carries local clipboard changes to the peer;
     /// `remote_rx` delivers the `Clipboard` messages the engine received from the peer;
-    /// `connected` (set by the engine) gates outgoing broadcasts so we never queue
-    /// unboundedly while disconnected nor flush a stale backlog on reconnect.
+    /// `commands` delivers the panel's re-use requests; `connected` (set by the engine)
+    /// gates outgoing broadcasts so we never queue unboundedly while disconnected nor
+    /// flush a stale backlog on reconnect.
     pub fn spawn(
         to_peer: UnboundedSender<Message>,
         remote_rx: Receiver<Message>,
+        commands: Option<ClipCommandRx>,
         connected: Arc<AtomicBool>,
         history: Option<ClipboardHistory>,
+        settings: ClipboardSettings,
     ) -> ClipboardSync {
         let stop = Arc::new(AtomicBool::new(false));
         let st = stop.clone();
         let join = std::thread::Builder::new()
             .name("clipboard-sync".into())
-            .spawn(move || run(to_peer, remote_rx, st, connected, history))
+            .spawn(move || run(to_peer, remote_rx, commands, st, connected, history, settings))
             .ok();
         if join.is_none() {
             tracing::warn!("could not spawn clipboard-sync thread; clipboard sync disabled");
@@ -276,12 +569,15 @@ impl Drop for ClipboardSync {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run(
     to_peer: UnboundedSender<Message>,
     remote_rx: Receiver<Message>,
+    commands: Option<ClipCommandRx>,
     stop: Arc<AtomicBool>,
     connected: Arc<AtomicBool>,
     history: Option<ClipboardHistory>,
+    settings: ClipboardSettings,
 ) {
     let mut clipboard = match arboard::Clipboard::new() {
         Ok(c) => c,
@@ -307,47 +603,73 @@ fn run(
 
     loop {
         // Apply a received clipboard update if one arrived; this recv is also the
-        // loop's wait point (wakes on a message or every POLL_INTERVAL).
-        match remote_rx.recv_timeout(POLL_INTERVAL) {
-            Ok(Message::Clipboard { text }) => {
-                if apply_remote(&mut clipboard, &mut last, text.clone()) {
+        // loop's wait point (wakes on a message or every WAIT_TICK).
+        match remote_rx.recv_timeout(WAIT_TICK) {
+            Ok(Message::Clipboard { text }) if settings.sync_text => {
+                let text = Arc::new(text);
+                if apply_remote(&mut clipboard, &mut last, &text) {
                     if let Some(h) = &history {
-                        h.record(text, true);
+                        h.record_text(text, true);
                     }
                 }
             }
-            Ok(Message::ClipboardImage { data, w, h }) => {
-                if let Some(label) = apply_remote_image(&mut clipboard, &mut last_img, &data, w, h) {
+            Ok(Message::ClipboardImage { data, w, h }) if settings.sync_images => {
+                if let Some(got) =
+                    apply_remote_image(&mut clipboard, &mut last_img, &data, w, h, settings)
+                {
                     if let Some(hist) = &history {
-                        hist.record(label, true);
+                        hist.record_image(got.png, got.w, got.h, true);
                     }
                 }
             }
-            Ok(_) => {} // stray message for this thread: ignore
+            // A stray message for this thread, or a kind the user has switched off.
+            Ok(_) => {}
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break, // engine dropped the sender
         }
         if stop.load(Ordering::SeqCst) {
             break;
         }
+        // Panel requests are drained every tick so re-using an entry feels immediate.
+        // They are handled whether or not a peer is connected: putting an item back on
+        // *this* machine's clipboard is useful on its own.
+        if let Some(cmds) = &commands {
+            while let Ok(ClipCommand::Reuse(id)) = cmds.rx.try_recv() {
+                if let Some(h) = &history {
+                    reuse_entry(
+                        &mut clipboard,
+                        &mut last,
+                        &mut last_img,
+                        h,
+                        &to_peer,
+                        connected.load(Ordering::SeqCst),
+                        id,
+                        settings,
+                    );
+                }
+            }
+        }
+        tick = tick.wrapping_add(1);
         // Only broadcast local changes while a peer is connected: this avoids
         // queueing unboundedly while disconnected, and avoids flushing a stale
         // backlog (clipboard copied while disconnected) to whoever connects next. On
         // reconnect the first poll naturally syncs the current clipboard once.
         if connected.load(Ordering::SeqCst) {
-            if let Some(sent) = poll_local(&mut clipboard, &mut last, &to_peer) {
-                if let Some(h) = &history {
-                    h.record(sent, false);
+            if settings.sync_text && tick % TEXT_POLL_TICKS == 0 {
+                if let Some(sent) = poll_local(&mut clipboard, &mut last, &to_peer, settings) {
+                    if let Some(h) = &history {
+                        h.record_text(sent, false);
+                    }
                 }
             }
-            // Images on the slow tick — see `IMAGE_POLL_EVERY`. When the clipboard holds
+            // Images on the slow tick — see `IMAGE_POLL_TICKS`. When the clipboard holds
             // text rather than an image the read fails fast, so the expensive path only
             // runs when there is actually an image to copy.
-            tick = tick.wrapping_add(1);
-            if tick % IMAGE_POLL_EVERY == 0 {
-                if let Some(sent) = poll_local_image(&mut clipboard, &mut last_img, &to_peer) {
+            if settings.sync_images && tick % IMAGE_POLL_TICKS == 0 {
+                if let Some(sent) = poll_local_image(&mut clipboard, &mut last_img, &to_peer, settings)
+                {
                     if let Some(h) = &history {
-                        h.record(sent, false);
+                        h.record_image(sent.png, sent.w, sent.h, false);
                     }
                 }
             }
@@ -355,15 +677,73 @@ fn run(
     }
 }
 
+/// Put a history entry back on the system clipboard, and send it to the peer so that
+/// re-using an old entry behaves exactly like copying it afresh.
+///
+/// `last`/`last_img` are updated to the value we just wrote. That is what stops the
+/// next local poll from seeing our own write as a new user copy and sending it twice.
+#[allow(clippy::too_many_arguments)]
+fn reuse_entry<C: SystemClipboard>(
+    clipboard: &mut C,
+    last: &mut Option<String>,
+    last_img: &mut Option<u64>,
+    history: &ClipboardHistory,
+    to_peer: &UnboundedSender<Message>,
+    connected: bool,
+    id: u64,
+    settings: ClipboardSettings,
+) -> bool {
+    let Some(payload) = history.payload(id) else {
+        tracing::debug!(id, "re-use asked for a clipboard entry that no longer exists");
+        return false;
+    };
+    match payload {
+        ClipPayload::Text(text) => {
+            if !clipboard.write_text(&text) {
+                tracing::warn!(id, "could not put the history entry back on the clipboard");
+                return false;
+            }
+            *last = Some((*text).clone());
+            if connected {
+                let _ = to_peer.send(Message::Clipboard {
+                    text: (*text).clone(),
+                });
+            }
+        }
+        ClipPayload::Image { png, .. } => {
+            let Some(img) = decode_png(&png, settings.max_image_px) else {
+                tracing::warn!(id, "stored clipboard image could not be decoded");
+                return false;
+            };
+            if !clipboard.write_image(&img) {
+                tracing::warn!(id, "could not put the history image back on the clipboard");
+                return false;
+            }
+            *last_img = Some(image_key(&img));
+            if connected {
+                use base64::Engine as _;
+                let _ = to_peer.send(Message::ClipboardImage {
+                    data: base64::engine::general_purpose::STANDARD.encode(png.as_slice()),
+                    w: img.w as i32,
+                    h: img.h as i32,
+                });
+            }
+        }
+    }
+    history.promote(id);
+    tracing::info!(id, "clipboard entry re-used from history");
+    true
+}
+
 /// Apply a clipboard value received from the peer, unless it's what we already have
 /// (which would mean it originated here and came back — don't reapply). Returns true
 /// if a new value was actually written (so the caller can record it in history).
-fn apply_remote<C: SystemClipboard>(clipboard: &mut C, last: &mut Option<String>, text: String) -> bool {
+fn apply_remote<C: SystemClipboard>(clipboard: &mut C, last: &mut Option<String>, text: &Arc<String>) -> bool {
     if last.as_deref() == Some(text.as_str()) {
         return false;
     }
-    if clipboard.write_text(&text) {
-        *last = Some(text);
+    if clipboard.write_text(text) {
+        *last = Some((**text).clone());
         true
     } else {
         tracing::debug!("clipboard set failed");
@@ -378,22 +758,36 @@ fn poll_local<C: SystemClipboard>(
     clipboard: &mut C,
     last: &mut Option<String>,
     to_peer: &UnboundedSender<Message>,
-) -> Option<String> {
+    settings: ClipboardSettings,
+) -> Option<Arc<String>> {
     let text = clipboard.read_text()?; // empty or non-text (e.g. an image): nothing to forward
     if text.is_empty() || last.as_deref() == Some(text.as_str()) {
         return None;
     }
-    if text.len() > MAX_TEXT_BYTES {
-        tracing::debug!("clipboard text {} bytes exceeds cap; not syncing", text.len());
+    if text.len() > settings.max_item_bytes {
+        tracing::debug!(
+            bytes = text.len(),
+            cap = settings.max_item_bytes,
+            "clipboard text is over the per-item limit; not syncing"
+        );
         *last = Some(text); // remember it so we don't re-check it every poll
         return None;
     }
     *last = Some(text.clone());
-    let _ = to_peer.send(Message::Clipboard { text: text.clone() });
-    Some(text)
+    let _ = to_peer.send(Message::Clipboard { text });
+    // `last` now holds exactly what we sent, so re-wrap that rather than cloning twice.
+    last.as_ref().map(|t| Arc::new(t.clone()))
 }
 
-/// Apply an image received from the peer. Returns a history label if a new image was
+/// An image that crossed the link, in the form the history stores it: the encoded PNG
+/// plus the dimensions it decodes to.
+struct SyncedImage {
+    png: Arc<Vec<u8>>,
+    w: usize,
+    h: usize,
+}
+
+/// Apply an image received from the peer. Returns the stored form if a new image was
 /// actually written, `None` if it was rejected or is what we already have.
 ///
 /// `w`/`h` come off the wire alongside the PNG; they are treated as a claim to be
@@ -404,14 +798,19 @@ fn apply_remote_image<C: SystemClipboard>(
     data: &str,
     w: i32,
     h: i32,
-) -> Option<String> {
+    settings: ClipboardSettings,
+) -> Option<SyncedImage> {
     use base64::Engine as _;
     let raw = base64::engine::general_purpose::STANDARD.decode(data).ok()?;
-    if raw.len() > MAX_IMAGE_BYTES {
-        tracing::debug!("received clipboard image of {} bytes exceeds cap; ignoring", raw.len());
+    if raw.len() > settings.max_item_bytes {
+        tracing::debug!(
+            bytes = raw.len(),
+            cap = settings.max_item_bytes,
+            "received clipboard image is over the per-item limit; ignoring"
+        );
         return None;
     }
-    let img = decode_png(&raw).or_else(|| {
+    let img = decode_png(&raw, settings.max_image_px).or_else(|| {
         tracing::debug!("received clipboard image could not be decoded; ignoring");
         None
     })?;
@@ -432,16 +831,21 @@ fn apply_remote_image<C: SystemClipboard>(
         return None;
     }
     *last_img = Some(key);
-    Some(image_label(&img, raw.len()))
+    Some(SyncedImage {
+        png: Arc::new(raw),
+        w: img.w,
+        h: img.h,
+    })
 }
 
 /// Forward a local clipboard image to the peer, unless it's what we last set/sent.
-/// Returns a history label if something was sent.
+/// Returns the stored form if something was sent.
 fn poll_local_image<C: SystemClipboard>(
     clipboard: &mut C,
     last_img: &mut Option<u64>,
     to_peer: &UnboundedSender<Message>,
-) -> Option<String> {
+    settings: ClipboardSettings,
+) -> Option<SyncedImage> {
     use base64::Engine as _;
     let img = clipboard.read_image()?; // no image on the clipboard: nothing to do
     let key = image_key(&img);
@@ -450,18 +854,25 @@ fn poll_local_image<C: SystemClipboard>(
     }
     // Remember it either way: a rejected image must not be re-encoded every poll.
     *last_img = Some(key);
-    let png = encode_png(&img)?;
-    if png.len() > MAX_IMAGE_BYTES {
-        tracing::debug!("local clipboard image is {} bytes encoded; not syncing", png.len());
+    let png = encode_png(&img, settings.max_image_px)?;
+    if png.len() > settings.max_item_bytes {
+        tracing::debug!(
+            bytes = png.len(),
+            cap = settings.max_item_bytes,
+            "local clipboard image is over the per-item limit; not syncing"
+        );
         return None;
     }
-    let label = image_label(&img, png.len());
     let _ = to_peer.send(Message::ClipboardImage {
         data: base64::engine::general_purpose::STANDARD.encode(&png),
         w: img.w as i32,
         h: img.h as i32,
     });
-    Some(label)
+    Some(SyncedImage {
+        png: Arc::new(png),
+        w: img.w,
+        h: img.h,
+    })
 }
 
 /// Join `handle`, but never block longer than `timeout`: detach a wedged backend
@@ -481,6 +892,14 @@ fn join_bounded(handle: JoinHandle<()>, timeout: Duration) {
 mod tests {
     use super::*;
     use tokio::sync::mpsc::unbounded_channel;
+
+    /// Image edge limit used throughout the tests.
+    const TEST_PX: usize = 4096;
+
+    /// Default settings for tests that don't care about the limits themselves.
+    fn set() -> ClipboardSettings {
+        ClipboardSettings::default()
+    }
 
     /// A fake shared clipboard for the sync logic.
     #[derive(Default)]
@@ -527,8 +946,8 @@ mod tests {
         // Clipboard images must survive the wire unchanged — a lossy or misordered
         // channel conversion would silently corrupt every screenshot.
         let original = img(32, 24, 5);
-        let encoded = encode_png(&original).expect("encode");
-        let decoded = decode_png(&encoded).expect("decode");
+        let encoded = encode_png(&original, TEST_PX).expect("encode");
+        let decoded = decode_png(&encoded, TEST_PX).expect("decode");
         assert_eq!(decoded, original);
     }
 
@@ -540,12 +959,12 @@ mod tests {
         let mut cb = Fake::default();
         let mut last_img = None;
         let source = img(16, 16, 9);
-        let png = encode_png(&source).unwrap();
+        let png = encode_png(&source, TEST_PX).unwrap();
 
-        assert!(apply_remote_image(&mut cb, &mut last_img, &b64(&png), 16, 16).is_some());
+        assert!(apply_remote_image(&mut cb, &mut last_img, &b64(&png), 16, 16, set()).is_some());
         assert_eq!(cb.image.as_ref(), Some(&source));
         // The poll now reads back exactly what we just applied.
-        assert_eq!(poll_local_image(&mut cb, &mut last_img, &tx), None);
+        assert!(poll_local_image(&mut cb, &mut last_img, &tx, set()).is_none());
         assert!(rx.try_recv().is_err(), "applied image must not echo back to the peer");
     }
 
@@ -558,24 +977,24 @@ mod tests {
         };
         let mut last_img = None;
 
-        assert!(poll_local_image(&mut cb, &mut last_img, &tx).is_some());
+        assert!(poll_local_image(&mut cb, &mut last_img, &tx, set()).is_some());
         match rx.try_recv() {
             Ok(Message::ClipboardImage { w, h, data }) => {
                 assert_eq!((w, h), (8, 8));
                 assert_eq!(decode_png(&{
                     use base64::Engine as _;
                     base64::engine::general_purpose::STANDARD.decode(&data).unwrap()
-                }), Some(img(8, 8, 1)));
+                }, TEST_PX), Some(img(8, 8, 1)));
             }
             other => panic!("expected a ClipboardImage, got {other:?}"),
         }
         // Unchanged clipboard: no repeat send on the next poll.
-        assert_eq!(poll_local_image(&mut cb, &mut last_img, &tx), None);
+        assert!(poll_local_image(&mut cb, &mut last_img, &tx, set()).is_none());
         assert!(rx.try_recv().is_err());
 
         // A genuinely different image does go out.
         cb.image = Some(img(8, 8, 200));
-        assert!(poll_local_image(&mut cb, &mut last_img, &tx).is_some());
+        assert!(poll_local_image(&mut cb, &mut last_img, &tx, set()).is_some());
         assert!(rx.try_recv().is_ok());
     }
 
@@ -586,14 +1005,18 @@ mod tests {
         let mut cb = Fake::default();
         let mut last_img = None;
 
-        assert_eq!(apply_remote_image(&mut cb, &mut last_img, "not base64!!", 4, 4), None);
-        assert_eq!(apply_remote_image(&mut cb, &mut last_img, &b64(b"not a png"), 4, 4), None);
-        assert_eq!(apply_remote_image(&mut cb, &mut last_img, "", 0, 0), None);
+        assert!(apply_remote_image(&mut cb, &mut last_img, "not base64!!", 4, 4, set()).is_none());
+        assert!(apply_remote_image(&mut cb, &mut last_img, &b64(b"not a png"), 4, 4, set()).is_none());
+        assert!(apply_remote_image(&mut cb, &mut last_img, "", 0, 0, set()).is_none());
 
         // A valid PNG whose real dimensions contradict the declared ones is refused:
         // trusting the header over the payload is how buffer-size bugs start.
-        let png = encode_png(&img(8, 8, 3)).unwrap();
-        assert_eq!(apply_remote_image(&mut cb, &mut last_img, &b64(&png), 4096, 4096), None);
+        let png = encode_png(&img(8, 8, 3), TEST_PX).unwrap();
+        assert!(apply_remote_image(&mut cb, &mut last_img, &b64(&png), 4096, 4096, set()).is_none());
+
+        // And an image beyond the user's own edge limit is refused before decoding.
+        let small = ClipboardSettings { max_image_px: 4, ..set() };
+        assert!(apply_remote_image(&mut cb, &mut last_img, &b64(&png), 8, 8, small).is_none());
 
         assert!(cb.image.is_none(), "nothing should have reached the clipboard");
         assert_eq!(last_img, None);
@@ -610,7 +1033,7 @@ mod tests {
             ..Default::default()
         };
         let mut last_img = None;
-        assert_eq!(poll_local_image(&mut cb, &mut last_img, &tx), None);
+        assert!(poll_local_image(&mut cb, &mut last_img, &tx, set()).is_none());
         assert!(last_img.is_some(), "the rejected image must still be fingerprinted");
     }
 
@@ -622,11 +1045,11 @@ mod tests {
         let mut cb = Fake::default();
         let mut last = None;
 
-        apply_remote(&mut cb, &mut last, "hello".to_string());
+        apply_remote(&mut cb, &mut last, &txt("hello"));
         assert_eq!(cb.content.as_deref(), Some("hello"));
         assert_eq!(last.as_deref(), Some("hello"));
 
-        poll_local(&mut cb, &mut last, &tx);
+        poll_local(&mut cb, &mut last, &tx, set());
         assert!(rx.try_recv().is_err(), "applied-remote text must not echo back");
     }
 
@@ -638,11 +1061,11 @@ mod tests {
 
         // User copies something locally.
         cb.content = Some("world".to_string());
-        poll_local(&mut cb, &mut last, &tx);
+        poll_local(&mut cb, &mut last, &tx, set());
         assert_eq!(rx.try_recv().unwrap(), Message::Clipboard { text: "world".to_string() });
 
         // Polling again with no change must not resend.
-        poll_local(&mut cb, &mut last, &tx);
+        poll_local(&mut cb, &mut last, &tx, set());
         assert!(rx.try_recv().is_err(), "unchanged clipboard must not resend");
     }
 
@@ -652,13 +1075,13 @@ mod tests {
         let mut cb = Fake::default();
         let mut last = None;
 
-        apply_remote(&mut cb, &mut last, "A".to_string());
-        poll_local(&mut cb, &mut last, &tx);
+        apply_remote(&mut cb, &mut last, &txt("A"));
+        poll_local(&mut cb, &mut last, &tx, set());
         assert!(rx.try_recv().is_err(), "no echo for A");
 
         // A genuinely new local copy is forwarded.
         cb.content = Some("B".to_string());
-        poll_local(&mut cb, &mut last, &tx);
+        poll_local(&mut cb, &mut last, &tx, set());
         assert_eq!(rx.try_recv().unwrap(), Message::Clipboard { text: "B".to_string() });
         assert!(rx.try_recv().is_err());
     }
@@ -668,8 +1091,8 @@ mod tests {
         let (tx, mut rx) = unbounded_channel();
         let mut cb = Fake::default();
         let mut last = None;
-        cb.content = Some("x".repeat(MAX_TEXT_BYTES + 1));
-        poll_local(&mut cb, &mut last, &tx);
+        cb.content = Some("x".repeat(set().max_item_bytes + 1));
+        poll_local(&mut cb, &mut last, &tx, set());
         assert!(rx.try_recv().is_err(), "oversized clipboard must not be synced");
         // And it's remembered so we don't re-evaluate it forever.
         assert!(last.is_some());
@@ -680,32 +1103,156 @@ mod tests {
         let (tx, mut rx) = unbounded_channel();
         let mut cb = Fake { content: Some(String::new()), ..Default::default() };
         let mut last = None;
-        poll_local(&mut cb, &mut last, &tx);
+        poll_local(&mut cb, &mut last, &tx, set());
         assert!(rx.try_recv().is_err());
     }
 
+    fn txt(s: &str) -> Arc<String> {
+        Arc::new(s.to_string())
+    }
+
     #[test]
-    fn history_records_newest_first_dedups_and_caps() {
+    fn history_is_newest_first_and_moves_repeats_to_the_front() {
         let h = ClipboardHistory::new();
-        h.record("a".into(), false);
-        h.record("a".into(), false); // immediate duplicate collapses
-        h.record("b".into(), true);
-        let snap = h.snapshot();
-        assert_eq!(snap.len(), 2);
-        assert_eq!(snap[0], ClipEntry { text: "b".into(), incoming: true }, "newest first");
-        assert_eq!(snap[1], ClipEntry { text: "a".into(), incoming: false });
+        h.record_text(txt("a"), false);
+        h.record_text(txt("b"), true);
+        let m = h.meta();
+        assert_eq!(m.len(), 2);
+        assert_eq!(m[0].preview, "b", "newest first");
+        assert!(m[0].incoming);
 
-        // The same text in the other direction is a distinct entry.
-        h.record("b".into(), false);
-        assert_eq!(h.snapshot().len(), 3);
+        // Copying something we already hold moves it up rather than duplicating it —
+        // the clipboard-manager behaviour. Direction is refreshed to the latest.
+        h.record_text(txt("a"), true);
+        let m = h.meta();
+        assert_eq!(m.len(), 2, "a repeat must not create a second entry");
+        assert_eq!(m[0].preview, "a");
+        assert!(m[0].incoming, "direction follows the most recent transfer");
+    }
 
-        for i in 0..HISTORY_CAP + 10 {
-            h.record(format!("x{i}"), false);
+    #[test]
+    fn the_item_count_limit_is_honoured() {
+        let limits = HistoryLimits { max_items: 3, ..Default::default() };
+        let h = ClipboardHistory::with_limits(limits);
+        for i in 0..10 {
+            h.record_text(txt(&format!("x{i}")), false);
         }
-        assert_eq!(h.snapshot().len(), HISTORY_CAP, "capped");
+        let m = h.meta();
+        assert_eq!(m.len(), 3, "capped at the user's setting");
+        assert_eq!(m[0].preview, "x9", "the newest survives");
+    }
+
+    #[test]
+    fn the_memory_budget_evicts_oldest_first() {
+        // Three 100-byte entries against a 250-byte budget: the oldest goes.
+        let limits = HistoryLimits {
+            max_items: 100,
+            max_item_bytes: 1024,
+            memory_budget: 250,
+        };
+        let h = ClipboardHistory::with_limits(limits);
+        for i in 0..3 {
+            h.record_text(txt(&format!("{}{}", i, "x".repeat(99))), false);
+        }
+        let (count, bytes) = h.usage();
+        assert_eq!(count, 2, "evicted down to the budget");
+        assert!(bytes <= 250, "budget respected, got {bytes}");
+        assert!(h.meta()[0].preview.starts_with('2'), "the newest survives");
+    }
+
+    #[test]
+    fn an_item_over_the_per_item_limit_is_not_kept() {
+        let limits = HistoryLimits { max_item_bytes: 10, ..Default::default() };
+        let h = ClipboardHistory::with_limits(limits);
+        assert!(h.record_text(txt("x".repeat(11).as_str()), false).is_none());
+        assert!(h.meta().is_empty());
+        assert!(h.record_text(txt("short"), false).is_some());
+    }
+
+    #[test]
+    fn pinned_entries_survive_eviction_and_clear() {
+        let limits = HistoryLimits { max_items: 2, ..Default::default() };
+        let h = ClipboardHistory::with_limits(limits);
+        let keep = h.record_text(txt("keep me"), false).unwrap();
+        assert_eq!(h.toggle_pin(keep), Some(true));
+
+        // Push well past the cap; the pinned entry must still be there.
+        for i in 0..10 {
+            h.record_text(txt(&format!("junk{i}")), false);
+        }
+        assert!(h.meta().iter().any(|e| e.id == keep), "pinned entry was evicted");
 
         h.clear();
-        assert!(h.snapshot().is_empty());
+        let m = h.meta();
+        assert_eq!(m.len(), 1, "clear keeps pinned entries and drops the rest");
+        assert_eq!(m[0].id, keep);
+    }
+
+    #[test]
+    fn images_keep_their_bytes_so_they_can_be_pasted_again() {
+        // The defect this whole change exists to fix: an image used to be stored as a
+        // text label with the pixels thrown away, so it could never be put back.
+        let h = ClipboardHistory::new();
+        let png = encode_png(&img(8, 8, 3), TEST_PX).unwrap();
+        let id = h.record_image(Arc::new(png.clone()), 8, 8, true).unwrap();
+
+        let m = h.meta();
+        assert!(m[0].is_image);
+        assert_eq!(m[0].preview, format!("image 8×8, {} KB", png.len().div_ceil(1024)));
+        match h.payload(id) {
+            Some(ClipPayload::Image { png: stored, w, h: hh }) => {
+                assert_eq!(*stored, png, "the encoded image itself must be kept");
+                assert_eq!((w, hh), (8, 8));
+            }
+            other => panic!("expected the image payload back, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reusing_an_entry_sets_the_clipboard_sends_it_and_promotes_it() {
+        let (tx, mut rx) = unbounded_channel();
+        let mut cb = Fake::default();
+        let mut last = None;
+        let mut last_img = None;
+        let h = ClipboardHistory::new();
+        let old = h.record_text(txt("older"), false).unwrap();
+        h.record_text(txt("newer"), false);
+
+        assert!(reuse_entry(&mut cb, &mut last, &mut last_img, &h, &tx, true, old, set()));
+        assert_eq!(cb.content.as_deref(), Some("older"), "clipboard was set");
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            Message::Clipboard { text: "older".into() },
+            "re-use syncs like a fresh copy"
+        );
+        assert_eq!(h.meta()[0].id, old, "the re-used entry moves to the front");
+
+        // `last` now holds what we wrote, so the next poll must not send it again —
+        // otherwise every re-use would cost two sends.
+        cb.content = Some("older".into());
+        assert!(poll_local(&mut cb, &mut last, &tx, set()).is_none());
+        assert!(rx.try_recv().is_err(), "re-use must not echo on the next poll");
+    }
+
+    #[test]
+    fn reusing_while_disconnected_still_sets_the_local_clipboard() {
+        let (tx, mut rx) = unbounded_channel();
+        let mut cb = Fake::default();
+        let h = ClipboardHistory::new();
+        let id = h.record_text(txt("offline"), false).unwrap();
+
+        assert!(reuse_entry(&mut cb, &mut None, &mut None, &h, &tx, false, id, set()));
+        assert_eq!(cb.content.as_deref(), Some("offline"));
+        assert!(rx.try_recv().is_err(), "nothing goes to a peer that isn't connected");
+    }
+
+    #[test]
+    fn reusing_a_missing_entry_is_a_no_op() {
+        let (tx, _rx) = unbounded_channel();
+        let mut cb = Fake::default();
+        let h = ClipboardHistory::new();
+        assert!(!reuse_entry(&mut cb, &mut None, &mut None, &h, &tx, true, 999, set()));
+        assert!(cb.content.is_none());
     }
 
     #[test]
@@ -713,11 +1260,11 @@ mod tests {
         let (tx, _rx) = unbounded_channel();
         let mut cb = Fake::default();
         let mut last = None;
-        assert!(apply_remote(&mut cb, &mut last, "in".into()), "new remote -> true");
-        assert!(!apply_remote(&mut cb, &mut last, "in".into()), "same remote -> false");
+        assert!(apply_remote(&mut cb, &mut last, &Arc::new("in".to_string())), "new remote -> true");
+        assert!(!apply_remote(&mut cb, &mut last, &Arc::new("in".to_string())), "same remote -> false");
 
         cb.content = Some("out".into());
-        assert_eq!(poll_local(&mut cb, &mut last, &tx).as_deref(), Some("out"));
-        assert_eq!(poll_local(&mut cb, &mut last, &tx), None, "unchanged -> None");
+        assert_eq!(poll_local(&mut cb, &mut last, &tx, set()).as_deref().map(|s| s.as_str()), Some("out"));
+        assert!(poll_local(&mut cb, &mut last, &tx, set()).is_none(), "unchanged -> None");
     }
 }

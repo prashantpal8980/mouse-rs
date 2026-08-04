@@ -60,6 +60,19 @@ enum Message {
     GenerateSecret,
     TlsToggled(bool),
     ClipboardToggled(bool),
+    // --- clipboard manager ---
+    /// Put a history entry back on the clipboard.
+    ClipReuse(u64),
+    ClipTogglePin(u64),
+    ClipRemove(u64),
+    ClipClear,
+    ClipAdvancedToggled(bool),
+    ClipSyncTextToggled(bool),
+    ClipSyncImagesToggled(bool),
+    ClipItemsChanged(String),
+    ClipItemMbChanged(String),
+    ClipMemMbChanged(String),
+    ClipImagePxChanged(String),
     ReconnectToggled(bool),
     AutostartToggled(bool),
     AutoconnectToggled(bool),
@@ -179,6 +192,35 @@ struct App {
     /// so the footer can hold only the two actions used constantly — the old footer packed
     /// in eight and pushed Stop and Quit off the edge at normal window width.
     menu_open: bool,
+    /// Whether the Clipboard tab's Advanced settings are expanded. Everything is
+    /// configurable, but not everything is shown at once: the four settings most people
+    /// touch stay visible and the rest sit one click away.
+    clip_advanced: bool,
+    // String buffers for the numeric clipboard settings, same reason as the ports:
+    // a partial edit ("1" on the way to "128") must not be parsed and written back.
+    clip_items_s: String,
+    clip_item_mb_s: String,
+    clip_mem_mb_s: String,
+    clip_img_px_s: String,
+}
+
+/// Bytes → whole MB for display. The panel talks in MB because that is the unit the
+/// user thinks in; config stores bytes because that is what the code compares against.
+fn mb_of(bytes: usize) -> String {
+    (bytes as f64 / (1024.0 * 1024.0)).round().to_string()
+}
+
+/// A byte count in the largest unit that keeps it readable.
+fn human_bytes(bytes: usize) -> String {
+    const MB: f64 = 1024.0 * 1024.0;
+    let mb = bytes as f64 / MB;
+    if mb >= 1024.0 {
+        format!("{:.1} GB", mb / 1024.0)
+    } else if mb >= 1.0 {
+        format!("{:.1} MB", mb)
+    } else {
+        format!("{} KB", bytes.div_ceil(1024))
+    }
 }
 
 #[derive(Default)]
@@ -214,6 +256,11 @@ impl App {
             scan: Arc::new(Mutex::new(ScanState::Idle)),
             found_servers: Vec::new(),
             menu_open: false,
+            clip_advanced: false,
+            clip_items_s: String::new(),
+            clip_item_mb_s: String::new(),
+            clip_mem_mb_s: String::new(),
+            clip_img_px_s: String::new(),
             saved_cfg: cfg.clone(),
             cfg,
         };
@@ -227,6 +274,10 @@ impl App {
         self.listen_port_s = self.cfg.listen_port.to_string();
         self.screen_w_s = self.cfg.screen_width.to_string();
         self.screen_h_s = self.cfg.screen_height.to_string();
+        self.clip_items_s = self.cfg.clipboard_history_size.to_string();
+        self.clip_item_mb_s = mb_of(self.cfg.clipboard_max_item_bytes);
+        self.clip_mem_mb_s = mb_of(self.cfg.clipboard_memory_budget);
+        self.clip_img_px_s = self.cfg.clipboard_max_image_px.to_string();
     }
 
     fn running(&self) -> bool {
@@ -383,6 +434,63 @@ impl App {
             }
             Message::TlsToggled(v) => self.cfg.tls_enabled = v,
             Message::ClipboardToggled(v) => self.cfg.clipboard_sync = v,
+            // Re-use goes to the clipboard thread; pin/remove/clear touch the shared
+            // history directly, because they never talk to the OS clipboard.
+            Message::ClipReuse(id) => {
+                if let Some(e) = &self.engine {
+                    e.clipboard_reuse(id);
+                    self.feedback = "copied — paste it anywhere".into();
+                }
+            }
+            Message::ClipTogglePin(id) => {
+                if let Some(e) = &self.engine {
+                    match e.clipboard_toggle_pin(id) {
+                        Some(true) => self.feedback = "pinned — it won't be evicted".into(),
+                        Some(false) => self.feedback = "unpinned".into(),
+                        None => {}
+                    }
+                }
+            }
+            Message::ClipRemove(id) => {
+                if let Some(e) = &self.engine {
+                    e.clipboard_remove(id);
+                }
+            }
+            Message::ClipClear => {
+                if let Some(e) = &self.engine {
+                    e.clipboard_clear();
+                    self.feedback = "history cleared (pinned entries kept)".into();
+                }
+            }
+            Message::ClipAdvancedToggled(v) => self.clip_advanced = v,
+            Message::ClipSyncTextToggled(v) => self.cfg.clipboard_sync_text = v,
+            Message::ClipSyncImagesToggled(v) => self.cfg.clipboard_sync_images = v,
+            // The numeric settings keep their own string buffer so a half-typed value is
+            // never parsed; an unparseable buffer simply leaves `cfg` alone.
+            Message::ClipItemsChanged(s) => {
+                if let Ok(v) = s.trim().parse::<usize>() {
+                    self.cfg.clipboard_history_size = v.max(1);
+                }
+                self.clip_items_s = s;
+            }
+            Message::ClipItemMbChanged(s) => {
+                if let Ok(v) = s.trim().parse::<usize>() {
+                    self.cfg.clipboard_max_item_bytes = v.max(1) * 1024 * 1024;
+                }
+                self.clip_item_mb_s = s;
+            }
+            Message::ClipMemMbChanged(s) => {
+                if let Ok(v) = s.trim().parse::<usize>() {
+                    self.cfg.clipboard_memory_budget = v.max(1) * 1024 * 1024;
+                }
+                self.clip_mem_mb_s = s;
+            }
+            Message::ClipImagePxChanged(s) => {
+                if let Ok(v) = s.trim().parse::<usize>() {
+                    self.cfg.clipboard_max_image_px = v.max(1);
+                }
+                self.clip_img_px_s = s;
+            }
             Message::ReconnectToggled(v) => self.cfg.reconnect = v,
             Message::AutostartToggled(v) => {
                 // This one touches the OS, not just `cfg`, so it takes effect immediately
@@ -767,20 +875,22 @@ impl App {
     /// what this says in ~70px. It answers the only question that changes moment to moment —
     /// which machine currently has the mouse and keyboard — so it stays on every tab.
     fn hero(&self, p: Palette, running: bool, snap: Option<&StatusSnapshot>) -> Element<'_, Message> {
-        let engaged = snap.map(|s| s.connected && s.engaged).unwrap_or(false);
-        let server_side = self.cfg.role == Role::Server;
+        let connected = snap.map(|s| s.connected).unwrap_or(false);
+        // Exactly one chip is lit, and it is always the machine that currently has the
+        // mouse and keyboard. See `control_is_local` for why the role has to be folded in.
+        let local_has_control = control_is_local(self.cfg.role, snap);
 
         let local = machine_chip(
             p,
             &self.cfg.name,
             &format!("{}×{}", self.cfg.screen_width, self.cfg.screen_height),
-            !engaged || !server_side,
+            local_has_control,
         );
         let (peer_name, peer_res) = match snap {
             Some(s) if s.connected => (s.peer.clone(), format!("{}×{}", s.peer_w, s.peer_h)),
             _ => ("waiting…".to_string(), "—".to_string()),
         };
-        let peer = machine_chip(p, &peer_name, &peer_res, engaged && server_side);
+        let peer = machine_chip(p, &peer_name, &peer_res, connected && !local_has_control);
 
         let link = text(if running { "⇄" } else { "—" })
             .size(18.0)
@@ -1011,35 +1121,145 @@ impl App {
         .spacing(14.0))
     }
 
+    /// The clipboard manager: a list you can act on, not a log you can only read.
+    ///
+    /// Every row is a button that puts that item back on the clipboard (and sends it to
+    /// the peer, exactly as a fresh copy would). Settings split Basic / Advanced so the
+    /// four most people touch stay visible while the rest are one click away — nothing
+    /// is hidden, it just isn't all shouting at once.
     fn tab_clipboard(&self, p: Palette) -> Element<'_, Message> {
-        let history = self.engine.as_ref().map(|e| e.clipboard_history());
+        let entries = self.engine.as_ref().map(|e| e.clipboard_meta());
         let mut list = column![].spacing(8.0);
-        match history {
-            None => list = list.push(text("Start sharing to see synced clipboard text here.").size(12.0).color(p.txt3)),
-            Some(entries) if entries.is_empty() => {
-                list = list.push(text("Nothing synced yet.").size(12.0).color(p.txt3))
+        match &entries {
+            None => {
+                list = list.push(
+                    text("Start sharing to build up clipboard history.").size(12.0).color(p.txt3),
+                )
             }
-            Some(entries) => {
-                for e in entries {
-                    let (arrow, col) = if e.incoming { ("↓ in", p.accent) } else { ("↑ out", p.good) };
-                    list = list.push(
-                        container(row![
+            Some(e) if e.is_empty() => {
+                list = list.push(text("Nothing copied yet.").size(12.0).color(p.txt3))
+            }
+            Some(e) => {
+                for m in e {
+                    let (arrow, col) = if m.incoming { ("↓ in", p.accent) } else { ("↑ out", p.good) };
+                    let kind = if m.is_image { "🖼" } else { "¶" };
+                    // The row itself is the re-use action — the thing the user wants
+                    // nine times out of ten needs no menu and no second click.
+                    let reuse = button(
+                        row![
+                            text(kind).size(12.0).color(p.txt3),
                             text(arrow).size(11.0).color(col),
-                            text(preview(&e.text)).size(13.0).color(p.txt2),
-                        ].spacing(10.0))
-                        .style(move |_| ui_theme::well(p))
-                        .padding([10.0, 12.0])
-                        .width(Length::Fill),
-                    );
+                            text(m.preview.clone()).size(13.0).color(p.txt2),
+                            Space::new().width(Length::Fill),
+                            text(human_bytes(m.bytes)).size(11.0).color(p.txt3),
+                        ]
+                        .spacing(10.0)
+                        .align_y(Alignment::Center),
+                    )
+                    .style(ui_theme::ghost(p))
+                    .padding([10.0, 12.0])
+                    .width(Length::Fill)
+                    .on_press(Message::ClipReuse(m.id));
+
+                    let pin = button(text(if m.pinned { "📌" } else { "📍" }).size(12.0))
+                        .style(ui_theme::ghost(p))
+                        .padding([10.0, 10.0])
+                        .on_press(Message::ClipTogglePin(m.id));
+                    let del = button(text("✕").size(12.0))
+                        .style(ui_theme::ghost(p))
+                        .padding([10.0, 10.0])
+                        .on_press(Message::ClipRemove(m.id));
+
+                    list = list.push(row![reuse, pin, del].spacing(4.0).align_y(Alignment::Center));
                 }
             }
         }
-        card(p, column![
-            toggle_row(p, "Sync clipboard", "copy here, paste there — text and images", self.cfg.clipboard_sync, Message::ClipboardToggled),
-            field_label(p, "Clipboard history — newest first"),
-            list,
+
+        // What the user's own limits are costing right now — shown rather than left to
+        // be discovered later.
+        let usage: Element<'_, Message> = match self.engine.as_ref().map(|e| e.clipboard_usage()) {
+            Some((count, bytes)) if count > 0 => text(format!(
+                "{count} of {} entries · {} of {}",
+                self.cfg.clipboard_history_size,
+                human_bytes(bytes),
+                human_bytes(self.cfg.clipboard_memory_budget),
+            ))
+            .size(11.0)
+            .color(p.txt3)
+            .into(),
+            _ => Space::new().height(0.0).into(),
+        };
+
+        let header = row![
+            field_label(p, "History — newest first · click any entry to copy it again"),
+            Space::new().width(Length::Fill),
+            button(text("Clear").size(12.0))
+                .style(ui_theme::ghost(p))
+                .padding([7.0, 12.0])
+                .on_press(Message::ClipClear),
         ]
-        .spacing(12.0))
+        .align_y(Alignment::Center);
+
+        let mut body = column![
+            toggle_row(
+                p,
+                "Sync clipboard",
+                "copy here, paste there — text and images",
+                self.cfg.clipboard_sync,
+                Message::ClipboardToggled
+            ),
+            header,
+            list,
+            usage,
+            labeled(p, "Keep this many entries", input(p, "25", &self.clip_items_s, Message::ClipItemsChanged)),
+            toggle_row(
+                p,
+                "Advanced settings",
+                "size limits, memory budget, what gets synced",
+                self.clip_advanced,
+                Message::ClipAdvancedToggled
+            ),
+        ]
+        .spacing(12.0);
+
+        if self.clip_advanced {
+            // The worst case this configuration allows. Stating the cost is the job;
+            // refusing the value is not — a slow setting chosen deliberately is the
+            // owner's trade to make.
+            let worst = self
+                .cfg
+                .clipboard_history_size
+                .saturating_mul(self.cfg.clipboard_max_item_bytes)
+                .min(self.cfg.clipboard_memory_budget);
+            let px = self.cfg.clipboard_max_image_px;
+            // 4 bytes a pixel of RGBA, allocated while an image is encoded or decoded.
+            let img_cost = px.saturating_mul(px).saturating_mul(4);
+
+            body = body.push(
+                column![
+                    toggle_row(p, "Sync text", "copied text crosses machines", self.cfg.clipboard_sync_text, Message::ClipSyncTextToggled),
+                    toggle_row(p, "Sync images", "copied images cross machines", self.cfg.clipboard_sync_images, Message::ClipSyncImagesToggled),
+                    labeled(p, "Biggest item to keep (MB)", input(p, "5", &self.clip_item_mb_s, Message::ClipItemMbChanged)),
+                    labeled(p, "Memory budget (MB)", input(p, "64", &self.clip_mem_mb_s, Message::ClipMemMbChanged)),
+                    text(format!(
+                        "This configuration can hold up to {}. Pinned entries are never evicted.",
+                        human_bytes(worst)
+                    ))
+                    .size(11.0)
+                    .color(p.txt3),
+                    labeled(p, "Largest image edge (px)", input(p, "4096", &self.clip_img_px_s, Message::ClipImagePxChanged)),
+                    text(format!(
+                        "An image this size costs about {} of memory for a moment while it is compressed.",
+                        human_bytes(img_cost)
+                    ))
+                    .size(11.0)
+                    .color(if img_cost > 128 * 1024 * 1024 { p.warn } else { p.txt3 }),
+                ]
+                .spacing(12.0),
+            );
+        }
+
+        card(p, body)
     }
 
     // ---------- profiles + footer ----------
@@ -1267,6 +1487,30 @@ fn machine_chip(p: Palette, name: &str, res: &str, active: bool) -> Element<'sta
     .into()
 }
 
+/// Which machine currently holds the mouse and keyboard — `true` for this one.
+///
+/// `StatusSnapshot::engaged` is **role-relative**, and that is the trap. On the server it
+/// means the cursor has left for the peer; on the client it means the peer is driving *this*
+/// machine. It therefore points at opposite machines on the two ends of the same session,
+/// and folding the role back in is not optional.
+///
+/// The hero used `engaged` directly (`!engaged || !server_side` for the local chip,
+/// `engaged && server_side` for the peer), which on a **client** reduces to `true` and
+/// `false` — constants. So on Kali, which is the client here, the local chip was lit
+/// permanently and the peer chip could never light, whichever way the mouse went. The one
+/// question the hero exists to answer went unanswered on half the machines.
+///
+/// With no live session, control is trivially on this machine.
+fn control_is_local(role: Role, snap: Option<&StatusSnapshot>) -> bool {
+    match snap {
+        Some(s) if s.connected => match role {
+            Role::Server => !s.engaged,
+            Role::Client => s.engaged,
+        },
+        _ => true,
+    }
+}
+
 // ---------- status text helpers ----------
 
 fn status_pill(p: Palette, running: bool, snap: Option<&StatusSnapshot>) -> (iced::Color, iced::Color, String) {
@@ -1305,17 +1549,6 @@ fn hero_line(running: bool, role: Role, snap: Option<&StatusSnapshot>) -> String
         Some(s) if s.connected => format!("connected to {}", s.peer),
         _ if running => "waiting for peer…".into(),
         _ => "stopped".into(),
-    }
-}
-
-/// A single-line, length-capped preview of clipboard text.
-fn preview(text: &str) -> String {
-    const MAX: usize = 58;
-    let one_line: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    if one_line.chars().count() > MAX {
-        format!("{}…", one_line.chars().take(MAX).collect::<String>())
-    } else {
-        one_line
     }
 }
 
@@ -1422,6 +1655,34 @@ mod tests {
         assert_eq!(restored.shared_secret, "a-real-secret");
         assert_eq!((restored.screen_width, restored.screen_height), (1440, 900));
         assert_eq!(restored.exit_edge, Config::default().exit_edge, "preferences do reset");
+    }
+
+    /// The hero highlight must track the machine that has the mouse, on **both** ends.
+    /// It did not: `engaged` is role-relative, and using it raw made the client's chips
+    /// constants — local always lit, peer never — so the panel on the client machine could
+    /// not say where control was. Asserted per role because the client is the side that
+    /// was broken and the side no test covered.
+    #[test]
+    fn the_lit_chip_is_the_machine_that_has_control() {
+        let idle = StatusSnapshot { connected: true, engaged: false, ..Default::default() };
+        let crossing = StatusSnapshot { connected: true, engaged: true, ..Default::default() };
+
+        // Server: not engaged = the cursor is still here; engaged = it has gone to the peer.
+        assert!(control_is_local(Role::Server, Some(&idle)));
+        assert!(!control_is_local(Role::Server, Some(&crossing)));
+
+        // Client: engaged = the peer is driving *this* machine, so control is here — the
+        // exact inversion the old code missed.
+        assert!(!control_is_local(Role::Client, Some(&idle)));
+        assert!(control_is_local(Role::Client, Some(&crossing)));
+
+        // No session: control is trivially local, on either role. A client showing the
+        // peer chip lit while stopped would be a new way of lying about the same thing.
+        let down = StatusSnapshot { connected: false, engaged: false, ..Default::default() };
+        for role in [Role::Server, Role::Client] {
+            assert!(control_is_local(role, None), "{role:?}: no engine");
+            assert!(control_is_local(role, Some(&down)), "{role:?}: disconnected");
+        }
     }
 
     /// Screen size is two fields but one user-facing setting; reporting it twice would

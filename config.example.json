@@ -4,6 +4,12 @@
   "shared_secret": "change-me-to-a-long-random-string",
   "tls_enabled": true,
   "clipboard_sync": true,
+  "clipboard_sync_text": true,
+  "clipboard_sync_images": true,
+  "clipboard_history_size": 25,
+  "clipboard_max_item_bytes": 5242880,
+  "clipboard_memory_budget": 67108864,
+  "clipboard_max_image_px": 4096,
   "lock_hotkey": "scroll_lock",
   "return_hotkey": "ctrl+win+alt+esc",
 

@@ -1,0 +1,337 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Exit edge &amp; Entry edge — the simple version</title>
+<style>
+  :root{
+    --bg:#0d111c; --card:#151b2b; --card2:#1b2233; --inset:#111726;
+    --line:#232c42; --line2:#2c3650;
+    --txt:#e7ebf5; --txt2:#a6b0c8; --txt3:#6c7794;
+    --accent:#5b7cfa; --accent2:#8b5cf6; --warn:#f0b429; --good:#3ecf8e; --bad:#ef5f6b;
+  }
+  *{box-sizing:border-box}
+  body{
+    margin:0;padding:0 20px 90px;background:var(--bg);color:var(--txt);
+    font:15px/1.65 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+  }
+  .wrap{max-width:980px;margin:0 auto}
+  header{padding:48px 0 8px}
+  h1{font-size:29px;line-height:1.25;margin:0 0 10px;letter-spacing:-.02em}
+  h2{font-size:20px;margin:0 0 6px;letter-spacing:-.01em}
+  .sub{color:var(--txt2);margin:0;max-width:64ch}
+  section{margin-top:22px;padding:24px;background:var(--card);border:1px solid var(--line);border-radius:16px}
+  .step{
+    display:inline-block;font-size:11px;letter-spacing:.14em;text-transform:uppercase;
+    color:var(--accent);border:1px solid rgba(91,124,250,.35);
+    background:rgba(91,124,250,.10);border-radius:999px;padding:3px 10px;margin-bottom:12px;
+  }
+  p{margin:10px 0}
+  .muted{color:var(--txt2)} .small{font-size:13px}
+  code{font:12.5px ui-monospace,SFMono-Regular,Menlo,monospace;background:var(--inset);
+       border:1px solid var(--line);border-radius:5px;padding:1px 6px}
+  .scroll{overflow-x:auto}
+
+  /* ---------- the 4-step round trip ---------- */
+  .trip{list-style:none;padding:0;margin:16px 0 0}
+  .trip > li{
+    display:flex;gap:18px;align-items:center;flex-wrap:wrap;
+    padding:16px;background:var(--inset);border:1px solid var(--line);
+    border-radius:12px;margin-bottom:12px;
+  }
+  .trip .num{
+    flex:0 0 28px;height:28px;border-radius:50%;background:rgba(91,124,250,.16);
+    color:var(--accent);font-weight:700;font-size:14px;
+    display:flex;align-items:center;justify-content:center;
+  }
+  .trip .say{flex:1 1 260px;font-size:14.5px}
+  .trip .say b{color:var(--txt)}
+  .trip .say .tagline{display:block;margin-top:4px;font-size:12.5px;color:var(--txt3)}
+
+  .mini{display:flex;align-items:center;gap:10px;flex:0 0 auto}
+  .m{
+    position:relative;width:132px;height:82px;background:var(--card2);
+    border:1px solid var(--line2);border-radius:9px;
+    display:flex;align-items:center;justify-content:center;
+  }
+  /* Label pinned to the top so the cursor arrow can never land on top of it. */
+  .m span{position:absolute;top:7px;left:0;right:0;text-align:center;font-size:10.5px;color:var(--txt3)}
+  .m .eg{position:absolute;width:4px;height:44px;top:19px;border-radius:3px;background:var(--line2)}
+  .m .eg.l{left:5px} .m .eg.r{right:5px}
+  .m .eg.on{background:linear-gradient(180deg,var(--accent),var(--accent2));
+            box-shadow:0 0 12px rgba(91,124,250,.7)}
+  .cur{
+    position:absolute;top:34px;width:0;height:0;z-index:2;
+    border-left:8px solid #fff;border-top:4px solid transparent;border-bottom:8px solid transparent;
+    filter:drop-shadow(0 1px 2px rgba(0,0,0,.9));
+  }
+  .arrow{color:var(--txt3);font-size:16px}
+
+  /* ---------- who decides ---------- */
+  table{border-collapse:collapse;width:100%;min-width:560px;margin-top:8px;font-size:14px}
+  th,td{text-align:left;padding:11px 12px;border-bottom:1px solid var(--line);vertical-align:top}
+  th{color:var(--txt3);font-weight:600;font-size:12px;letter-spacing:.06em;text-transform:uppercase}
+  td.yes{color:var(--good)} td.no{color:var(--bad)}
+  tr:last-child td{border-bottom:0}
+
+  /* ---------- panel replica ---------- */
+  .panels{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:18px;margin-top:14px}
+  .panel{background:var(--card2);border:1px solid var(--line);border-radius:14px;padding:16px}
+  .panel h3{margin:0 0 4px;font-size:14px}
+  .panel .why{font-size:12px;color:var(--txt3);margin:0 0 14px}
+  .flabel{font-size:12.5px;color:var(--txt2);margin:14px 0 7px}
+  .flabel:first-of-type{margin-top:0}
+  .picker{position:relative;height:88px;background:var(--inset);border:1px solid var(--line);
+          border-radius:10px;display:flex;align-items:center;justify-content:center}
+  .picker .lbl{font-size:11px;color:var(--txt3)}
+  .picker .eg{position:absolute;width:5px;height:40px;top:23px;border-radius:3px;background:var(--line2)}
+  .picker .eg.l{left:7px} .picker .eg.r{right:7px}
+  .picker .eg.on{background:linear-gradient(180deg,var(--accent),var(--accent2));
+                 box-shadow:0 0 14px rgba(91,124,250,.65)}
+  .warn{color:var(--warn);font-size:11.5px;margin:10px 0 0;line-height:1.5}
+  .note{color:var(--txt3);font-size:11.5px;margin:8px 0 0;line-height:1.5}
+  .bad-tag,.good-tag{display:inline-block;font-size:10.5px;font-weight:600;padding:2px 8px;
+                     border-radius:999px;vertical-align:middle;margin-left:6px}
+  .bad-tag{color:var(--bad);background:rgba(239,95,107,.12);border:1px solid rgba(239,95,107,.35)}
+  .good-tag{color:var(--good);background:rgba(62,207,142,.12);border:1px solid rgba(62,207,142,.35)}
+
+  .callouts{list-style:none;padding:0;margin:16px 0 0}
+  .callouts li{display:flex;gap:12px;padding:12px 14px;background:var(--inset);border:1px solid var(--line);
+               border-left:3px solid var(--bad);border-radius:8px;margin-bottom:10px}
+  .callouts li .n{flex:0 0 22px;height:22px;border-radius:50%;background:rgba(239,95,107,.15);
+                  color:var(--bad);font-size:12px;font-weight:700;
+                  display:flex;align-items:center;justify-content:center}
+  .callouts li .t{font-size:13.5px}
+  .callouts li .t b{color:var(--txt)}
+  .callouts.fix li{border-left-color:var(--good)}
+  .callouts.fix li .n{background:rgba(62,207,142,.15);color:var(--good)}
+
+  .big{
+    margin-top:16px;padding:16px 18px;border-radius:12px;
+    background:linear-gradient(180deg,rgba(240,180,41,.10),rgba(240,180,41,.03));
+    border:1px solid rgba(240,180,41,.32);
+  }
+  .big h3{margin:0 0 6px;font-size:15px;color:var(--warn)}
+  .verdict{margin-top:22px;padding:18px 20px;border-radius:14px;
+           background:linear-gradient(180deg,rgba(62,207,142,.10),rgba(62,207,142,.03));
+           border:1px solid rgba(62,207,142,.30)}
+  .verdict h2{color:var(--good)}
+  footer{margin-top:26px;color:var(--txt3);font-size:12.5px}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <h1>Exit edge and Entry edge — the simple version</h1>
+  <p class="sub">Using your own example: leave Windows at the <b>right</b>, arrive on Kali at the
+  <b>left</b>. Which means Kali sits to the right of the laptop.</p>
+</header>
+
+<!-- 1 -->
+<section>
+  <span class="step">1 · the whole thing</span>
+  <h2>The two settings describe <u>one</u> trip: Windows → Kali</h2>
+  <p class="muted">Not two trips. Not one per machine. One trip, and a trip has a place you leave
+  from and a place you arrive at.</p>
+
+  <ul class="trip">
+    <li>
+      <span class="num">1</span>
+      <div class="mini">
+        <div class="m"><span>laptop</span><i class="eg l"></i><i class="eg r on"></i>
+          <i class="cur" style="right:9px"></i></div>
+        <span class="arrow">→</span>
+        <div class="m"><span>kali</span><i class="eg l"></i><i class="eg r"></i></div>
+      </div>
+      <div class="say">You push the mouse off the <b>right</b> edge of the laptop.
+        <span class="tagline">That edge is the <b>EXIT EDGE</b>. Set on the laptop.</span></div>
+    </li>
+    <li>
+      <span class="num">2</span>
+      <div class="mini">
+        <div class="m"><span>laptop</span><i class="eg l"></i><i class="eg r on"></i></div>
+        <span class="arrow">→</span>
+        <div class="m"><span>kali</span><i class="eg l on"></i><i class="eg r"></i>
+          <i class="cur" style="left:11px"></i></div>
+      </div>
+      <div class="say">The cursor pops up on Kali at the <b>left</b> edge.
+        <span class="tagline">That edge is the <b>ENTRY EDGE</b>. Also set on the laptop — it's the
+        laptop that works out the landing spot and sends it.</span></div>
+    </li>
+    <li>
+      <span class="num">3</span>
+      <div class="mini">
+        <div class="m"><span>laptop</span><i class="eg l"></i><i class="eg r on"></i></div>
+        <span class="arrow">→</span>
+        <div class="m"><span>kali</span><i class="eg l on"></i><i class="eg r"></i>
+          <i class="cur" style="left:60px"></i></div>
+      </div>
+      <div class="say">You work on Kali. Your keyboard and mouse are driving it.
+        <span class="tagline">Nothing about edges matters here.</span></div>
+    </li>
+    <li>
+      <span class="num">4</span>
+      <div class="mini">
+        <div class="m"><span>laptop</span><i class="eg l"></i><i class="eg r on"></i>
+          <i class="cur" style="right:9px"></i></div>
+        <span class="arrow">←</span>
+        <div class="m"><span>kali</span><i class="eg l on"></i><i class="eg r"></i>
+          <i class="cur" style="left:11px"></i></div>
+      </div>
+      <div class="say">You push the cursor back into that <b>same left edge</b> on Kali. Control
+        goes home.
+        <span class="tagline">This is the only thing Kali needs the setting for: "which edge means
+        go home". Same edge you arrived at.</span></div>
+    </li>
+  </ul>
+</section>
+
+<!-- 2 -->
+<section>
+  <span class="step">2 · your question</span>
+  <h2>"Can I make the arrow come back on the laptop's <i>left</i> side?"</h2>
+  <p><b style="color:var(--bad)">No — and there is no setting for it, on purpose.</b></p>
+  <p class="muted">Here's why. While you were on Kali, the laptop's cursor <b>never moved</b>. It sat
+  parked at the right edge the whole time, frozen. So when control comes back, it's already there —
+  nothing has to be placed anywhere.</p>
+
+  <div class="mini" style="margin:14px 0 4px">
+    <div class="m"><span>laptop</span><i class="eg l"></i><i class="eg r on"></i>
+      <i class="cur" style="right:9px"></i></div>
+    <span class="arrow">·</span>
+    <div class="m"><span>kali</span><i class="eg l on"></i><i class="eg r"></i>
+      <i class="cur" style="left:60px"></i></div>
+  </div>
+  <p class="small muted">Left: the laptop's cursor, frozen at the exit edge, waiting for you.
+  Right: where you actually are.</p>
+
+  <div class="big">
+    <h3>And you wouldn't want it anyway</h3>
+    <p class="small" style="margin:0;color:var(--txt2)">If it came back on the left, the cursor would
+    teleport across your whole 1920px screen every single time you returned. You'd lose it constantly.
+    Coming back where you left is what makes it feel like one big desk.</p>
+  </div>
+
+  <p class="small muted">So the round trip needs exactly <b>two</b> settings, not four: where you
+  leave, and where you land. The way home is the same door you came in by.</p>
+</section>
+
+<!-- 3 -->
+<section>
+  <span class="step">3 · who decides</span>
+  <h2>Why only the laptop decides</h2>
+  <p class="muted">Simple reason: <b>the laptop is the machine holding the mouse.</b> Kali has no
+  mouse of its own in this setup — it only receives. So Kali cannot decide when a crossing starts,
+  because nothing is crossing <i>from</i> Kali.</p>
+
+  <div class="scroll">
+  <table>
+    <tr><th>Question</th><th>Who answers it</th><th>Which setting</th></tr>
+    <tr><td>When does the mouse leave?</td><td class="yes">Laptop only</td><td>Exit edge</td></tr>
+    <tr><td>Where does it land on Kali?</td><td class="yes">Laptop only</td><td>Entry edge</td></tr>
+    <tr><td>Which edge sends control home?</td><td class="yes">Kali needs to know</td><td>Entry edge <span class="muted">(same value)</span></td></tr>
+    <tr><td>Where does it come back on the laptop?</td><td class="muted">Nobody — it never left that spot</td><td class="muted">no setting</td></tr>
+  </table>
+  </div>
+
+  <p class="small muted">That's why <b>entry edge exists on both machines and must match</b>: the
+  laptop uses it to place the cursor, Kali uses it to know which edge means "go home". If they
+  disagree, the cursor lands on one side and Kali waits for you on the other.</p>
+</section>
+
+<!-- 4 -->
+<section>
+  <span class="step">4 · the removal</span>
+  <h2>We're not removing a setting. We're removing a fake knob.</h2>
+  <p class="muted">Nothing you can do today stops working. To be exact about what changes:</p>
+
+  <ul class="callouts fix">
+    <li><span class="n">✓</span><span class="t"><b>Exit edge still exists and still works</b> — on the
+      laptop, where it does its job. Untouched.</span></li>
+    <li><span class="n">✓</span><span class="t"><b>On Kali it is only hidden</b>, because the Kali
+      engine never reads it. Turning that dial today writes a value into the config file that nothing
+      ever looks at. It looks like a control; it does nothing.</span></li>
+    <li><span class="n">✓</span><span class="t"><b>Entry edge stays on both machines</b> — it's real
+      on both, just for different reasons (place the cursor / send control home).</span></li>
+  </ul>
+
+  <p class="small muted">Think of a car with a steering wheel painted on the passenger door. Removing
+  the painting doesn't stop the car steering — it stops you trying to turn it and wondering why
+  nothing happens.</p>
+</section>
+
+<!-- 5 -->
+<section>
+  <span class="step">5 · what's wrong today</span>
+  <h2>The Layout tab was written for the laptop, then shown unchanged on Kali</h2>
+
+  <div class="panels">
+    <div class="panel">
+      <h3>What your Kali panel shows now <span class="bad-tag">confusing</span></h3>
+      <p class="why">The card from your screenshot.</p>
+      <p class="flabel">Exit edge — this machine leaves here</p>
+      <div class="picker"><span class="lbl">screen</span><i class="eg l on"></i><i class="eg r"></i></div>
+      <p class="flabel">Entry edge — client appears here</p>
+      <div class="picker"><span class="lbl">screen</span><i class="eg l on"></i><i class="eg r"></i></div>
+      <p class="warn">⚠ Leaving at the left edge should bring the cursor in at the right edge of the
+      other screen — left will feel like the screens overlap.</p>
+    </div>
+    <div class="panel">
+      <h3>What it should show on Kali <span class="good-tag">proposed</span></h3>
+      <p class="why">Only what this machine actually does.</p>
+      <p class="flabel">Return edge — push the cursor back in here to go to laptop</p>
+      <div class="picker"><span class="lbl">screen</span><i class="eg l on"></i><i class="eg r"></i></div>
+      <p class="note">Must match the laptop's entry edge — that's the edge the cursor arrives at.</p>
+      <p class="note">Exit edge and the overlap warning are gone: they belong to the machine that
+      owns the mouse.</p>
+    </div>
+  </div>
+
+  <ul class="callouts">
+    <li><span class="n">1</span><span class="t"><b>"Exit edge" does nothing here</b> — the client
+      engine reads <code>entry_edge</code> and never looks at <code>exit_edge</code>.</span></li>
+    <li><span class="n">2</span><span class="t"><b>"client appears here" is the wrong label</b> —
+      Kali <i>is</i> the client, and this setting doesn't place the cursor anyway.</span></li>
+    <li><span class="n">3</span><span class="t"><b>That ⚠ warning is comparing a dead setting.</b>
+      On the Kali panel it can fire even when your laptop is set up perfectly — so it may be
+      complaining about nothing at all.</span></li>
+  </ul>
+</section>
+
+<!-- 6 -->
+<section>
+  <span class="step">6 · what I can actually see</span>
+  <h2>Your setup, honestly</h2>
+  <p class="muted">From Kali's log I can see <b>one</b> of the two values for certain. All 321
+  crossings arrive at <code>entry (0, y)</code> — x = 0 is Kali's <b>left</b> edge.</p>
+  <ul class="callouts fix">
+    <li><span class="n">✓</span><span class="t"><b>Laptop's entry edge = left</b>, and Kali's entry
+      edge = left. <b>They match</b>, which is why going back and forth works.</span></li>
+    <li><span class="n">?</span><span class="t"><b>Laptop's exit edge — I can't see it from here.</b>
+      It's only in the laptop's own config. If it's <b>right</b> (your example), the pair is perfect
+      and there is nothing to change. If it's <b>left</b>, the cursor jumps to Kali's far side.</span></li>
+  </ul>
+  <p class="small muted">Earlier I said your setting was "left → left". That was wrong — I read
+  <code>exit_edge</code> out of <b>Kali's</b> config, and that is precisely the value that means
+  nothing on Kali. The only place that answer lives is the laptop's Layout tab.</p>
+</section>
+
+<div class="verdict">
+  <h2>In one line</h2>
+  <p style="margin:6px 0 0"><b>Exit edge</b> = the door you leave the laptop by. <b>Entry edge</b> =
+  the door you arrive at on Kali, and the same door you push back into to come home. The way back to
+  the laptop needs no setting, because the cursor never left that spot.</p>
+</div>
+
+<footer>
+  In the code: <code>crates/mouse-engine/src/server.rs</code> uses both ·
+  <code>crates/mouse-engine/src/client.rs:36</code> reads only <code>entry_edge</code> ·
+  <code>server.rs:198</code> <code>return_to_local()</code> never moves the cursor ·
+  <code>crates/mouse/src/gui.rs:953</code> draws the same card for every role.
+</footer>
+
+</div>
+</body>
+</html>
