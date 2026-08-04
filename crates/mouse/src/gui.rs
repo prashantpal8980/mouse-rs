@@ -78,6 +78,8 @@ enum Message {
     ClipSyncFilesToggled(bool),
     ClipAutoMbChanged(String),
     ClipCacheGbChanged(String),
+    ClipInlineKbChanged(String),
+    ClipMaxFilesChanged(String),
     ReconnectToggled(bool),
     AutostartToggled(bool),
     AutoconnectToggled(bool),
@@ -210,6 +212,8 @@ struct App {
     bulk_port_s: String,
     clip_auto_mb_s: String,
     clip_cache_gb_s: String,
+    clip_inline_kb_s: String,
+    clip_max_files_s: String,
 }
 
 /// Bytes → whole MB for display. The panel talks in MB because that is the unit the
@@ -272,6 +276,8 @@ impl App {
             bulk_port_s: String::new(),
             clip_auto_mb_s: String::new(),
             clip_cache_gb_s: String::new(),
+            clip_inline_kb_s: String::new(),
+            clip_max_files_s: String::new(),
             saved_cfg: cfg.clone(),
             cfg,
         };
@@ -290,6 +296,8 @@ impl App {
         self.clip_mem_mb_s = mb_of(self.cfg.clipboard_memory_budget);
         self.clip_img_px_s = self.cfg.clipboard_max_image_px.to_string();
         self.clip_auto_mb_s = (self.cfg.clipboard_auto_transfer_max / (1024 * 1024)).to_string();
+        self.clip_inline_kb_s = (self.cfg.clipboard_inline_image_max / 1024).max(1).to_string();
+        self.clip_max_files_s = self.cfg.clipboard_max_files_per_copy.to_string();
         self.clip_cache_gb_s =
             (self.cfg.clipboard_cache_budget / (1024 * 1024 * 1024)).max(1).to_string();
         self.bulk_port_s = if self.cfg.bulk_port == 0 {
@@ -520,11 +528,25 @@ impl App {
                 }
                 self.clip_auto_mb_s = s;
             }
+            Message::ClipInlineKbChanged(s) => {
+                if let Ok(v) = s.trim().parse::<usize>() {
+                    self.cfg.clipboard_inline_image_max = v.max(1) * 1024;
+                }
+                self.clip_inline_kb_s = s;
+            }
+            Message::ClipMaxFilesChanged(s) => {
+                if let Ok(v) = s.trim().parse::<usize>() {
+                    self.cfg.clipboard_max_files_per_copy = v.max(1);
+                }
+                self.clip_max_files_s = s;
+            }
             Message::ClipCacheGbChanged(s) => {
                 if let Ok(v) = s.trim().parse::<u64>() {
                     self.cfg.clipboard_cache_budget = v.max(1) * 1024 * 1024 * 1024;
                 }
-                self.clip_cache_gb_s = s;
+                self.clip_inline_kb_s = (self.cfg.clipboard_inline_image_max / 1024).max(1).to_string();
+        self.clip_max_files_s = self.cfg.clipboard_max_files_per_copy.to_string();
+        self.clip_cache_gb_s = s;
             }
             Message::BulkPortChanged(s) => {
                 // 0 (or an empty box) means "share the input link's port".
@@ -1382,7 +1404,19 @@ impl App {
                 column![
                     toggle_row(p, "Sync text", "copied text crosses machines", self.cfg.clipboard_sync_text, Message::ClipSyncTextToggled),
                     toggle_row(p, "Sync images", "copied images cross machines", self.cfg.clipboard_sync_images, Message::ClipSyncImagesToggled),
-                    toggle_row(p, "Sync files", "any file, any extension — no allow-list", self.cfg.clipboard_sync_files, Message::ClipSyncFilesToggled),
+                    toggle_row(p, "Sync files", "any file or folder, any extension — no allow-list", self.cfg.clipboard_sync_files, Message::ClipSyncFilesToggled),
+                    labeled(p, "Most files in one copy", input(p, "10000", &self.clip_max_files_s, Message::ClipMaxFilesChanged)),
+                    text("Bounds a stray click on an enormous folder. The rest is left behind, and the log says so.")
+                        .size(11.0)
+                        .color(p.txt3),
+                    labeled(
+                        p,
+                        "Send images inline up to (KB)",
+                        input(p, "256", &self.clip_inline_kb_s, Message::ClipInlineKbChanged)
+                    ),
+                    text("Bigger images take the separate lane instead, so they can't stall the mouse. Lower this on a slow link; raise it to skip the extra round trip on a fast one.")
+                        .size(11.0)
+                        .color(p.txt3),
                     labeled(p, "Disk for transferred files (GB)", input(p, "2", &self.clip_cache_gb_s, Message::ClipCacheGbChanged)),
                     text("Oldest go first when it fills. Pinned entries are never removed.")
                         .size(11.0)

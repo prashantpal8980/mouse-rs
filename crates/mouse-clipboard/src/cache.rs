@@ -158,6 +158,51 @@ impl BlobCache {
         }
     }
 
+    /// Rebuild a copied selection under a directory of its own, preserving the shape a
+    /// folder had, and return the top-level paths to put on the clipboard.
+    ///
+    /// `items` is `(hash, relative path)`. A plain file has a one-component relative
+    /// path and comes back as itself; a folder comes back as the folder, so pasting
+    /// gives you the directory rather than a heap of loose files.
+    ///
+    /// Every relative path is rebuilt component by component from sanitised parts. It
+    /// is peer-controlled data, and `../../.config/autostart/evil.desktop` taken
+    /// literally is a write outside the cache — so no component is ever trusted.
+    pub fn materialize_tree(&self, key: &str, items: &[(String, String)]) -> io::Result<Vec<PathBuf>> {
+        if !is_safe_hash(key) {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "unsafe tree key"));
+        }
+        let root = self.root.join("trees").join(key);
+        let mut tops: Vec<PathBuf> = Vec::new();
+        for (hash, rel) in items {
+            let parts = safe_components(rel);
+            if parts.is_empty() {
+                continue;
+            }
+            let mut dest = root.clone();
+            for part in &parts {
+                dest.push(part);
+            }
+            if let Some(parent) = dest.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            if !dest.exists() {
+                let blob = self.blob_path(hash);
+                if fs::hard_link(&blob, &dest).is_err() {
+                    fs::copy(&blob, &dest)?;
+                }
+            }
+            let top = root.join(&parts[0]);
+            if !tops.contains(&top) {
+                tops.push(top);
+            }
+        }
+        if tops.is_empty() {
+            return Err(io::Error::new(io::ErrorKind::NotFound, "nothing to materialise"));
+        }
+        Ok(tops)
+    }
+
     /// Total bytes held in blobs.
     pub fn total_bytes(&self) -> u64 {
         let Ok(entries) = fs::read_dir(self.root.join("blobs")) else {
@@ -290,6 +335,68 @@ pub fn sanitize_name(name: &str) -> String {
     } else {
         cleaned
     }
+}
+
+/// Split a peer-supplied relative path into components that cannot escape their root.
+///
+/// `..` and empty/current-directory components are dropped rather than rejected, so a
+/// slightly odd path still delivers its file somewhere sane instead of failing the
+/// whole folder; every surviving component then goes through [`sanitize_name`], which
+/// also strips drive letters and separators.
+pub fn safe_components(rel: &str) -> Vec<String> {
+    rel.split(['/', '\\'])
+        .filter(|c| !c.is_empty() && *c != "." && *c != "..")
+        .map(sanitize_name)
+        .filter(|c| c != "clipboard-file" || !rel.is_empty())
+        .collect()
+}
+
+/// Walk a directory, returning every file inside it with its path relative to the
+/// directory's *parent* — so the folder's own name is the first component and the copy
+/// arrives with its shape intact.
+///
+/// Symlinks are not followed: a link pointing outside the copied tree would silently
+/// pull in unrelated files, and one pointing back inside would recurse forever.
+pub fn walk_dir(root: &Path, max_files: usize) -> io::Result<Vec<(PathBuf, String)>> {
+    let base = root.parent().unwrap_or(Path::new(""));
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in fs::read_dir(&dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            let meta = match entry.metadata() {
+                Ok(m) => m,
+                Err(e) => {
+                    // One unreadable file must not kill a 500-file copy.
+                    tracing::warn!(path = %path.display(), "skipping: {e}");
+                    continue;
+                }
+            };
+            if meta.file_type().is_symlink() {
+                tracing::debug!(path = %path.display(), "skipping a symlink inside a copied folder");
+                continue;
+            }
+            if meta.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            let rel = path
+                .strip_prefix(base)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            out.push((path, rel));
+            if out.len() >= max_files {
+                tracing::warn!(
+                    limit = max_files,
+                    "the copied folder hit the file-count limit; the rest was not included"
+                );
+                return Ok(out);
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Copy `src` into `dst`, streaming, returning bytes written.

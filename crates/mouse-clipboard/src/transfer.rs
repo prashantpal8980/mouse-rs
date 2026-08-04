@@ -149,8 +149,9 @@ impl Transfers {
     /// Hashing reads every byte, so this is slow for large files — but it happens on the
     /// clipboard thread, never on an input thread, and it buys deduplication, integrity
     /// and survival of the original being deleted.
-    pub fn describe_local(&self, list: &FileList, origin: &str) -> Option<FileSet> {
+    pub fn describe_local(&self, list: &FileList, origin: &str, max_files: usize) -> Option<FileSet> {
         let mut files = Vec::new();
+        let mut budget = max_files;
         for path in &list.paths {
             let meta = match std::fs::metadata(path) {
                 Ok(m) => m,
@@ -159,23 +160,49 @@ impl Transfers {
                     continue;
                 }
             };
-            if meta.is_dir() {
-                // Folders are a manifest of many files; not handled here yet, and
-                // skipping loudly beats silently copying an empty entry.
-                tracing::warn!(path = %path.display(), "folders are not copied yet; skipping");
-                continue;
+            // A folder is just many files that remember where they sat inside it.
+            let members: Vec<(PathBuf, String)> = if meta.is_dir() {
+                match cache::walk_dir(path, budget) {
+                    Ok(v) => {
+                        tracing::info!(
+                            path = %path.display(),
+                            count = v.len(),
+                            "walking a copied folder"
+                        );
+                        v
+                    }
+                    Err(e) => {
+                        tracing::warn!(path = %path.display(), "could not read a copied folder: {e}");
+                        continue;
+                    }
+                }
+            } else {
+                let name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "file".into());
+                vec![(path.clone(), name)]
+            };
+            budget = budget.saturating_sub(members.len());
+            for (member, rel) in members {
+                match self.cache.ingest(&member) {
+                    Ok((hash, size)) => files.push(FileRef {
+                        name: member
+                            .file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| "file".into()),
+                        size,
+                        hash,
+                        source_path: Some(member.to_string_lossy().into_owned()),
+                        rel,
+                    }),
+                    Err(e) => {
+                        tracing::warn!(path = %member.display(), "could not read a copied file: {e}")
+                    }
+                }
             }
-            match self.cache.ingest(path) {
-                Ok((hash, size)) => files.push(FileRef {
-                    name: path
-                        .file_name()
-                        .map(|n| n.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| "file".into()),
-                    size,
-                    hash,
-                    source_path: Some(path.to_string_lossy().into_owned()),
-                }),
-                Err(e) => tracing::warn!(path = %path.display(), "could not read a copied file: {e}"),
+            if budget == 0 {
+                break;
             }
         }
         if files.is_empty() {
@@ -442,25 +469,45 @@ impl Transfers {
         set.files.iter().all(|f| self.cache.contains(&f.hash))
     }
 
-    /// Materialise a complete set under its real filenames, ready for the clipboard.
+    /// Materialise a complete set under its real names, ready for the clipboard.
+    ///
+    /// A folder is rebuilt as a folder — pasting gives you the directory, not its
+    /// contents scattered loose — and a plainly-copied file comes back as itself.
     pub fn materialize(&self, set: &FileSet) -> Option<FileList> {
-        let mut paths = Vec::new();
-        for f in &set.files {
-            match self.cache.materialize(&f.hash, &f.name) {
-                Ok(p) => paths.push(p),
-                Err(e) => {
-                    tracing::warn!(name = %f.name, "could not prepare a file for pasting: {e}");
-                    return None;
-                }
+        let items: Vec<(String, String)> = set
+            .files
+            .iter()
+            .map(|f| {
+                let rel = if f.rel.is_empty() { f.name.clone() } else { f.rel.clone() };
+                (f.hash.clone(), rel)
+            })
+            .collect();
+        match self.cache.materialize_tree(&set_key(set), &items) {
+            Ok(paths) => Some(FileList { paths }),
+            Err(e) => {
+                tracing::warn!("could not prepare the copied files for pasting: {e}");
+                None
             }
         }
-        (!paths.is_empty()).then_some(FileList { paths })
     }
 
     /// Keep the cache inside the user's disk budget, never dropping pinned content.
     pub fn enforce_disk_budget(&self, budget: u64, history: &ClipboardHistory) {
         self.cache.evict_to(budget, &history.pinned_hashes());
     }
+}
+
+/// A stable key for a whole selection, so pasting the same copy twice reuses one tree
+/// instead of building a fresh one each time.
+fn set_key(set: &FileSet) -> String {
+    let mut buf = String::new();
+    for f in &set.files {
+        buf.push_str(&f.hash);
+        buf.push('\0');
+        buf.push_str(&f.rel);
+        buf.push('\n');
+    }
+    cache::hash_bytes(buf.as_bytes())
 }
 
 /// A transfer id derived from the hash, so the two ends agree without negotiating one —
@@ -500,7 +547,7 @@ mod tests {
         let a = root.join("one.txt");
         fs::write(&a, b"hello").unwrap();
         let set = t
-            .describe_local(&FileList { paths: vec![a.clone()] }, "kali")
+            .describe_local(&FileList { paths: vec![a.clone()] }, "kali", 10_000)
             .expect("a file list");
         assert_eq!(set.files.len(), 1);
         assert_eq!(set.files[0].name, "one.txt");
@@ -516,7 +563,7 @@ mod tests {
         let (root, t, _h) = setup("dedup");
         let a = root.join("known.bin");
         fs::write(&a, vec![7u8; 4096]).unwrap();
-        let set = t.describe_local(&FileList { paths: vec![a] }, "kali").unwrap();
+        let set = t.describe_local(&FileList { paths: vec![a] }, "kali", 10_000).unwrap();
         // Tiny auto-limit, so only the cache hit can explain a Ready verdict.
         assert_eq!(t.initial_status(&set, 1), ClipStatus::Ready);
         let _ = fs::remove_dir_all(&root);
@@ -531,6 +578,7 @@ mod tests {
                 size: 100 * 1024 * 1024,
                 hash: "b".repeat(64),
                 source_path: None,
+                rel: String::new(),
             }],
             origin: "laptop".into(),
         };
@@ -549,7 +597,7 @@ mod tests {
         let content: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
         fs::write(&src, &content).unwrap();
         let set = sender
-            .describe_local(&FileList { paths: vec![src] }, "laptop")
+            .describe_local(&FileList { paths: vec![src] }, "laptop", 10_000)
             .unwrap();
         s_hist.record_files(Arc::new(set.clone()), false, ClipStatus::Ready);
 
@@ -593,13 +641,116 @@ mod tests {
     }
 
     #[test]
+    fn a_copied_folder_keeps_its_shape() {
+        let (root, t, _h) = setup("folder");
+        // A small tree, including a nested directory.
+        let proj = root.join("myproject");
+        fs::create_dir_all(proj.join("src").join("deep")).unwrap();
+        fs::write(proj.join("README.md"), b"readme").unwrap();
+        fs::write(proj.join("src").join("main.rs"), b"fn main() {}").unwrap();
+        fs::write(proj.join("src").join("deep").join("x.txt"), b"deep").unwrap();
+
+        let set = t
+            .describe_local(&FileList { paths: vec![proj.clone()] }, "laptop", 10_000)
+            .expect("a folder should describe");
+        assert_eq!(set.files.len(), 3, "every file in the tree");
+
+        let mut rels: Vec<_> = set.files.iter().map(|f| f.rel.clone()).collect();
+        rels.sort();
+        assert_eq!(
+            rels,
+            vec!["myproject/README.md", "myproject/src/deep/x.txt", "myproject/src/main.rs"],
+            "paths are relative to the folder's parent, so the folder name leads"
+        );
+
+        // And it rebuilds as a folder, not as loose files.
+        let list = t.materialize(&set).expect("materialised");
+        assert_eq!(list.paths.len(), 1, "pasting gives you the folder itself");
+        assert_eq!(list.paths[0].file_name().unwrap(), "myproject");
+        assert_eq!(
+            fs::read(list.paths[0].join("src").join("deep").join("x.txt")).unwrap(),
+            b"deep"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_folder_and_a_loose_file_copied_together_both_arrive() {
+        let (root, t, _h) = setup("mixed");
+        let dir = root.join("docs");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("a.txt"), b"a").unwrap();
+        let loose = root.join("loose.txt");
+        fs::write(&loose, b"loose").unwrap();
+
+        let set = t
+            .describe_local(&FileList { paths: vec![dir, loose] }, "laptop", 10_000)
+            .unwrap();
+        let list = t.materialize(&set).unwrap();
+        let names: std::collections::HashSet<_> = list
+            .paths
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert!(names.contains("docs") && names.contains("loose.txt"), "got {names:?}");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_file_count_limit_is_honoured() {
+        let (root, t, _h) = setup("many");
+        let dir = root.join("lots");
+        fs::create_dir_all(&dir).unwrap();
+        for i in 0..20 {
+            fs::write(dir.join(format!("f{i}.txt")), format!("{i}")).unwrap();
+        }
+        let set = t
+            .describe_local(&FileList { paths: vec![dir] }, "laptop", 5)
+            .unwrap();
+        assert_eq!(set.files.len(), 5, "a stray click on a huge folder must be bounded");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_hostile_relative_path_cannot_escape_the_tree() {
+        // `rel` is peer-controlled. Taken literally this writes into the user's
+        // autostart directory.
+        let (root, t, _h) = setup("evil-rel");
+        let content = b"payload";
+        let hash = cache::hash_bytes(content);
+        {
+            let mut f = t.cache.open_partial(&hash).unwrap();
+            f.write_all(content).unwrap();
+        }
+        t.cache.finish(&hash).unwrap();
+
+        let set = FileSet {
+            files: vec![FileRef {
+                name: "evil.desktop".into(),
+                size: content.len() as u64,
+                hash,
+                source_path: None,
+                rel: "../../../.config/autostart/evil.desktop".into(),
+            }],
+            origin: "laptop".into(),
+        };
+        let list = t.materialize(&set).expect("it should still land, just not there");
+        for p in &list.paths {
+            let s = p.to_string_lossy();
+            assert!(!s.contains(".."), "no traversal survives: {s}");
+            assert!(s.starts_with(&root.to_string_lossy().to_string()), "stayed in the cache: {s}");
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn a_deleted_source_is_reported_rather_than_left_hanging() {
         // The exact question the owner asked: what happens when the file is gone.
         let (root, sender, s_hist) = setup("deleted");
         let src = root.join("temporary.txt");
         fs::write(&src, b"here for now").unwrap();
         let set = sender
-            .describe_local(&FileList { paths: vec![src.clone()] }, "laptop")
+            .describe_local(&FileList { paths: vec![src.clone()] }, "laptop", 10_000)
             .unwrap();
         let hash = set.files[0].hash.clone();
         s_hist.record_files(Arc::new(set), false, ClipStatus::Ready);
@@ -630,7 +781,7 @@ mod tests {
         let src = root.join("notes.txt");
         fs::write(&src, b"version one").unwrap();
         let set = sender
-            .describe_local(&FileList { paths: vec![src.clone()] }, "laptop")
+            .describe_local(&FileList { paths: vec![src.clone()] }, "laptop", 10_000)
             .unwrap();
         let hash = set.files[0].hash.clone();
         s_hist.record_files(Arc::new(set), false, ClipStatus::Ready);
@@ -658,6 +809,7 @@ mod tests {
                 size: 10,
                 hash: hash.clone(),
                 source_path: None,
+                rel: String::new(),
             }],
             origin: "laptop".into(),
         };
@@ -698,7 +850,7 @@ mod tests {
         let (root, mut receiver, r_hist) = setup("corrupt");
         let hash = cache::hash_bytes(b"the real content");
         let set = FileSet {
-            files: vec![FileRef { name: "f".into(), size: 16, hash: hash.clone(), source_path: None }],
+            files: vec![FileRef { name: "f".into(), size: 16, hash: hash.clone(), source_path: None, rel: String::new() }],
             origin: "laptop".into(),
         };
         let entry = r_hist
@@ -730,6 +882,7 @@ mod tests {
                 size: 10,
                 hash: "c".repeat(64),
                 source_path: None,
+                rel: String::new(),
             }],
             origin: "laptop".into(),
         };
@@ -751,7 +904,7 @@ mod tests {
         let (root, mut receiver, r_hist) = setup("unavail");
         let hash = "d".repeat(64);
         let set = FileSet {
-            files: vec![FileRef { name: "f".into(), size: 1, hash: hash.clone(), source_path: None }],
+            files: vec![FileRef { name: "f".into(), size: 1, hash: hash.clone(), source_path: None, rel: String::new() }],
             origin: "laptop".into(),
         };
         let entry = r_hist.record_files(Arc::new(set), true, ClipStatus::Remote).unwrap();

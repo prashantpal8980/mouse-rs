@@ -89,6 +89,12 @@ fn default_auto_transfer() -> u64 {
 fn default_cache_budget() -> u64 {
     2 * 1024 * 1024 * 1024
 }
+fn default_inline_image() -> usize {
+    256 * 1024
+}
+fn default_max_files() -> usize {
+    10_000
+}
 
 /// On-disk configuration. Field names match the Python version exactly.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -152,6 +158,15 @@ pub struct Config {
     /// Where transferred files are kept. Empty = `~/.mouse_share/cache`.
     #[serde(default)]
     pub cache_dir: String,
+    /// Largest image still sent inline on the input lane, in bytes. Above this the
+    /// pixels go by reference over the paced bulk lane instead. Lower it to protect a
+    /// slow link harder; raise it to skip the extra round trip on a fast one.
+    #[serde(default = "default_inline_image")]
+    pub clipboard_inline_image_max: usize,
+    /// Most files one copy may include, so a stray click on an enormous folder does not
+    /// commit the machine to hashing all of it.
+    #[serde(default = "default_max_files")]
+    pub clipboard_max_files_per_copy: usize,
 
     #[serde(default = "default_lock_hotkey")]
     pub lock_hotkey: String,
@@ -217,6 +232,8 @@ impl Default for Config {
             clipboard_auto_transfer_max: default_auto_transfer(),
             clipboard_cache_budget: default_cache_budget(),
             cache_dir: String::new(),
+            clipboard_inline_image_max: default_inline_image(),
+            clipboard_max_files_per_copy: default_max_files(),
             lock_hotkey: default_lock_hotkey(),
             return_hotkey: String::new(),
             listen_host: default_listen_host(),

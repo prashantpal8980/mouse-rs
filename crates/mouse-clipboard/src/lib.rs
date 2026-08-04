@@ -37,6 +37,16 @@ const DEFAULT_MAX_ITEM_BYTES: usize = 5 * 1024 * 1024;
 const DEFAULT_MEMORY_BUDGET: usize = 64 * 1024 * 1024;
 /// Default largest accepted image edge, in pixels.
 const DEFAULT_MAX_IMAGE_PX: usize = 4096;
+/// Default largest image still sent inline on the input lane.
+///
+/// 256 KB is roughly a 1080p screenshot: about 50 ms even on a weak hotspot, which is
+/// below the point where a pointer stutter is noticeable. Above it the reference path
+/// costs one extra round trip and protects the input lane completely. The owner can
+/// move it either way — lower to protect a slow link harder, higher to avoid the round
+/// trip on a fast one.
+const DEFAULT_INLINE_IMAGE_MAX: usize = 256 * 1024;
+/// Default cap on how many files one copy may include.
+const DEFAULT_MAX_FILES_PER_COPY: usize = 10_000;
 /// How much of an entry's text is kept for display. The preview is cloned on every
 /// panel redraw, so it is deliberately short and built once when the entry is recorded.
 const PREVIEW_CHARS: usize = 72;
@@ -524,6 +534,12 @@ pub struct ClipboardSettings {
     pub cache_budget: u64,
     /// This machine's name, shown on the other side as where a copy came from.
     pub machine: &'static str,
+    /// Largest image still sent inline on the input lane. Above this the pixels go by
+    /// reference over the paced bulk lane instead.
+    pub inline_image_max: usize,
+    /// Most files one copy may include, so a stray click on a huge folder does not
+    /// commit the machine to hashing a million files.
+    pub max_files_per_copy: usize,
 }
 
 impl Default for ClipboardSettings {
@@ -537,6 +553,8 @@ impl Default for ClipboardSettings {
             auto_transfer_max: 1024 * 1024,
             cache_budget: 2 * 1024 * 1024 * 1024,
             machine: "this machine",
+            inline_image_max: DEFAULT_INLINE_IMAGE_MAX,
+            max_files_per_copy: DEFAULT_MAX_FILES_PER_COPY,
         }
     }
 }
@@ -948,7 +966,7 @@ fn run(
                         let key = files::list_key(&list);
                         if last_files != Some(key) {
                             last_files = Some(key);
-                            if let Some(set) = t.describe_local(&list, settings.machine) {
+                            if let Some(set) = t.describe_local(&list, settings.machine, settings.max_files_per_copy) {
                                 tracing::info!(
                                     count = set.files.len(),
                                     bytes = set.total_bytes(),
@@ -1212,7 +1230,7 @@ fn poll_local_image<C: SystemClipboard>(
     let png = encode_png(&img, settings.max_image_px)?;
     // Staged before the size decision so the reference path always has something to
     // point at; staging a small image costs a hash and one file write.
-    let staged = if png.len() > INLINE_IMAGE_MAX {
+    let staged = if png.len() > settings.inline_image_max {
         transfers.and_then(|t| t.stage_image(&png))
     } else {
         None
@@ -1229,7 +1247,7 @@ fn poll_local_image<C: SystemClipboard>(
     // round trip through the bulk lane would make them slower, not faster. Anything
     // larger goes as a reference, because base64 pixels sitting in front of the next
     // mouse packet is exactly the stall this whole lane exists to prevent.
-    let inline = png.len() <= INLINE_IMAGE_MAX || staged.is_none();
+    let inline = png.len() <= settings.inline_image_max || staged.is_none();
     if inline {
         let _ = to_peer.send(Message::ClipboardImage {
             data: base64::engine::general_purpose::STANDARD.encode(&png),
@@ -1252,12 +1270,7 @@ fn poll_local_image<C: SystemClipboard>(
     })
 }
 
-/// Largest image still sent inline on the input lane.
-///
-/// 256 KB is roughly a 1080p screenshot: about 50 ms even on a weak hotspot, which is
-/// below the threshold where a pointer stutter is noticeable. Above it, the reference
-/// path costs one extra round trip and protects the input lane completely.
-const INLINE_IMAGE_MAX: usize = 256 * 1024;
+
 
 /// Decode an encoded PNG and put it on the clipboard, recording it in history.
 ///
@@ -1686,7 +1699,7 @@ mod tests {
             *b = ((i * 2654435761) >> 13) as u8;
         }
         let encoded = encode_png(&big, 4096).unwrap();
-        assert!(encoded.len() > INLINE_IMAGE_MAX, "test image must be over the threshold");
+        assert!(encoded.len() > DEFAULT_INLINE_IMAGE_MAX, "test image must be over the threshold");
 
         let (tx, mut rx) = unbounded_channel();
         let mut cb = Fake { image: Some(big), ..Default::default() };

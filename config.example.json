@@ -16,6 +16,8 @@
   "clipboard_auto_transfer_max": 1048576,
   "clipboard_cache_budget": 2147483648,
   "cache_dir": "",
+  "clipboard_inline_image_max": 262144,
+  "clipboard_max_files_per_copy": 10000,
   "lock_hotkey": "scroll_lock",
   "return_hotkey": "ctrl+win+alt+esc",
 

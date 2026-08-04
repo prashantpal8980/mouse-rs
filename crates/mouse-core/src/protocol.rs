@@ -53,6 +53,14 @@ pub struct FileRef {
     /// and to say something true once it has moved.
     #[serde(default)]
     pub source_path: Option<String>,
+    /// Path relative to what the user actually selected, so a copied folder arrives with
+    /// its shape intact: `myproject/src/main.rs`, not a flat pile of `main.rs`.
+    ///
+    /// Empty for a plainly-copied file. Every component is re-sanitised on the
+    /// receiving side — this field is peer-controlled, and taken literally it would be
+    /// a write outside the cache.
+    #[serde(default)]
+    pub rel: String,
 }
 
 /// Every message that can cross the link.

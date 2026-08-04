@@ -476,6 +476,8 @@ fn clipboard_settings(cfg: &Config) -> ClipboardSettings {
         // the life of the process; the alternative is threading a String through every
         // frame for a value that never changes.
         machine: Box::leak(cfg.name.clone().into_boxed_str()),
+        inline_image_max: cfg.clipboard_inline_image_max.max(1),
+        max_files_per_copy: cfg.clipboard_max_files_per_copy.max(1),
     }
 }
 
