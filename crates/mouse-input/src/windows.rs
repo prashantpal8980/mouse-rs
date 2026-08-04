@@ -502,6 +502,11 @@ enum DiagEvent {
         ok: bool,
         to: String,
     },
+    /// The hand-off was *requested* successfully and the foreground still did not leave
+    /// this process. See `verify_at` in the pump loop for why this is checked separately.
+    FocusHandoffIneffective {
+        retried: bool,
+    },
 }
 
 /// `thread_local` because low-level hook callbacks are dispatched by the OS *on
@@ -1134,6 +1139,16 @@ fn capture_loop(
     // control has moved to the other machine, so the panel has no reason to hold focus.
     let mut last_foreign_fg: HWND = std::ptr::null_mut();
     let mut yielded_from: HWND = std::ptr::null_mut();
+    // When to check that a requested hand-off actually happened.
+    //
+    // `SetForegroundWindow` returning non-zero means the request was accepted, not that the
+    // foreground has moved — the activation is delivered through the target thread's queue
+    // and the system can decline it. So "handed foreground to X" was never evidence that we
+    // stopped owning the foreground, and if we didn't, the keyboard hook is still starved
+    // while the log claims the fix worked. That is the same shape of mistake as counting
+    // `hook_calls=0` as proof: an instrument that cannot see its own failure. Re-check a
+    // moment later and say plainly which of the two happened.
+    let mut verify_at: Option<std::time::Instant> = None;
     /// How often to re-arm while control is on the peer. Short enough that a mid-crossing
     /// removal costs a couple of keystrokes rather than the whole session.
     const REARM_INTERVAL: Duration = Duration::from_millis(1000);
@@ -1190,11 +1205,26 @@ fn capture_loop(
                 let ok = unsafe { SetForegroundWindow(last_foreign_fg) } != 0;
                 if ok {
                     yielded_from = fg;
+                    // 120 ms: long enough for the target thread to have pumped the
+                    // activation, short enough that the answer arrives inside the crossing
+                    // it belongs to rather than after it.
+                    verify_at = Some(std::time::Instant::now() + Duration::from_millis(120));
                 }
                 let _ = diag.send(DiagEvent::FocusHandedOff {
                     ok,
                     to: describe_window(last_foreign_fg),
                 });
+            }
+        }
+        // Did the foreground actually leave? One retry, then report either way — a second
+        // refusal is a fact about this machine that belongs in the log, not a silent state
+        // the next investigation has to rediscover.
+        if verify_at.is_some_and(|due| due <= std::time::Instant::now()) {
+            verify_at = None;
+            if want && fg_is_ours {
+                let retried =
+                    !last_foreign_fg.is_null() && unsafe { SetForegroundWindow(last_foreign_fg) } != 0;
+                let _ = diag.send(DiagEvent::FocusHandoffIneffective { retried });
             }
         }
         // Control came back: return foreground to whatever of ours had it, so the hand-off
@@ -1502,6 +1532,15 @@ fn diag_loop(rx: std::sync::mpsc::Receiver<DiagEvent>) {
                          be handed off — expect keystrokes to stay on this machine"
                     );
                 }
+            }
+            DiagEvent::FocusHandoffIneffective { retried } => {
+                tracing::warn!(
+                    retried,
+                    "the foreground did NOT leave this process after the hand-off — \
+                     SetForegroundWindow was accepted but we still own the foreground, so \
+                     the keyboard hook stays starved and keystrokes will remain on this \
+                     machine. This is the fix being refused, not the bug returning."
+                );
             }
             DiagEvent::Rearmed { ok } => {
                 if ok {

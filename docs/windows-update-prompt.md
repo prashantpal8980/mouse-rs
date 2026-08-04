@@ -16,6 +16,29 @@ sent real clicks onto the owner's Kali desktop and never reached Windows at all,
 why it could not complete this step. Every action below is a shell command; none of them
 need the pointer. If you find yourself wanting to click, stop and say what you are stuck on.
 
+## Step 0 — record what is installed *now*, before replacing it
+
+Do this first. Step 2 overwrites the exe, and the answer to "did the keyboard leak come back
+because the fixed build was never installed here?" is destroyed the moment it does.
+
+```powershell
+(Get-Item $HOME\mouse-rs\mouse-rs.exe).LastWriteTime
+(Get-FileHash $HOME\mouse-rs\mouse-rs.exe -Algorithm SHA256).Hash
+Select-String -Path $env:USERPROFILE\.mouse_share\mouse-rs.log `
+  -Pattern 'handed foreground|could NOT be handed off' | Measure-Object | Select-Object Count
+Select-String -Path $env:USERPROFILE\.mouse_share\mouse-rs.log `
+  -Pattern 'NEVER CALLED OUR KEYBOARD HOOK|released \(no leaks\)|SOME KEYS LEAKED' |
+  Select-Object -Last 12 | ForEach-Object { $_.Line }
+```
+
+Report all four results. They separate two very different causes:
+
+- **the hash differs from the one in Step 2 and the hand-off count is 0** — this machine is
+  running a build from before the fix. The leak is not a regression; the fix is not here yet.
+- **the hash matches Step 2 and hand-off lines exist** — the fix is installed and running, and the
+  question becomes whether it succeeded (`handed foreground to …`) or failed (`could NOT be
+  handed off`) on the crossings that leaked. Say which of the two appears, and how often.
+
 ## Step 1 — stop the running instance, by process
 
 ```powershell
@@ -35,8 +58,8 @@ Invoke-WebRequest -Uri http://192.168.137.2:8000/mouse-rs.exe -OutFile $HOME\mou
 (Get-FileHash $HOME\mouse-rs\mouse-rs.exe -Algorithm SHA256).Hash
 ```
 
-Must be exactly size `11459072` bytes, SHA256
-`7A4E5F195A54C3AB8430705B60C7867BC9B11C79E41ECD1A9BAA75922E1C97FB`.
+Must be exactly size `11459584` bytes, SHA256
+`7AEBF7514F531BC7AEE3034A185CA6400D8DDA7F6EA63298CE76E0CA860DC5FD`.
 If either differs, stop and say so — do not launch it.
 
 ## Step 3 — check the config was not damaged

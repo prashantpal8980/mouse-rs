@@ -47,6 +47,36 @@ INFO our own window had focus at the crossing; handed foreground to another proc
 WARN our own window had focus at the crossing and foreground could NOT be handed off
 ```
 
+## The fix is only as good as the hand-off it requests
+
+`SetForegroundWindow` returning non-zero means the **request was accepted**, not that the
+foreground moved: the activation is delivered through the target thread's queue and the
+system can decline it. The first version of this fix logged "handed foreground to X" on that
+return value alone, so a refused hand-off and a successful one were indistinguishable in the
+log — and a refused one leaves the hook starved with the log claiming otherwise.
+
+The pump now re-checks 120 ms later and reports the difference:
+
+```
+WARN the foreground did NOT leave this process after the hand-off — SetForegroundWindow
+     was accepted but we still own the foreground … This is the fix being refused, not
+     the bug returning.  retried=true|false
+```
+
+Two other ways the fix can do nothing, both visible in the log:
+
+- **No window to hand to.** `last_foreign_fg` only fills in when some other process's
+  window is foreground *while the capture pump is running*. Start the panel, press Start,
+  and cross without ever focusing another window and it is still null — logged as
+  `foreground could NOT be handed off`.
+- **A stale target.** The recorded window may have been closed or minimized since; a
+  minimized window does not come forward from `SetForegroundWindow` alone (the same fact
+  that broke tray *Open*, `crates/mouse/src/gui.rs`).
+
+**When triaging a report of the leak, read these lines before assuming a regression.** The
+leak returning and the fix being refused look identical from the user's chair and need
+opposite work.
+
 ## Why four earlier attempts failed
 
 Each fixed a plausible cause rather than a proven one. **The hook was never broken** —
