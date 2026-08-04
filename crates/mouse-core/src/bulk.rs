@@ -352,8 +352,10 @@ use tokio_util::sync::CancellationToken;
 pub struct BulkChannels {
     /// Frames the app wants to send to the peer.
     pub outgoing: mpsc::UnboundedReceiver<BulkFrame>,
-    /// Frames received from the peer.
-    pub incoming: mpsc::UnboundedSender<BulkFrame>,
+    /// Frames received from the peer. A std channel, because the far end is the
+    /// clipboard thread — a blocking native thread with no runtime, exactly like the
+    /// input backends.
+    pub incoming: std::sync::mpsc::Sender<BulkFrame>,
 }
 
 /// What the input listener does with a connection that declared [`crate::protocol::Lane::Bulk`].

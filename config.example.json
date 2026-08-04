@@ -12,6 +12,10 @@
   "clipboard_max_image_px": 4096,
   "bulk_enabled": true,
   "bulk_port": 0,
+  "clipboard_sync_files": true,
+  "clipboard_auto_transfer_max": 1048576,
+  "clipboard_cache_budget": 2147483648,
+  "cache_dir": "",
   "lock_hotkey": "scroll_lock",
   "return_hotkey": "ctrl+win+alt+esc",
 

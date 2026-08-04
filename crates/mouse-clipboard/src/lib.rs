@@ -12,6 +12,10 @@
 //! image off the clipboard is orders of magnitude more expensive than reading text and
 //! this process is also carrying live mouse and keyboard input.
 
+pub mod cache;
+pub mod files;
+pub mod transfer;
+
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
@@ -76,6 +80,57 @@ pub enum ClipPayload {
         w: usize,
         h: usize,
     },
+    /// One or more files. The *contents* are not here — they live in the blob cache,
+    /// addressed by hash. This entry costs a few hundred bytes whether it describes a
+    /// text file or a 4 GB ISO, which is what lets a big copy appear in the history
+    /// instantly and transfer later (or never).
+    Files(Arc<FileSet>),
+}
+
+pub use mouse_core::protocol::FileRef;
+
+/// The file list behind one history entry.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct FileSet {
+    pub files: Vec<FileRef>,
+    /// Name of the machine the copy happened on, for "on laptop · click to fetch".
+    pub origin: String,
+}
+
+impl FileSet {
+    pub fn total_bytes(&self) -> u64 {
+        self.files.iter().map(|f| f.size).sum()
+    }
+}
+
+/// Where an entry's content actually is, from the user's point of view.
+///
+/// Shown verbatim in the panel. Every variant exists because it is a state the user can
+/// really be in and would otherwise have to guess at — most of all `SourceGone`, which
+/// is what a pure path reference turns into the moment the file moves.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub enum ClipStatus {
+    /// We hold the content. Pasting is instant and needs no network.
+    #[default]
+    Ready,
+    /// Metadata only; the bytes are still on the peer.
+    Remote,
+    /// Over the user's auto-transfer limit, waiting for them to say yes.
+    NeedsConsent,
+    /// Transfer in progress.
+    Fetching { done: u64, total: u64 },
+    /// The peer looked and could not produce it. Carries the reason to show.
+    ///
+    /// The wording matters: without indexing the whole disk we cannot tell a delete
+    /// from a rename, so the message says "no longer at the recorded path" rather than
+    /// claiming one of them.
+    Unavailable(String),
+}
+
+impl ClipStatus {
+    pub fn is_ready(&self) -> bool {
+        matches!(self, ClipStatus::Ready)
+    }
 }
 
 impl ClipPayload {
@@ -84,11 +139,27 @@ impl ClipPayload {
         match self {
             ClipPayload::Text(t) => t.len(),
             ClipPayload::Image { png, .. } => png.len(),
+            // A file entry costs only its description in memory; the contents live on
+            // disk in the blob cache under their own budget.
+            ClipPayload::Files(set) => set.files.len() * std::mem::size_of::<FileRef>(),
         }
     }
 
     pub fn is_image(&self) -> bool {
         matches!(self, ClipPayload::Image { .. })
+    }
+
+    pub fn is_files(&self) -> bool {
+        matches!(self, ClipPayload::Files(_))
+    }
+
+    /// Bytes on disk this entry refers to — what it costs the *cache* budget, as
+    /// opposed to the memory budget `bytes` reports.
+    pub fn disk_bytes(&self) -> u64 {
+        match self {
+            ClipPayload::Files(set) => set.total_bytes(),
+            _ => 0,
+        }
     }
 
     /// The short, display-ready line shown in the panel.
@@ -105,6 +176,11 @@ impl ClipPayload {
             ClipPayload::Image { png, w, h } => {
                 format!("image {}×{}, {} KB", w, h, png.len().div_ceil(1024))
             }
+            ClipPayload::Files(set) => match set.files.as_slice() {
+                [] => "no files".to_string(),
+                [one] => one.name.clone(),
+                many => format!("{} files — {}, …", many.len(), many[0].name),
+            },
         }
     }
 }
@@ -120,6 +196,9 @@ pub struct ClipEntry {
     pub pinned: bool,
     pub preview: String,
     pub payload: ClipPayload,
+    /// Where the content is right now. Only ever `Ready` for text and images, which
+    /// carry their content inline; file entries move through the other states.
+    pub status: ClipStatus,
 }
 
 /// The display-only view the panel works with. Deliberately carries no payload: the
@@ -131,8 +210,13 @@ pub struct ClipMeta {
     pub incoming: bool,
     pub pinned: bool,
     pub is_image: bool,
+    pub is_files: bool,
     pub preview: String,
     pub bytes: usize,
+    pub status: ClipStatus,
+    /// Total size on disk for a file entry, so the panel can say "104 MB" without
+    /// touching the payload.
+    pub disk_bytes: u64,
 }
 
 #[derive(Default)]
@@ -179,6 +263,68 @@ impl ClipboardHistory {
         self.record(ClipPayload::Text(text), incoming)
     }
 
+    /// Record a file set. `status` says whether we already hold the contents.
+    pub fn record_files(&self, set: Arc<FileSet>, incoming: bool, status: ClipStatus) -> Option<u64> {
+        let id = self.record(ClipPayload::Files(set), incoming)?;
+        self.set_status(id, status);
+        Some(id)
+    }
+
+    /// Update where an entry's content is. Returns false if the entry has gone.
+    pub fn set_status(&self, id: u64, status: ClipStatus) -> bool {
+        let Ok(mut g) = self.inner.lock() else { return false };
+        match g.entries.iter_mut().find(|e| e.id == id) {
+            Some(e) => {
+                e.status = status;
+                true
+            }
+            None => false,
+        }
+    }
+
+    pub fn status(&self, id: u64) -> Option<ClipStatus> {
+        let g = self.inner.lock().ok()?;
+        g.entries.iter().find(|e| e.id == id).map(|e| e.status.clone())
+    }
+
+    /// The entry currently describing this file set, if any — so an arriving transfer
+    /// can find the row it belongs to.
+    pub fn find_by_hash(&self, hash: &str) -> Option<u64> {
+        let g = self.inner.lock().ok()?;
+        g.entries
+            .iter()
+            .find(|e| match &e.payload {
+                ClipPayload::Files(set) => set.files.iter().any(|f| f.hash == hash),
+                _ => false,
+            })
+            .map(|e| e.id)
+    }
+
+    /// The description of a file we hold a record of, by hash — so a request can be
+    /// answered with the right name, and re-read from the right path.
+    pub fn file_ref(&self, hash: &str) -> Option<FileRef> {
+        let g = self.inner.lock().ok()?;
+        g.entries.iter().find_map(|e| match &e.payload {
+            ClipPayload::Files(set) => set.files.iter().find(|f| f.hash == hash).cloned(),
+            _ => None,
+        })
+    }
+
+    /// Every hash referenced by a **pinned** entry. Passed to the cache so pinning
+    /// protects file contents from the disk budget, not just the row from the list.
+    pub fn pinned_hashes(&self) -> std::collections::HashSet<String> {
+        let Ok(g) = self.inner.lock() else { return Default::default() };
+        g.entries
+            .iter()
+            .filter(|e| e.pinned)
+            .filter_map(|e| match &e.payload {
+                ClipPayload::Files(set) => Some(set.files.iter().map(|f| f.hash.clone())),
+                _ => None,
+            })
+            .flatten()
+            .collect()
+    }
+
     /// Record an image, keeping the encoded PNG so it can be pasted again later.
     pub fn record_image(&self, png: Arc<Vec<u8>>, w: usize, h: usize, incoming: bool) -> Option<u64> {
         self.record(ClipPayload::Image { png, w, h }, incoming)
@@ -213,6 +359,7 @@ impl ClipboardHistory {
             pinned: false,
             preview,
             payload,
+            status: ClipStatus::Ready,
         });
         let limits = g.limits;
         trim(&mut g.entries, limits);
@@ -231,8 +378,11 @@ impl ClipboardHistory {
                         incoming: e.incoming,
                         pinned: e.pinned,
                         is_image: e.payload.is_image(),
+                        is_files: e.payload.is_files(),
                         preview: e.preview.clone(),
                         bytes: e.payload.bytes(),
+                        status: e.status.clone(),
+                        disk_bytes: e.payload.disk_bytes(),
                     })
                     .collect()
             })
@@ -347,6 +497,15 @@ pub fn command_channel() -> (ClipboardCommander, ClipCommandRx) {
     (ClipboardCommander { tx }, ClipCommandRx { rx })
 }
 
+/// The bulk lane, as the clipboard thread sees it: somewhere to send file chunks, and
+/// somewhere to receive them. Both ends are owned by the network layer.
+pub struct BulkLink {
+    pub to_bulk: UnboundedSender<mouse_core::bulk::BulkFrame>,
+    pub from_bulk: Receiver<mouse_core::bulk::BulkFrame>,
+    /// Where transferred contents are kept.
+    pub cache: Arc<cache::BlobCache>,
+}
+
 /// The clipboard-thread half of the user's settings.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ClipboardSettings {
@@ -356,6 +515,15 @@ pub struct ClipboardSettings {
     pub max_item_bytes: usize,
     /// Largest accepted image edge, in pixels.
     pub max_image_px: usize,
+    /// Copy files as well as text and images.
+    pub sync_files: bool,
+    /// Transfer a file set this size or smaller without asking. Above it, the entry
+    /// waits for the user. `u64::MAX` means never ask.
+    pub auto_transfer_max: u64,
+    /// Disk the blob cache may use.
+    pub cache_budget: u64,
+    /// This machine's name, shown on the other side as where a copy came from.
+    pub machine: &'static str,
 }
 
 impl Default for ClipboardSettings {
@@ -365,6 +533,10 @@ impl Default for ClipboardSettings {
             sync_images: true,
             max_item_bytes: DEFAULT_MAX_ITEM_BYTES,
             max_image_px: DEFAULT_MAX_IMAGE_PX,
+            sync_files: true,
+            auto_transfer_max: 1024 * 1024,
+            cache_budget: 2 * 1024 * 1024 * 1024,
+            machine: "this machine",
         }
     }
 }
@@ -537,12 +709,13 @@ impl ClipboardSync {
         connected: Arc<AtomicBool>,
         history: Option<ClipboardHistory>,
         settings: ClipboardSettings,
+        bulk: Option<BulkLink>,
     ) -> ClipboardSync {
         let stop = Arc::new(AtomicBool::new(false));
         let st = stop.clone();
         let join = std::thread::Builder::new()
             .name("clipboard-sync".into())
-            .spawn(move || run(to_peer, remote_rx, commands, st, connected, history, settings))
+            .spawn(move || run(to_peer, remote_rx, commands, st, connected, history, settings, bulk))
             .ok();
         if join.is_none() {
             tracing::warn!("could not spawn clipboard-sync thread; clipboard sync disabled");
@@ -578,6 +751,7 @@ fn run(
     connected: Arc<AtomicBool>,
     history: Option<ClipboardHistory>,
     settings: ClipboardSettings,
+    bulk: Option<BulkLink>,
 ) {
     let mut clipboard = match arboard::Clipboard::new() {
         Ok(c) => c,
@@ -599,6 +773,21 @@ fn run(
     // the same anchor for images, kept as a fingerprint rather than the bitmap itself.
     let mut last = clipboard.read_text().filter(|t| !t.is_empty());
     let mut last_img = clipboard.read_image().as_ref().map(image_key);
+    // Same anchor for file lists. Seeded from whatever is already on the clipboard so a
+    // pre-existing selection isn't broadcast the moment sharing starts.
+    let mut last_files = if settings.sync_files {
+        files::read_files().as_ref().map(files::list_key)
+    } else {
+        None
+    };
+    let (mut transfers, to_bulk, from_bulk) = match bulk {
+        Some(b) => (
+            Some(transfer::Transfers::new(b.cache)),
+            Some(b.to_bulk),
+            Some(b.from_bulk),
+        ),
+        None => (None, None, None),
+    };
     let mut tick: u32 = 0;
 
     loop {
@@ -608,6 +797,7 @@ fn run(
             Ok(Message::Clipboard { text }) if settings.sync_text => {
                 let text = Arc::new(text);
                 if apply_remote(&mut clipboard, &mut last, &text) {
+                    tracing::info!(bytes = text.len(), "clipboard text received from the peer");
                     if let Some(h) = &history {
                         h.record_text(text, true);
                     }
@@ -617,9 +807,48 @@ fn run(
                 if let Some(got) =
                     apply_remote_image(&mut clipboard, &mut last_img, &data, w, h, settings)
                 {
+                    tracing::info!(
+                        w = got.w,
+                        h = got.h,
+                        bytes = got.png.len(),
+                        "clipboard image received from the peer"
+                    );
                     if let Some(hist) = &history {
                         hist.record_image(got.png, got.w, got.h, true);
                     }
+                }
+            }
+            // Files copied on the other machine: record the description, then decide
+            // whether to fetch now, ask first, or do nothing because we already have it.
+            Ok(Message::ClipboardFiles { files: refs, origin }) if settings.sync_files => {
+                if let (Some(t), Some(h)) = (transfers.as_mut(), history.as_ref()) {
+                    let set = Arc::new(FileSet { files: refs, origin });
+                    let status = t.initial_status(&set, settings.auto_transfer_max);
+                    tracing::info!(
+                        count = set.files.len(),
+                        bytes = set.total_bytes(),
+                        ?status,
+                        "the peer copied files"
+                    );
+                    if let Some(id) = h.record_files(set.clone(), true, status.clone()) {
+                        if status == ClipStatus::Remote {
+                            t.request_missing(&set, id, &to_peer);
+                        }
+                    }
+                }
+            }
+            // The peer wants a file we advertised.
+            Ok(Message::BlobRequest { hash, offset }) => {
+                if let (Some(t), Some(h), Some(tb)) =
+                    (transfers.as_ref(), history.as_ref(), to_bulk.as_ref())
+                {
+                    t.serve_request(&hash, offset, h, &to_peer, tb);
+                }
+            }
+            Ok(Message::BlobUnavailable { hash, reason }) => {
+                if let (Some(t), Some(h)) = (transfers.as_mut(), history.as_ref()) {
+                    tracing::warn!(hash, "the peer cannot send a file: {reason}");
+                    t.on_unavailable(&hash, &reason, h);
                 }
             }
             // A stray message for this thread, or a kind the user has switched off.
@@ -645,9 +874,35 @@ fn run(
                         connected.load(Ordering::SeqCst),
                         id,
                         settings,
+                        transfers.as_mut(),
+                        &mut last_files,
                     );
                 }
             }
+        }
+        // Drain whatever the bulk lane delivered. A completed set is published to the
+        // clipboard here, on the one thread allowed to touch it.
+        if let (Some(fb), Some(t), Some(h)) = (from_bulk.as_ref(), transfers.as_mut(), history.as_ref())
+        {
+            while let Ok(frame) = fb.try_recv() {
+                if let Some(entry) = t.on_bulk_frame(frame, h) {
+                    if let Some(ClipPayload::Files(set)) = h.payload(entry) {
+                        if t.is_complete(&set) {
+                            h.set_status(entry, ClipStatus::Ready);
+                            if let Some(list) = t.materialize(&set) {
+                                if files::write_files(&list) {
+                                    last_files = Some(files::list_key(&list));
+                                    tracing::info!(
+                                        count = set.files.len(),
+                                        "files received and put on the clipboard"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            t.enforce_disk_budget(settings.cache_budget, h);
         }
         tick = tick.wrapping_add(1);
         // Only broadcast local changes while a peer is connected: this avoids
@@ -657,8 +912,33 @@ fn run(
         if connected.load(Ordering::SeqCst) {
             if settings.sync_text && tick % TEXT_POLL_TICKS == 0 {
                 if let Some(sent) = poll_local(&mut clipboard, &mut last, &to_peer, settings) {
+                    tracing::info!(bytes = sent.len(), "clipboard text sent to the peer");
                     if let Some(h) = &history {
                         h.record_text(sent, false);
+                    }
+                }
+            }
+            // Files on the same slow tick as images: reading the list is cheap, but
+            // hashing what it points at is not, so it must not run twice a second.
+            if settings.sync_files && tick % IMAGE_POLL_TICKS == 0 {
+                if let (Some(t), Some(h)) = (transfers.as_ref(), history.as_ref()) {
+                    if let Some(list) = files::read_files() {
+                        let key = files::list_key(&list);
+                        if last_files != Some(key) {
+                            last_files = Some(key);
+                            if let Some(set) = t.describe_local(&list, settings.machine) {
+                                tracing::info!(
+                                    count = set.files.len(),
+                                    bytes = set.total_bytes(),
+                                    "files copied here; telling the peer"
+                                );
+                                let _ = to_peer.send(Message::ClipboardFiles {
+                                    files: set.files.clone(),
+                                    origin: set.origin.clone(),
+                                });
+                                h.record_files(Arc::new(set), false, ClipStatus::Ready);
+                            }
+                        }
                     }
                 }
             }
@@ -668,6 +948,12 @@ fn run(
             if settings.sync_images && tick % IMAGE_POLL_TICKS == 0 {
                 if let Some(sent) = poll_local_image(&mut clipboard, &mut last_img, &to_peer, settings)
                 {
+                    tracing::info!(
+                        w = sent.w,
+                        h = sent.h,
+                        bytes = sent.png.len(),
+                        "clipboard image sent to the peer"
+                    );
                     if let Some(h) = &history {
                         h.record_image(sent.png, sent.w, sent.h, false);
                     }
@@ -692,6 +978,8 @@ fn reuse_entry<C: SystemClipboard>(
     connected: bool,
     id: u64,
     settings: ClipboardSettings,
+    transfers: Option<&mut transfer::Transfers>,
+    last_files: &mut Option<u64>,
 ) -> bool {
     let Some(payload) = history.payload(id) else {
         tracing::debug!(id, "re-use asked for a clipboard entry that no longer exists");
@@ -727,6 +1015,45 @@ fn reuse_entry<C: SystemClipboard>(
                     w: img.w as i32,
                     h: img.h as i32,
                 });
+            }
+        }
+        ClipPayload::Files(set) => {
+            let Some(t) = transfers else {
+                tracing::warn!(id, "file entries need the blob cache, which is unavailable");
+                return false;
+            };
+            // Already ours: publish it. Otherwise this click *is* the consent, so ask
+            // for what is missing and let the arriving transfer publish it later.
+            if t.is_complete(&set) {
+                let Some(list) = t.materialize(&set) else { return false };
+                if !files::write_files(&list) {
+                    tracing::warn!(id, "could not put the files on the clipboard");
+                    return false;
+                }
+                *last_files = Some(files::list_key(&list));
+                history.set_status(id, ClipStatus::Ready);
+                if connected {
+                    let _ = to_peer.send(Message::ClipboardFiles {
+                        files: set.files.clone(),
+                        origin: set.origin.clone(),
+                    });
+                }
+            } else if connected {
+                history.set_status(
+                    id,
+                    ClipStatus::Fetching { done: 0, total: set.total_bytes() },
+                );
+                if !t.request_missing(&set, id, to_peer) {
+                    // Nothing new to ask for: a request is already in flight.
+                    tracing::debug!(id, "a transfer for this entry is already running");
+                }
+                return true; // the click did something; publishing happens on arrival
+            } else {
+                history.set_status(
+                    id,
+                    ClipStatus::Unavailable("needs the other machine connected".into()),
+                );
+                return false;
             }
         }
     }
@@ -1218,7 +1545,7 @@ mod tests {
         let old = h.record_text(txt("older"), false).unwrap();
         h.record_text(txt("newer"), false);
 
-        assert!(reuse_entry(&mut cb, &mut last, &mut last_img, &h, &tx, true, old, set()));
+        assert!(reuse_entry(&mut cb, &mut last, &mut last_img, &h, &tx, true, old, set(), None, &mut None));
         assert_eq!(cb.content.as_deref(), Some("older"), "clipboard was set");
         assert_eq!(
             rx.try_recv().unwrap(),
@@ -1241,7 +1568,7 @@ mod tests {
         let h = ClipboardHistory::new();
         let id = h.record_text(txt("offline"), false).unwrap();
 
-        assert!(reuse_entry(&mut cb, &mut None, &mut None, &h, &tx, false, id, set()));
+        assert!(reuse_entry(&mut cb, &mut None, &mut None, &h, &tx, false, id, set(), None, &mut None));
         assert_eq!(cb.content.as_deref(), Some("offline"));
         assert!(rx.try_recv().is_err(), "nothing goes to a peer that isn't connected");
     }
@@ -1251,7 +1578,7 @@ mod tests {
         let (tx, _rx) = unbounded_channel();
         let mut cb = Fake::default();
         let h = ClipboardHistory::new();
-        assert!(!reuse_entry(&mut cb, &mut None, &mut None, &h, &tx, true, 999, set()));
+        assert!(!reuse_entry(&mut cb, &mut None, &mut None, &h, &tx, true, 999, set(), None, &mut None));
         assert!(cb.content.is_none());
     }
 

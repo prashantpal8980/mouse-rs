@@ -18,3 +18,17 @@ arboard = { version = "3", default-features = false, features = ["image-data"] }
 # PNG codec for clipboard images: pure Rust, MIT/Apache-2.0 (no GPL in the tree).
 png = "0.17"
 base64 = "0.22"
+# Content addressing for the blob cache. Already in the workspace (used by the auth
+# HMAC), so this adds no new dependency to audit or license.
+sha2.workspace = true
+# File metadata crosses the link as JSON on the input lane.
+serde.workspace = true
+serde_json.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+# CF_HDROP: arboard cannot do file lists at all. BSL-1.0 — permissive, fine to ship.
+clipboard-win = "5"
+
+[target.'cfg(unix)'.dependencies]
+# Owning the X11 CLIPBOARD selection to serve file targets. Already a workspace dep.
+x11rb.workspace = true

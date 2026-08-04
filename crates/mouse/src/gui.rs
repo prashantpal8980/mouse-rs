@@ -75,6 +75,9 @@ enum Message {
     ClipImagePxChanged(String),
     BulkEnabledToggled(bool),
     BulkPortChanged(String),
+    ClipSyncFilesToggled(bool),
+    ClipAutoMbChanged(String),
+    ClipCacheGbChanged(String),
     ReconnectToggled(bool),
     AutostartToggled(bool),
     AutoconnectToggled(bool),
@@ -205,6 +208,8 @@ struct App {
     clip_mem_mb_s: String,
     clip_img_px_s: String,
     bulk_port_s: String,
+    clip_auto_mb_s: String,
+    clip_cache_gb_s: String,
 }
 
 /// Bytes → whole MB for display. The panel talks in MB because that is the unit the
@@ -265,6 +270,8 @@ impl App {
             clip_mem_mb_s: String::new(),
             clip_img_px_s: String::new(),
             bulk_port_s: String::new(),
+            clip_auto_mb_s: String::new(),
+            clip_cache_gb_s: String::new(),
             saved_cfg: cfg.clone(),
             cfg,
         };
@@ -282,6 +289,9 @@ impl App {
         self.clip_item_mb_s = mb_of(self.cfg.clipboard_max_item_bytes);
         self.clip_mem_mb_s = mb_of(self.cfg.clipboard_memory_budget);
         self.clip_img_px_s = self.cfg.clipboard_max_image_px.to_string();
+        self.clip_auto_mb_s = (self.cfg.clipboard_auto_transfer_max / (1024 * 1024)).to_string();
+        self.clip_cache_gb_s =
+            (self.cfg.clipboard_cache_budget / (1024 * 1024 * 1024)).max(1).to_string();
         self.bulk_port_s = if self.cfg.bulk_port == 0 {
             String::new()
         } else {
@@ -501,6 +511,21 @@ impl App {
                 self.clip_img_px_s = s;
             }
             Message::BulkEnabledToggled(v) => self.cfg.bulk_enabled = v,
+            Message::ClipSyncFilesToggled(v) => self.cfg.clipboard_sync_files = v,
+            Message::ClipAutoMbChanged(s) => {
+                // 0 is meaningful here — it means "always ask" — so it is accepted as
+                // typed rather than clamped up to 1 like the size limits.
+                if let Ok(v) = s.trim().parse::<u64>() {
+                    self.cfg.clipboard_auto_transfer_max = v * 1024 * 1024;
+                }
+                self.clip_auto_mb_s = s;
+            }
+            Message::ClipCacheGbChanged(s) => {
+                if let Ok(v) = s.trim().parse::<u64>() {
+                    self.cfg.clipboard_cache_budget = v.max(1) * 1024 * 1024 * 1024;
+                }
+                self.clip_cache_gb_s = s;
+            }
             Message::BulkPortChanged(s) => {
                 // 0 (or an empty box) means "share the input link's port".
                 if s.trim().is_empty() {
@@ -760,6 +785,9 @@ impl App {
         .spacing(12.0)
         .padding(16.0);
         if let Some(banner) = self.restart_banner(p) {
+            content = content.push(banner);
+        }
+        if let Some(banner) = self.pending_files_banner(p) {
             content = content.push(banner);
         }
         let content = content.push(self.tab_bar(p)).push(
@@ -1140,6 +1168,59 @@ impl App {
         .spacing(14.0))
     }
 
+    /// "The other machine copied something big — want it?"
+    ///
+    /// A banner rather than a dialog, and that is not a style preference. Windows
+    /// withholds `WH_KEYBOARD_LL` callbacks from a process while that process owns the
+    /// foreground window — the exact root cause of the keyboard leak fixed on
+    /// 2026‑07‑31. A pop-up that grabbed focus the moment a large file was copied would
+    /// bring it straight back, and it would do so mid-work, quite possibly mid-crossing.
+    /// So this never calls `SetForegroundWindow` and never steals focus.
+    fn pending_files_banner(&self, p: Palette) -> Option<Element<'_, Message>> {
+        let waiting: Vec<_> = self
+            .engine
+            .as_ref()?
+            .clipboard_meta()
+            .into_iter()
+            .filter(|m| m.status == mouse_clipboard::ClipStatus::NeedsConsent)
+            .collect();
+        let first = waiting.first()?;
+        let more = waiting.len().saturating_sub(1);
+        let title = if more > 0 {
+            format!("{} (and {more} more) is waiting", first.preview)
+        } else {
+            format!("{} is waiting", first.preview)
+        };
+        Some(
+            container(
+                row![
+                    column![
+                        text(title).size(13.5).color(p.txt),
+                        text(format!(
+                            "{} — over your {} limit, so it hasn't been brought over yet.",
+                            human_bytes(first.disk_bytes as usize),
+                            human_bytes(self.cfg.clipboard_auto_transfer_max as usize)
+                        ))
+                        .size(11.0)
+                        .color(p.txt3),
+                    ]
+                    .spacing(3.0),
+                    Space::new().width(Length::Fill),
+                    button(text("Bring it over").size(12.5))
+                        .style(ui_theme::primary(p))
+                        .padding([9.0, 14.0])
+                        .on_press(Message::ClipReuse(first.id)),
+                ]
+                .spacing(10.0)
+                .align_y(Alignment::Center),
+            )
+            .style(move |_| ui_theme::well(p))
+            .padding([11.0, 14.0])
+            .width(Length::Fill)
+            .into(),
+        )
+    }
+
     /// The clipboard manager: a list you can act on, not a log you can only read.
     ///
     /// Every row is a button that puts that item back on the clipboard (and sends it to
@@ -1161,7 +1242,35 @@ impl App {
             Some(e) => {
                 for m in e {
                     let (arrow, col) = if m.incoming { ("↓ in", p.accent) } else { ("↑ out", p.good) };
-                    let kind = if m.is_image { "🖼" } else { "¶" };
+                    let kind = if m.is_files {
+                        "🗎"
+                    } else if m.is_image {
+                        "🖼"
+                    } else {
+                        "¶"
+                    };
+                    // The right-hand label is the entry's state in the user's words.
+                    // Every one of these is a situation they can really be in, and the
+                    // alternative to saying so is leaving them to guess.
+                    let (note, note_col) = match &m.status {
+                        mouse_clipboard::ClipStatus::Ready if m.is_files => {
+                            (format!("{} · ready", human_bytes(m.disk_bytes as usize)), p.good)
+                        }
+                        mouse_clipboard::ClipStatus::Ready => (human_bytes(m.bytes), p.txt3),
+                        mouse_clipboard::ClipStatus::Remote => (
+                            format!("{} · fetching…", human_bytes(m.disk_bytes as usize)),
+                            p.accent,
+                        ),
+                        mouse_clipboard::ClipStatus::NeedsConsent => (
+                            format!("{} · click to bring it over", human_bytes(m.disk_bytes as usize)),
+                            p.warn,
+                        ),
+                        mouse_clipboard::ClipStatus::Fetching { done, total } => {
+                            let pct = if *total > 0 { done * 100 / total } else { 0 };
+                            (format!("{pct}% of {}", human_bytes(*total as usize)), p.accent)
+                        }
+                        mouse_clipboard::ClipStatus::Unavailable(why) => (why.clone(), p.danger),
+                    };
                     // The row itself is the re-use action — the thing the user wants
                     // nine times out of ten needs no menu and no second click.
                     let reuse = button(
@@ -1170,7 +1279,7 @@ impl App {
                             text(arrow).size(11.0).color(col),
                             text(m.preview.clone()).size(13.0).color(p.txt2),
                             Space::new().width(Length::Fill),
-                            text(human_bytes(m.bytes)).size(11.0).color(p.txt3),
+                            text(note).size(11.0).color(note_col),
                         ]
                         .spacing(10.0)
                         .align_y(Alignment::Center),
@@ -1231,6 +1340,21 @@ impl App {
             list,
             usage,
             labeled(p, "Keep this many entries", input(p, "25", &self.clip_items_s, Message::ClipItemsChanged)),
+            labeled(
+                p,
+                "Ask before bringing over anything larger than (MB)",
+                input(p, "1", &self.clip_auto_mb_s, Message::ClipAutoMbChanged)
+            ),
+            text(if self.cfg.clipboard_auto_transfer_max == 0 {
+                "0 — always ask, whatever the size.".to_string()
+            } else {
+                format!(
+                    "Under {} it just arrives; over it, the entry waits for you.",
+                    human_bytes(self.cfg.clipboard_auto_transfer_max as usize)
+                )
+            })
+            .size(11.0)
+            .color(p.txt3),
             toggle_row(
                 p,
                 "Advanced settings",
@@ -1258,6 +1382,11 @@ impl App {
                 column![
                     toggle_row(p, "Sync text", "copied text crosses machines", self.cfg.clipboard_sync_text, Message::ClipSyncTextToggled),
                     toggle_row(p, "Sync images", "copied images cross machines", self.cfg.clipboard_sync_images, Message::ClipSyncImagesToggled),
+                    toggle_row(p, "Sync files", "any file, any extension — no allow-list", self.cfg.clipboard_sync_files, Message::ClipSyncFilesToggled),
+                    labeled(p, "Disk for transferred files (GB)", input(p, "2", &self.clip_cache_gb_s, Message::ClipCacheGbChanged)),
+                    text("Oldest go first when it fills. Pinned entries are never removed.")
+                        .size(11.0)
+                        .color(p.txt3),
                     labeled(p, "Biggest item to keep (MB)", input(p, "5", &self.clip_item_mb_s, Message::ClipItemMbChanged)),
                     labeled(p, "Memory budget (MB)", input(p, "64", &self.clip_mem_mb_s, Message::ClipMemMbChanged)),
                     text(format!(

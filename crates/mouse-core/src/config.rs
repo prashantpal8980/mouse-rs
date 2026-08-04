@@ -83,6 +83,12 @@ fn default_clip_memory() -> usize {
 fn default_clip_image_px() -> usize {
     4096
 }
+fn default_auto_transfer() -> u64 {
+    1024 * 1024
+}
+fn default_cache_budget() -> u64 {
+    2 * 1024 * 1024 * 1024
+}
 
 /// On-disk configuration. Field names match the Python version exactly.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -133,6 +139,19 @@ pub struct Config {
     /// the two apart.
     #[serde(default)]
     pub bulk_port: u16,
+    /// Copy files between machines, not just text and images.
+    #[serde(default = "default_true")]
+    pub clipboard_sync_files: bool,
+    /// Transfer a file set this size or smaller without asking, in bytes. `0` means
+    /// always ask; a very large value means never ask.
+    #[serde(default = "default_auto_transfer")]
+    pub clipboard_auto_transfer_max: u64,
+    /// Disk the file cache may use, in bytes.
+    #[serde(default = "default_cache_budget")]
+    pub clipboard_cache_budget: u64,
+    /// Where transferred files are kept. Empty = `~/.mouse_share/cache`.
+    #[serde(default)]
+    pub cache_dir: String,
 
     #[serde(default = "default_lock_hotkey")]
     pub lock_hotkey: String,
@@ -194,6 +213,10 @@ impl Default for Config {
             bulk_enabled: true,
             // 0 = share the input link's port. Anything else is a deliberate choice.
             bulk_port: 0,
+            clipboard_sync_files: true,
+            clipboard_auto_transfer_max: default_auto_transfer(),
+            clipboard_cache_budget: default_cache_budget(),
+            cache_dir: String::new(),
             lock_hotkey: default_lock_hotkey(),
             return_hotkey: String::new(),
             listen_host: default_listen_host(),

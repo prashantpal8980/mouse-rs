@@ -1196,7 +1196,7 @@ mod tests {
         let (c_ch, _c_to, mut c_from, mut c_events) = channels();
 
         // Server side of the bulk lane, so we can observe what arrives on it.
-        let (bulk_in_tx, mut bulk_in_rx) = mpsc::unbounded_channel();
+        let (bulk_in_tx, bulk_in_rx) = std::sync::mpsc::channel();
         let (_bulk_out_tx, bulk_out_rx) = mpsc::unbounded_channel();
         let health = LinkHealth::new();
         let bulk = BulkServer::enabled(
@@ -1249,10 +1249,12 @@ mod tests {
             .await
             .expect("send a bulk chunk");
 
-        let got = timeout(Duration::from_secs(3), bulk_in_rx.recv())
-            .await
-            .expect("a bulk frame must arrive")
-            .expect("bulk channel open");
+        let got = tokio::task::spawn_blocking(move || {
+            bulk_in_rx.recv_timeout(Duration::from_secs(3))
+        })
+        .await
+        .expect("join")
+        .expect("a bulk frame must arrive");
         assert_eq!(got, crate::bulk::BulkFrame::Chunk { transfer: 1, seq: 0, data: vec![9; 32] });
 
         // And input still works, unaffected by the bulk traffic.

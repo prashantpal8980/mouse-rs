@@ -37,6 +37,24 @@ pub enum Lane {
     Bulk,
 }
 
+/// A file copied to the clipboard: what it is, and where it came from.
+///
+/// Only this description crosses the input link. The contents travel on the bulk lane,
+/// and only if the receiving machine decides it wants them — which is what lets a 4 GB
+/// copy show up in the other machine's history instantly and cost nothing until asked for.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileRef {
+    pub name: String,
+    pub size: u64,
+    /// SHA-256 of the contents: the cache key, the integrity check, and the reason a
+    /// file the peer already holds needs no transfer at all.
+    pub hash: String,
+    /// Where it lived on the machine it was copied from. Used to re-read it on request,
+    /// and to say something true once it has moved.
+    #[serde(default)]
+    pub source_path: Option<String>,
+}
+
 /// Every message that can cross the link.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "t")]
@@ -104,6 +122,23 @@ pub enum Message {
         data: String, // base64 PNG
         w: i32,
         h: i32,
+    },
+    /// "I copied these files." Description only — no contents.
+    ClipboardFiles {
+        files: Vec<FileRef>,
+        /// Name of the machine the copy happened on, for "on laptop · click to fetch".
+        origin: String,
+    },
+    /// "Send me the contents of this hash, starting at `offset`." Tiny, so it rides the
+    /// input lane; the answer comes back on the bulk lane.
+    BlobRequest {
+        hash: String,
+        offset: u64,
+    },
+    /// "I cannot produce that." `reason` is shown to the user verbatim.
+    BlobUnavailable {
+        hash: String,
+        reason: String,
     },
 
     // --- liveness ---

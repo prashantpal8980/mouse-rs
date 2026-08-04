@@ -51,6 +51,7 @@ pub fn run_blocking(
     // round-trip here and the bulk lane paces against it, so a big transfer backs off
     // from the very thing it would otherwise damage.
     let health = LinkHealth::new();
+    let mut bulk_wiring = setup_bulk(&cfg);
     let (link_channels, mut engine_link) = EngineLink::new();
     // Wire the UI's status sink in (the headless CLI passes `None`).
     engine_link.status = status;
@@ -62,8 +63,13 @@ pub fn run_blocking(
             // can self-release suppression on it (the Linux backend ignores it).
             let (capture, suppressor) =
                 start_capture(cap_tx, NamedKey::from_name(&cfg.lock_hotkey))?;
-            let (clip_route, clipboard) =
-                setup_clipboard(&cfg, &engine_link.to_peer, clip_history.clone(), clip_commands);
+            let (clip_route, clipboard) = setup_clipboard(
+                &cfg,
+                &engine_link.to_peer,
+                clip_history.clone(),
+                clip_commands,
+                bulk_wiring.link.take(),
+            );
 
             let cfg_link = cfg.clone();
             let cfg_engine = cfg.clone();
@@ -73,7 +79,10 @@ pub fn run_blocking(
             // and a second listener serves them instead; with the default (0) the two
             // lanes share one port and one listener.
             let separate_bulk_port = bulk_port(&cfg) != cfg.listen_port;
-            let (bulk_server, _bulk_rx) = setup_bulk_server(&cfg, health.clone());
+            let bulk_server = match bulk_wiring.channels.take() {
+                Some(ch) => BulkServer::enabled(ch, health.clone()),
+                None => BulkServer::disabled(),
+            };
             let (shared_bulk, extra_bulk) = if separate_bulk_port {
                 (BulkServer::disabled(), Some(bulk_server))
             } else {
@@ -127,15 +136,20 @@ pub fn run_blocking(
         Role::Client => {
             let injector = Injector::spawn(new_injector()?)?;
             let inject_tx = injector.sender();
-            let (clip_route, clipboard) =
-                setup_clipboard(&cfg, &engine_link.to_peer, clip_history.clone(), clip_commands);
+            let (clip_route, clipboard) = setup_clipboard(
+                &cfg,
+                &engine_link.to_peer,
+                clip_history.clone(),
+                clip_commands,
+                bulk_wiring.link.take(),
+            );
 
             let cfg_link = cfg.clone();
             let cfg_engine = cfg.clone();
             let cfg_bulk_client = cfg.clone();
             let c1 = cancel.clone();
             let c2 = cancel.clone();
-            let (bulk_channels, _bulk_tx) = setup_bulk_client(&cfg);
+            let bulk_channels = bulk_wiring.channels.take();
             let health_link = health.clone();
             runtime.block_on(async move {
                 if install_ctrl_c {
@@ -322,6 +336,7 @@ fn setup_clipboard(
     to_peer: &tokio::sync::mpsc::UnboundedSender<Message>,
     history: Option<ClipboardHistory>,
     commands: Option<ClipCommandRx>,
+    bulk: Option<mouse_clipboard::BulkLink>,
 ) -> (Option<ClipboardRoute>, Option<ClipboardSync>) {
     if !cfg.clipboard_sync {
         return (None, None);
@@ -340,6 +355,7 @@ fn setup_clipboard(
         connected.clone(),
         history,
         clipboard_settings(cfg),
+        bulk,
     );
     (Some(ClipboardRoute { tx, connected }), Some(sync))
 }
@@ -357,50 +373,44 @@ fn bulk_port(cfg: &Config) -> u16 {
     }
 }
 
-/// Server side of the bulk lane: the handle the input listener hands connections to.
-fn setup_bulk_server(
-    cfg: &Config,
-    health: std::sync::Arc<LinkHealth>,
-) -> (
-    BulkServer,
-    Option<tokio::sync::mpsc::UnboundedReceiver<mouse_core::bulk::BulkFrame>>,
-) {
-    if !cfg.bulk_enabled {
-        return (BulkServer::disabled(), None);
-    }
-    let (in_tx, in_rx) = unbounded_channel();
-    let (_out_tx, out_rx) = unbounded_channel();
-    (
-        BulkServer::enabled(
-            BulkChannels {
-                outgoing: out_rx,
-                incoming: in_tx,
-            },
-            health,
-        ),
-        Some(in_rx),
-    )
+/// Everything the clipboard thread needs to use the bulk lane.
+struct BulkWiring {
+    channels: Option<BulkChannels>,
+    link: Option<mouse_clipboard::BulkLink>,
 }
 
-/// Client side of the bulk lane.
-fn setup_bulk_client(
-    cfg: &Config,
-) -> (
-    Option<BulkChannels>,
-    Option<tokio::sync::mpsc::UnboundedSender<mouse_core::bulk::BulkFrame>>,
-) {
+/// Build both halves of the bulk lane and the blob cache behind it.
+///
+/// The cache is opened here rather than in the clipboard thread so a failure — a
+/// read-only home, a full disk — is reported once at startup and simply leaves file
+/// transfer switched off, instead of failing on every copy.
+fn setup_bulk(cfg: &Config) -> BulkWiring {
     if !cfg.bulk_enabled {
-        return (None, None);
+        return BulkWiring { channels: None, link: None };
     }
-    let (in_tx, _in_rx) = unbounded_channel();
+    let root = if cfg.cache_dir.trim().is_empty() {
+        mouse_clipboard::cache::BlobCache::default_root()
+    } else {
+        std::path::PathBuf::from(&cfg.cache_dir)
+    };
+    let cache = match mouse_clipboard::cache::BlobCache::new(root.clone()) {
+        Ok(c) => std::sync::Arc::new(c),
+        Err(e) => {
+            tracing::warn!(path = %root.display(), "no file cache ({e}); file copying is off");
+            return BulkWiring { channels: None, link: None };
+        }
+    };
+    // outgoing: clipboard thread -> network. incoming: network -> clipboard thread.
     let (out_tx, out_rx) = unbounded_channel();
-    (
-        Some(BulkChannels {
-            outgoing: out_rx,
-            incoming: in_tx,
+    let (in_tx, in_rx) = std::sync::mpsc::channel();
+    BulkWiring {
+        channels: Some(BulkChannels { outgoing: out_rx, incoming: in_tx }),
+        link: Some(mouse_clipboard::BulkLink {
+            to_bulk: out_tx,
+            from_bulk: in_rx,
+            cache,
         }),
-        Some(out_tx),
-    )
+    }
 }
 
 /// Keep the client's bulk lane up, retrying quietly on its own schedule.
@@ -458,6 +468,14 @@ fn clipboard_settings(cfg: &Config) -> ClipboardSettings {
         sync_images: cfg.clipboard_sync_images,
         max_item_bytes: cfg.clipboard_max_item_bytes,
         max_image_px: cfg.clipboard_max_image_px.max(1),
+        sync_files: cfg.clipboard_sync_files,
+        // 0 means "always ask"; the panel says so next to the field.
+        auto_transfer_max: cfg.clipboard_auto_transfer_max,
+        cache_budget: cfg.clipboard_cache_budget,
+        // Leaked once at startup so the clipboard thread can hold a &'static str for
+        // the life of the process; the alternative is threading a String through every
+        // frame for a value that never changes.
+        machine: Box::leak(cfg.name.clone().into_boxed_str()),
     }
 }
 
