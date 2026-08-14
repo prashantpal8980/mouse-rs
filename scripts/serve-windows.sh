@@ -40,7 +40,7 @@ echo "==> exe: $SIZE bytes, $SHA"
 # --- keep the prompts' stated checksum equal to what is actually being served ---
 for doc in docs/windows-test-prompt.md docs/windows-retest-prompt.md \
            docs/windows-leak-hunt-prompt.md docs/windows-paired-test-prompt.md \
-           docs/windows-update-prompt.md; do
+           docs/windows-update-prompt.md docs/windows-clipboard-prompt.md; do
   [ -f "$doc" ] || continue
   # Both lines are written by this script, so match loosely on the label and replace
   # the whole value rather than trying to find the previous hash.
@@ -63,6 +63,7 @@ ln -sfn "$REPO_ROOT/docs/windows-test-prompt.md"   "$SERVE_DIR/setup.md"
 ln -sfn "$REPO_ROOT/docs/windows-leak-hunt-prompt.md" "$SERVE_DIR/leak-hunt.md"
 ln -sfn "$REPO_ROOT/docs/windows-paired-test-prompt.md" "$SERVE_DIR/paired.md"
 ln -sfn "$REPO_ROOT/docs/windows-update-prompt.md" "$SERVE_DIR/update.md"
+ln -sfn "$REPO_ROOT/docs/windows-clipboard-prompt.md" "$SERVE_DIR/clipboard.md"
 printf 'mouse-rs.exe  %s bytes\nSHA256  %s\n' "$SIZE" "$SHA" > "$SERVE_DIR/CHECKSUM.txt"
 
 # --- restart the server ---
@@ -85,7 +86,8 @@ if curl -sf -o /dev/null "http://$BIND_ADDR:$PORT/retest.md"; then
 
 ==> serving on http://$BIND_ADDR:$PORT/  (cable only)
 
-    http://$BIND_ADDR:$PORT/update.md      install the current build  <-- standing prompt
+    http://$BIND_ADDR:$PORT/clipboard.md   install + check the clipboard build  <-- current
+    http://$BIND_ADDR:$PORT/update.md      install the current build  (standing prompt)
     http://$BIND_ADDR:$PORT/paired.md      paired foreground/background test
     http://$BIND_ADDR:$PORT/leak-hunt.md   the keyboard-leak hunt
     http://$BIND_ADDR:$PORT/retest.md      focused retest of the six fixes
