@@ -499,6 +499,14 @@ enum ClipCommand {
     Cancel(u64),
     /// "Not now" — quieten the prompt without discarding the entry.
     Decline(u64),
+    /// Write a copied image out as a real .png and put *that file* on the clipboard.
+    ///
+    /// Neither Explorer nor Thunar can paste pixels — their Paste needs a reference to
+    /// a file on disk. So an image that pastes fine into a browser or a chat window
+    /// cannot be pasted into a file manager at all, by any program. Turning it into a
+    /// file is the way round that, and it is offered per entry rather than done always,
+    /// because publishing the file would replace the pixels and break the common case.
+    ImageAsFile(u64),
     /// Raise the ask-first threshold on the *running* thread.
     ///
     /// Applying it only on restart would make "always allow this size" look broken the
@@ -528,6 +536,12 @@ impl ClipboardCommander {
     /// Answer "not now" to the consent prompt for entry `id`.
     pub fn decline(&self, id: u64) {
         let _ = self.tx.send(ClipCommand::Decline(id));
+    }
+
+    /// Offer history entry `id`'s image as a `.png` file on the clipboard, so it can
+    /// be pasted into a file manager.
+    pub fn image_as_file(&self, id: u64) {
+        let _ = self.tx.send(ClipCommand::ImageAsFile(id));
     }
 
     /// Change the "bring it over without asking" limit on the running thread.
@@ -994,6 +1008,29 @@ fn run(
                         }
                         continue;
                     }
+                    ClipCommand::ImageAsFile(id) => {
+                        if let (Some(t), Some(h)) = (transfers.as_ref(), history.as_ref()) {
+                            match image_to_file(t, h, id) {
+                                Some(path) => {
+                                    let list = files::FileList { paths: vec![path.clone()] };
+                                    if files::write_files(&list) {
+                                        last_files = Some(files::list_key(&list));
+                                        tracing::info!(
+                                            id,
+                                            path = %path.display(),
+                                            "image offered as a file — paste it in a file manager"
+                                        );
+                                    } else {
+                                        tracing::warn!(id, "could not put the image file on the clipboard");
+                                    }
+                                }
+                                None => tracing::warn!(id, "that entry has no image to write out"),
+                            }
+                        } else {
+                            tracing::warn!(id, "writing an image out needs the file cache, which is unavailable");
+                        }
+                        continue;
+                    }
                     ClipCommand::SetAutoMax(bytes) => {
                         settings.auto_transfer_max = bytes;
                         tracing::info!(bytes, "ask-first limit raised from the panel");
@@ -1068,7 +1105,7 @@ fn run(
                         let key = files::list_key(&list);
                         if last_files != Some(key) {
                             last_files = Some(key);
-                            if let Some(set) = t.describe_local(&list, settings.machine, settings.max_files_per_copy, settings.follow_symlinks) {
+                            if let Some(set) = t.describe_local(&list, settings.machine, settings.max_files_per_copy, settings.follow_symlinks, settings.cache_budget) {
                                 tracing::info!(
                                     count = set.files.len(),
                                     bytes = set.total_bytes(),
@@ -1407,6 +1444,31 @@ fn apply_encoded_image<C: SystemClipboard>(
         h.record_image(Arc::new(png.to_vec()), img.w, img.h, true);
     }
     true
+}
+
+/// Write a history entry's image into the cache as a real `.png` and return its path.
+///
+/// The name matters: a file manager shows whatever the file is called, and pasting
+/// something named after a 64-character hash would be technically correct and useless.
+/// The hash still decides the *content*, so writing the same image out twice reuses one
+/// file rather than accumulating copies.
+fn image_to_file(
+    transfers: &transfer::Transfers,
+    history: &ClipboardHistory,
+    id: u64,
+) -> Option<std::path::PathBuf> {
+    let ClipPayload::Image { png, w, h } = history.payload(id)? else {
+        return None;
+    };
+    let hash = transfers.stage_image(&png)?;
+    let name = format!("clipboard-image-{w}x{h}-{}.png", &hash[..8]);
+    match transfers.cache().materialize(&hash, &name) {
+        Ok(p) => Some(p),
+        Err(e) => {
+            tracing::warn!(id, "could not write the image out as a file: {e}");
+            None
+        }
+    }
 }
 
 /// Join `handle`, but never block longer than `timeout`: detach a wedged backend

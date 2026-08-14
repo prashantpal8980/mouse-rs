@@ -100,6 +100,9 @@ fn default_max_files() -> usize {
 fn default_send_buffer_mb() -> u32 {
     8
 }
+fn default_log_upload_secs() -> u32 {
+    30
+}
 fn default_quick_send() -> u32 {
     3
 }
@@ -175,6 +178,18 @@ pub struct Config {
     /// commit the machine to hashing all of it.
     #[serde(default = "default_max_files")]
     pub clipboard_max_files_per_copy: usize,
+    /// Where to ship this machine's log for diagnosis, e.g.
+    /// `http://192.168.137.2:8001`. Empty = off, which is the default.
+    ///
+    /// A two-machine fault is almost never visible from one side, and fetching the
+    /// other log by hand is slow enough that in practice the diagnosis becomes a guess
+    /// instead. Plain HTTP to a machine the owner names themselves — nothing leaves the
+    /// machine unless this is set.
+    #[serde(default)]
+    pub log_upload_url: String,
+    /// How often to ship it, in seconds.
+    #[serde(default = "default_log_upload_secs")]
+    pub log_upload_secs: u32,
     /// Show a desktop notification when a file is waiting for a decision.
     ///
     /// Never a dialog — see `crates/mouse/src/notify.rs` for why a focus-stealing
@@ -288,6 +303,8 @@ impl Default for Config {
             clipboard_max_files_per_copy: default_max_files(),
             clipboard_follow_symlinks: false,
             clipboard_notify: true,
+            log_upload_url: String::new(),
+            log_upload_secs: default_log_upload_secs(),
             bulk_pause_while_crossed: true,
             bulk_rate_limit_mbps: 0,
             bulk_send_buffer_mb: default_send_buffer_mb(),

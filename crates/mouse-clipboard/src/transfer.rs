@@ -195,6 +195,7 @@ impl Transfers {
         origin: &str,
         max_files: usize,
         follow_symlinks: bool,
+        cache_budget: u64,
     ) -> Option<FileSet> {
         let mut files = Vec::new();
         let mut dirs: Vec<String> = Vec::new();
@@ -235,7 +236,7 @@ impl Transfers {
             };
             budget = budget.saturating_sub(members.len());
             for (member, rel) in members {
-                match self.cache.ingest(&member) {
+                match self.cache.ingest(&member, cache_budget) {
                     Ok((hash, size)) => files.push(FileRef {
                         name: member
                             .file_name()
@@ -279,11 +280,23 @@ impl Transfers {
         auto_limit: u64,
         quick: Option<QuickSend>,
     ) -> ClipStatus {
+        // Every branch below says why it chose what it chose. "The file never arrived"
+        // is otherwise unanswerable from a log: waiting for consent, fetching, and
+        // silently doing nothing all look identical from outside.
         if set.files.iter().all(|f| self.cache.contains(&f.hash)) {
+            tracing::info!(
+                files = set.files.len(),
+                "DECISION: ready immediately — every file is already in this machine's cache, nothing to transfer"
+            );
             return ClipStatus::Ready;
         }
         let total = set.total_bytes();
         if total <= auto_limit {
+            tracing::info!(
+                bytes = total,
+                auto_limit,
+                "DECISION: fetching now — under the ask-first limit, so no prompt"
+            );
             return ClipStatus::Remote;
         }
         // Over the size limit, but if we can *measure* that it will be done in a few
@@ -296,13 +309,26 @@ impl Transfers {
                         tracing::info!(
                             bytes = total,
                             est_secs = est,
-                            "over the ask limit, but quick enough on this link to just fetch"
+                            "DECISION: fetching now — over the ask limit, but measured as quick on this link"
                         );
                         return ClipStatus::Remote;
                     }
                 }
             }
         }
+        // The state the owner hit and could not see. Say plainly what is being waited
+        // for and what would change it, because nothing else in the system will.
+        tracing::warn!(
+            bytes = total,
+            auto_limit,
+            files = set.files.len(),
+            measured_bps = quick.map(|q| q.bps).unwrap_or(0),
+            "DECISION: WAITING FOR YOU — {} is over the {} ask-first limit, so nothing has been transferred. \
+             Nothing will arrive until 'Bring it over' is pressed in the panel's Clipboard tab, or the \
+             ask-first limit is raised above this size.",
+            human(total),
+            human(auto_limit),
+        );
         ClipStatus::NeedsConsent
     }
 
@@ -635,6 +661,21 @@ impl Transfers {
     }
 }
 
+/// A byte count in the largest unit that stays readable, for log lines a human reads.
+fn human(bytes: u64) -> String {
+    const MB: f64 = 1024.0 * 1024.0;
+    let b = bytes as f64;
+    if b >= 1024.0 * MB {
+        format!("{:.1} GB", b / (1024.0 * MB))
+    } else if b >= MB {
+        format!("{:.1} MB", b / MB)
+    } else if b >= 1024.0 {
+        format!("{:.0} KB", b / 1024.0)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
 /// A stable key for a whole selection, so pasting the same copy twice reuses one tree
 /// instead of building a fresh one each time.
 fn set_key(set: &FileSet) -> String {
@@ -800,7 +841,7 @@ mod tests {
         let a = root.join("one.txt");
         fs::write(&a, b"hello").unwrap();
         let set = t
-            .describe_local(&FileList { paths: vec![a.clone()] }, "kali", 10_000, false)
+            .describe_local(&FileList { paths: vec![a.clone()] }, "kali", 10_000, false, u64::MAX)
             .expect("a file list");
         assert_eq!(set.files.len(), 1);
         assert_eq!(set.files[0].name, "one.txt");
@@ -816,7 +857,7 @@ mod tests {
         let (root, t, _h) = setup("dedup");
         let a = root.join("known.bin");
         fs::write(&a, vec![7u8; 4096]).unwrap();
-        let set = t.describe_local(&FileList { paths: vec![a] }, "kali", 10_000, false).unwrap();
+        let set = t.describe_local(&FileList { paths: vec![a] }, "kali", 10_000, false, u64::MAX).unwrap();
         // Tiny auto-limit, so only the cache hit can explain a Ready verdict.
         assert_eq!(t.initial_status(&set, 1, None), ClipStatus::Ready);
         let _ = fs::remove_dir_all(&root);
@@ -851,7 +892,7 @@ mod tests {
         let content: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
         fs::write(&src, &content).unwrap();
         let set = sender
-            .describe_local(&FileList { paths: vec![src] }, "laptop", 10_000, false)
+            .describe_local(&FileList { paths: vec![src] }, "laptop", 10_000, false, u64::MAX)
             .unwrap();
         s_hist.record_files(Arc::new(set.clone()), false, ClipStatus::Ready);
 
@@ -905,7 +946,7 @@ mod tests {
         fs::write(proj.join("src").join("deep").join("x.txt"), b"deep").unwrap();
 
         let set = t
-            .describe_local(&FileList { paths: vec![proj.clone()] }, "laptop", 10_000, false)
+            .describe_local(&FileList { paths: vec![proj.clone()] }, "laptop", 10_000, false, u64::MAX)
             .expect("a folder should describe");
         assert_eq!(set.files.len(), 3, "every file in the tree");
 
@@ -938,7 +979,7 @@ mod tests {
         fs::write(&loose, b"loose").unwrap();
 
         let set = t
-            .describe_local(&FileList { paths: vec![dir, loose] }, "laptop", 10_000, false)
+            .describe_local(&FileList { paths: vec![dir, loose] }, "laptop", 10_000, false, u64::MAX)
             .unwrap();
         let list = t.materialize(&set).unwrap();
         let names: std::collections::HashSet<_> = list
@@ -959,7 +1000,7 @@ mod tests {
             fs::write(dir.join(format!("f{i}.txt")), format!("{i}")).unwrap();
         }
         let set = t
-            .describe_local(&FileList { paths: vec![dir] }, "laptop", 5, false)
+            .describe_local(&FileList { paths: vec![dir] }, "laptop", 5, false, u64::MAX)
             .unwrap();
         assert_eq!(set.files.len(), 5, "a stray click on a huge folder must be bounded");
         let _ = fs::remove_dir_all(&root);
@@ -1005,7 +1046,7 @@ mod tests {
         let src = root.join("temporary.txt");
         fs::write(&src, b"here for now").unwrap();
         let set = sender
-            .describe_local(&FileList { paths: vec![src.clone()] }, "laptop", 10_000, false)
+            .describe_local(&FileList { paths: vec![src.clone()] }, "laptop", 10_000, false, u64::MAX)
             .unwrap();
         let hash = set.files[0].hash.clone();
         s_hist.record_files(Arc::new(set), false, ClipStatus::Ready);
@@ -1036,7 +1077,7 @@ mod tests {
         let src = root.join("notes.txt");
         fs::write(&src, b"version one").unwrap();
         let set = sender
-            .describe_local(&FileList { paths: vec![src.clone()] }, "laptop", 10_000, false)
+            .describe_local(&FileList { paths: vec![src.clone()] }, "laptop", 10_000, false, u64::MAX)
             .unwrap();
         let hash = set.files[0].hash.clone();
         s_hist.record_files(Arc::new(set), false, ClipStatus::Ready);
@@ -1186,7 +1227,7 @@ mod tests {
         let content = vec![7u8; 4 * CHUNK_BYTES];
         fs::write(&src, &content).unwrap();
         let set = sender
-            .describe_local(&FileList { paths: vec![src] }, "laptop", 10_000, false)
+            .describe_local(&FileList { paths: vec![src] }, "laptop", 10_000, false, u64::MAX)
             .unwrap();
         let hash = set.files[0].hash.clone();
         s_hist.record_files(Arc::new(set), false, ClipStatus::Ready);
@@ -1228,7 +1269,7 @@ mod tests {
         let src = root.join("film.mkv");
         fs::write(&src, vec![3u8; 3 * CHUNK_BYTES]).unwrap();
         let set = sender
-            .describe_local(&FileList { paths: vec![src] }, "laptop", 10_000, false)
+            .describe_local(&FileList { paths: vec![src] }, "laptop", 10_000, false, u64::MAX)
             .unwrap();
         let hash = set.files[0].hash.clone();
         s_hist.record_files(Arc::new(set), false, ClipStatus::Ready);
@@ -1295,7 +1336,7 @@ mod tests {
         fs::write(tree.join("src").join("main.rs"), b"fn main() {}").unwrap();
 
         let set = sender
-            .describe_local(&FileList { paths: vec![tree] }, "laptop", 10_000, false)
+            .describe_local(&FileList { paths: vec![tree] }, "laptop", 10_000, false, u64::MAX)
             .unwrap();
         assert!(
             set.dirs.iter().any(|d| d.ends_with("project/logs")),
@@ -1322,12 +1363,12 @@ mod tests {
         std::os::unix::fs::symlink(&outside, tree.join("link.txt")).unwrap();
 
         let skipped = sender
-            .describe_local(&FileList { paths: vec![tree.clone()] }, "laptop", 10_000, false)
+            .describe_local(&FileList { paths: vec![tree.clone()] }, "laptop", 10_000, false, u64::MAX)
             .unwrap();
         assert_eq!(skipped.files.len(), 1, "the link must not be copied by default");
 
         let followed = sender
-            .describe_local(&FileList { paths: vec![tree] }, "laptop", 10_000, true)
+            .describe_local(&FileList { paths: vec![tree] }, "laptop", 10_000, true, u64::MAX)
             .unwrap();
         assert_eq!(followed.files.len(), 2, "with following on, the link's target is included");
         let _ = fs::remove_dir_all(&root);
@@ -1345,7 +1386,7 @@ mod tests {
         std::os::unix::fs::symlink(&tree, tree.join("inner").join("back")).unwrap();
 
         let set = sender
-            .describe_local(&FileList { paths: vec![tree] }, "laptop", 10_000, true)
+            .describe_local(&FileList { paths: vec![tree] }, "laptop", 10_000, true, u64::MAX)
             .unwrap();
         assert_eq!(set.files.len(), 1, "the loop must be detected, not walked: {:?}", set.files);
         let _ = fs::remove_dir_all(&root);

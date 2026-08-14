@@ -123,8 +123,27 @@ impl BlobCache {
     }
 
     /// Take a local file into the cache. Returns its hash and size.
-    pub fn ingest(&self, src: &Path) -> io::Result<(String, u64)> {
+    ///
+    /// `budget` is the disk this cache is allowed. A file larger than the whole budget
+    /// is **hashed but not copied**: copying it would write gigabytes only for the very
+    /// next eviction pass to delete them again for being over budget. That actually
+    /// happened — a 3.3 GB copy against a 2 GB budget wrote 3.3 GB and kept none of it.
+    ///
+    /// Nothing is lost by skipping the copy. The cache is an optimisation here; serving
+    /// falls back to the original path, re-verifying the hash first so a file that
+    /// changed underneath is refused rather than sent as the old one.
+    pub fn ingest(&self, src: &Path, budget: u64) -> io::Result<(String, u64)> {
         let (hash, size) = hash_file(src)?;
+        if size > budget {
+            tracing::info!(
+                path = %src.display(),
+                size,
+                budget,
+                "not caching this file — it is larger than the whole cache budget, so it \
+                 would be evicted immediately. It will be read from its original path instead."
+            );
+            return Ok((hash, size));
+        }
         if !self.contains(&hash) {
             let part = self.part_path(&hash);
             fs::copy(src, &part)?;
@@ -514,8 +533,8 @@ mod tests {
         fs::write(&a, b"identical").unwrap();
         fs::write(&b, b"identical").unwrap();
 
-        let (ha, sa) = c.ingest(&a).unwrap();
-        let (hb, sb) = c.ingest(&b).unwrap();
+        let (ha, sa) = c.ingest(&a, u64::MAX).unwrap();
+        let (hb, sb) = c.ingest(&b, u64::MAX).unwrap();
         assert_eq!(ha, hb, "same bytes, same hash");
         assert_eq!((sa, sb), (9, 9));
         assert_eq!(c.total_bytes(), 9, "stored once, not twice");
@@ -529,7 +548,7 @@ mod tests {
         let c = BlobCache::new(root.clone()).unwrap();
         let src = root.join("gone-soon.txt");
         fs::write(&src, b"still here").unwrap();
-        let (hash, _) = c.ingest(&src).unwrap();
+        let (hash, _) = c.ingest(&src, u64::MAX).unwrap();
         fs::remove_file(&src).unwrap();
 
         assert!(c.contains(&hash));
@@ -601,7 +620,7 @@ mod tests {
         for i in 0..4u8 {
             let p = root.join(format!("f{i}.bin"));
             fs::write(&p, vec![i; 1000]).unwrap();
-            let (h, _) = c.ingest(&p).unwrap();
+            let (h, _) = c.ingest(&p, u64::MAX).unwrap();
             hashes.push(h);
             // Distinct timestamps so "oldest" is well defined.
             std::thread::sleep(std::time::Duration::from_millis(20));

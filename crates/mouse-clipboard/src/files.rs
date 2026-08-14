@@ -83,8 +83,18 @@ mod imp {
                 return false;
             }
         };
+        // Every path published is named. Explorer greying out Paste after a
+        // "successful" transfer is otherwise impossible to tell apart from a transfer
+        // that never happened, and both look like silence from here.
         match formats::FileList.write_clipboard(strings.as_slice()) {
-            Ok(()) => true,
+            Ok(()) => {
+                tracing::info!(
+                    count = strings.len(),
+                    paths = %strings.join(" | "),
+                    "PUBLISHED files to the Windows clipboard (CF_HDROP) — Explorer's Paste should now be enabled"
+                );
+                true
+            }
             Err(e) => {
                 tracing::warn!("could not put files on the clipboard: {e}");
                 false
@@ -300,19 +310,29 @@ mod imp {
         }
         let utf8 = intern(&x.conn, "UTF8_STRING");
 
-        if x.conn
+        if let Err(e) = x
+            .conn
             .set_selection_owner(x.window, x.clipboard, x11rb::CURRENT_TIME)
-            .is_err()
         {
+            tracing::warn!("could not take the X11 clipboard to publish files: {e}");
             return;
         }
         let _ = x.conn.flush();
+        tracing::info!(
+            targets = FILE_TARGETS.len(),
+            uris = %uri_list.replace(['\r', '\n'], " "),
+            "PUBLISHED files to the X11 clipboard — Thunar's Paste should now be enabled"
+        );
 
         loop {
             let Ok(event) = x.conn.wait_for_event() else { return };
             match event {
                 Event::SelectionRequest(req) => {
                     let ok = answer(&x, &req, targets_atom, utf8, &serve, &uri_list);
+                    // Which target a file manager actually asked for, and whether we
+                    // could answer it. A paste that silently does nothing is usually a
+                    // target we do not serve, and this is the only place that shows it.
+                    tracing::debug!(target = req.target, answered = ok, "a paste asked us for the file list");
                     let notify = SelectionNotifyEvent {
                         response_type: SELECTION_NOTIFY_EVENT,
                         sequence: 0,

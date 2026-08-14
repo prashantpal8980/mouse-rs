@@ -66,6 +66,7 @@ enum Message {
     ClipCancel(u64),
     ClipDecline(u64),
     ClipAlwaysAllow(u64),
+    ClipImageAsFile(u64),
     ClipTogglePin(u64),
     ClipRemove(u64),
     ClipClear,
@@ -608,6 +609,12 @@ impl App {
                         }
                         Err(e) => self.feedback = format!("could not save that: {e}"),
                     }
+                }
+            }
+            Message::ClipImageAsFile(id) => {
+                if let Some(e) = &self.engine {
+                    e.clipboard_image_as_file(id);
+                    self.feedback = "saved as a .png and copied — paste it in a file manager".into();
                 }
             }
             Message::ClipRemove(id) => {
@@ -1519,6 +1526,16 @@ impl App {
                         .on_press(Message::ClipRemove(m.id));
 
                     let mut controls = row![reuse].spacing(4.0).align_y(Alignment::Center);
+                    // Only for images, and only because no file manager on either OS can
+                    // paste pixels — this turns them into something that can be.
+                    if m.is_image {
+                        controls = controls.push(
+                            button(text("as file").size(11.0))
+                                .style(ui_theme::ghost(p))
+                                .padding([10.0, 8.0])
+                                .on_press(Message::ClipImageAsFile(m.id)),
+                        );
+                    }
                     // Stop only exists while there is something to stop. What has already
                     // arrived is kept, so pressing it is cheap to undo.
                     if fetching {

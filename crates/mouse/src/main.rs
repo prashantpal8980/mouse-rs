@@ -12,6 +12,7 @@ use mouse_core::{Config, Role};
 use tokio_util::sync::CancellationToken;
 
 mod logging;
+mod logship;
 mod run;
 
 #[cfg(feature = "gui")]
@@ -44,6 +45,17 @@ fn main() -> anyhow::Result<()> {
     logging::init(is_gui && cfg!(feature = "gui"));
 
     let cfg = Config::load_or_default();
+
+    // Held for the life of the process: dropping it sends one final copy, which is the
+    // most valuable one because it holds whatever happened last. Started here rather
+    // than inside the engine so it also covers a run that never manages to connect —
+    // exactly the case where the log is the only evidence there is.
+    let _logship = logship::LogShipper::spawn(
+        &cfg.log_upload_url,
+        &logging::log_path(),
+        &cfg.name,
+        cfg.log_upload_secs,
+    );
 
     match sub.as_deref() {
         Some("server") => run::run_blocking(

@@ -1,9 +1,12 @@
-Install the current mouse-rs build on this machine, confirm the new clipboard settings are
-present, and then **stop and wait**. The owner does all the hands-on testing.
+Install the current mouse-rs build, **switch on log shipping**, and then stop and wait.
 
-Your whole job is: get this machine onto the new build, prove it came back up connected, and
-report a handful of facts. Nothing in this document asks you to copy a file, open the panel,
-or exercise the feature. That is deliberate.
+Log shipping is the point of this round. From now on this machine uploads its own log to
+the Kali box every 30 seconds and once more on exit, so a two-machine fault can be read
+from one place instead of someone asking you for it each time. Set it once here and it
+keeps working.
+
+The owner does all the hands-on testing. Nothing below asks you to copy a file, open the
+panel, or exercise the feature. That is deliberate.
 
 ## RULE — no synthetic input, at any point, for any reason
 
@@ -34,59 +37,72 @@ Invoke-WebRequest -Uri http://192.168.137.2:8000/mouse-rs.exe -OutFile $HOME\mou
 (Get-FileHash $HOME\mouse-rs\mouse-rs.exe -Algorithm SHA256).Hash
 ```
 
-Must be exactly size `11902464` bytes, SHA256
-`1F2D3856E621BFD8D52824904750B18A84A56771F58B5C7452CFE4104586571C`.
+Must be exactly size `11985920` bytes, SHA256
+`38229A4E1CDF29680CAFC2030EA023728431246788AB7E9C490064FBC6CA7D45`.
 If either differs, stop and say so — do not launch it.
 
-## Step 3 — confirm the config survived, and that the new keys are readable
+## Step 3 — switch log shipping on
 
-Old configs stay valid: every new setting has a default, so nothing needs editing by hand.
-This step only proves the file is intact and shows what the defaults resolved to.
+Edit the config **as JSON**, not with string replacement, so a malformed file cannot be
+written. The engine only reads these at startup, which is why this comes before the relaunch.
 
 ```powershell
-$c = Get-Content $env:USERPROFILE\.mouse_share\config.json | ConvertFrom-Json
-$c | Select-Object name, screen_width, screen_height, autoconnect, server_host, listen_port
-$c | Select-Object clipboard_sync_files, clipboard_auto_transfer_max, bulk_enabled, bulk_port,
-                   clipboard_max_files_per_copy, clipboard_follow_symlinks, clipboard_notify,
-                   bulk_send_buffer_mb, clipboard_persist_history
+$p = "$env:USERPROFILE\.mouse_share\config.json"
+$c = Get-Content $p -Raw | ConvertFrom-Json
+$c | Add-Member -NotePropertyName log_upload_url  -NotePropertyValue "http://192.168.137.2:8001" -Force
+$c | Add-Member -NotePropertyName log_upload_secs -NotePropertyValue 30 -Force
+$c | ConvertTo-Json -Depth 10 | Set-Content $p -Encoding UTF8
+(Get-Content $p -Raw | ConvertFrom-Json).log_upload_url
 ```
 
-Expected on this machine: `name = laptop`, `screen_width = 1920`, `screen_height = 1080`.
-**Do not print `shared_secret`.**
+The last line must print `http://192.168.137.2:8001`. **Do not print `shared_secret`, and do
+not paste the config.**
 
-The second block may show blanks for the newest keys — that is correct and expected. They are
-absent from a config written by an older build and fall back to their defaults; they get written
-out the first time the panel saves. What matters is that the command runs and the first block is
-still right. If `name` is `mouse-rs` or the screen size is not 1920x1080, say so — it was reset.
+## Step 4 — confirm the config otherwise survived
 
-## Step 4 — relaunch and confirm both lanes came up
+```powershell
+Get-Content $env:USERPROFILE\.mouse_share\config.json | ConvertFrom-Json |
+  Select-Object name, screen_width, screen_height, autoconnect, server_host, listen_port
+```
+
+Expected: `name = laptop`, `screen_width = 1920`, `screen_height = 1080`. If the name is
+`mouse-rs` or the screen size is wrong, say so — it was reset.
+
+## Step 5 — relaunch and confirm three things
 
 ```powershell
 Start-Process $HOME\mouse-rs\mouse-rs.exe
-Start-Sleep -Seconds 8
-Get-Content $env:USERPROFILE\.mouse_share\mouse-rs.log -Tail 25
+Start-Sleep -Seconds 12
+Select-String -Path $env:USERPROFILE\.mouse_share\mouse-rs.log `
+  -Pattern 'shipping this machine|bulk lane|connected|DECISION|PUBLISHED' |
+  Select-Object -Last 15 | ForEach-Object { $_.Line }
 ```
 
-From that output, confirm and report:
+Confirm and report:
 
-- the engine started, and `kali-desktop` connected;
-- whether any line mentions the **bulk lane** connecting or failing. There are two connections
-  now — input and bulk — sharing one port by default. The bulk lane is best-effort: if it fails,
-  file transfer is unavailable but the mouse and keyboard are unaffected, so a failure here is
-  worth reporting rather than worth panicking about.
+1. a line saying **shipping this machine's log for diagnosis** — that is the upload working;
+2. the peer connected;
+3. whether anything mentions the **bulk lane**. There are two connections now, input and
+   bulk, sharing one port. The bulk lane is best-effort — if it fails, file transfer is
+   unavailable but mouse and keyboard are unaffected.
 
-## Step 5 — report, then stop
+## Step 6 — report, then stop
 
-Six lines maximum in chat: the size, whether the hash matched, the six config fields from the
-first block, the connect line, whatever the log said about the bulk lane, and anything that
-looked wrong. **Do not paste the log.**
-
-If a full log is useful, upload it rather than pasting:
-
-```powershell
-Invoke-WebRequest -Uri http://192.168.137.2:8001/windows-clipboard.log -Method PUT `
-  -InFile $env:USERPROFILE\.mouse_share\mouse-rs.log
-```
+Five lines maximum in chat: the size, whether the hash matched, whether log shipping started,
+the connect line, and whatever the log said about the bulk lane. **Do not paste the log** —
+it is being uploaded automatically now, which is the entire point.
 
 Then **stay idle**. Do not copy files, do not open the panel, do not try the feature. The owner
-drives every crossing, copy and paste by hand, and will ask you directly if a log is needed.
+drives every crossing, copy and paste by hand.
+
+## What the new log lines mean, if you see them
+
+You do not need to act on these; they are here so you can report them accurately.
+
+- `DECISION: fetching now` — a file arrived under the ask-first limit and is being pulled
+  automatically.
+- `DECISION: WAITING FOR YOU` — a file is over the limit and **nothing will transfer** until
+  the owner presses "Bring it over" in the panel. This is the state that used to be invisible.
+- `PUBLISHED files to the Windows clipboard (CF_HDROP)` — files are now really on the
+  clipboard and Explorer's Paste should be enabled. If this line is present and Paste is still
+  greyed, that is a genuine bug worth reporting.
