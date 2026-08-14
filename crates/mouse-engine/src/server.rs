@@ -184,7 +184,14 @@ pub async fn run_server_engine(
                     }
                     // Clipboard sync lives off the input path: hand it to the
                     // clipboard thread (if enabled) and otherwise ignore it.
-                    Some(m @ (Message::Clipboard { .. } | Message::ClipboardImage { .. })) => {
+                    //
+                    // This must match *every* clipboard-family message. It once listed
+                    // only text and images by name, so `ClipboardFiles`,
+                    // `ClipboardImageRef` and the blob messages fell through to the
+                    // catch-all below and were dropped without a trace — which meant
+                    // file transfer could not work at all, however correct the code
+                    // behind it was. See `is_clipboard_message`.
+                    Some(m) if crate::is_clipboard_message(&m) => {
                         if let Some(c) = &clipboard {
                             let _ = c.tx.send(m);
                         }

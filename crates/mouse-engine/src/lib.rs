@@ -61,10 +61,49 @@ pub struct EngineLink {
 /// connection, so the clipboard thread only broadcasts local changes while a peer
 /// is connected — no unbounded queue, and no stale flush to whoever connects next.
 pub struct ClipboardRoute {
-    /// Received `Clipboard`/`ClipboardImage` messages are forwarded here.
+    /// Every clipboard-family message is forwarded here — see `is_clipboard_message`.
     pub tx: std::sync::mpsc::Sender<Message>,
     /// Set true while a peer is connected, false otherwise.
     pub connected: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// Does this message belong to the clipboard thread rather than the input path?
+///
+/// **Written as an exhaustive match on purpose.** The previous version was two
+/// variants listed inline at each call site, and when file transfer added
+/// `ClipboardFiles`, `ClipboardImageRef`, `BlobRequest`, `BlobUnavailable` and
+/// `BlobCancel`, none of them were added to either list. They fell through to the
+/// catch-all arm and were dropped without a log line, so the entire file-transfer
+/// feature was unreachable in a real session — every handler behind it correct, tested,
+/// and never once called.
+///
+/// Listing every variant means the compiler stops the next person making that mistake:
+/// adding a message to the protocol will not build until it is classified here.
+pub(crate) fn is_clipboard_message(m: &Message) -> bool {
+    match m {
+        Message::Clipboard { .. }
+        | Message::ClipboardImage { .. }
+        | Message::ClipboardImageRef { .. }
+        | Message::ClipboardFiles { .. }
+        | Message::BlobRequest { .. }
+        | Message::BlobUnavailable { .. }
+        | Message::BlobCancel { .. } => true,
+
+        // Input, geometry and liveness: everything here is the engine's own business.
+        Message::Hello { .. }
+        | Message::AuthChallenge { .. }
+        | Message::AuthResponse { .. }
+        | Message::AuthOk { .. }
+        | Message::Enter { .. }
+        | Message::Leave
+        | Message::LeaveRequest
+        | Message::MouseMove { .. }
+        | Message::MouseButton { .. }
+        | Message::MouseScroll { .. }
+        | Message::Key { .. }
+        | Message::Ping
+        | Message::Pong => false,
+    }
 }
 
 /// Flip the clipboard route's connection flag, if clipboard sync is wired in.
@@ -136,5 +175,52 @@ mod tests {
         assert!(matches_hotkey(NamedKey::ScrollLock, NamedKey::ScrollLock));
         assert!(matches_hotkey(NamedKey::CtrlR, NamedKey::CtrlL));
         assert!(!matches_hotkey(NamedKey::ScrollLock, NamedKey::CtrlL));
+    }
+}
+
+#[cfg(test)]
+mod route_tests {
+    use super::*;
+
+    /// The bug this exists to prevent: file transfer was complete, unit-tested and
+    /// entirely unreachable, because the engine's routing listed clipboard messages by
+    /// name and nobody added the new ones. Every message the clipboard thread handles
+    /// must reach it.
+    #[test]
+    fn every_message_the_clipboard_thread_handles_is_routed_to_it() {
+        let must_route = [
+            Message::Clipboard { text: "x".into() },
+            Message::ClipboardImage { data: String::new(), w: 1, h: 1 },
+            Message::ClipboardImageRef { hash: "a".repeat(64), w: 1, h: 1, size: 1 },
+            Message::ClipboardFiles { files: vec![], origin: "p".into(), dirs: vec![] },
+            Message::BlobRequest { hash: "a".repeat(64), offset: 0 },
+            Message::BlobUnavailable { hash: "a".repeat(64), reason: "gone".into() },
+            Message::BlobCancel { hash: "a".repeat(64) },
+        ];
+        for m in must_route {
+            assert!(
+                is_clipboard_message(&m),
+                "{m:?} is handled by the clipboard thread but the engine would drop it"
+            );
+        }
+    }
+
+    /// The other half: input must never be diverted off the input path, which would
+    /// silently break crossing rather than silently break the clipboard.
+    #[test]
+    fn input_and_liveness_stay_on_the_input_path() {
+        let must_not_route = [
+            Message::MouseMove { dx: 1, dy: 1 },
+            Message::MouseButton { button: mouse_core::protocol::Button::Left, pressed: true },
+            Message::MouseScroll { dx: 0, dy: 1 },
+            Message::Key { key: "a".into(), pressed: true },
+            Message::Leave,
+            Message::LeaveRequest,
+            Message::Ping,
+            Message::Pong,
+        ];
+        for m in must_not_route {
+            assert!(!is_clipboard_message(&m), "{m:?} must stay on the input path");
+        }
     }
 }

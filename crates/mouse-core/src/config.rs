@@ -346,8 +346,38 @@ impl Config {
     pub fn load(path: &Path) -> Result<Config, ConfigError> {
         let raw = std::fs::read_to_string(path).map_err(ConfigError::Io)?;
         let trimmed = raw.strip_prefix('\u{feff}').unwrap_or(&raw);
-        let cfg: Config = serde_json::from_str(trimmed).map_err(ConfigError::Parse)?;
+        let mut cfg: Config = serde_json::from_str(trimmed).map_err(ConfigError::Parse)?;
+        cfg.tidy();
         Ok(cfg)
+    }
+
+    /// Clean up values that are harmless in the file but corrupt everything downstream.
+    ///
+    /// The machine name is the case that bit: trailing spaces in the config travelled
+    /// into the handshake (the peer displayed `laptop           `), into the panel, and
+    /// into the uploaded log filename as `laptop------------mouse-rs.log`. Nothing in
+    /// the program added them and nothing was going to remove them, so a typo made once
+    /// stayed visible in three unrelated places for ever.
+    ///
+    /// Trimmed on load rather than on save, so an already-damaged config is fixed the
+    /// next time it is read instead of only after someone happens to press Save.
+    fn tidy(&mut self) {
+        let name = self.name.trim();
+        if name.len() != self.name.len() {
+            tracing::info!(
+                trimmed = %name,
+                "the machine name had surrounding whitespace; using the trimmed form"
+            );
+            self.name = name.to_string();
+        }
+        if self.name.is_empty() {
+            self.name = default_name();
+        }
+        // Same reasoning: a stray space in a host or URL fails in a way that reads as a
+        // network fault rather than a typo.
+        self.listen_host = self.listen_host.trim().to_string();
+        self.server_host = self.server_host.trim().to_string();
+        self.log_upload_url = self.log_upload_url.trim().to_string();
     }
 
     /// Load from the default path, or return defaults if it doesn't exist yet.
@@ -693,5 +723,36 @@ mod tests {
         assert_eq!(cfg.listen_port, 24800);
         assert!(cfg.tls_enabled);
         assert_eq!(cfg.warp_threshold_px, 120);
+    }
+
+    #[test]
+    fn a_name_with_stray_whitespace_is_trimmed_on_load() {
+        // This really happened: the Windows config held "laptop" plus twelve spaces, and
+        // they surfaced in the handshake, the panel and an uploaded log filename.
+        let dir = std::env::temp_dir().join("mouse-rs-cfg-tidy");
+        let _ = std::fs::create_dir_all(&dir);
+        let p = dir.join("config.json");
+        std::fs::write(
+            &p,
+            br#"{"name":"laptop            ","server_host":" 192.168.137.2 ","log_upload_url":" http://a:1 "}"#,
+        )
+        .unwrap();
+
+        let c = Config::load(&p).expect("loads");
+        assert_eq!(c.name, "laptop");
+        assert_eq!(c.server_host, "192.168.137.2");
+        assert_eq!(c.log_upload_url, "http://a:1");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_name_that_is_only_whitespace_falls_back_rather_than_becoming_empty() {
+        let dir = std::env::temp_dir().join("mouse-rs-cfg-blank");
+        let _ = std::fs::create_dir_all(&dir);
+        let p = dir.join("config.json");
+        std::fs::write(&p, br#"{"name":"   "}"#).unwrap();
+        let c = Config::load(&p).expect("loads");
+        assert!(!c.name.is_empty(), "an empty name would show as a blank peer everywhere");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

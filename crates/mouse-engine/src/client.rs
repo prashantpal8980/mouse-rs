@@ -108,8 +108,9 @@ pub async fn run_client_engine(
                         }
                     }
                     // Clipboard sync is independent of who owns input: hand it to the
-                    // clipboard thread (if enabled) whether active or not.
-                    m @ (Message::Clipboard { .. } | Message::ClipboardImage { .. }) => {
+                    // clipboard thread (if enabled) whether active or not. Must match
+                    // every clipboard-family message — see `is_clipboard_message`.
+                    m if crate::is_clipboard_message(&m) => {
                         if let Some(c) = &clipboard {
                             let _ = c.tx.send(m);
                         }
