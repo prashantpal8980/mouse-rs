@@ -399,6 +399,72 @@ use tokio::sync::mpsc;
 use tokio_util::codec::{Framed, FramedParts};
 use tokio_util::sync::CancellationToken;
 
+/// How many payload bytes are queued for the bulk lane but not yet written out.
+///
+/// This is the difference between a big file being cheap and a big file being fatal.
+/// A sender reads from disk at hundreds of MB/s; the lane drains at whatever the
+/// network gives, deliberately slowed further while the pointer is crossing. Left
+/// unbounded, the queue *becomes* the file — sending a 4 GB ISO would hold 4 GB of it
+/// in memory.
+///
+/// So the producer waits while this sits at its limit. Memory then tracks the limit
+/// instead of the file size, which is what makes a 4 GB transfer cost the same as a
+/// 4 MB one — the promise the design makes, and this is what backs it.
+///
+/// It counts bytes *in the channel*, not bytes in flight on the socket, so a dropped
+/// connection leaves it accurate: those frames are still queued and go out when the
+/// lane returns.
+#[derive(Debug)]
+pub struct BulkQueue {
+    queued: AtomicU64,
+    limit: u64,
+}
+
+impl BulkQueue {
+    /// `limit` is a ceiling on buffered payload in bytes, raised to at least one chunk
+    /// — a smaller limit would deadlock a producer that cannot split a chunk to fit.
+    pub fn new(limit: u64) -> BulkQueue {
+        BulkQueue {
+            queued: AtomicU64::new(0),
+            limit: limit.max(CHUNK_BYTES as u64),
+        }
+    }
+
+    pub fn limit(&self) -> u64 {
+        self.limit
+    }
+
+    pub fn queued(&self) -> u64 {
+        self.queued.load(Ordering::Relaxed)
+    }
+
+    /// Account for a frame handed to the lane.
+    pub fn add(&self, bytes: u64) {
+        self.queued.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// Account for a frame written to the socket. Saturating, so a miscount can never
+    /// wrap to a huge value and wedge the producer permanently.
+    pub fn take(&self, bytes: u64) {
+        let _ = self
+            .queued
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |q| {
+                Some(q.saturating_sub(bytes))
+            });
+    }
+
+    /// Whether a producer should wait before queueing more.
+    pub fn is_full(&self) -> bool {
+        self.queued() >= self.limit
+    }
+}
+
+impl Default for BulkQueue {
+    fn default() -> BulkQueue {
+        BulkQueue::new(8 * 1024 * 1024)
+    }
+}
+
 /// Channels the app uses to talk to the bulk lane.
 pub struct BulkChannels {
     /// Frames the app wants to send to the peer.
@@ -407,6 +473,8 @@ pub struct BulkChannels {
     /// clipboard thread — a blocking native thread with no runtime, exactly like the
     /// input backends.
     pub incoming: std::sync::mpsc::Sender<BulkFrame>,
+    /// Shared with whoever fills `outgoing`, so it knows when to stop reading ahead.
+    pub queue: Arc<BulkQueue>,
 }
 
 /// What the input listener does with a connection that declared [`crate::protocol::Lane::Bulk`].
@@ -558,6 +626,9 @@ async fn bulk_pump(
                         tracing::warn!("bulk send failed: {e}");
                         return;
                     }
+                    // Credit the producer only once the bytes are actually gone. This
+                    // is what paces the reader against the network instead of the disk.
+                    ch.queue.take(bytes as u64);
                     sent_bytes += bytes as u64;
                     if is_end {
                         if let Some(t0) = started.take() {
@@ -594,6 +665,36 @@ pub async fn run_bulk_client(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_queue_reports_full_and_drains_back_down() {
+        let q = BulkQueue::new(1024 * 1024);
+        assert!(!q.is_full(), "a fresh queue has room");
+        q.add(1024 * 1024);
+        assert!(q.is_full(), "at the limit the producer must wait");
+        q.take(512 * 1024);
+        assert!(!q.is_full(), "sending frees room again");
+        assert_eq!(q.queued(), 512 * 1024);
+    }
+
+    #[test]
+    fn the_queue_limit_is_never_below_one_chunk() {
+        // A limit under one chunk would leave a producer that has just read a chunk with
+        // nowhere to put it and no way to make room: a deadlock, not a tight budget.
+        let q = BulkQueue::new(1);
+        assert_eq!(q.limit(), CHUNK_BYTES as u64);
+    }
+
+    #[test]
+    fn crediting_more_than_was_queued_cannot_wrap() {
+        // If it wrapped, `queued` would become astronomically large and every producer
+        // would block forever.
+        let q = BulkQueue::new(1024 * 1024);
+        q.add(10);
+        q.take(999_999);
+        assert_eq!(q.queued(), 0);
+        assert!(!q.is_full());
+    }
 
     fn roundtrip(f: BulkFrame) -> BulkFrame {
         let mut codec = BulkCodec::new();

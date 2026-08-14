@@ -310,6 +310,23 @@ impl EngineHandle {
         self.clip_commands.reuse(id);
     }
 
+    /// Stop an in-flight transfer. What has arrived stays on disk, so clicking the
+    /// entry again resumes from there.
+    pub fn clipboard_cancel(&self, id: u64) {
+        self.clip_commands.cancel(id);
+    }
+
+    /// Answer "not now" — quieten the prompt without discarding the entry.
+    pub fn clipboard_decline(&self, id: u64) {
+        self.clip_commands.decline(id);
+    }
+
+    /// Raise the "ask first" threshold on the running engine, so "always allow this
+    /// size" takes effect on the next file rather than only after a restart.
+    pub fn clipboard_set_auto_max(&self, bytes: u64) {
+        self.clip_commands.set_auto_max(bytes);
+    }
+
     /// Pin or unpin an entry. Returns the new state.
     pub fn clipboard_toggle_pin(&self, id: u64) -> Option<bool> {
         self.clip_history.toggle_pin(id)
@@ -475,13 +492,24 @@ fn setup_bulk(cfg: &Config, health: std::sync::Arc<LinkHealth>) -> BulkWiring {
     // outgoing: clipboard thread -> network. incoming: network -> clipboard thread.
     let (out_tx, out_rx) = unbounded_channel();
     let (in_tx, in_rx) = std::sync::mpsc::channel();
+    // One counter, shared both ways: the sender adds to it, the lane subtracts as bytes
+    // actually leave. This is what stops a 4 GB file being read into memory far faster
+    // than the network can drain it.
+    let queue = std::sync::Arc::new(mouse_core::bulk::BulkQueue::new(
+        u64::from(cfg.bulk_send_buffer_mb.max(1)) * 1024 * 1024,
+    ));
     BulkWiring {
-        channels: Some(BulkChannels { outgoing: out_rx, incoming: in_tx }),
+        channels: Some(BulkChannels {
+            outgoing: out_rx,
+            incoming: in_tx,
+            queue: queue.clone(),
+        }),
         link: Some(mouse_clipboard::BulkLink {
             to_bulk: out_tx,
             from_bulk: in_rx,
             cache,
             health,
+            queue,
         }),
     }
 }
@@ -553,6 +581,7 @@ fn clipboard_settings(cfg: &Config) -> ClipboardSettings {
         machine: Box::leak(cfg.name.clone().into_boxed_str()),
         inline_image_max: cfg.clipboard_inline_image_max.max(1),
         max_files_per_copy: cfg.clipboard_max_files_per_copy.max(1),
+        follow_symlinks: cfg.clipboard_follow_symlinks,
         quick_send_secs: cfg.clipboard_quick_send_secs as f64,
         persist_history: cfg.clipboard_persist_history,
     }

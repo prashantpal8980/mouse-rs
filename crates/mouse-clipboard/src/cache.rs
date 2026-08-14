@@ -168,12 +168,34 @@ impl BlobCache {
     /// Every relative path is rebuilt component by component from sanitised parts. It
     /// is peer-controlled data, and `../../.config/autostart/evil.desktop` taken
     /// literally is a write outside the cache — so no component is ever trusted.
-    pub fn materialize_tree(&self, key: &str, items: &[(String, String)]) -> io::Result<Vec<PathBuf>> {
+    pub fn materialize_tree(
+        &self,
+        key: &str,
+        items: &[(String, String)],
+        dirs: &[String],
+    ) -> io::Result<Vec<PathBuf>> {
         if !is_safe_hash(key) {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "unsafe tree key"));
         }
         let root = self.root.join("trees").join(key);
         let mut tops: Vec<PathBuf> = Vec::new();
+        // Directories first, and from the same sanitised-component rule as files —
+        // a peer-supplied directory name is no more trustworthy than a file name.
+        for rel in dirs {
+            let parts = safe_components(rel);
+            if parts.is_empty() {
+                continue;
+            }
+            let mut dest = root.clone();
+            for part in &parts {
+                dest.push(part);
+            }
+            fs::create_dir_all(&dest)?;
+            let top = root.join(&parts[0]);
+            if !tops.contains(&top) {
+                tops.push(top);
+            }
+        }
         for (hash, rel) in items {
             let parts = safe_components(rel);
             if parts.is_empty() {
@@ -351,16 +373,46 @@ pub fn safe_components(rel: &str) -> Vec<String> {
         .collect()
 }
 
+/// Everything a walk found: the files to transfer, and the directories that hold them.
+///
+/// Directories are listed separately because an *empty* one has no file to imply it,
+/// and rebuilding a folder without its empty subdirectories is not the folder that was
+/// copied.
+#[derive(Debug, Default)]
+pub struct Walked {
+    /// `(absolute path, path relative to the copied folder's parent)`.
+    pub files: Vec<(PathBuf, String)>,
+    /// Relative paths of every directory in the tree, in the same form.
+    pub dirs: Vec<String>,
+}
+
 /// Walk a directory, returning every file inside it with its path relative to the
 /// directory's *parent* — so the folder's own name is the first component and the copy
 /// arrives with its shape intact.
 ///
-/// Symlinks are not followed: a link pointing outside the copied tree would silently
-/// pull in unrelated files, and one pointing back inside would recurse forever.
-pub fn walk_dir(root: &Path, max_files: usize) -> io::Result<Vec<(PathBuf, String)>> {
+/// `follow_symlinks` is the user's call, and off by default for two reasons: a link
+/// pointing outside the copied tree silently pulls in unrelated files, and one pointing
+/// back inside recurses. When it is on, directories already visited are remembered so a
+/// cycle terminates instead of running until the file limit stops it.
+pub fn walk_dir(root: &Path, max_files: usize, follow_symlinks: bool) -> io::Result<Walked> {
     let base = root.parent().unwrap_or(Path::new(""));
-    let mut out = Vec::new();
+    let rel_of = |path: &Path| -> String {
+        path.strip_prefix(base)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .replace('\\', "/")
+    };
+
+    let mut out = Walked::default();
+    out.dirs.push(rel_of(root));
     let mut stack = vec![root.to_path_buf()];
+    let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    if follow_symlinks {
+        if let Ok(c) = fs::canonicalize(root) {
+            seen.insert(c);
+        }
+    }
+
     while let Some(dir) = stack.pop() {
         for entry in fs::read_dir(&dir)? {
             let entry = entry?;
@@ -373,21 +425,46 @@ pub fn walk_dir(root: &Path, max_files: usize) -> io::Result<Vec<(PathBuf, Strin
                     continue;
                 }
             };
-            if meta.file_type().is_symlink() {
-                tracing::debug!(path = %path.display(), "skipping a symlink inside a copied folder");
-                continue;
-            }
+            // `entry.metadata()` describes the link itself, so this is the point where
+            // following or not following is decided.
+            let meta = if meta.file_type().is_symlink() {
+                if !follow_symlinks {
+                    tracing::debug!(path = %path.display(), "skipping a symlink inside a copied folder");
+                    continue;
+                }
+                match fs::metadata(&path) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        tracing::warn!(path = %path.display(), "skipping a broken symlink: {e}");
+                        continue;
+                    }
+                }
+            } else {
+                meta
+            };
             if meta.is_dir() {
+                if follow_symlinks {
+                    // Only a followed link can produce a cycle, so only pay for the
+                    // canonicalize when following is on.
+                    match fs::canonicalize(&path) {
+                        Ok(c) => {
+                            if !seen.insert(c) {
+                                tracing::warn!(path = %path.display(), "not descending: this link loops back into the tree");
+                                continue;
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(path = %path.display(), "skipping: {e}");
+                            continue;
+                        }
+                    }
+                }
+                out.dirs.push(rel_of(&path));
                 stack.push(path);
                 continue;
             }
-            let rel = path
-                .strip_prefix(base)
-                .unwrap_or(&path)
-                .to_string_lossy()
-                .replace('\\', "/");
-            out.push((path, rel));
-            if out.len() >= max_files {
+            out.files.push((path, rel_of(&entry.path())));
+            if out.files.len() >= max_files {
                 tracing::warn!(
                     limit = max_files,
                     "the copied folder hit the file-count limit; the rest was not included"

@@ -95,6 +95,11 @@ fn default_inline_image() -> usize {
 fn default_max_files() -> usize {
     10_000
 }
+/// 8 MB: about 32 chunks in flight, which keeps a gigabit link fed while costing less
+/// memory than a single screenshot.
+fn default_send_buffer_mb() -> u32 {
+    8
+}
 fn default_quick_send() -> u32 {
     3
 }
@@ -170,6 +175,19 @@ pub struct Config {
     /// commit the machine to hashing all of it.
     #[serde(default = "default_max_files")]
     pub clipboard_max_files_per_copy: usize,
+    /// Show a desktop notification when a file is waiting for a decision.
+    ///
+    /// Never a dialog — see `crates/mouse/src/notify.rs` for why a focus-stealing
+    /// prompt would resurrect the keyboard leak.
+    #[serde(default = "default_true")]
+    pub clipboard_notify: bool,
+    /// Follow symbolic links found inside a copied folder instead of skipping them.
+    ///
+    /// Off by default because a link pointing outside the folder quietly copies files
+    /// the user never selected. On, cycles are detected and refused rather than
+    /// followed forever.
+    #[serde(default)]
+    pub clipboard_follow_symlinks: bool,
     /// Suspend transfers while you are driving the other machine — the moment latency
     /// is most noticeable, and a pause the transfer will not miss.
     #[serde(default = "default_true")]
@@ -178,6 +196,14 @@ pub struct Config {
     /// default and what protects the mouse automatically.
     #[serde(default)]
     pub bulk_rate_limit_mbps: u32,
+    /// How much of a file may sit in memory waiting to go out, in MB.
+    ///
+    /// This is the ceiling that makes a 4 GB transfer cost the same memory as a 4 MB
+    /// one: the sender stops reading while this much is queued. Raising it buys a
+    /// little throughput on a fast link at the cost of exactly that much RAM; the
+    /// default is comfortable on any machine.
+    #[serde(default = "default_send_buffer_mb")]
+    pub bulk_send_buffer_mb: u32,
     /// Skip the "this is big" prompt when the transfer is estimated to finish within
     /// this many seconds. `0` disables the shortcut and the size limit alone decides.
     ///
@@ -260,8 +286,11 @@ impl Default for Config {
             cache_dir: String::new(),
             clipboard_inline_image_max: default_inline_image(),
             clipboard_max_files_per_copy: default_max_files(),
+            clipboard_follow_symlinks: false,
+            clipboard_notify: true,
             bulk_pause_while_crossed: true,
             bulk_rate_limit_mbps: 0,
+            bulk_send_buffer_mb: default_send_buffer_mb(),
             clipboard_quick_send_secs: default_quick_send(),
             clipboard_persist_history: false,
             lock_hotkey: default_lock_hotkey(),

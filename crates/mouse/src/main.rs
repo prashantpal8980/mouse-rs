@@ -22,6 +22,8 @@ mod gui;
 mod ui_theme;
 #[cfg(feature = "gui")]
 mod tray;
+#[cfg(feature = "gui")]
+mod notify;
 
 fn main() -> anyhow::Result<()> {
     let sub = std::env::args().nth(1);

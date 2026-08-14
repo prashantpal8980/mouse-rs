@@ -147,6 +147,10 @@ pub enum Message {
         files: Vec<FileRef>,
         /// Name of the machine the copy happened on, for "on laptop · click to fetch".
         origin: String,
+        /// Directories in the copied tree, so empty ones survive the trip. Defaulted,
+        /// so a peer running an older build still parses the message.
+        #[serde(default)]
+        dirs: Vec<String>,
     },
     /// "Send me the contents of this hash, starting at `offset`." Tiny, so it rides the
     /// input lane; the answer comes back on the bulk lane.
@@ -158,6 +162,14 @@ pub enum Message {
     BlobUnavailable {
         hash: String,
         reason: String,
+    },
+    /// "Stop sending that — I don't want it after all."
+    ///
+    /// Sent by the *receiver*, because cancelling is the receiver's decision but only
+    /// the sender can act on it. Without this, Stop would halt the progress display
+    /// while the bytes kept arriving and the lane stayed busy.
+    BlobCancel {
+        hash: String,
     },
 
     // --- liveness ---

@@ -7,8 +7,8 @@
 use std::sync::{Arc, Mutex};
 
 use iced::widget::{
-    button, column, container, mouse_area, pick_list, row, scrollable, stack, text, text_input,
-    toggler, Space,
+    button, column, container, mouse_area, pick_list, progress_bar, row, scrollable, stack, text,
+    text_input, toggler, Space,
 };
 use iced::{Alignment, Element, Length, Subscription, Task};
 
@@ -63,6 +63,9 @@ enum Message {
     // --- clipboard manager ---
     /// Put a history entry back on the clipboard.
     ClipReuse(u64),
+    ClipCancel(u64),
+    ClipDecline(u64),
+    ClipAlwaysAllow(u64),
     ClipTogglePin(u64),
     ClipRemove(u64),
     ClipClear,
@@ -76,6 +79,9 @@ enum Message {
     BulkEnabledToggled(bool),
     BulkPortChanged(String),
     ClipSyncFilesToggled(bool),
+    ClipFollowSymlinksToggled(bool),
+    ClipNotifyToggled(bool),
+    BulkBufferChanged(String),
     ClipAutoMbChanged(String),
     ClipCacheGbChanged(String),
     ClipInlineKbChanged(String),
@@ -137,6 +143,31 @@ fn pending_restart_changes(live: &Config, now: &Config) -> Vec<&'static str> {
     chk(live.shared_secret != now.shared_secret, "shared secret");
     chk(live.tls_enabled != now.tls_enabled, "TLS");
     chk(live.clipboard_sync != now.clipboard_sync, "clipboard sync");
+    // Everything the clipboard thread and the bulk lane read once, at Start. They were
+    // missing here, so editing any of them while sharing was live changed the panel and
+    // nothing else, with no prompt to say so — the same silent-staleness this function
+    // exists to prevent. `clipboard_notify` is absent on purpose: the panel reads it on
+    // every tick, so it really does apply immediately. `clipboard_auto_transfer_max` is
+    // absent because it is pushed to the running thread as it changes.
+    chk(live.clipboard_history_size != now.clipboard_history_size, "history size");
+    chk(live.clipboard_max_item_bytes != now.clipboard_max_item_bytes, "biggest item");
+    chk(live.clipboard_memory_budget != now.clipboard_memory_budget, "memory budget");
+    chk(live.clipboard_max_image_px != now.clipboard_max_image_px, "largest image");
+    chk(live.clipboard_sync_text != now.clipboard_sync_text, "sync text");
+    chk(live.clipboard_sync_images != now.clipboard_sync_images, "sync images");
+    chk(live.clipboard_sync_files != now.clipboard_sync_files, "sync files");
+    chk(live.clipboard_cache_budget != now.clipboard_cache_budget, "disk for files");
+    chk(live.cache_dir != now.cache_dir, "cache location");
+    chk(live.clipboard_inline_image_max != now.clipboard_inline_image_max, "inline image size");
+    chk(live.clipboard_max_files_per_copy != now.clipboard_max_files_per_copy, "files per copy");
+    chk(live.clipboard_follow_symlinks != now.clipboard_follow_symlinks, "following shortcuts");
+    chk(live.clipboard_quick_send_secs != now.clipboard_quick_send_secs, "don't-ask-if-quick");
+    chk(live.clipboard_persist_history != now.clipboard_persist_history, "keep history after restart");
+    chk(live.bulk_enabled != now.bulk_enabled, "separate transfer lane");
+    chk(live.bulk_port != now.bulk_port, "transfer lane port");
+    chk(live.bulk_pause_while_crossed != now.bulk_pause_while_crossed, "pause while crossed");
+    chk(live.bulk_rate_limit_mbps != now.bulk_rate_limit_mbps, "transfer speed limit");
+    chk(live.bulk_send_buffer_mb != now.bulk_send_buffer_mb, "send buffer");
     chk(live.lock_hotkey != now.lock_hotkey, "lock hotkey");
     chk(live.return_hotkey != now.return_hotkey, "return hotkey");
     chk(live.listen_host != now.listen_host, "listen host");
@@ -170,6 +201,9 @@ struct App {
     screen_h_s: String,
     /// The system tray (kept alive; pushes live tooltip). `None` if unavailable.
     tray: Option<crate::tray::TrayHandle>,
+    /// How many waiting files the user has already been notified about, so a
+    /// notification fires once per file rather than on every tick.
+    notified_waiting: usize,
     /// Live state of the OS login entry — read from the OS at boot, not from `cfg`,
     /// because the user may have removed it outside the app.
     autostart_on: bool,
@@ -220,12 +254,28 @@ struct App {
     clip_max_files_s: String,
     clip_quick_s: String,
     bulk_rate_s: String,
+    bulk_buf_s: String,
 }
 
 /// Bytes → whole MB for display. The panel talks in MB because that is the unit the
 /// user thinks in; config stores bytes because that is what the code compares against.
 fn mb_of(bytes: usize) -> String {
     (bytes as f64 / (1024.0 * 1024.0)).round().to_string()
+}
+
+/// Round a size up to a whole megabyte, for "always allow this size".
+///
+/// Rounding *up* matters: allowing exactly this file's byte count would leave the next
+/// copy of the same kind of thing one byte over the line and asking again, which is
+/// precisely what the button was pressed to stop.
+fn round_up_mb(bytes: u64) -> u64 {
+    const MB: u64 = 1024 * 1024;
+    bytes.div_ceil(MB).max(1) * MB
+}
+
+/// How that rounded limit reads on the button.
+fn mb_ceil_label(bytes: u64) -> String {
+    human_bytes(round_up_mb(bytes) as usize)
 }
 
 /// A byte count in the largest unit that keeps it readable.
@@ -266,6 +316,7 @@ impl App {
             screen_h_s: cfg.screen_height.to_string(),
             // Spawn the tray here — boot runs on the UI thread, which Windows requires.
             tray: crate::tray::spawn("mouse-rs — stopped"),
+            notified_waiting: 0,
             autostart_on: crate::autostart::is_enabled(),
             launch_done: false,
             log_path: crate::logging::log_path().display().to_string(),
@@ -286,6 +337,7 @@ impl App {
             clip_max_files_s: String::new(),
             clip_quick_s: String::new(),
             bulk_rate_s: String::new(),
+            bulk_buf_s: String::new(),
             saved_cfg: cfg.clone(),
             cfg,
         };
@@ -308,6 +360,7 @@ impl App {
         self.clip_max_files_s = self.cfg.clipboard_max_files_per_copy.to_string();
         self.clip_quick_s = self.cfg.clipboard_quick_send_secs.to_string();
         self.bulk_rate_s = self.cfg.bulk_rate_limit_mbps.to_string();
+        self.bulk_buf_s = self.cfg.bulk_send_buffer_mb.to_string();
         self.clip_cache_gb_s =
             (self.cfg.clipboard_cache_budget / (1024 * 1024 * 1024)).max(1).to_string();
         self.bulk_port_s = if self.cfg.bulk_port == 0 {
@@ -319,6 +372,22 @@ impl App {
 
     fn running(&self) -> bool {
         self.engine.as_ref().is_some_and(|e| e.is_running())
+    }
+
+    /// How many entries are sitting on an unanswered "shall I bring this over?".
+    ///
+    /// `Declined` deliberately does not count: answering "not now" is an answer, and
+    /// nagging afterwards would make the button pointless.
+    fn waiting_files(&self) -> usize {
+        self.engine
+            .as_ref()
+            .map(|e| {
+                e.clipboard_meta()
+                    .iter()
+                    .filter(|m| m.status == mouse_clipboard::ClipStatus::NeedsConsent)
+                    .count()
+            })
+            .unwrap_or(0)
     }
 
     fn start_engine(&mut self) {
@@ -420,11 +489,22 @@ impl App {
                     }
                     self.found_servers = list;
                 }
-                // Keep the tray tooltip reflecting live status.
+                // Keep the tray tooltip reflecting live status — including anything
+                // waiting on an answer, which is invisible while the panel is closed.
+                let waiting = self.waiting_files();
                 if let Some(t) = &self.tray {
                     let snap = self.engine.as_ref().map(|e| e.status());
                     let running = self.running();
-                    t.set_state(&tray_tooltip(running, snap.as_ref()), running);
+                    t.set_state(&tray_tooltip(running, snap.as_ref(), waiting), running);
+                }
+                // One notification per newly-waiting file, never a repeat per tick.
+                if waiting > self.notified_waiting {
+                    if self.cfg.clipboard_notify {
+                        crate::notify::file_waiting(waiting);
+                    }
+                    self.notified_waiting = waiting;
+                } else if waiting < self.notified_waiting {
+                    self.notified_waiting = waiting;
                 }
                 // Act on tray menu clicks (the tray can't touch the engine/window itself).
                 let mut want_open = false;
@@ -488,6 +568,48 @@ impl App {
                     }
                 }
             }
+            Message::ClipCancel(id) => {
+                if let Some(e) = &self.engine {
+                    e.clipboard_cancel(id);
+                    self.feedback = "stopped — what arrived is kept, click to resume".into();
+                }
+            }
+            Message::ClipDecline(id) => {
+                if let Some(e) = &self.engine {
+                    e.clipboard_decline(id);
+                    self.feedback = "left for later — it's still in the list".into();
+                }
+            }
+            // "Always allow this size" is a settings change, so it behaves like one:
+            // the limit is raised, saved, and named back to the user. Silently
+            // remembering it somewhere they cannot see or undo would be worse than
+            // asking every time.
+            Message::ClipAlwaysAllow(id) => {
+                let size = self
+                    .engine
+                    .as_ref()
+                    .and_then(|e| e.clipboard_meta().into_iter().find(|m| m.id == id))
+                    .map(|m| m.disk_bytes)
+                    .unwrap_or(0);
+                if size > 0 {
+                    let limit = round_up_mb(size);
+                    self.cfg.clipboard_auto_transfer_max = limit;
+                    self.clip_auto_mb_s = (limit / (1024 * 1024)).to_string();
+                    match self.cfg.save(&Config::default_path()) {
+                        Ok(()) => {
+                            if let Some(e) = &self.engine {
+                                e.clipboard_set_auto_max(limit);
+                                e.clipboard_reuse(id);
+                            }
+                            self.feedback = format!(
+                                "anything up to {} now comes over without asking",
+                                human_bytes(limit as usize)
+                            );
+                        }
+                        Err(e) => self.feedback = format!("could not save that: {e}"),
+                    }
+                }
+            }
             Message::ClipRemove(id) => {
                 if let Some(e) = &self.engine {
                     e.clipboard_remove(id);
@@ -530,11 +652,26 @@ impl App {
             }
             Message::BulkEnabledToggled(v) => self.cfg.bulk_enabled = v,
             Message::ClipSyncFilesToggled(v) => self.cfg.clipboard_sync_files = v,
+            Message::ClipFollowSymlinksToggled(v) => self.cfg.clipboard_follow_symlinks = v,
+            Message::ClipNotifyToggled(v) => self.cfg.clipboard_notify = v,
+            Message::BulkBufferChanged(s) => {
+                // Floored at 1 MB: below one chunk the sender would have nowhere to put
+                // the chunk it just read and would wait forever.
+                if let Ok(v) = s.trim().parse::<u32>() {
+                    self.cfg.bulk_send_buffer_mb = v.max(1);
+                }
+                self.bulk_buf_s = s;
+            }
             Message::ClipAutoMbChanged(s) => {
                 // 0 is meaningful here — it means "always ask" — so it is accepted as
                 // typed rather than clamped up to 1 like the size limits.
                 if let Ok(v) = s.trim().parse::<u64>() {
                     self.cfg.clipboard_auto_transfer_max = v * 1024 * 1024;
+                    // Pushed straight to the running thread, so this one needs no
+                    // restart and stays out of the stale-settings list.
+                    if let Some(e) = &self.engine {
+                        e.clipboard_set_auto_max(self.cfg.clipboard_auto_transfer_max);
+                    }
                 }
                 self.clip_auto_mb_s = s;
             }
@@ -574,6 +711,7 @@ impl App {
         self.clip_max_files_s = self.cfg.clipboard_max_files_per_copy.to_string();
         self.clip_quick_s = self.cfg.clipboard_quick_send_secs.to_string();
         self.bulk_rate_s = self.cfg.bulk_rate_limit_mbps.to_string();
+        self.bulk_buf_s = self.cfg.bulk_send_buffer_mb.to_string();
         self.clip_cache_gb_s = s;
             }
             Message::BulkPortChanged(s) => {
@@ -1256,12 +1394,23 @@ impl App {
                     ]
                     .spacing(3.0),
                     Space::new().width(Length::Fill),
+                    // Three answers, because "yes" and "no" are not the only ones: the
+                    // third says "stop asking me about files this size", which is the
+                    // real request behind repeatedly pressing the first.
                     button(text("Bring it over").size(12.5))
                         .style(ui_theme::primary(p))
                         .padding([9.0, 14.0])
                         .on_press(Message::ClipReuse(first.id)),
+                    button(text("Not now").size(12.5))
+                        .style(ui_theme::ghost(p))
+                        .padding([9.0, 12.0])
+                        .on_press(Message::ClipDecline(first.id)),
+                    button(text(format!("Always allow {}", mb_ceil_label(first.disk_bytes))).size(12.5))
+                        .style(ui_theme::ghost(p))
+                        .padding([9.0, 12.0])
+                        .on_press(Message::ClipAlwaysAllow(first.id)),
                 ]
-                .spacing(10.0)
+                .spacing(8.0)
                 .align_y(Alignment::Center),
             )
             .style(move |_| ui_theme::well(p))
@@ -1315,29 +1464,50 @@ impl App {
                             format!("{} · click to bring it over", human_bytes(m.disk_bytes as usize)),
                             p.warn,
                         ),
+                        // "Not now" is not an error and not a dead end — say what it is
+                        // and what to do about it.
+                        mouse_clipboard::ClipStatus::Declined => (
+                            format!("{} · left for later", human_bytes(m.disk_bytes as usize)),
+                            p.txt3,
+                        ),
                         mouse_clipboard::ClipStatus::Fetching { done, total } => {
                             let pct = if *total > 0 { done * 100 / total } else { 0 };
                             (format!("{pct}% of {}", human_bytes(*total as usize)), p.accent)
                         }
                         mouse_clipboard::ClipStatus::Unavailable(why) => (why.clone(), p.danger),
                     };
+                    let fetching = matches!(m.status, mouse_clipboard::ClipStatus::Fetching { .. });
                     // The row itself is the re-use action — the thing the user wants
                     // nine times out of ten needs no menu and no second click.
-                    let reuse = button(
-                        row![
-                            text(kind).size(12.0).color(p.txt3),
-                            text(arrow).size(11.0).color(col),
-                            text(m.preview.clone()).size(13.0).color(p.txt2),
-                            Space::new().width(Length::Fill),
-                            text(note).size(11.0).color(note_col),
-                        ]
-                        .spacing(10.0)
-                        .align_y(Alignment::Center),
-                    )
-                    .style(ui_theme::ghost(p))
-                    .padding([10.0, 12.0])
-                    .width(Length::Fill)
-                    .on_press(Message::ClipReuse(m.id));
+                    let head = row![
+                        text(kind).size(12.0).color(p.txt3),
+                        text(arrow).size(11.0).color(col),
+                        text(m.preview.clone()).size(13.0).color(p.txt2),
+                        Space::new().width(Length::Fill),
+                        text(note).size(11.0).color(note_col),
+                    ]
+                    .spacing(10.0)
+                    .align_y(Alignment::Center);
+                    // A bar while it is moving: a percentage answers "how far", a bar
+                    // answers "is it still going", which is the one being asked while
+                    // watching a long transfer.
+                    let body: Element<'_, Message> = if let mouse_clipboard::ClipStatus::Fetching {
+                        done,
+                        total,
+                    } = &m.status
+                    {
+                        let frac = if *total > 0 { *done as f32 / *total as f32 } else { 0.0 };
+                        column![head, progress_bar(0.0..=1.0, frac).girth(3.0)]
+                            .spacing(6.0)
+                            .into()
+                    } else {
+                        head.into()
+                    };
+                    let reuse = button(body)
+                        .style(ui_theme::ghost(p))
+                        .padding([10.0, 12.0])
+                        .width(Length::Fill)
+                        .on_press(Message::ClipReuse(m.id));
 
                     let pin = button(text(if m.pinned { "📌" } else { "📍" }).size(12.0))
                         .style(ui_theme::ghost(p))
@@ -1348,7 +1518,18 @@ impl App {
                         .padding([10.0, 10.0])
                         .on_press(Message::ClipRemove(m.id));
 
-                    list = list.push(row![reuse, pin, del].spacing(4.0).align_y(Alignment::Center));
+                    let mut controls = row![reuse].spacing(4.0).align_y(Alignment::Center);
+                    // Stop only exists while there is something to stop. What has already
+                    // arrived is kept, so pressing it is cheap to undo.
+                    if fetching {
+                        controls = controls.push(
+                            button(text("Stop").size(11.5))
+                                .style(ui_theme::ghost(p))
+                                .padding([10.0, 10.0])
+                                .on_press(Message::ClipCancel(m.id)),
+                        );
+                    }
+                    list = list.push(controls.push(pin).push(del));
                 }
             }
         }
@@ -1444,6 +1625,20 @@ impl App {
                     text("Bounds a stray click on an enormous folder. The rest is left behind, and the log says so.")
                         .size(11.0)
                         .color(p.txt3),
+                    toggle_row(
+                        p,
+                        "Follow shortcuts inside copied folders",
+                        "off by default: one pointing outside the folder quietly copies files you never picked",
+                        self.cfg.clipboard_follow_symlinks,
+                        Message::ClipFollowSymlinksToggled
+                    ),
+                    toggle_row(
+                        p,
+                        "Notify me when a file is waiting",
+                        "a desktop notification, never a pop-up — a window stealing focus is what caused the keyboard bug",
+                        self.cfg.clipboard_notify,
+                        Message::ClipNotifyToggled
+                    ),
                     labeled(
                         p,
                         "Send images inline up to (KB)",
@@ -1504,6 +1699,17 @@ impl App {
                     text("Automatic watches your mouse latency and backs off by itself. Pin a number if you'd rather decide.")
                         .size(11.0)
                         .color(p.txt3),
+                    labeled(
+                        p,
+                        "Send buffer (MB)",
+                        input(p, "8", &self.bulk_buf_s, Message::BulkBufferChanged)
+                    ),
+                    text(format!(
+                        "How much of a file may sit in memory waiting to go out. This is what keeps a 4 GB copy costing the same as a 4 MB one — right now, at most {}.",
+                        human_bytes((self.cfg.bulk_send_buffer_mb.max(1) as usize) * 1024 * 1024)
+                    ))
+                    .size(11.0)
+                    .color(p.txt3),
                     toggle_row(
                         p,
                         "Separate lane for large transfers",
@@ -1795,7 +2001,19 @@ fn status_pill(p: Palette, running: bool, snap: Option<&StatusSnapshot>) -> (ice
 }
 
 /// Compact hover text for the tray icon: a mirror of the header status.
-fn tray_tooltip(running: bool, snap: Option<&StatusSnapshot>) -> String {
+///
+/// Files waiting for an answer take precedence over connection state, because they are
+/// the only thing here the user has to *act* on — and with the panel closed the tray is
+/// the only place that can be said. A pop-up dialog is not an option: Windows withholds
+/// the low-level keyboard hook while our own window owns the foreground, which is the
+/// leak fixed on 31 July and would come straight back.
+fn tray_tooltip(running: bool, snap: Option<&StatusSnapshot>, waiting: usize) -> String {
+    if running && waiting > 0 {
+        return match waiting {
+            1 => "mouse-rs — a file is waiting for you".to_owned(),
+            n => format!("mouse-rs — {n} files are waiting for you"),
+        };
+    }
     match (running, snap) {
         (false, _) => "mouse-rs — stopped".to_owned(),
         (true, Some(s)) if s.connected => {

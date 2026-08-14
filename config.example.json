@@ -18,10 +18,13 @@
   "cache_dir": "",
   "clipboard_inline_image_max": 262144,
   "clipboard_max_files_per_copy": 10000,
+  "clipboard_follow_symlinks": false,
+  "clipboard_notify": true,
   "clipboard_quick_send_secs": 3,
   "clipboard_persist_history": false,
   "bulk_pause_while_crossed": true,
   "bulk_rate_limit_mbps": 0,
+  "bulk_send_buffer_mb": 8,
   "lock_hotkey": "scroll_lock",
   "return_hotkey": "ctrl+win+alt+esc",
 

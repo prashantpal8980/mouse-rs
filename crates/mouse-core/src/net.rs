@@ -1200,7 +1200,11 @@ mod tests {
         let (_bulk_out_tx, bulk_out_rx) = mpsc::unbounded_channel();
         let health = LinkHealth::new();
         let bulk = BulkServer::enabled(
-            crate::bulk::BulkChannels { outgoing: bulk_out_rx, incoming: bulk_in_tx },
+            crate::bulk::BulkChannels {
+                outgoing: bulk_out_rx,
+                incoming: bulk_in_tx,
+                queue: std::sync::Arc::new(crate::bulk::BulkQueue::default()),
+            },
             health.clone(),
             crate::bulk::BulkSettings::default(),
         );

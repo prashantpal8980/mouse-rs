@@ -105,6 +105,11 @@ pub use mouse_core::protocol::FileRef;
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct FileSet {
     pub files: Vec<FileRef>,
+    /// Every directory in the copied tree, relative to the copied folder's parent.
+    ///
+    /// Needed because an empty directory has no file to imply it, and a folder rebuilt
+    /// without its empty subdirectories is not the folder that was copied.
+    pub dirs: Vec<String>,
     /// Name of the machine the copy happened on, for "on laptop · click to fetch".
     pub origin: String,
 }
@@ -129,6 +134,12 @@ pub enum ClipStatus {
     Remote,
     /// Over the user's auto-transfer limit, waiting for them to say yes.
     NeedsConsent,
+    /// They answered "not now", or stopped a transfer part-way.
+    ///
+    /// Distinct from [`ClipStatus::NeedsConsent`] only so the banner stops asking. The
+    /// entry is still there and still one click from being fetched — saying "not now"
+    /// should quieten the prompt, not discard the entry.
+    Declined,
     /// Transfer in progress.
     Fetching { done: u64, total: u64 },
     /// The peer looked and could not produce it. Carries the reason to show.
@@ -477,11 +488,22 @@ fn trim(entries: &mut VecDeque<ClipEntry>, limits: HistoryLimits) {
     }
 }
 
-/// What the panel can ask the clipboard thread to do. Only re-use has to reach the
-/// thread — pinning, deleting and clearing touch the shared history directly, because
-/// they never talk to the OS clipboard.
+/// What the panel can ask the clipboard thread to do.
+///
+/// Pinning, deleting and clearing are absent on purpose: they touch the shared history
+/// directly, because they never talk to the OS clipboard. These are the ones that do,
+/// or that have to reach the transfer engine.
 enum ClipCommand {
     Reuse(u64),
+    /// Stop an in-flight transfer, and tell the sender to stop too.
+    Cancel(u64),
+    /// "Not now" — quieten the prompt without discarding the entry.
+    Decline(u64),
+    /// Raise the ask-first threshold on the *running* thread.
+    ///
+    /// Applying it only on restart would make "always allow this size" look broken the
+    /// very next time a file that size arrived.
+    SetAutoMax(u64),
 }
 
 /// The panel's handle for asking that a history entry be put back on the clipboard.
@@ -495,6 +517,22 @@ impl ClipboardCommander {
     /// re-using an old entry syncs exactly like a fresh copy).
     pub fn reuse(&self, id: u64) {
         let _ = self.tx.send(ClipCommand::Reuse(id));
+    }
+
+    /// Stop fetching entry `id`. What has already arrived is kept, so clicking the
+    /// entry again resumes rather than starting over.
+    pub fn cancel(&self, id: u64) {
+        let _ = self.tx.send(ClipCommand::Cancel(id));
+    }
+
+    /// Answer "not now" to the consent prompt for entry `id`.
+    pub fn decline(&self, id: u64) {
+        let _ = self.tx.send(ClipCommand::Decline(id));
+    }
+
+    /// Change the "bring it over without asking" limit on the running thread.
+    pub fn set_auto_max(&self, bytes: u64) {
+        let _ = self.tx.send(ClipCommand::SetAutoMax(bytes));
     }
 }
 
@@ -518,6 +556,9 @@ pub struct BulkLink {
     pub cache: Arc<cache::BlobCache>,
     /// Shared link measurements, for the "will this be quick?" question.
     pub health: Arc<mouse_core::bulk::LinkHealth>,
+    /// How much is queued but not yet sent, so a sender knows when to stop reading
+    /// ahead. Without this a big file is buffered whole in memory.
+    pub queue: Arc<mouse_core::bulk::BulkQueue>,
 }
 
 /// The clipboard-thread half of the user's settings.
@@ -544,6 +585,8 @@ pub struct ClipboardSettings {
     /// Most files one copy may include, so a stray click on a huge folder does not
     /// commit the machine to hashing a million files.
     pub max_files_per_copy: usize,
+    /// Follow symlinks inside a copied folder rather than skipping them.
+    pub follow_symlinks: bool,
     /// Skip the prompt when a transfer is measured to finish this fast. 0 disables it.
     pub quick_send_secs: f64,
     /// Keep history across restarts.
@@ -563,6 +606,7 @@ impl Default for ClipboardSettings {
             machine: "this machine",
             inline_image_max: DEFAULT_INLINE_IMAGE_MAX,
             max_files_per_copy: DEFAULT_MAX_FILES_PER_COPY,
+            follow_symlinks: false,
             quick_send_secs: 3.0,
             persist_history: false,
         }
@@ -778,7 +822,9 @@ fn run(
     stop: Arc<AtomicBool>,
     connected: Arc<AtomicBool>,
     history: Option<ClipboardHistory>,
-    settings: ClipboardSettings,
+    // Mutable because "always allow this size" changes the ask-first limit while the
+    // thread is running; everything else here is fixed for the life of the engine.
+    mut settings: ClipboardSettings,
     bulk: Option<BulkLink>,
 ) {
     let mut clipboard = match arboard::Clipboard::new() {
@@ -808,14 +854,15 @@ fn run(
     } else {
         None
     };
-    let (mut transfers, to_bulk, from_bulk, health) = match bulk {
+    let (mut transfers, to_bulk, from_bulk, health, bulk_queue) = match bulk {
         Some(b) => (
             Some(transfer::Transfers::new(b.cache)),
             Some(b.to_bulk),
             Some(b.from_bulk),
             Some(b.health),
+            Some(b.queue),
         ),
-        None => (None, None, None, None),
+        None => (None, None, None, None, None),
     };
     let mut tick: u32 = 0;
 
@@ -865,9 +912,9 @@ fn run(
             }
             // Files copied on the other machine: record the description, then decide
             // whether to fetch now, ask first, or do nothing because we already have it.
-            Ok(Message::ClipboardFiles { files: refs, origin }) if settings.sync_files => {
+            Ok(Message::ClipboardFiles { files: refs, origin, dirs }) if settings.sync_files => {
                 if let (Some(t), Some(h)) = (transfers.as_mut(), history.as_ref()) {
-                    let set = Arc::new(FileSet { files: refs, origin });
+                    let set = Arc::new(FileSet { files: refs, dirs, origin });
                     let status = t.initial_status(
                         &set,
                         settings.auto_transfer_max,
@@ -891,10 +938,21 @@ fn run(
             }
             // The peer wants a file we advertised.
             Ok(Message::BlobRequest { hash, offset }) => {
-                if let (Some(t), Some(h), Some(tb)) =
-                    (transfers.as_ref(), history.as_ref(), to_bulk.as_ref())
-                {
-                    t.serve_request(&hash, offset, h, &to_peer, tb);
+                if let (Some(t), Some(h), Some(tb), Some(q)) = (
+                    transfers.as_mut(),
+                    history.as_ref(),
+                    to_bulk.as_ref(),
+                    bulk_queue.as_ref(),
+                ) {
+                    t.serve_request(&hash, offset, h, &to_peer, tb, q);
+                }
+            }
+            // The peer changed its mind about a file we are streaming to it.
+            Ok(Message::BlobCancel { hash }) => {
+                if let Some(t) = transfers.as_mut() {
+                    if t.stop_serving(&hash) {
+                        tracing::info!(hash, "the peer cancelled; stopped sending");
+                    }
                 }
             }
             Ok(Message::BlobUnavailable { hash, reason }) => {
@@ -915,7 +973,33 @@ fn run(
         // They are handled whether or not a peer is connected: putting an item back on
         // *this* machine's clipboard is useful on its own.
         if let Some(cmds) = &commands {
-            while let Ok(ClipCommand::Reuse(id)) = cmds.rx.try_recv() {
+            while let Ok(cmd) = cmds.rx.try_recv() {
+                let id = match cmd {
+                    ClipCommand::Reuse(id) => id,
+                    // Stop the fetch and put the entry back to "click to bring it
+                    // over" — what has arrived stays on disk, so a second click
+                    // resumes instead of restarting.
+                    ClipCommand::Cancel(id) => {
+                        if let (Some(t), Some(h)) = (transfers.as_mut(), history.as_ref()) {
+                            if t.cancel_entry(id, &to_peer) {
+                                h.set_status(id, ClipStatus::Declined);
+                            }
+                        }
+                        continue;
+                    }
+                    ClipCommand::Decline(id) => {
+                        if let Some(h) = history.as_ref() {
+                            h.set_status(id, ClipStatus::Declined);
+                            tracing::info!(id, "left a file for later");
+                        }
+                        continue;
+                    }
+                    ClipCommand::SetAutoMax(bytes) => {
+                        settings.auto_transfer_max = bytes;
+                        tracing::info!(bytes, "ask-first limit raised from the panel");
+                        continue;
+                    }
+                };
                 if let Some(h) = &history {
                     reuse_entry(
                         &mut clipboard,
@@ -984,7 +1068,7 @@ fn run(
                         let key = files::list_key(&list);
                         if last_files != Some(key) {
                             last_files = Some(key);
-                            if let Some(set) = t.describe_local(&list, settings.machine, settings.max_files_per_copy) {
+                            if let Some(set) = t.describe_local(&list, settings.machine, settings.max_files_per_copy, settings.follow_symlinks) {
                                 tracing::info!(
                                     count = set.files.len(),
                                     bytes = set.total_bytes(),
@@ -993,6 +1077,7 @@ fn run(
                                 let _ = to_peer.send(Message::ClipboardFiles {
                                     files: set.files.clone(),
                                     origin: set.origin.clone(),
+                                    dirs: set.dirs.clone(),
                                 });
                                 h.record_files(Arc::new(set), false, ClipStatus::Ready);
                             }
@@ -1019,6 +1104,11 @@ fn run(
                 }
             }
         }
+    }
+    // Serving threads outlive this loop otherwise, holding open files and pushing into
+    // a channel nobody reads.
+    if let Some(t) = transfers.as_mut() {
+        t.stop_all_serving();
     }
 }
 
@@ -1095,6 +1185,7 @@ fn reuse_entry<C: SystemClipboard>(
                     let _ = to_peer.send(Message::ClipboardFiles {
                         files: set.files.clone(),
                         origin: set.origin.clone(),
+                        dirs: set.dirs.clone(),
                     });
                 }
             } else if connected {
@@ -1762,6 +1853,7 @@ mod tests {
                 source_path: None,
                 rel: String::new(),
             }],
+            dirs: Vec::new(),
             origin: "laptop".into(),
         };
         let limit = 1024 * 1024;
@@ -1931,6 +2023,10 @@ struct StoredImage {
 struct StoredFiles {
     files: Vec<FileRef>,
     origin: String,
+    /// Defaulted so a history file written before folders carried their directory
+    /// list still loads instead of being discarded wholesale.
+    #[serde(default)]
+    dirs: Vec<String>,
 }
 
 impl ClipboardHistory {
@@ -1986,6 +2082,7 @@ impl ClipboardHistory {
                     files: Some(StoredFiles {
                         files: set.files.clone(),
                         origin: set.origin.clone(),
+                        dirs: set.dirs.clone(),
                     }),
                 },
             };
@@ -2026,7 +2123,7 @@ impl ClipboardHistory {
                     None => continue, // the pixels were evicted; the row would be dead
                 }
             } else if let Some(f) = s.files {
-                let set = Arc::new(FileSet { files: f.files, origin: f.origin });
+                let set = Arc::new(FileSet { files: f.files, dirs: f.dirs, origin: f.origin });
                 let status = match cache {
                     Some(c) if set.files.iter().all(|f| c.contains(&f.hash)) => ClipStatus::Ready,
                     _ => ClipStatus::Remote,
