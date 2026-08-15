@@ -499,14 +499,6 @@ enum ClipCommand {
     Cancel(u64),
     /// "Not now" — quieten the prompt without discarding the entry.
     Decline(u64),
-    /// Write a copied image out as a real .png and put *that file* on the clipboard.
-    ///
-    /// Neither Explorer nor Thunar can paste pixels — their Paste needs a reference to
-    /// a file on disk. So an image that pastes fine into a browser or a chat window
-    /// cannot be pasted into a file manager at all, by any program. Turning it into a
-    /// file is the way round that, and it is offered per entry rather than done always,
-    /// because publishing the file would replace the pixels and break the common case.
-    ImageAsFile(u64),
     /// Raise the ask-first threshold on the *running* thread.
     ///
     /// Applying it only on restart would make "always allow this size" look broken the
@@ -536,12 +528,6 @@ impl ClipboardCommander {
     /// Answer "not now" to the consent prompt for entry `id`.
     pub fn decline(&self, id: u64) {
         let _ = self.tx.send(ClipCommand::Decline(id));
-    }
-
-    /// Offer history entry `id`'s image as a `.png` file on the clipboard, so it can
-    /// be pasted into a file manager.
-    pub fn image_as_file(&self, id: u64) {
-        let _ = self.tx.send(ClipCommand::ImageAsFile(id));
     }
 
     /// Change the "bring it over without asking" limit on the running thread.
@@ -1008,29 +994,6 @@ fn run(
                         }
                         continue;
                     }
-                    ClipCommand::ImageAsFile(id) => {
-                        if let (Some(t), Some(h)) = (transfers.as_ref(), history.as_ref()) {
-                            match image_to_file(t, h, id) {
-                                Some(path) => {
-                                    let list = files::FileList { paths: vec![path.clone()] };
-                                    if files::write_files(&list) {
-                                        last_files = Some(files::list_key(&list));
-                                        tracing::info!(
-                                            id,
-                                            path = %path.display(),
-                                            "image offered as a file — paste it in a file manager"
-                                        );
-                                    } else {
-                                        tracing::warn!(id, "could not put the image file on the clipboard");
-                                    }
-                                }
-                                None => tracing::warn!(id, "that entry has no image to write out"),
-                            }
-                        } else {
-                            tracing::warn!(id, "writing an image out needs the file cache, which is unavailable");
-                        }
-                        continue;
-                    }
                     ClipCommand::SetAutoMax(bytes) => {
                         settings.auto_transfer_max = bytes;
                         tracing::info!(bytes, "ask-first limit raised from the panel");
@@ -1184,12 +1147,34 @@ fn reuse_entry<C: SystemClipboard>(
                 });
             }
         }
-        ClipPayload::Image { png, .. } => {
+        ClipPayload::Image { png, w, h } => {
             let Some(img) = decode_png(&png, settings.max_image_px) else {
                 tracing::warn!(id, "stored clipboard image could not be decoded");
                 return false;
             };
-            if !clipboard.write_image(&img) {
+            // Clicking an image puts it on the clipboard in *both* useful forms: pixels
+            // for a browser or a chat window, and a .png file for Explorer or Thunar.
+            // Offering only one would mean the user has to decide where they are going
+            // to paste before they click, which is not a question they should be asked.
+            let as_file = transfers
+                .as_deref()
+                .and_then(|t| stage_image_file(t, &png, w, h));
+            let published = match as_file {
+                Some(path) => {
+                    let list = files::FileList { paths: vec![path.clone()] };
+                    let ok = files::write_image_and_file(&list, png.to_vec(), || {
+                        clipboard.write_image(&img)
+                    });
+                    if ok {
+                        *last_files = Some(files::list_key(&list));
+                        tracing::info!(id, path = %path.display(), "image copied as pixels and as a file");
+                    }
+                    ok
+                }
+                // No cache, so no file — the pixels alone are still worth having.
+                None => clipboard.write_image(&img),
+            };
+            if !published {
                 tracing::warn!(id, "could not put the history image back on the clipboard");
                 return false;
             }
@@ -1446,26 +1431,24 @@ fn apply_encoded_image<C: SystemClipboard>(
     true
 }
 
-/// Write a history entry's image into the cache as a real `.png` and return its path.
+/// Write an image into the cache as a real `.png` and return its path.
 ///
 /// The name matters: a file manager shows whatever the file is called, and pasting
 /// something named after a 64-character hash would be technically correct and useless.
-/// The hash still decides the *content*, so writing the same image out twice reuses one
-/// file rather than accumulating copies.
-fn image_to_file(
+/// The hash still decides the *content*, so copying the same image twice reuses one file
+/// rather than accumulating identical ones.
+fn stage_image_file(
     transfers: &transfer::Transfers,
-    history: &ClipboardHistory,
-    id: u64,
+    png: &[u8],
+    w: usize,
+    h: usize,
 ) -> Option<std::path::PathBuf> {
-    let ClipPayload::Image { png, w, h } = history.payload(id)? else {
-        return None;
-    };
-    let hash = transfers.stage_image(&png)?;
+    let hash = transfers.stage_image(png)?;
     let name = format!("clipboard-image-{w}x{h}-{}.png", &hash[..8]);
     match transfers.cache().materialize(&hash, &name) {
         Ok(p) => Some(p),
         Err(e) => {
-            tracing::warn!(id, "could not write the image out as a file: {e}");
+            tracing::warn!("could not write the image out as a file: {e}");
             None
         }
     }

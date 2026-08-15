@@ -65,6 +65,42 @@ mod imp {
         Some(FileList { paths })
     }
 
+    /// Add `CF_HDROP` **without** clearing what is already on the clipboard.
+    ///
+    /// This is what lets one clipboard hold an image *and* a file at the same time: the
+    /// pixels for a browser or a chat window, the file for Explorer. Writing the file
+    /// normally would empty the clipboard first and destroy the image, which is why
+    /// this needed a separate path rather than a second ordinary write.
+    pub fn add_files_keeping_rest(list: &FileList) -> bool {
+        use clipboard_win::{options, raw, Clipboard};
+        let strings: Vec<String> = list
+            .paths
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        let _clip = match Clipboard::new_attempts(10) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!("could not open the clipboard to add files: {e}");
+                return false;
+            }
+        };
+        match raw::set_file_list_with(strings.as_slice(), options::NoClear) {
+            Ok(()) => {
+                tracing::info!(
+                    count = strings.len(),
+                    paths = %strings.join(" | "),
+                    "ADDED files alongside the image on the Windows clipboard — pasteable in Explorer and in a browser"
+                );
+                true
+            }
+            Err(e) => {
+                tracing::warn!("could not add files to the clipboard: {e}");
+                false
+            }
+        }
+    }
+
     /// Put a file list on the clipboard as `CF_HDROP`, so Explorer pastes real files.
     ///
     /// `set_clipboard` cannot be used here: `FileList`'s `Setter` is implemented for the
@@ -278,6 +314,16 @@ mod imp {
     /// answer — and it also means the list dies when mouse-rs exits, which is ordinary
     /// X11 behaviour rather than something we can fix here.
     pub fn write_files(list: &FileList) -> bool {
+        write_files_with_image(list, None)
+    }
+
+    /// Publish files, and optionally the same content as an image, from one owner.
+    ///
+    /// One X11 selection owner can advertise as many targets as it likes, so serving
+    /// `image/png` alongside the file targets means a single copy pastes as pixels into
+    /// a browser and as a file into Thunar. Doing it in two separate calls could not
+    /// work: the second owner would take the selection from the first.
+    pub fn write_files_with_image(list: &FileList, png: Option<Vec<u8>>) -> bool {
         let uris: Vec<String> = list
             .paths
             .iter()
@@ -291,14 +337,14 @@ mod imp {
 
         std::thread::Builder::new()
             .name("clip-files-owner".into())
-            .spawn(move || serve_selection(uri_list, gnome))
+            .spawn(move || serve_selection(uri_list, gnome, png))
             .is_ok()
     }
 
     /// Own the selection until someone else takes it. Returns when we lose ownership,
     /// which is exactly when the user copies something else — including via our own
     /// text/image path.
-    fn serve_selection(uri_list: String, gnome: String) {
+    fn serve_selection(uri_list: String, gnome: String, png: Option<Vec<u8>>) {
         let Some(x) = open() else { return };
         let Some(targets_atom) = intern(&x.conn, "TARGETS") else { return };
         let mut serve: Vec<(u32, Vec<u8>)> = Vec::new();
@@ -306,6 +352,16 @@ mod imp {
             if let Some(a) = intern(&x.conn, name) {
                 let body = if *name == "text/uri-list" { &uri_list } else { &gnome };
                 serve.push((a, body.as_bytes().to_vec()));
+            }
+        }
+        // The image target, when this copy carries pixels as well as a path. Same
+        // owner, same selection — that is what lets one copy satisfy both a browser and
+        // a file manager.
+        if let Some(bytes) = png {
+            for name in ["image/png", "image/x-png"] {
+                if let Some(a) = intern(&x.conn, name) {
+                    serve.push((a, bytes.clone()));
+                }
             }
         }
         let utf8 = intern(&x.conn, "UTF8_STRING");
@@ -420,6 +476,12 @@ mod imp {
     pub fn read_files() -> Option<FileList> {
         None
     }
+    pub fn write_files_with_image(_list: &FileList, _png: Option<Vec<u8>>) -> bool {
+        false
+    }
+    pub fn add_files_keeping_rest(_list: &FileList) -> bool {
+        false
+    }
     pub fn write_files(_list: &FileList) -> bool {
         false
     }
@@ -433,6 +495,36 @@ pub fn read_files() -> Option<FileList> {
 /// Put a file list on the system clipboard.
 pub fn write_files(list: &FileList) -> bool {
     imp::write_files(list)
+}
+
+/// Put an image on the clipboard **and** the same content as a file, so one copy can be
+/// pasted into a browser or a chat window *and* into a file manager.
+///
+/// Neither Explorer nor Thunar can paste pixels — their Paste needs a path — while
+/// browsers and chat apps want the pixels. Offering only one of the two forces the user
+/// to know which they will need before they click, which is a question they should never
+/// be asked. The two platforms reach the same result differently: X11 has one selection
+/// owner advertising both targets; Windows writes the image first and then adds
+/// `CF_HDROP` *without* clearing, because a normal write would empty the clipboard and
+/// destroy the image it was meant to accompany.
+///
+/// `write_image_first` is the platform's ordinary image write, run between opening and
+/// adding the file on Windows and ignored on X11, where the same owner serves both.
+pub fn write_image_and_file(list: &FileList, png: Vec<u8>, write_image_first: impl FnOnce() -> bool) -> bool {
+    #[cfg(windows)]
+    {
+        let _ = &png;
+        // Order matters: the image write clears the clipboard, so it has to go first.
+        if !write_image_first() {
+            return false;
+        }
+        imp::add_files_keeping_rest(list)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = write_image_first;
+        imp::write_files_with_image(list, Some(png))
+    }
 }
 
 #[cfg(test)]

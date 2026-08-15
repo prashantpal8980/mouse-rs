@@ -316,12 +316,6 @@ impl EngineHandle {
         self.clip_commands.cancel(id);
     }
 
-    /// Write a copied image out as a `.png` and put that file on the clipboard, so it
-    /// can be pasted into Explorer or Thunar — which cannot paste pixels.
-    pub fn clipboard_image_as_file(&self, id: u64) {
-        self.clip_commands.image_as_file(id);
-    }
-
     /// Answer "not now" — quieten the prompt without discarding the entry.
     pub fn clipboard_decline(&self, id: u64) {
         self.clip_commands.decline(id);

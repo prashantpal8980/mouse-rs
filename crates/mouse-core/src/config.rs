@@ -203,8 +203,12 @@ pub struct Config {
     /// followed forever.
     #[serde(default)]
     pub clipboard_follow_symlinks: bool,
-    /// Suspend transfers while you are driving the other machine — the moment latency
-    /// is most noticeable, and a pause the transfer will not miss.
+    /// Cap transfer speed hard while you are driving the other machine.
+    ///
+    /// This used to *stop* transfers outright, and that read as a hang: a copy froze the
+    /// instant the pointer crossed and resumed when it came back. Slowing achieves the
+    /// same protection — the pointer is what matters at that moment — while the transfer
+    /// still finishes.
     #[serde(default = "default_true")]
     pub bulk_pause_while_crossed: bool,
     /// Fixed transfer rate in MB/s. `0` adapts to measured input latency, which is the

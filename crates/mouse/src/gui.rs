@@ -48,6 +48,16 @@ impl Tab {
     }
 }
 
+/// The Clipboard tab has two jobs that do not belong on one screen: *using* the history
+/// and *configuring* it. Showing both at once made the tab read as a pile of unrelated
+/// controls — the history you came for, buried under a dozen numeric fields you did not.
+/// One tab, two views, one visible at a time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClipView {
+    History,
+    Settings,
+}
+
 #[derive(Debug, Clone)]
 enum Message {
     Tick,
@@ -66,11 +76,11 @@ enum Message {
     ClipCancel(u64),
     ClipDecline(u64),
     ClipAlwaysAllow(u64),
-    ClipImageAsFile(u64),
     ClipTogglePin(u64),
     ClipRemove(u64),
     ClipClear,
     ClipAdvancedToggled(bool),
+    ClipViewPicked(ClipView),
     ClipSyncTextToggled(bool),
     ClipSyncImagesToggled(bool),
     ClipItemsChanged(String),
@@ -242,6 +252,7 @@ struct App {
     /// configurable, but not everything is shown at once: the four settings most people
     /// touch stay visible and the rest sit one click away.
     clip_advanced: bool,
+    clip_view: ClipView,
     // String buffers for the numeric clipboard settings, same reason as the ports:
     // a partial edit ("1" on the way to "128") must not be parsed and written back.
     clip_items_s: String,
@@ -327,6 +338,7 @@ impl App {
             found_servers: Vec::new(),
             menu_open: false,
             clip_advanced: false,
+            clip_view: ClipView::History,
             clip_items_s: String::new(),
             clip_item_mb_s: String::new(),
             clip_mem_mb_s: String::new(),
@@ -611,12 +623,6 @@ impl App {
                     }
                 }
             }
-            Message::ClipImageAsFile(id) => {
-                if let Some(e) = &self.engine {
-                    e.clipboard_image_as_file(id);
-                    self.feedback = "saved as a .png and copied — paste it in a file manager".into();
-                }
-            }
             Message::ClipRemove(id) => {
                 if let Some(e) = &self.engine {
                     e.clipboard_remove(id);
@@ -629,6 +635,7 @@ impl App {
                 }
             }
             Message::ClipAdvancedToggled(v) => self.clip_advanced = v,
+            Message::ClipViewPicked(v) => self.clip_view = v,
             Message::ClipSyncTextToggled(v) => self.cfg.clipboard_sync_text = v,
             Message::ClipSyncImagesToggled(v) => self.cfg.clipboard_sync_images = v,
             // The numeric settings keep their own string buffer so a half-typed value is
@@ -1526,16 +1533,6 @@ impl App {
                         .on_press(Message::ClipRemove(m.id));
 
                     let mut controls = row![reuse].spacing(4.0).align_y(Alignment::Center);
-                    // Only for images, and only because no file manager on either OS can
-                    // paste pixels — this turns them into something that can be.
-                    if m.is_image {
-                        controls = controls.push(
-                            button(text("as file").size(11.0))
-                                .style(ui_theme::ghost(p))
-                                .padding([10.0, 8.0])
-                                .on_press(Message::ClipImageAsFile(m.id)),
-                        );
-                    }
                     // Stop only exists while there is something to stop. What has already
                     // arrived is kept, so pressing it is cheap to undo.
                     if fetching {
@@ -1576,7 +1573,37 @@ impl App {
         ]
         .align_y(Alignment::Center);
 
+        // Two views, one at a time. The switch is the first thing on the tab so it is
+        // obvious that the settings still exist — hiding them without saying where they
+        // went would trade one complaint for another.
+        let switch = |label: &'static str, which: ClipView| {
+            let b = button(text(label).size(12.5))
+                .padding([7.0, 16.0])
+                .on_press(Message::ClipViewPicked(which));
+            // The two style helpers are distinct opaque types, so the choice has to be
+            // made by branching on the whole widget rather than on the style.
+            if self.clip_view == which {
+                b.style(ui_theme::primary(p))
+            } else {
+                b.style(ui_theme::ghost(p))
+            }
+        };
+        let view_switch = row![
+            switch("History", ClipView::History),
+            switch("Settings", ClipView::Settings),
+        ]
+        .spacing(6.0);
+
+        if self.clip_view == ClipView::History {
+            // Just the thing the tab is named after: what you copied, and the one action
+            // per row. Nothing to configure, nothing to read past.
+            return column![view_switch, header, list, usage]
+                .spacing(12.0)
+                .into();
+        }
+
         let mut body = column![
+            view_switch,
             toggle_row(
                 p,
                 "Sync clipboard",
@@ -1584,9 +1611,6 @@ impl App {
                 self.cfg.clipboard_sync,
                 Message::ClipboardToggled
             ),
-            header,
-            list,
-            usage,
             labeled(p, "Keep this many entries", input(p, "25", &self.clip_items_s, Message::ClipItemsChanged)),
             labeled(
                 p,
@@ -1703,8 +1727,8 @@ impl App {
                     .color(p.txt3),
                     toggle_row(
                         p,
-                        "Pause transfers while I'm on the other machine",
-                        "protects the moment lag is most noticeable",
+                        "Slow transfers while I'm on the other machine",
+                        "keeps the pointer smooth by capping transfers at 2 MB/s — they keep moving, they do not stop",
                         self.cfg.bulk_pause_while_crossed,
                         Message::BulkPauseToggled
                     ),

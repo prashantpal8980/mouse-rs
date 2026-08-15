@@ -312,6 +312,12 @@ pub const MAX_RATE_BYTES_PER_SEC: u64 = 512 * 1024 * 1024;
 const START_RATE_BYTES_PER_SEC: u64 = 2 * 1024 * 1024;
 /// How much to add per healthy step (additive increase).
 const RATE_STEP_BYTES_PER_SEC: u64 = 1024 * 1024;
+/// Ceiling while the user is driving the other machine.
+///
+/// 2 MB/s keeps a 3 GB transfer visibly moving rather than frozen, while using a small
+/// enough share of even a hotspot that pointer latency is unaffected. The previous
+/// behaviour here was a full stop, which was indistinguishable from a hang.
+const CROSSED_RATE_BYTES_PER_SEC: u64 = 2 * 1024 * 1024;
 
 /// How the owner wants the bulk lane to behave.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -374,18 +380,28 @@ impl Pacer {
 
     /// How long to wait before sending `bytes`, to hold the current rate.
     pub fn delay_for(&self, bytes: usize) -> Duration {
-        if self.rate == 0 {
-            return Duration::ZERO;
-        }
-        Duration::from_micros((bytes as u64).saturating_mul(1_000_000) / self.rate)
+        self.delay_for_capped(bytes, None)
     }
 
-    /// Should the lane stand down entirely right now?
+    /// As [`Pacer::delay_for`], but never faster than `cap` bytes per second.
+    pub fn delay_for_capped(&self, bytes: usize, cap: Option<u64>) -> Duration {
+        let rate = match cap {
+            Some(c) => self.rate.min(c),
+            None => self.rate,
+        };
+        if rate == 0 {
+            return Duration::ZERO;
+        }
+        Duration::from_micros((bytes as u64).saturating_mul(1_000_000) / rate)
+    }
+
+    /// The rate ceiling to apply while the user is driving the other machine.
     ///
-    /// True while the user is driving the other machine — the moment lag is most
-    /// noticeable, and a few seconds of pause the transfer will not miss.
-    pub fn should_pause(&self, pause_while_crossed: bool) -> bool {
-        pause_while_crossed && self.health.crossed()
+    /// `None` means no extra ceiling. The floor is deliberately generous enough that a
+    /// large transfer still visibly progresses — the point is that the pointer stays
+    /// smooth, not that the transfer stops existing.
+    pub fn crossed_cap(&self, slow_while_crossed: bool) -> Option<u64> {
+        (slow_while_crossed && self.health.crossed()).then_some(CROSSED_RATE_BYTES_PER_SEC)
     }
 }
 
@@ -595,21 +611,21 @@ async fn bulk_pump(
                         sent_bytes = 0;
                         started = Some(tokio::time::Instant::now());
                     }
-                    // Standing down while the user is driving the other machine: that is
-                    // the moment latency is felt, and it costs the transfer a few
-                    // seconds it will not miss.
-                    while pacer.should_pause(settings.pause_while_crossed) {
-                        tokio::select! {
-                            _ = cancel.cancelled() => return,
-                            _ = tokio::time::sleep(Duration::from_millis(120)) => {}
-                        }
-                    }
                     // Hold the paced rate *before* writing, so the delay is spent idle
                     // rather than inside a socket write we could no longer interrupt.
+                    //
+                    // While the user is driving the other machine the rate is capped
+                    // hard rather than stopped. Stopping was the old behaviour and it
+                    // reads as a hang: the owner watched a copy freeze the instant they
+                    // crossed and resume when they crossed back, which looks like a bug
+                    // however deliberate it is.
                     let bytes = frame.payload_len();
                     if bytes > 0 {
                         pacer.step();
-                        let delay = pacer.delay_for(bytes);
+                        let delay = pacer.delay_for_capped(
+                            bytes,
+                            pacer.crossed_cap(settings.pause_while_crossed),
+                        );
                         if !delay.is_zero() {
                             tokio::select! {
                                 _ = cancel.cancelled() => return,
@@ -845,10 +861,15 @@ mod tests {
     fn crossing_pauses_the_lane_only_when_the_user_asked() {
         let h = LinkHealth::new();
         let p = Pacer::new(h.clone(), None);
-        assert!(!p.should_pause(true), "not crossed: nothing to pause for");
+        assert!(p.crossed_cap(true).is_none(), "not crossed: no extra ceiling");
         h.set_crossed(true);
-        assert!(p.should_pause(true));
-        assert!(!p.should_pause(false), "the setting must actually be honoured");
+        assert_eq!(p.crossed_cap(true), Some(CROSSED_RATE_BYTES_PER_SEC));
+        assert!(p.crossed_cap(false).is_none(), "the setting must actually be honoured");
+        // The point of the change: crossing slows the transfer, it does not stop it.
+        assert!(
+            !p.delay_for_capped(CHUNK_BYTES, p.crossed_cap(true)).is_zero(),
+            "crossing must slow the lane"
+        );
     }
 
     #[test]

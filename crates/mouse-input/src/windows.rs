@@ -55,7 +55,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClassNameW,
     GetCursorPos, GetForegroundWindow, GetSystemMetrics, GetWindowTextW, GetWindowThreadProcessId,
     MsgWaitForMultipleObjectsEx, PeekMessageW, PostThreadMessageW, RegisterClassW,
-    SetForegroundWindow, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx,
+    GetDesktopWindow, GetShellWindow, SetForegroundWindow, SetWindowsHookExW, ShowWindow,
+    SW_MINIMIZE, TranslateMessage, UnhookWindowsHookEx,
     UnregisterClassW, HC_ACTION,
     HWND_MESSAGE, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, LLKHF_UP, MSG, MSLLHOOKSTRUCT,
     MWMO_INPUTAVAILABLE, PM_REMOVE, QS_ALLINPUT, SM_CXSCREEN, SM_CXVIRTUALSCREEN, SM_CYSCREEN,
@@ -1199,21 +1200,50 @@ fn capture_loop(
 
         let crossing_started = want && !prev_suppress;
         if crossing_started && fg_is_ours {
-            if last_foreign_fg.is_null() {
-                let _ = diag.send(DiagEvent::FocusHandedOff { ok: false, to: String::new() });
-            } else {
-                let ok = unsafe { SetForegroundWindow(last_foreign_fg) } != 0;
-                if ok {
+            // Candidates in order of how invisible they are to the user. The first was
+            // once the only one, and when it was null — which is the state right after
+            // launch, before any other window has been focused — the hand-off was simply
+            // abandoned and every keystroke stayed on this machine. There is always a
+            // shell window and always a desktop window, so "nothing to hand to" is not a
+            // real state; it was only ever a gap in this list.
+            let mut handed: Option<(*mut core::ffi::c_void, &'static str)> = None;
+            let candidates: [(*mut core::ffi::c_void, &'static str); 3] = [
+                (last_foreign_fg, "the window that had focus before us"),
+                (unsafe { GetShellWindow() }, "the shell window"),
+                (unsafe { GetDesktopWindow() }, "the desktop"),
+            ];
+            for (hwnd, what) in candidates {
+                if hwnd.is_null() {
+                    continue;
+                }
+                if unsafe { SetForegroundWindow(hwnd) } != 0 {
+                    handed = Some((hwnd, what));
+                    break;
+                }
+            }
+            match handed {
+                Some((hwnd, what)) => {
                     yielded_from = fg;
                     // 120 ms: long enough for the target thread to have pumped the
                     // activation, short enough that the answer arrives inside the crossing
                     // it belongs to rather than after it.
                     verify_at = Some(std::time::Instant::now() + Duration::from_millis(120));
+                    let _ = diag.send(DiagEvent::FocusHandedOff {
+                        ok: true,
+                        to: format!("{} ({what})", describe_window(hwnd)),
+                    });
                 }
-                let _ = diag.send(DiagEvent::FocusHandedOff {
-                    ok,
-                    to: describe_window(last_foreign_fg),
-                });
+                None => {
+                    // Everything refused. Minimising ourselves cannot be refused, and a
+                    // panel that ducks out of the way is a far smaller problem than a
+                    // keyboard that silently stops crossing.
+                    unsafe { ShowWindow(fg, SW_MINIMIZE) };
+                    yielded_from = std::ptr::null_mut(); // do not restore a window we minimised
+                    let _ = diag.send(DiagEvent::FocusHandedOff {
+                        ok: true,
+                        to: "nothing would take focus, so our own window was minimised".into(),
+                    });
+                }
             }
         }
         // Did the foreground actually leave? One retry, then report either way — a second
