@@ -35,4 +35,10 @@ windows-sys = { version = "0.59", features = [
     "Win32_UI_HiDpi",
     "Win32_System_LibraryLoader",
     "Win32_System_Threading",
+    # Integrity levels: a low-level hook installed by a medium-integrity process is
+    # simply not called while an elevated window has the foreground, which is why
+    # crossing silently stops working over an installer or a game launcher. Detecting
+    # it needs the process token and the SID in its mandatory label.
+    "Win32_Security",
+    "Win32_System_SystemServices",
 ] }

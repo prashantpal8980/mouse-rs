@@ -1139,6 +1139,9 @@ fn capture_loop(
     // Handing foreground to the window the user was last on is also what they'd expect:
     // control has moved to the other machine, so the panel has no reason to hold focus.
     let mut last_foreign_fg: HWND = std::ptr::null_mut();
+    let mut last_checked_fg: *mut core::ffi::c_void = std::ptr::null_mut();
+    // Our own integrity level, read once: it cannot change while we run.
+    let our_integrity = integrity_of(std::process::id()).unwrap_or(0x2000);
     let mut yielded_from: HWND = std::ptr::null_mut();
     // When to check that a requested hand-off actually happened.
     //
@@ -1196,6 +1199,27 @@ fn capture_loop(
         };
         if !fg.is_null() && !fg_is_ours {
             last_foreign_fg = fg;
+        }
+
+        // Warn once per window when the thing in front runs at a higher integrity level
+        // than we do. While it has the foreground Windows will not call our low-level
+        // hooks at all, so the pointer cannot cross and nothing else in this program
+        // ever finds out why. Checked only when the foreground actually changes —
+        // opening a process token per mouse event would be absurd.
+        if fg != last_checked_fg {
+            last_checked_fg = fg;
+            if let Some((what, level)) = foreground_blocks_our_hooks(our_integrity) {
+                tracing::warn!(
+                    window = %what,
+                    their_level = format!("{:#x} ({})", level, integrity_name(level)),
+                    our_level = format!("{:#x} ({})", our_integrity, integrity_name(our_integrity)),
+                    "CROSSING WILL NOT WORK while this window is in front. It runs at a higher \
+                     Windows integrity level than mouse-rs, and Windows does not deliver \
+                     low-level mouse or keyboard hooks to a lower-integrity process. Nothing is \
+                     broken and there is no workaround inside the program — run mouse-rs as \
+                     administrator to match it."
+                );
+            }
         }
 
         let crossing_started = want && !prev_suppress;
@@ -1721,6 +1745,117 @@ impl Drop for WinCapture {
             join_bounded(j, Duration::from_millis(500));
         }
     }
+}
+
+// ----------------------------------------------------------------------------
+// Integrity levels — why crossing stops working over an elevated window
+// ----------------------------------------------------------------------------
+
+/// Windows integrity level of a process, as a raw RID.
+///
+/// The values that matter: `0x2000` medium (an ordinary program), `0x3000` high (a
+/// program started with "Run as administrator"), `0x4000` system.
+///
+/// ## Why this is here
+///
+/// User Interface Privilege Isolation (UIPI) stops a lower-integrity process from
+/// interfering with a higher-integrity one, and low-level hooks are part of what it
+/// blocks: while an **elevated** window has the foreground, Windows does not call the
+/// `WH_MOUSE_LL` / `WH_KEYBOARD_LL` hooks belonging to a process running at medium
+/// integrity. There is no error and no callback — the input simply never reaches us.
+///
+/// The visible symptom is that the pointer will not cross to the other machine while a
+/// game launcher, an installer, or anything else started as administrator is in front,
+/// and works again the moment it is not. That reads as a bug in the crossing code, and
+/// it is not one: the crossing code is never told the pointer moved.
+///
+/// It cannot be fixed from inside a medium-integrity process. The only remedy is to run
+/// mouse-rs elevated too. So the least this can do is *say so*, rather than leave the
+/// user to conclude the software is broken.
+fn integrity_of(pid: u32) -> Option<u32> {
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::Security::{
+        GetTokenInformation, TokenIntegrityLevel, TOKEN_MANDATORY_LABEL, TOKEN_QUERY,
+    };
+    use windows_sys::Win32::System::Threading::{OpenProcess, OpenProcessToken};
+
+    // QUERY_LIMITED_INFORMATION rather than QUERY_INFORMATION: the limited right is
+    // granted across integrity levels, which is exactly the case being measured.
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+    unsafe {
+        let proc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if proc.is_null() {
+            return None;
+        }
+        let mut token: HANDLE = std::ptr::null_mut();
+        if OpenProcessToken(proc, TOKEN_QUERY, &mut token) == 0 {
+            CloseHandle(proc);
+            return None;
+        }
+        // Two calls: the first learns the size, the second fills the buffer.
+        let mut needed = 0u32;
+        GetTokenInformation(token, TokenIntegrityLevel, std::ptr::null_mut(), 0, &mut needed);
+        let mut buf = vec![0u8; needed.max(1) as usize];
+        let ok = GetTokenInformation(
+            token,
+            TokenIntegrityLevel,
+            buf.as_mut_ptr().cast(),
+            needed,
+            &mut needed,
+        ) != 0;
+        let level = if ok {
+            let label = &*(buf.as_ptr() as *const TOKEN_MANDATORY_LABEL);
+            // The integrity level is the last sub-authority of the label's SID.
+            let sid = label.Label.Sid;
+            if sid.is_null() {
+                None
+            } else {
+                let count = *windows_sys::Win32::Security::GetSidSubAuthorityCount(sid);
+                if count == 0 {
+                    None
+                } else {
+                    Some(*windows_sys::Win32::Security::GetSidSubAuthority(
+                        sid,
+                        u32::from(count - 1),
+                    ))
+                }
+            }
+        } else {
+            None
+        };
+        CloseHandle(token);
+        CloseHandle(proc);
+        level
+    }
+}
+
+/// A human name for an integrity RID, for a log line someone has to act on.
+fn integrity_name(level: u32) -> &'static str {
+    match level {
+        l if l >= 0x4000 => "system",
+        l if l >= 0x3000 => "elevated (administrator)",
+        l if l >= 0x2000 => "normal",
+        _ => "low",
+    }
+}
+
+/// Is the foreground window owned by a process we cannot receive input for?
+///
+/// Returns the offending window's description and level when so. Checked on foreground
+/// changes rather than continuously: opening a process token is far too expensive to do
+/// per mouse event, and the answer only changes when the focused window does.
+fn foreground_blocks_our_hooks(our_level: u32) -> Option<(String, u32)> {
+    let fg = unsafe { GetForegroundWindow() };
+    if fg.is_null() {
+        return None;
+    }
+    let mut pid = 0u32;
+    unsafe { GetWindowThreadProcessId(fg, &mut pid) };
+    if pid == 0 || pid == std::process::id() {
+        return None;
+    }
+    let level = integrity_of(pid)?;
+    (level > our_level).then(|| (describe_window(fg), level))
 }
 
 #[cfg(test)]
