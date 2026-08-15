@@ -190,6 +190,14 @@ pub struct Config {
     /// How often to ship it, in seconds.
     #[serde(default = "default_log_upload_secs")]
     pub log_upload_secs: u32,
+    /// Set once the user has been told that normal privileges limit crossing on
+    /// Windows, so the warning is shown **once** rather than every launch.
+    ///
+    /// Running without administrator rights is a legitimate choice — most people never
+    /// meet an elevated window — so this is a one-time notice with a way to act on it,
+    /// not a permanent banner nagging about a decision already made.
+    #[serde(default)]
+    pub elevation_notice_seen: bool,
     /// Show a desktop notification when a file is waiting for a decision.
     ///
     /// Never a dialog — see `crates/mouse/src/notify.rs` for why a focus-stealing
@@ -307,6 +315,7 @@ impl Default for Config {
             clipboard_max_files_per_copy: default_max_files(),
             clipboard_follow_symlinks: false,
             clipboard_notify: true,
+            elevation_notice_seen: false,
             log_upload_url: String::new(),
             log_upload_secs: default_log_upload_secs(),
             bulk_pause_while_crossed: true,

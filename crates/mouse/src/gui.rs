@@ -104,6 +104,8 @@ enum Message {
     ReconnectToggled(bool),
     AutostartToggled(bool),
     AutostartElevatedToggled(bool),
+    RelaunchElevated,
+    DismissElevationNotice,
     AutoconnectToggled(bool),
     StartMinimizedToggled(bool),
     LockHotkeyChanged(String),
@@ -746,6 +748,36 @@ impl App {
             // usual failure is that mouse-rs is not itself elevated, and Windows will
             // not let a normal-privilege process register a highest-privileges task —
             // so the message says that rather than a bare error code.
+            // Both answers are recorded, because both are decisions. Dismissing is not
+            // "not yet" — it is "I have chosen normal permissions", and asking again
+            // would be ignoring the answer.
+            Message::DismissElevationNotice => {
+                self.cfg.elevation_notice_seen = true;
+                let path = Config::default_path();
+                self.feedback = match self.cfg.save(&path) {
+                    Ok(()) => "keeping normal permissions — you can change this in Startup".into(),
+                    Err(e) => format!("could not save that choice: {e}"),
+                };
+            }
+            Message::RelaunchElevated => {
+                // Remember the answer first: whichever way this goes, they have now been
+                // asked, and a UAC prompt they declined must not reappear next launch.
+                self.cfg.elevation_notice_seen = true;
+                let _ = self.cfg.save(&Config::default_path());
+                match crate::autostart::relaunch_elevated() {
+                    Ok(true) => {
+                        // The new instance is starting; this one must go, or two copies
+                        // fight over the same hooks and port.
+                        tracing::info!("restarting with administrator rights at the user's request");
+                        self.stop_engine();
+                        return iced::exit();
+                    }
+                    Ok(false) => {
+                        self.feedback = "Windows declined — staying with normal permissions".into();
+                    }
+                    Err(e) => self.feedback = format!("{e}"),
+                }
+            }
             Message::AutostartElevatedToggled(v) => {
                 let res = if v {
                     crate::autostart::enable_elevated()
@@ -1020,6 +1052,9 @@ impl App {
             content = content.push(banner);
         }
         if let Some(banner) = self.pending_files_banner(p) {
+            content = content.push(banner);
+        }
+        if let Some(banner) = self.elevation_notice(p) {
             content = content.push(banner);
         }
         let content = content.push(self.tab_bar(p)).push(
@@ -1310,42 +1345,34 @@ impl App {
         ]
         .spacing(12.0);
 
-        // Windows only, and only worth showing where it can actually bite. Without
-        // administrator rights the OS refuses to deliver our input hooks while an
-        // elevated window is in front, so the pointer will not cross over a game
-        // launcher, an installer or a UAC prompt — and nothing about that is obvious
-        // from the outside. Saying it here is the difference between a known limitation
-        // and a mystery.
+        // Windows only. Which privilege level we are at is a *fact* worth stating
+        // permanently — it is one line and answers a real question — but the
+        // explanation of what it costs is a one-time notice, dismissed for good once
+        // read. Running with normal privileges is a legitimate choice most people never
+        // notice, so nagging about a decision already made would be worse than useless.
         if mouse_input::elevation() != mouse_input::Elevation::NotApplicable {
             let limited = mouse_input::elevation().is_limited();
             startup = startup.push(
-                container(
-                    column![
-                        text(if limited {
-                            "Running with normal permissions"
-                        } else {
-                            "Running as administrator"
-                        })
-                        .size(13.0)
-                        .color(if limited { p.warn } else { p.good }),
-                        text(if limited {
-                            "The pointer will not cross while a window running as administrator is                              in front — a game launcher, an installer, or a Windows permission                              prompt. Windows blocks us from seeing the mouse over those, and no                              setting inside this program can change that. Restart as administrator                              to fix it."
-                        } else {
-                            "The pointer can cross over administrator windows too, including game                              launchers and installers."
-                        })
-                        .size(11.0)
-                        .color(p.txt3),
-                    ]
-                    .spacing(4.0),
-                )
-                .style(move |_| ui_theme::well(p))
-                .padding([10.0, 12.0])
-                .width(Length::Fill),
+                row![
+                    text(if limited {
+                        "Permissions: normal"
+                    } else {
+                        "Permissions: administrator"
+                    })
+                    .size(12.0)
+                    .color(if limited { p.txt2 } else { p.good }),
+                    Space::new().width(Length::Fill),
+                    button(text(if limited { "Restart as administrator" } else { "Restart as normal user" }).size(11.5))
+                        .style(ui_theme::ghost(p))
+                        .padding([7.0, 12.0])
+                        .on_press(Message::RelaunchElevated),
+                ]
+                .align_y(Alignment::Center),
             );
             startup = startup.push(toggle_row(
                 p,
                 "Start at login as administrator",
-                "keeps that working after a reboot — a normal login entry always starts without it. Setting this up needs mouse-rs to be running as administrator now.",
+                "keeps administrator rights after a reboot — a normal login entry always starts without them. Setting this up needs mouse-rs to be running as administrator now.",
                 self.autostart_elevated_on,
                 Message::AutostartElevatedToggled,
             ));
@@ -1449,6 +1476,52 @@ impl App {
     /// 2026‑07‑31. A pop-up that grabbed focus the moment a large file was copied would
     /// bring it straight back, and it would do so mid-work, quite possibly mid-crossing.
     /// So this never calls `SetForegroundWindow` and never steals focus.
+    /// Told once, then never again.
+    ///
+    /// Running without administrator rights is a perfectly reasonable way to use this —
+    /// most people never focus an elevated window from one week to the next. So this
+    /// says the limitation plainly, offers the two ways to act on it, and then goes away
+    /// for good. A permanent banner about a choice already made is nagging, and gets
+    /// ignored exactly when it matters.
+    fn elevation_notice(&self, p: Palette) -> Option<Element<'_, Message>> {
+        if self.cfg.elevation_notice_seen || !mouse_input::elevation().is_limited() {
+            return None;
+        }
+        Some(
+            container(
+                column![
+                    text("mouse-rs is running with normal permissions").size(13.5).color(p.txt),
+                    text(
+                        "That is fine for everyday use. The one limitation: Windows will not let \
+                         us see the mouse while a window running as administrator is in front — a \
+                         game launcher, an installer, or a Windows permission prompt — so the \
+                         pointer cannot cross to the other machine until you click away from it. \
+                         No setting inside this program can change that; only running as \
+                         administrator can."
+                    )
+                    .size(11.0)
+                    .color(p.txt3),
+                    row![
+                        button(text("Restart as administrator").size(12.5))
+                            .style(ui_theme::primary(p))
+                            .padding([9.0, 14.0])
+                            .on_press(Message::RelaunchElevated),
+                        button(text("Keep normal permissions").size(12.5))
+                            .style(ui_theme::ghost(p))
+                            .padding([9.0, 12.0])
+                            .on_press(Message::DismissElevationNotice),
+                    ]
+                    .spacing(8.0),
+                ]
+                .spacing(8.0),
+            )
+            .style(move |_| ui_theme::well(p))
+            .padding([11.0, 14.0])
+            .width(Length::Fill)
+            .into(),
+        )
+    }
+
     fn pending_files_banner(&self, p: Palette) -> Option<Element<'_, Message>> {
         let waiting: Vec<_> = self
             .engine

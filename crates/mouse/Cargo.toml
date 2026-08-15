@@ -46,4 +46,7 @@ gtk = { version = "0.18", optional = true }
 [target.'cfg(windows)'.dependencies]
 # Just `FreeConsole`, to drop the console window when launching the GUI (the binary
 # stays a console app so `server`/`client` keep foreground logs + Ctrl-C).
-windows-sys = { version = "0.59", features = ["Win32_System_Console", "Win32_System_Registry", "Win32_Foundation"], optional = true }
+windows-sys = { version = "0.59", features = ["Win32_System_Console", "Win32_System_Registry",
+    # ShellExecuteW with the "runas" verb: the only way to ask Windows for elevation,
+    # which it grants through its own consent prompt rather than to us directly.
+    "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging", "Win32_Foundation"], optional = true }

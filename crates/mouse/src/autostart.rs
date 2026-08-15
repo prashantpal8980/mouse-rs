@@ -94,6 +94,11 @@ pub fn disable_elevated() -> Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
+pub fn relaunch_elevated() -> Result<bool> {
+    anyhow::bail!("running as administrator is a Windows-only concept")
+}
+
 // --------------------------------------------------------------------- Windows
 
 #[cfg(windows)]
@@ -178,6 +183,45 @@ mod win {
         Ok(())
     }
 
+    /// Relaunch this program with administrator rights and ask the current instance to
+    /// quit.
+    ///
+    /// `runas` is the shell verb behind "Run as administrator", so Windows shows its own
+    /// consent prompt — which is the point. Elevation must be the user's decision, made
+    /// through the OS, not something a program can grant itself.
+    ///
+    /// Returns `Ok(false)` when the prompt was declined: a refusal is an answer, not a
+    /// failure, and must not be reported as an error.
+    pub fn relaunch_elevated() -> Result<bool> {
+        use windows_sys::Win32::UI::Shell::ShellExecuteW;
+        use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+        let exe = super::exe_path()?;
+        let verb = wide("runas");
+        let file = wide(&exe.to_string_lossy());
+        // SAFETY: both strings are NUL-terminated wide buffers that outlive the call.
+        let rc = unsafe {
+            ShellExecuteW(
+                std::ptr::null_mut(),
+                verb.as_ptr(),
+                file.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                SW_SHOWNORMAL,
+            )
+        };
+        // ShellExecuteW returns a fake HINSTANCE; anything over 32 means it started.
+        // SE_ERR_ACCESSDENIED (5) is what a declined UAC prompt produces.
+        let code = rc as isize;
+        if code > 32 {
+            Ok(true)
+        } else if code == 5 {
+            Ok(false)
+        } else {
+            anyhow::bail!("could not restart as administrator (code {code})")
+        }
+    }
+
     /// Name of the scheduled task used for the elevated variant.
     const TASK: &str = "mouse-rs (elevated)";
 
@@ -257,7 +301,10 @@ mod win {
 }
 
 #[cfg(windows)]
-pub use win::{disable, disable_elevated, elevated_is_enabled, enable, enable_elevated, is_enabled};
+pub use win::{
+    disable, disable_elevated, elevated_is_enabled, enable, enable_elevated, is_enabled,
+    relaunch_elevated,
+};
 
 #[cfg(test)]
 #[cfg(unix)]
