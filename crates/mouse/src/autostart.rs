@@ -77,6 +77,23 @@ pub fn disable() -> Result<()> {
     }
 }
 
+/// Elevated autostart is a Windows-only concept: X11 imposes no equivalent restriction
+/// on reading input, so there is nothing to escalate for.
+#[cfg(unix)]
+pub fn elevated_is_enabled() -> bool {
+    false
+}
+
+#[cfg(unix)]
+pub fn enable_elevated() -> Result<()> {
+    anyhow::bail!("elevated autostart is a Windows-only setting")
+}
+
+#[cfg(unix)]
+pub fn disable_elevated() -> Result<()> {
+    Ok(())
+}
+
 // --------------------------------------------------------------------- Windows
 
 #[cfg(windows)]
@@ -161,6 +178,69 @@ mod win {
         Ok(())
     }
 
+    /// Name of the scheduled task used for the elevated variant.
+    const TASK: &str = "mouse-rs (elevated)";
+
+    /// Is there a login task that starts us with administrator rights?
+    ///
+    /// A plain `Run` registry entry always starts at normal privilege, and Windows
+    /// gives no way to raise that without a UAC prompt at every login. A scheduled task
+    /// marked "run with highest privileges" is the one mechanism that starts elevated at
+    /// login *silently*, which is why autostart has two shapes rather than one.
+    pub fn elevated_is_enabled() -> bool {
+        std::process::Command::new("schtasks.exe")
+            .args(["/Query", "/TN", TASK])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    /// Create that task. **Requires the current process to be elevated** — Windows will
+    /// not let a normal-privilege process register a task that runs with highest
+    /// privileges, and refusing clearly is better than appearing to succeed.
+    pub fn enable_elevated() -> Result<()> {
+        let exe = super::exe_path()?;
+        let out = std::process::Command::new("schtasks.exe")
+            .args([
+                "/Create",
+                "/TN",
+                TASK,
+                "/TR",
+                &format!("\"{}\"", exe.display()),
+                "/SC",
+                "ONLOGON",
+                "/RL",
+                "HIGHEST",
+                "/F",
+            ])
+            .output()?;
+        if !out.status.success() {
+            let err = String::from_utf8_lossy(&out.stderr);
+            anyhow::bail!(
+                "could not create the elevated login task — mouse-rs must itself be \
+                 running as administrator to set this up. {}",
+                err.trim()
+            );
+        }
+        Ok(())
+    }
+
+    pub fn disable_elevated() -> Result<()> {
+        let out = std::process::Command::new("schtasks.exe")
+            .args(["/Delete", "/TN", TASK, "/F"])
+            .output()?;
+        // A task that is already absent is the requested end state.
+        if !out.status.success() && elevated_is_enabled() {
+            anyhow::bail!(
+                "could not remove the elevated login task: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        Ok(())
+    }
+
     pub fn disable() -> Result<()> {
         let key = open_run(KEY_WRITE)?;
         // SAFETY: valid key and NUL-terminated value name.
@@ -177,7 +257,7 @@ mod win {
 }
 
 #[cfg(windows)]
-pub use win::{disable, enable, is_enabled};
+pub use win::{disable, disable_elevated, elevated_is_enabled, enable, enable_elevated, is_enabled};
 
 #[cfg(test)]
 #[cfg(unix)]

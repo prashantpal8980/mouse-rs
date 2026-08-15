@@ -1829,6 +1829,16 @@ fn integrity_of(pid: u32) -> Option<u32> {
     }
 }
 
+/// This process's privilege level, for the panel to show and act on.
+pub(crate) fn process_elevation() -> crate::Elevation {
+    match integrity_of(std::process::id()) {
+        Some(l) if l >= 0x3000 => crate::Elevation::Elevated,
+        // Unreadable is treated as normal: claiming elevation we cannot prove would be
+        // worse than the warning being shown once too often.
+        _ => crate::Elevation::Normal,
+    }
+}
+
 /// A human name for an integrity RID, for a log line someone has to act on.
 fn integrity_name(level: u32) -> &'static str {
     match level {

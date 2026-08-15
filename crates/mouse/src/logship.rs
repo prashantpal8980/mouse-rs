@@ -41,6 +41,15 @@ const MAX_TAIL_BYTES: u64 = 4 * 1024 * 1024;
 /// to delay shutdown.
 const NET_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Consecutive failed uploads before saying so out loud.
+///
+/// Not the first: a collector that is briefly down, or a machine that boots before it,
+/// is ordinary and must not cry wolf. Three in a row at the default interval is a minute
+/// and a half of the logs going nowhere, which is worth knowing about.
+const FAILURES_BEFORE_WARNING: u32 = 3;
+/// How often to repeat the warning after that, in cycles.
+const WARN_EVERY: u32 = 20;
+
 pub struct LogShipper {
     stop: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
@@ -93,6 +102,10 @@ impl LogShipper {
                 // A first upload straight away, so a machine that starts and immediately
                 // misbehaves is still represented.
                 let _ = put(&t);
+                // Consecutive failures. Silence here once cost a full day of logs from
+                // both machines — the collector had died and nothing said so, on either
+                // side, so the evidence simply stopped existing without anyone noticing.
+                let mut failures: u32 = 0;
                 loop {
                     // Slept in short slices so stopping is prompt even with a long
                     // interval — shutdown must not wait out a full cycle.
@@ -104,10 +117,36 @@ impl LogShipper {
                         std::thread::sleep(Duration::from_millis(250));
                         waited += Duration::from_millis(250);
                     }
-                    if let Err(e) = put(&t) {
-                        // Debug: the collector being down is normal and must not fill
-                        // the very log it is trying to ship.
-                        tracing::debug!("log upload failed: {e}");
+                    match put(&t) {
+                        Ok(()) => {
+                            if failures >= FAILURES_BEFORE_WARNING {
+                                tracing::warn!(
+                                    after_failures = failures,
+                                    "log upload is working again"
+                                );
+                            }
+                            failures = 0;
+                        }
+                        Err(e) => {
+                            failures = failures.saturating_add(1);
+                            // Warn on the threshold and then at intervals — loud enough
+                            // to be noticed, quiet enough not to fill the log it ships.
+                            if failures == FAILURES_BEFORE_WARNING
+                                || (failures > FAILURES_BEFORE_WARNING
+                                    && failures % WARN_EVERY == 0)
+                            {
+                                tracing::warn!(
+                                    consecutive_failures = failures,
+                                    url = %format!("http://{}:{}{}", t.host, t.port, t.path),
+                                    "LOG UPLOAD IS FAILING — this machine's logs are not \
+                                     reaching the collector, so a fault here will leave no \
+                                     evidence anywhere else. Is the collector running? \
+                                     Last error: {e}"
+                                );
+                            } else {
+                                tracing::debug!("log upload failed: {e}");
+                            }
+                        }
                     }
                 }
             })

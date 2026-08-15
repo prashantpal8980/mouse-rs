@@ -103,6 +103,7 @@ enum Message {
     BulkRateChanged(String),
     ReconnectToggled(bool),
     AutostartToggled(bool),
+    AutostartElevatedToggled(bool),
     AutoconnectToggled(bool),
     StartMinimizedToggled(bool),
     LockHotkeyChanged(String),
@@ -218,6 +219,7 @@ struct App {
     /// Live state of the OS login entry — read from the OS at boot, not from `cfg`,
     /// because the user may have removed it outside the app.
     autostart_on: bool,
+    autostart_elevated_on: bool,
     /// One-shot latch for the `autoconnect` / `start_minimized` launch actions, so they
     /// fire once on the first tick and never again (e.g. after a manual Stop).
     launch_done: bool,
@@ -330,6 +332,7 @@ impl App {
             tray: crate::tray::spawn("mouse-rs — stopped"),
             notified_waiting: 0,
             autostart_on: crate::autostart::is_enabled(),
+            autostart_elevated_on: crate::autostart::elevated_is_enabled(),
             launch_done: false,
             log_path: crate::logging::log_path().display().to_string(),
             live_cfg: None,
@@ -738,6 +741,33 @@ impl App {
                 self.bulk_port_s = s;
             }
             Message::ReconnectToggled(v) => self.cfg.reconnect = v,
+            // Same shape as the plain one: touches the OS, applies immediately, and
+            // re-reads the real state on failure rather than trusting the toggle. The
+            // usual failure is that mouse-rs is not itself elevated, and Windows will
+            // not let a normal-privilege process register a highest-privileges task —
+            // so the message says that rather than a bare error code.
+            Message::AutostartElevatedToggled(v) => {
+                let res = if v {
+                    crate::autostart::enable_elevated()
+                } else {
+                    crate::autostart::disable_elevated()
+                };
+                match res {
+                    Ok(()) => {
+                        self.autostart_elevated_on = v;
+                        tracing::info!(enabled = v, "elevated login task changed from the panel");
+                        self.feedback = if v {
+                            "it will start as administrator at login".into()
+                        } else {
+                            "elevated login entry removed".into()
+                        };
+                    }
+                    Err(e) => {
+                        self.autostart_elevated_on = crate::autostart::elevated_is_enabled();
+                        self.feedback = format!("{e}");
+                    }
+                }
+            }
             Message::AutostartToggled(v) => {
                 // This one touches the OS, not just `cfg`, so it takes effect immediately
                 // (no Save needed) and reports the real outcome. On failure we re-read the
@@ -1273,12 +1303,53 @@ impl App {
         // The three are deliberately independent: the OS launches the panel (Start at
         // login), the panel brings the link up by itself (Auto-connect), and it stays out
         // of the way while doing so (Start minimized).
-        let startup = column![
+        let mut startup = column![
             toggle_row(p, "Start at login", self.autostart_hint(), self.autostart_on, Message::AutostartToggled),
             toggle_row(p, "Auto-connect on launch", "begin sharing as soon as the panel opens", self.cfg.autoconnect, Message::AutoconnectToggled),
             toggle_row(p, "Start minimized", "open out of the way, into the tray/taskbar", self.cfg.start_minimized, Message::StartMinimizedToggled),
         ]
         .spacing(12.0);
+
+        // Windows only, and only worth showing where it can actually bite. Without
+        // administrator rights the OS refuses to deliver our input hooks while an
+        // elevated window is in front, so the pointer will not cross over a game
+        // launcher, an installer or a UAC prompt — and nothing about that is obvious
+        // from the outside. Saying it here is the difference between a known limitation
+        // and a mystery.
+        if mouse_input::elevation() != mouse_input::Elevation::NotApplicable {
+            let limited = mouse_input::elevation().is_limited();
+            startup = startup.push(
+                container(
+                    column![
+                        text(if limited {
+                            "Running with normal permissions"
+                        } else {
+                            "Running as administrator"
+                        })
+                        .size(13.0)
+                        .color(if limited { p.warn } else { p.good }),
+                        text(if limited {
+                            "The pointer will not cross while a window running as administrator is                              in front — a game launcher, an installer, or a Windows permission                              prompt. Windows blocks us from seeing the mouse over those, and no                              setting inside this program can change that. Restart as administrator                              to fix it."
+                        } else {
+                            "The pointer can cross over administrator windows too, including game                              launchers and installers."
+                        })
+                        .size(11.0)
+                        .color(p.txt3),
+                    ]
+                    .spacing(4.0),
+                )
+                .style(move |_| ui_theme::well(p))
+                .padding([10.0, 12.0])
+                .width(Length::Fill),
+            );
+            startup = startup.push(toggle_row(
+                p,
+                "Start at login as administrator",
+                "keeps that working after a reboot — a normal login entry always starts without it. Setting this up needs mouse-rs to be running as administrator now.",
+                self.autostart_elevated_on,
+                Message::AutostartElevatedToggled,
+            ));
+        }
 
         // The panel has no console behind it, so name the log file here — otherwise a user
         // hitting a problem has nothing to look at and nothing to send.

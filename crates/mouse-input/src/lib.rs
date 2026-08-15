@@ -210,3 +210,41 @@ pub fn screen_size() -> Result<(i32, i32), InputError> {
         Err(InputError::Unsupported)
     }
 }
+
+/// Whether this process can receive input while an elevated window is in front.
+///
+/// Windows only. User Interface Privilege Isolation stops the OS calling a
+/// lower-integrity process's low-level hooks while a higher-integrity window has the
+/// foreground — so a normal-privilege mouse-rs simply cannot see the pointer over a game
+/// launcher, an installer or a UAC prompt, and the crossing never fires. Running elevated
+/// is the only remedy, so the panel needs to be able to say which state it is in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Elevation {
+    /// Elevated: input is delivered over other elevated windows too.
+    Elevated,
+    /// Normal privileges: crossing will not work while an elevated window is focused.
+    Normal,
+    /// No such restriction on this platform.
+    NotApplicable,
+}
+
+impl Elevation {
+    /// True when this platform has the restriction and we are *not* clear of it.
+    pub fn is_limited(self) -> bool {
+        self == Elevation::Normal
+    }
+}
+
+/// What privilege level this process is running at.
+pub fn elevation() -> Elevation {
+    #[cfg(windows)]
+    {
+        windows::process_elevation()
+    }
+    #[cfg(not(windows))]
+    {
+        // X11 has no equivalent: a client can read input regardless of what owns the
+        // focused window, so there is nothing here to warn about.
+        Elevation::NotApplicable
+    }
+}
