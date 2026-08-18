@@ -11,7 +11,10 @@ Alongside that:
 * **pasting a received file moves it to where you pasted** rather than copying it out of
   the cache — Explorer is told `Preferred DropEffect = MOVE`, so within one volume it is
   a rename and a large paste moves no bytes;
-* a running transfer now reports speed and time remaining.
+* a running transfer now reports speed and time remaining;
+* several panel fixes on the receiving side — the progress text had been squeezed out
+  of existence by a layout bug, and clicking an entry that was still fetching claimed
+  to have copied it while leaving the clipboard untouched.
 
 None of it needs setup here; they are defaults an existing config picks up. **One
 exception, in Step 3** — and it is the opposite of last time, so read it rather than
