@@ -335,18 +335,24 @@ impl ClipboardHistory {
 
     /// Every hash referenced by a **pinned** entry. Passed to the cache so pinning
     /// protects file contents from the disk budget, not just the row from the list.
-    /// Hashes eviction must not touch: pinned entries, and anything belonging to a set
-    /// that is still arriving.
+    /// Hashes eviction must not touch: everything any entry in the history still
+    /// depends on.
     ///
-    /// The second half is not an optimisation. Without it a set larger than the budget
-    /// can never finish — completed files are evicted to stay under the cap while the
-    /// rest are still in flight, so the set is never whole, so it asks for them again,
-    /// forever. Bytes already paid for are the last thing that should be thrown away.
-    pub fn pinned_hashes(&self) -> std::collections::HashSet<String> {
+    /// This started as "pinned only", then grew to include transfers in flight, and both
+    /// were too narrow in the same way. A completed 6.8 GB folder against a 2 GB budget
+    /// was evicted down to 2 GB the moment its status turned `Ready` — so the entry said
+    /// "ready" while most of its files were gone, clicking it restarted the transfer at
+    /// 29% (which is exactly 2/6.8), it completed, and it was gutted again. Forever.
+    ///
+    /// An entry that cannot deliver what it claims is worse than no entry. So the cache
+    /// keeps what the history references, and eviction reclaims only what nothing points
+    /// at any more — orphans from entries that were removed or aged out. The budget is
+    /// then enforced by the history's own size limit and by Clear, both of which remove
+    /// the *entry* first, which is the only order that cannot destroy live work.
+    pub fn referenced_hashes(&self) -> std::collections::HashSet<String> {
         let Ok(g) = self.inner.lock() else { return Default::default() };
         g.entries
             .iter()
-            .filter(|e| e.pinned || matches!(e.status, ClipStatus::Fetching { .. }))
             .filter_map(|e| match &e.payload {
                 ClipPayload::Files(set) => Some(set.files.iter().map(|f| f.hash.clone())),
                 _ => None,

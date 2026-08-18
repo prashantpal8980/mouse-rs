@@ -122,10 +122,15 @@ impl BlobCache {
     /// running total wrong, and a wrong number here is worse than none — it is the figure
     /// someone decides whether to clear space by.
     pub fn usage(&self) -> (u64, usize) {
+        // Counted per *inode*, not per name. `names/` and `trees/` are hard links to the
+        // same content as `blobs/`, so adding up file sizes reported a 6.8 GB folder as
+        // 9.2 GB in 48 files — inflating the one number someone would use to decide
+        // whether to free space, in the alarming direction.
+        let mut seen: HashSet<(u64, u64)> = HashSet::new();
         let mut bytes = 0u64;
         let mut count = 0usize;
         for dir in ["blobs", "names", "trees"] {
-            walk_size(&self.root.join(dir), &mut bytes, &mut count);
+            walk_size(&self.root.join(dir), &mut bytes, &mut count, &mut seen);
         }
         (bytes, count)
     }
@@ -414,6 +419,27 @@ impl BlobCache {
         if total <= budget {
             return;
         }
+        // What is actually reclaimable: everything the history no longer references.
+        // The rest belongs to entries the user can still see and click, and taking it
+        // would make those entries lie about being ready.
+        let reclaimable: u64 = blobs
+            .iter()
+            .filter(|(p, _, _)| {
+                !keep.contains(p.file_name().and_then(|n| n.to_str()).unwrap_or_default())
+            })
+            .map(|(_, len, _)| *len)
+            .sum();
+        if total.saturating_sub(reclaimable) > budget {
+            tracing::info!(
+                total,
+                budget,
+                reclaimable,
+                "over the disk budget and cannot get under it without deleting files the \
+                 history still needs. Keeping them: an entry that cannot deliver what it \
+                 says is worse than being over budget. Remove entries, or press Clear, to \
+                 free the rest."
+            );
+        }
         // Oldest first.
         blobs.sort_by_key(|(_, _, used)| *used);
         for (path, len, _) in blobs {
@@ -656,17 +682,33 @@ fn unique_path(path: PathBuf) -> PathBuf {
     path
 }
 
-/// Add up a directory tree's file sizes, ignoring anything unreadable.
+/// Add up a directory tree's file sizes, counting each inode once and ignoring
+/// anything unreadable.
+///
+/// `seen` is what makes the total *disk usage* rather than the sum of names: the same
+/// content deliberately appears under several paths here, and counting it repeatedly
+/// would overstate what freeing it would recover.
 ///
 /// Errors are skipped rather than propagated: this feeds a display, and a permission
 /// problem on one file should shrink the number slightly, not withhold it entirely.
-fn walk_size(dir: &Path, bytes: &mut u64, count: &mut usize) {
+// On Windows `seen` really is unused: there is no cheap inode to key on, so links are
+// counted per name there. Kept in the signature rather than split into two functions,
+// because the traversal is identical and the divergence is one `if`.
+#[cfg_attr(windows, allow(clippy::only_used_in_recursion))]
+fn walk_size(dir: &Path, bytes: &mut u64, count: &mut usize, seen: &mut HashSet<(u64, u64)>) {
     let Ok(entries) = fs::read_dir(dir) else { return };
     for e in entries.flatten() {
         let Ok(meta) = e.metadata() else { continue };
         if meta.is_dir() {
-            walk_size(&e.path(), bytes, count);
+            walk_size(&e.path(), bytes, count, seen);
         } else if meta.is_file() {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                if !seen.insert((meta.dev(), meta.ino())) {
+                    continue; // another name for content already counted
+                }
+            }
             *bytes += meta.len();
             *count += 1;
         }

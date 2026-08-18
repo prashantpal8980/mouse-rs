@@ -817,7 +817,7 @@ impl Transfers {
 
     /// Keep the cache inside the user's disk budget, never dropping pinned content.
     pub fn enforce_disk_budget(&self, budget: u64, history: &ClipboardHistory) {
-        self.cache.evict_to(budget, &history.pinned_hashes());
+        self.cache.evict_to(budget, &history.referenced_hashes());
     }
 }
 
@@ -1704,12 +1704,22 @@ mod budget_tests {
             .record_files(Arc::new(set), true, ClipStatus::Fetching { done: 1, total: 10 })
             .unwrap();
         assert!(
-            hist.pinned_hashes().contains(&hash),
+            hist.referenced_hashes().contains(&hash),
             "a file being fetched right now must be protected from eviction"
         );
 
-        // Once it is finished and unpinned, it is fair game again.
+        // And it stays protected once complete. Losing protection at `Ready` is what
+        // made a 6.8 GB folder evict itself down to the 2 GB budget the instant it
+        // finished, so the entry claimed to be ready while its files were gone and
+        // clicking it restarted the transfer at 29%.
         hist.set_status(entry, ClipStatus::Ready);
-        assert!(!hist.pinned_hashes().contains(&hash));
+        assert!(
+            hist.referenced_hashes().contains(&hash),
+            "a completed entry must keep its files, or it is lying about being ready"
+        );
+
+        // Only removing the entry releases them.
+        hist.remove(entry);
+        assert!(!hist.referenced_hashes().contains(&hash));
     }
 }
