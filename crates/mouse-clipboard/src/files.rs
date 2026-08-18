@@ -33,6 +33,21 @@ use std::path::PathBuf;
 /// What we publish is a hard link to the cached blob, so the move takes the link while
 /// the cache keeps the data. `relink` is what lets a second paste work: after the first
 /// the link is gone, and X11 asks us live for every paste, so it can be recreated.
+/// Shared between the selection owner and the clipboard thread, so a paste can *start*
+/// a transfer rather than requiring one to have already happened.
+///
+/// Copying something on the other machine should cost nothing here — only its
+/// description crosses. The bytes are wanted at exactly one moment: when the user
+/// pastes. X11 asks the selection owner live for every paste, so that moment is
+/// observable, and this is how it is reported to the side that can act on it.
+#[derive(Debug, Default)]
+pub struct PasteSignal {
+    /// Set by the owner thread when a paste asked for files we do not hold yet.
+    pub wanted: std::sync::atomic::AtomicBool,
+    /// Set by the clipboard thread when it has given up, so the owner stops waiting.
+    pub failed: std::sync::atomic::AtomicBool,
+}
+
 #[derive(Clone, Default)]
 pub struct Publish {
     /// Move rather than copy, where the platform can express it.
@@ -41,6 +56,8 @@ pub struct Publish {
     pub relink: Vec<(PathBuf, PathBuf)>,
     /// Pixels to advertise alongside the files, for a copied image.
     pub png: Option<Vec<u8>>,
+    /// Raised when a paste needs content we have not fetched yet.
+    pub on_paste: Option<std::sync::Arc<PasteSignal>>,
 }
 
 /// A file list on the clipboard.
@@ -323,6 +340,45 @@ mod imp {
         None
     }
 
+    /// Ask for the content and wait for it to land, so a paste of something not yet
+    /// transferred behaves like a slow copy rather than an empty one.
+    ///
+    /// The wait is generous because the alternative is worse: answering with paths that
+    /// do not exist yet makes the file manager paste nothing, or half a file. Bounded
+    /// all the same — a peer that has gone away must not leave the paste hanging for
+    /// ever.
+    fn fetch_for_paste(sig: &super::PasteSignal, paths: &[PathBuf]) {
+        use std::sync::atomic::Ordering;
+        let missing = || paths.iter().any(|p| !p.exists());
+        if !missing() {
+            return;
+        }
+        sig.failed.store(false, Ordering::SeqCst);
+        sig.wanted.store(true, Ordering::SeqCst);
+        tracing::info!(count = paths.len(), "paste asked for content we do not hold yet; fetching");
+
+        let deadline = Instant::now() + PASTE_FETCH_TIMEOUT;
+        while Instant::now() < deadline {
+            if !missing() {
+                tracing::info!("content arrived; answering the paste");
+                return;
+            }
+            if sig.failed.load(Ordering::SeqCst) {
+                tracing::warn!("the fetch failed; answering the paste with what exists");
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        tracing::warn!("gave up waiting for the paste's content");
+    }
+
+    /// Longest a paste will wait for content to arrive.
+    ///
+    /// Ten minutes sounds absurd until the file is 7 GB on a slow link — and a paste
+    /// that gives up early is worse than one that takes a while, because it silently
+    /// produces nothing.
+    const PASTE_FETCH_TIMEOUT: Duration = Duration::from_secs(600);
+
     /// Parse either `text/uri-list` or the `copy\nfile:///…` GNOME variant.
     pub(super) fn parse_uri_list(bytes: &[u8]) -> Option<FileList> {
         let text = String::from_utf8_lossy(bytes);
@@ -415,10 +471,12 @@ mod imp {
         let gnome = format!("{verb}\n{}", uris.join("\n"));
         let png = how.png;
         let relink = how.relink;
+        let on_paste = how.on_paste;
+        let wanted_paths = list.paths.clone();
 
         std::thread::Builder::new()
             .name("clip-files-owner".into())
-            .spawn(move || serve_selection(uri_list, gnome, png, relink))
+            .spawn(move || serve_selection(uri_list, gnome, png, relink, on_paste, wanted_paths))
             .is_ok()
     }
 
@@ -430,6 +488,8 @@ mod imp {
         gnome: String,
         png: Option<Vec<u8>>,
         relink: Vec<(PathBuf, PathBuf)>,
+        on_paste: Option<std::sync::Arc<super::PasteSignal>>,
+        wanted_paths: Vec<PathBuf>,
     ) {
         let Some(x) = open() else { return };
         let Some(targets_atom) = intern(&x.conn, "TARGETS") else { return };
@@ -470,6 +530,13 @@ mod imp {
             let Ok(event) = x.conn.wait_for_event() else { return };
             match event {
                 Event::SelectionRequest(req) => {
+                    // The paste is the moment the bytes are actually wanted. Until now
+                    // only the description crossed, so ask for the content and hold the
+                    // answer until it is here — a paste from another machine taking as
+                    // long as the transfer is exactly what it should do.
+                    if let Some(sig) = &on_paste {
+                        fetch_for_paste(sig, &wanted_paths);
+                    }
                     // A previous paste may have *moved* the file we published. Rebuild
                     // the link before answering, so pasting the same item into a second
                     // place works exactly like the first.

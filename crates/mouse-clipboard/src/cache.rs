@@ -235,6 +235,12 @@ impl BlobCache {
         Ok(out)
     }
 
+    /// Where a materialised selection lives, so its final paths can be known before any
+    /// of its content exists.
+    pub fn tree_root(&self, key: &str) -> PathBuf {
+        self.root.join("trees").join(key)
+    }
+
     /// Discard a partial transfer.
     pub fn abandon(&self, hash: &str) {
         if is_safe_hash(hash) {

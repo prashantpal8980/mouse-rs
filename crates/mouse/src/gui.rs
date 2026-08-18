@@ -286,6 +286,15 @@ fn mb_of(bytes: usize) -> String {
     (bytes as f64 / (1024.0 * 1024.0)).round().to_string()
 }
 
+/// Seconds as something a person reads at a glance while waiting.
+fn human_duration(secs: u64) -> String {
+    match secs {
+        0..=59 => format!("{secs}s"),
+        60..=3599 => format!("{}m {}s", secs / 60, secs % 60),
+        _ => format!("{}h {}m", secs / 3600, (secs % 3600) / 60),
+    }
+}
+
 /// Round a size up to a whole megabyte, for "always allow this size".
 ///
 /// Rounding *up* matters: allowing exactly this file's byte count would leave the next
@@ -1608,7 +1617,7 @@ impl App {
     /// is hidden, it just isn't all shouting at once.
     fn tab_clipboard(&self, p: Palette) -> Element<'_, Message> {
         let entries = self.engine.as_ref().map(|e| e.clipboard_meta());
-        let mut list = column![].spacing(8.0);
+        let mut list = column![].spacing(10.0);
         match &entries {
             None => {
                 list = list.push(
@@ -1652,7 +1661,25 @@ impl App {
                         ),
                         mouse_clipboard::ClipStatus::Fetching { done, total } => {
                             let pct = if *total > 0 { done * 100 / total } else { 0 };
-                            (format!("{pct}% of {}", human_bytes(*total as usize)), p.accent)
+                            // Speed and time left, because "22% of 6.8 GB" answers
+                            // neither of the two questions actually being asked while
+                            // watching a transfer: how fast, and how much longer.
+                            let rate = self.engine.as_ref().and_then(|e| e.measured_throughput());
+                            let tail = match rate {
+                                Some(bps) if bps > 0 => {
+                                    let left = total.saturating_sub(*done);
+                                    format!(
+                                        " · {}/s · {} left",
+                                        human_bytes(bps as usize),
+                                        human_duration(left / bps.max(1))
+                                    )
+                                }
+                                _ => String::new(),
+                            };
+                            (
+                                format!("{pct}% of {}{tail}", human_bytes(*total as usize)),
+                                p.accent,
+                            )
                         }
                         mouse_clipboard::ClipStatus::Unavailable(why) => (why.clone(), p.danger),
                     };
@@ -1685,20 +1712,25 @@ impl App {
                     };
                     let reuse = button(body)
                         .style(ui_theme::ghost(p))
-                        .padding([10.0, 12.0])
+                        .padding([12.0, 14.0])
                         .width(Length::Fill)
                         .on_press(Message::ClipReuse(m.id));
 
-                    let pin = button(text(if m.pinned { "📌" } else { "📍" }).size(12.0))
+                    // Worded, not glyphed. A pin icon told the user nothing about what it
+                    // did, and hovering it said nothing either — iced has no tooltip on
+                    // these, so the label has to be the explanation.
+                    let pin = button(
+                        text(if m.pinned { "Unpin" } else { "Keep" }).size(11.5),
+                    )
+                    .style(ui_theme::ghost(p))
+                    .padding([10.0, 12.0])
+                    .on_press(Message::ClipTogglePin(m.id));
+                    let del = button(text("Remove").size(11.5))
                         .style(ui_theme::ghost(p))
-                        .padding([10.0, 10.0])
-                        .on_press(Message::ClipTogglePin(m.id));
-                    let del = button(text("✕").size(12.0))
-                        .style(ui_theme::ghost(p))
-                        .padding([10.0, 10.0])
+                        .padding([10.0, 12.0])
                         .on_press(Message::ClipRemove(m.id));
 
-                    let mut controls = row![reuse].spacing(4.0).align_y(Alignment::Center);
+                    let mut controls = row![reuse].spacing(6.0).align_y(Alignment::Center);
                     // Stop only exists while there is something to stop. What has already
                     // arrived is kept, so pressing it is cheap to undo.
                     if fetching {

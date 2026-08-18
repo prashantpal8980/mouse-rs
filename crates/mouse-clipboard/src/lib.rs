@@ -882,6 +882,10 @@ fn run(
         ),
         None => (None, None, None, None, None),
     };
+    // Paste signals, per history entry. A paste raises one; this loop answers it by
+    // starting the transfer the entry has been describing but not fetching.
+    let mut paste_signals: std::collections::HashMap<u64, Arc<files::PasteSignal>> =
+        std::collections::HashMap::new();
     let mut tick: u32 = 0;
 
     loop {
@@ -952,6 +956,30 @@ fn run(
                     if let Some(id) = h.record_files(set.clone(), true, status.clone()) {
                         if status == ClipStatus::Remote {
                             t.request_missing(&set, id, &to_peer, settings.cache_budget);
+                        } else if status == ClipStatus::NeedsConsent {
+                            // Nothing is fetched yet — only the description crossed. The
+                            // files are still published to the clipboard so Ctrl+V works
+                            // straight away; pasting is what asks for the bytes, and the
+                            // paste waits for them. Copying something on the other
+                            // machine therefore costs nothing here until it is wanted.
+                            let sig = Arc::new(files::PasteSignal::default());
+                            paste_signals.insert(id, sig.clone());
+                            if let Some(list) = t.placeholder_paths(&set) {
+                                let how = files::Publish {
+                                    move_on_paste: settings.move_on_paste,
+                                    relink: Vec::new(),
+                                    png: None,
+                                    on_paste: Some(sig),
+                                };
+                                if files::publish(&list, how) {
+                                    last_files = Some(files::list_key(&list));
+                                    tracing::info!(
+                                        count = set.files.len(),
+                                        bytes = set.total_bytes(),
+                                        "described on the clipboard — paste it and the transfer starts then"
+                                    );
+                                }
+                            }
                         }
                     }
                 }
@@ -1078,6 +1106,7 @@ fn run(
                                     move_on_paste: settings.move_on_paste,
                                     relink: t.relink_pairs(&list, &set),
                                     png: None,
+                                    on_paste: None,
                                 };
                                 if files::publish(&list, how) {
                                     last_files = Some(files::list_key(&list));
@@ -1091,6 +1120,29 @@ fn run(
                     }
                 }
             }
+            // A paste is waiting on content: start fetching it now. This is the only
+            // thing that begins a large transfer, which is what keeps copying cheap.
+            paste_signals.retain(|id, sig| {
+                use std::sync::atomic::Ordering as O;
+                if !sig.wanted.swap(false, O::SeqCst) {
+                    return true;
+                }
+                match h.payload(*id) {
+                    Some(ClipPayload::Files(set)) => {
+                        tracing::info!(id, bytes = set.total_bytes(), "paste asked for it — fetching now");
+                        h.set_status(*id, ClipStatus::Fetching { done: 0, total: set.total_bytes() });
+                        if !t.request_missing(&set, *id, &to_peer, settings.cache_budget) && !t.is_complete(&set) {
+                            sig.failed.store(true, O::SeqCst);
+                        }
+                        true
+                    }
+                    // The entry is gone; nothing can answer this paste.
+                    _ => {
+                        sig.failed.store(true, O::SeqCst);
+                        false
+                    }
+                }
+            });
             t.enforce_disk_budget(settings.cache_budget, h);
         }
         tick = tick.wrapping_add(1);

@@ -83,17 +83,20 @@ fn default_clip_memory() -> usize {
 fn default_clip_image_px() -> usize {
     4096
 }
-/// No prompt by default.
+/// Fetch small things immediately; leave anything larger until it is pasted.
 ///
-/// This was 1 MB, which meant essentially every real file — a photo, a document, an
-/// episode — stopped and waited for someone to open the panel and press a button.
-/// Copying something *is* the decision to copy it; asking again is a second decision
-/// the user never wanted to make, and it turned Ctrl+C / Ctrl+V into a chore.
+/// This has now been wrong in both directions. At 1 MB, every real file stopped and
+/// waited for a button press in the panel — a step nobody wanted. At unlimited, copying
+/// a 7 GB folder immediately pulled 7 GB across whether or not it was ever pasted,
+/// which is worse: it spends the network and the disk on a decision the user has not
+/// made yet.
 ///
-/// The prompt still exists for anyone on a metered or slow link: set a limit and
-/// anything above it asks. It is opt-in rather than in everyone's way.
+/// 16 MB is the line between the two. Below it a fetch is over before anyone could
+/// notice, so doing it eagerly costs nothing and the paste is instant. Above it, only
+/// the description crosses and the transfer starts when a paste actually asks for the
+/// content — copying stays free, and pasting is what commits.
 fn default_auto_transfer() -> u64 {
-    u64::MAX
+    16 * 1024 * 1024
 }
 fn default_cache_budget() -> u64 {
     2 * 1024 * 1024 * 1024

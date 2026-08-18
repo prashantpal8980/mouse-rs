@@ -767,6 +767,36 @@ impl Transfers {
             .collect()
     }
 
+    /// The paths a set *will* occupy once fetched, without fetching anything.
+    ///
+    /// This is what makes copy cheap and paste the moment of truth: the clipboard can
+    /// carry real, final paths straight away, and the bytes only have to exist by the
+    /// time a paste asks for them. The directories are created so a file manager
+    /// inspecting the parent does not see a broken location.
+    pub fn placeholder_paths(&self, set: &FileSet) -> Option<FileList> {
+        let items = self.tree_items(set);
+        let root = self.cache.tree_root(&set_key(set));
+        let mut tops: Vec<PathBuf> = Vec::new();
+        for (_, rel) in &items {
+            let parts = cache::safe_components(rel);
+            if parts.is_empty() {
+                continue;
+            }
+            let mut dest = root.clone();
+            for part in &parts {
+                dest.push(part);
+            }
+            if let Some(parent) = dest.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let top = root.join(&parts[0]);
+            if !tops.contains(&top) {
+                tops.push(top);
+            }
+        }
+        (!tops.is_empty()).then_some(FileList { paths: tops })
+    }
+
     pub fn materialize(&self, set: &FileSet) -> Option<FileList> {
         let items: Vec<(String, String)> = set
             .files
