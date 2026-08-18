@@ -14,7 +14,11 @@ Alongside that:
 * a running transfer now reports speed and time remaining;
 * several panel fixes on the receiving side — the progress text had been squeezed out
   of existence by a layout bug, and clicking an entry that was still fetching claimed
-  to have copied it while leaving the clipboard untouched.
+  to have copied it while leaving the clipboard untouched;
+* the receiving cache no longer deletes a transfer the moment it completes. A folder
+  larger than the disk budget was trimmed to fit as soon as its status turned ready, so
+  the entry claimed to be ready with most of its files gone and clicking it restarted
+  the transfer part-way — repeatedly. Nothing to configure; it is a fix on the receiver.
 
 None of it needs setup here; they are defaults an existing config picks up. **One
 exception, in Step 3** — and it is the opposite of last time, so read it rather than
