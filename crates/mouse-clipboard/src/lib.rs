@@ -1886,7 +1886,7 @@ mod tests {
         h.toggle_pin(pinned);
         let png = encode_png(&img(8, 8, 2), 4096).unwrap();
         h.record_image(Arc::new(png.clone()), 8, 8, true);
-        h.save(&path, Some(&cache)).expect("save");
+        h.save(&path, Some(&cache), true).expect("save");
 
         // A fresh process.
         let back = ClipboardHistory::new();
@@ -1918,7 +1918,7 @@ mod tests {
         let png = encode_png(&img(8, 8, 5), 4096).unwrap();
         h.record_image(Arc::new(png.clone()), 8, 8, true);
         h.record_text(txt("text is fine"), false);
-        h.save(&path, Some(&cache)).unwrap();
+        h.save(&path, Some(&cache), true).unwrap();
 
         // The cache is cleared between runs; a row pointing at nothing is worse than
         // no row, because clicking it would silently do nothing.
@@ -2136,12 +2136,31 @@ impl ClipboardHistory {
     /// rewriting it to disk on every copy would both cost I/O and widen the window in
     /// which a password sits in a file.
     #[allow(clippy::needless_borrows_for_generic_args)]
-    pub fn save(&self, path: &std::path::Path, cache: Option<&cache::BlobCache>) -> std::io::Result<()> {
+    ///
+    /// `include_content` governs text and images only. **File entries are always
+    /// written**, whatever the setting says, and that distinction is the whole point:
+    /// the privacy reason for not persisting history is that copied text or a
+    /// screenshot may hold a password, and writing those to disk creates a risk that
+    /// did not exist. A file entry is a name, a size and a hash pointing at bytes
+    /// already sitting in the cache — persisting it leaks nothing new, and *not*
+    /// persisting it throws away a transfer. A restart used to lose a 7 GB download
+    /// that was 60% done and leave the partial files on disk with nothing referencing
+    /// them: the worst of both, unrecoverable and still taking up the space.
+    pub fn save(
+        &self,
+        path: &std::path::Path,
+        cache: Option<&cache::BlobCache>,
+        include_content: bool,
+    ) -> std::io::Result<()> {
         let Ok(g) = self.inner.lock() else {
             return Ok(()); // a poisoned lock is not worth failing shutdown over
         };
         let mut out = Vec::new();
         for e in g.entries.iter() {
+            // Text and images are the privacy-sensitive half; files are not.
+            if !include_content && !matches!(e.payload, ClipPayload::Files(_)) {
+                continue;
+            }
             let stored = match &e.payload {
                 ClipPayload::Text(t) => StoredEntry {
                     pinned: e.pinned,
@@ -2255,4 +2274,52 @@ fn restrict_permissions(path: &std::path::Path) {
     }
     #[cfg(not(unix))]
     let _ = path;
+}
+
+#[cfg(test)]
+mod persist_tests {
+    use super::*;
+
+    /// A restart used to lose an in-progress file transfer entirely — the entry went,
+    /// and the partly-downloaded files stayed on disk with nothing referencing them.
+    /// Unrecoverable *and* still taking the space. File entries are therefore written
+    /// whatever the privacy setting says; only text and images are gated by it.
+    #[test]
+    fn file_entries_survive_a_restart_even_with_history_persistence_off() {
+        let dir = std::env::temp_dir().join("mouse-rs-persist-files");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("history.json");
+        let cache = cache::BlobCache::new(dir.join("cache")).unwrap();
+
+        let h = ClipboardHistory::new();
+        h.record_text(Arc::new("a password, probably".into()), false);
+        let set = FileSet {
+            files: vec![FileRef {
+                name: "ep01.mkv".into(),
+                size: 314_000_000,
+                hash: "d".repeat(64),
+                source_path: None,
+                rel: String::new(),
+            }],
+            dirs: Vec::new(),
+            origin: "laptop".into(),
+        };
+        h.record_files(Arc::new(set), true, ClipStatus::Fetching { done: 5, total: 10 });
+
+        // include_content = false: the privacy default.
+        h.save(&path, Some(&cache), false).unwrap();
+
+        let restored = ClipboardHistory::new();
+        restored.load(&path, Some(&cache));
+        let metas = restored.meta();
+        assert_eq!(metas.len(), 1, "only the file entry should have been written");
+        assert!(metas[0].is_files, "and it must be the file entry that survived");
+        assert!(
+            metas[0].preview.contains("ep01.mkv"),
+            "the entry has to name the file to be resumable: {}",
+            metas[0].preview
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

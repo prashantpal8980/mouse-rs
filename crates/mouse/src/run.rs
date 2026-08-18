@@ -232,7 +232,10 @@ impl EngineHandle {
         let health = LinkHealth::new();
         let health_for_engine = health.clone();
         let clip_history = ClipboardHistory::with_limits(clipboard_limits(&cfg));
-        if cfg.clipboard_persist_history {
+        // Always loaded. What was *written* is what the privacy setting governs, so an
+        // unwanted text entry is never on disk to be read back — but a file transfer
+        // interrupted by a restart is, and can be resumed instead of lost.
+        {
             let cache = mouse_clipboard::cache::BlobCache::new(if cfg.cache_dir.trim().is_empty() {
                 mouse_clipboard::cache::BlobCache::default_root()
             } else {
@@ -379,14 +382,16 @@ impl Drop for EngineHandle {
         // Written on the way out rather than on every copy: this is clipboard content,
         // and rewriting it per keystroke would both cost I/O and widen the window in
         // which a copied password sits in a file.
-        if self.persist {
+        {
             let cache = mouse_clipboard::cache::BlobCache::new(if self.cache_dir.trim().is_empty() {
                 mouse_clipboard::cache::BlobCache::default_root()
             } else {
                 std::path::PathBuf::from(&self.cache_dir)
             })
             .ok();
-            if let Err(e) = self.clip_history.save(&history_path(), cache.as_ref()) {
+            if let Err(e) =
+                self.clip_history.save(&history_path(), cache.as_ref(), self.persist)
+            {
                 tracing::warn!("could not save clipboard history: {e}");
             }
         }
