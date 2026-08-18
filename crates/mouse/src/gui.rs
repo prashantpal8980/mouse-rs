@@ -225,6 +225,9 @@ struct App {
     /// How many waiting files the user has already been notified about, so a
     /// notification fires once per file rather than on every tick.
     notified_waiting: usize,
+    /// Per-entry transfer rate in bytes/sec, and the sample it was derived from.
+    clip_rates: std::collections::HashMap<u64, u64>,
+    clip_progress: std::collections::HashMap<u64, (std::time::Instant, u64)>,
     /// Live state of the OS login entry — read from the OS at boot, not from `cfg`,
     /// because the user may have removed it outside the app.
     autostart_on: bool,
@@ -369,6 +372,8 @@ impl App {
             // Spawn the tray here — boot runs on the UI thread, which Windows requires.
             tray: crate::tray::spawn("mouse-rs — stopped"),
             notified_waiting: 0,
+            clip_rates: std::collections::HashMap::new(),
+            clip_progress: std::collections::HashMap::new(),
             autostart_on: crate::autostart::is_enabled(),
             autostart_elevated_on: crate::autostart::elevated_is_enabled(),
             launch_done: false,
@@ -542,6 +547,37 @@ impl App {
                         self.cfg.server_host = only.clone();
                     }
                     self.found_servers = list;
+                }
+                // Sample each fetching entry's progress so the row can show a real
+                // rate. Smoothed, because a raw per-tick delta jitters far too much to
+                // read while a transfer is running.
+                if let Some(e) = &self.engine {
+                    let now = std::time::Instant::now();
+                    for m in e.clipboard_meta() {
+                        let mouse_clipboard::ClipStatus::Fetching { done, .. } = m.status else {
+                            self.clip_progress.remove(&m.id);
+                            self.clip_rates.remove(&m.id);
+                            continue;
+                        };
+                        match self.clip_progress.get(&m.id) {
+                            Some((then, before)) => {
+                                let secs = now.duration_since(*then).as_secs_f64();
+                                if secs >= 1.0 {
+                                    let moved = done.saturating_sub(*before);
+                                    let sample = (moved as f64 / secs) as u64;
+                                    let smoothed = match self.clip_rates.get(&m.id) {
+                                        Some(prev) => (prev * 3 + sample) / 4,
+                                        None => sample,
+                                    };
+                                    self.clip_rates.insert(m.id, smoothed);
+                                    self.clip_progress.insert(m.id, (now, done));
+                                }
+                            }
+                            None => {
+                                self.clip_progress.insert(m.id, (now, done));
+                            }
+                        }
+                    }
                 }
                 // Keep the tray tooltip reflecting live status — including anything
                 // waiting on an answer, which is invisible while the panel is closed.
@@ -1673,14 +1709,18 @@ impl App {
                             format!("{} · fetching…", human_bytes(m.disk_bytes as usize)),
                             p.accent,
                         ),
+                        // No longer an instruction. The paths are already on the
+                        // clipboard and pasting is what starts the transfer, so telling
+                        // the user to click first was describing an older design and
+                        // making a working feature look like a chore.
                         mouse_clipboard::ClipStatus::NeedsConsent => (
-                            format!("{} · click to bring it over", human_bytes(m.disk_bytes as usize)),
-                            p.warn,
+                            format!("{} · paste it anywhere", human_bytes(m.disk_bytes as usize)),
+                            p.txt3,
                         ),
                         // "Not now" is not an error and not a dead end — say what it is
                         // and what to do about it.
                         mouse_clipboard::ClipStatus::Declined => (
-                            format!("{} · left for later", human_bytes(m.disk_bytes as usize)),
+                            format!("{} · paste it anywhere", human_bytes(m.disk_bytes as usize)),
                             p.txt3,
                         ),
                         mouse_clipboard::ClipStatus::Fetching { done, total } => {
@@ -1688,7 +1728,11 @@ impl App {
                             // Speed and time left, because "22% of 6.8 GB" answers
                             // neither of the two questions actually being asked while
                             // watching a transfer: how fast, and how much longer.
-                            let rate = self.engine.as_ref().and_then(|e| e.measured_throughput());
+                            // Measured from this entry's own progress between ticks.
+                            // The lane's own throughput figure is reset by every Begin
+                            // frame, and a folder sends 23 of them interleaved, so it
+                            // measures a fragment of one file rather than the transfer.
+                            let rate = self.clip_rates.get(&m.id).copied();
                             let tail = match rate {
                                 Some(bps) if bps > 0 => {
                                     let left = total.saturating_sub(*done);

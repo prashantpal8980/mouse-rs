@@ -522,6 +522,12 @@ mod imp {
         let _ = x.conn.flush();
         tracing::info!(
             targets = FILE_TARGETS.len(),
+            // The verb the file manager acts on. `cut` should make it relocate our hard
+            // link — a rename, costing nothing. If a paste of this shows a copy progress
+            // dialog instead, the file manager declined to honour it, and that is the
+            // difference between a large paste being instant and taking its full size
+            // again on disk.
+            verb = %gnome.lines().next().unwrap_or("?"),
             uris = %uri_list.replace(['\r', '\n'], " "),
             "PUBLISHED files to the X11 clipboard — Thunar's Paste should now be enabled"
         );

@@ -607,7 +607,11 @@ async fn bulk_pump(
             out = ch.outgoing.recv() => match out {
                 None => return,
                 Some(frame) => {
-                    if matches!(frame, BulkFrame::Begin { .. }) {
+                    // Only the *first* Begin of an idle period starts the clock. A folder
+                    // interleaves a Begin per file — 23 of them — and resetting on each
+                    // one measured a fragment of whichever file began last rather than
+                    // the transfer, which is why the panel could not show a usable rate.
+                    if matches!(frame, BulkFrame::Begin { .. }) && started.is_none() {
                         sent_bytes = 0;
                         started = Some(tokio::time::Instant::now());
                     }
@@ -633,7 +637,9 @@ async fn bulk_pump(
                             }
                         }
                     }
-                    let is_end = matches!(frame, BulkFrame::End { .. });
+                    // Likewise, the measurement closes when the lane actually goes quiet,
+                    // not on the first file to finish out of many.
+                    let is_end = matches!(frame, BulkFrame::End { .. }) && ch.queue.queued() == 0;
                     let sent = tokio::select! {
                         _ = cancel.cancelled() => return,
                         r = sink.send(frame) => r,
