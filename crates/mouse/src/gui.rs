@@ -79,6 +79,7 @@ enum Message {
     ClipTogglePin(u64),
     ClipRemove(u64),
     ClipClear,
+    ClipCacheClear,
     ClipAdvancedToggled(bool),
     ClipViewPicked(ClipView),
     ClipSyncTextToggled(bool),
@@ -631,6 +632,18 @@ impl App {
             Message::ClipRemove(id) => {
                 if let Some(e) = &self.engine {
                     e.clipboard_remove(id);
+                }
+            }
+            // Deliberately not "delete everything": pinned entries and anything still
+            // arriving are kept, because those bytes are not ours to throw away.
+            Message::ClipCacheClear => {
+                if let Some(e) = &self.engine {
+                    let freed = e.cache_clear();
+                    self.feedback = if freed == 0 {
+                        "nothing to clear — what is left is pinned or still arriving".into()
+                    } else {
+                        format!("freed {} (pinned and in-progress files kept)", human_bytes(freed as usize))
+                    };
                 }
             }
             Message::ClipClear => {
@@ -1738,10 +1751,33 @@ impl App {
         ]
         .spacing(6.0);
 
+        // What the transferred files are actually costing on disk. Absent before, so
+        // there was no way to answer "is this program eating my drive?" short of finding
+        // the cache folder by hand — and no way to do anything about it if it was.
+        let disk: Element<'_, Message> = match self.engine.as_ref().and_then(|e| e.cache_usage()) {
+            Some((bytes, count)) if count > 0 => row![
+                text(format!(
+                    "transferred files on disk: {} in {count} file{}",
+                    human_bytes(bytes as usize),
+                    if count == 1 { "" } else { "s" }
+                ))
+                .size(11.0)
+                .color(if bytes > self.cfg.clipboard_cache_budget { p.warn } else { p.txt3 }),
+                Space::new().width(Length::Fill),
+                button(text("Clear").size(11.0))
+                    .style(ui_theme::ghost(p))
+                    .padding([5.0, 10.0])
+                    .on_press(Message::ClipCacheClear),
+            ]
+            .align_y(Alignment::Center)
+            .into(),
+            _ => Space::new().height(0.0).into(),
+        };
+
         if self.clip_view == ClipView::History {
             // Just the thing the tab is named after: what you copied, and the one action
             // per row. Nothing to configure, nothing to read past.
-            return column![view_switch, header, list, usage]
+            return column![view_switch, header, list, usage, disk]
                 .spacing(12.0)
                 .into();
         }

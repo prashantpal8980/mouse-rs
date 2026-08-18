@@ -115,6 +115,50 @@ impl BlobCache {
         fs::rename(&part, self.blob_path(hash))
     }
 
+    /// Bytes this cache is using on disk, and how many blobs that is.
+    ///
+    /// Counted from the filesystem rather than tracked, because the truth is what is on
+    /// the disk: a crash mid-transfer, an eviction, or a file removed by hand all make a
+    /// running total wrong, and a wrong number here is worse than none — it is the figure
+    /// someone decides whether to clear space by.
+    pub fn usage(&self) -> (u64, usize) {
+        let mut bytes = 0u64;
+        let mut count = 0usize;
+        for dir in ["blobs", "names", "trees"] {
+            walk_size(&self.root.join(dir), &mut bytes, &mut count);
+        }
+        (bytes, count)
+    }
+
+    /// Delete everything except the hashes named, and report what was freed.
+    ///
+    /// `keep` exists so clearing cannot destroy a pinned entry or one still arriving —
+    /// the two cases where the bytes are not the program's to throw away.
+    pub fn clear_except(&self, keep: &HashSet<String>) -> u64 {
+        let before = self.usage().0;
+        // Trees are rebuilt on demand from blobs, so they are always safe to drop.
+        let _ = fs::remove_dir_all(self.root.join("trees"));
+        if let Ok(entries) = fs::read_dir(self.root.join("blobs")) {
+            for e in entries.flatten() {
+                let path = e.path();
+                let name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or_default()
+                    .trim_end_matches(".part")
+                    .to_string();
+                if keep.contains(&name) {
+                    continue;
+                }
+                if fs::remove_file(&path).is_ok() {
+                    let _ = fs::remove_dir_all(self.root.join("names").join(&name));
+                }
+            }
+        }
+        let after = self.usage().0;
+        before.saturating_sub(after)
+    }
+
     /// Discard a partial transfer.
     pub fn abandon(&self, hash: &str) {
         if is_safe_hash(hash) {
@@ -508,6 +552,23 @@ pub fn stream_copy(src: &mut impl Read, dst: &mut impl Write) -> io::Result<u64>
         total += n as u64;
     }
     Ok(total)
+}
+
+/// Add up a directory tree's file sizes, ignoring anything unreadable.
+///
+/// Errors are skipped rather than propagated: this feeds a display, and a permission
+/// problem on one file should shrink the number slightly, not withhold it entirely.
+fn walk_size(dir: &Path, bytes: &mut u64, count: &mut usize) {
+    let Ok(entries) = fs::read_dir(dir) else { return };
+    for e in entries.flatten() {
+        let Ok(meta) = e.metadata() else { continue };
+        if meta.is_dir() {
+            walk_size(&e.path(), bytes, count);
+        } else if meta.is_file() {
+            *bytes += meta.len();
+            *count += 1;
+        }
+    }
 }
 
 #[cfg(test)]

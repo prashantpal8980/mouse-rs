@@ -335,11 +335,18 @@ impl ClipboardHistory {
 
     /// Every hash referenced by a **pinned** entry. Passed to the cache so pinning
     /// protects file contents from the disk budget, not just the row from the list.
+    /// Hashes eviction must not touch: pinned entries, and anything belonging to a set
+    /// that is still arriving.
+    ///
+    /// The second half is not an optimisation. Without it a set larger than the budget
+    /// can never finish — completed files are evicted to stay under the cap while the
+    /// rest are still in flight, so the set is never whole, so it asks for them again,
+    /// forever. Bytes already paid for are the last thing that should be thrown away.
     pub fn pinned_hashes(&self) -> std::collections::HashSet<String> {
         let Ok(g) = self.inner.lock() else { return Default::default() };
         g.entries
             .iter()
-            .filter(|e| e.pinned)
+            .filter(|e| e.pinned || matches!(e.status, ClipStatus::Fetching { .. }))
             .filter_map(|e| match &e.payload {
                 ClipPayload::Files(set) => Some(set.files.iter().map(|f| f.hash.clone())),
                 _ => None,
@@ -931,7 +938,7 @@ fn run(
                     );
                     if let Some(id) = h.record_files(set.clone(), true, status.clone()) {
                         if status == ClipStatus::Remote {
-                            t.request_missing(&set, id, &to_peer, settings.cache_budget, h);
+                            t.request_missing(&set, id, &to_peer, settings.cache_budget);
                         }
                     }
                 }
@@ -1215,7 +1222,7 @@ fn reuse_entry<C: SystemClipboard>(
                     id,
                     ClipStatus::Fetching { done: 0, total: set.total_bytes() },
                 );
-                if !t.request_missing(&set, id, to_peer, settings.cache_budget, history) {
+                if !t.request_missing(&set, id, to_peer, settings.cache_budget) {
                     // Nothing new to ask for: a request is already in flight.
                     tracing::debug!(id, "a transfer for this entry is already running");
                 }

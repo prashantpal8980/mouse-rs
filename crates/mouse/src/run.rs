@@ -310,6 +310,31 @@ impl EngineHandle {
         self.clip_commands.reuse(id);
     }
 
+    /// Disk the transferred-file cache is using, and how many files that is.
+    pub fn cache_usage(&self) -> Option<(u64, usize)> {
+        mouse_clipboard::cache::BlobCache::new(self.cache_root()).ok().map(|c| c.usage())
+    }
+
+    /// Where the cache actually lives: the configured path, or the default when blank.
+    fn cache_root(&self) -> std::path::PathBuf {
+        if self.cache_dir.trim().is_empty() {
+            mouse_clipboard::cache::BlobCache::default_root()
+        } else {
+            std::path::PathBuf::from(&self.cache_dir)
+        }
+    }
+
+    /// Delete cached file contents, keeping anything pinned or still arriving. Returns
+    /// bytes freed.
+    pub fn cache_clear(&self) -> u64 {
+        let Ok(cache) = mouse_clipboard::cache::BlobCache::new(self.cache_root()) else {
+            return 0;
+        };
+        // Same protection eviction uses: pinned entries and in-flight transfers are not
+        // the program's to throw away, whoever pressed the button.
+        cache.clear_except(&self.clip_history.pinned_hashes())
+    }
+
     /// Stop an in-flight transfer. What has arrived stays on disk, so clicking the
     /// entry again resumes from there.
     pub fn clipboard_cancel(&self, id: u64) {

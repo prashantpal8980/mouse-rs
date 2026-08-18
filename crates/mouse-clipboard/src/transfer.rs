@@ -365,37 +365,27 @@ impl Transfers {
         entry: u64,
         to_peer: &UnboundedSender<Message>,
         cache_budget: u64,
-        history: &ClipboardHistory,
     ) -> bool {
-        // A set larger than the whole cache budget can never be held all at once: files
-        // arrive, the budget evicts the oldest to stay under it, and the set is never
-        // complete — so it re-requests them, forever. Refusing with an explanation beats
-        // downloading gigabytes in a loop and never finishing, which is what happened to
-        // a 6.9 GB folder against the 2 GB default.
+        // A set larger than the cache budget is allowed. It is the owner's disk and
+        // their decision; the job here is to say what it will cost, not to refuse it.
+        // What must not happen is the silent version of the failure: completed files
+        // being evicted to stay under the budget *while the rest of the set is still
+        // arriving*, so the set never completes and re-requests itself forever. That is
+        // prevented by protecting in-flight hashes from eviction, not by blocking.
         let total = set.total_bytes();
         if cache_budget > 0 && total > cache_budget {
             tracing::warn!(
                 bytes = total,
                 cache_budget,
                 files = set.files.len(),
-                "TOO BIG FOR THE CACHE — {} of files against a {} disk budget. Completed files \
-                 would be evicted to stay under the budget before the rest arrived, so this can \
-                 never finish. Raise 'Disk for transferred files' in Clipboard settings above {} \
-                 and click the entry again.",
+                "this transfer is larger than the disk budget — {} against {}. It will still \
+                 run, and older cached items are evicted to make room; nothing already \
+                 transferred for *this* set is touched while it is in flight.",
                 human(total),
                 human(cache_budget),
-                human(total),
             );
-            history.set_status(
-                entry,
-                ClipStatus::Unavailable(format!(
-                    "{} needs more than the {} disk budget — raise it in Clipboard settings",
-                    human(total),
-                    human(cache_budget)
-                )),
-            );
-            return false;
         }
+
         // Whole-entry baseline, computed once here rather than per chunk: everything we
         // already hold counts as done, because it does — the user is waiting for the set,
         // not for one file.
@@ -993,7 +983,7 @@ mod tests {
             .record_files(Arc::new(set.clone()), true, ClipStatus::Remote)
             .unwrap();
         let (to_peer, mut peer_rx) = tokio::sync::mpsc::unbounded_channel();
-        assert!(receiver.request_missing(&set, entry, &to_peer, u64::MAX, &r_hist));
+        assert!(receiver.request_missing(&set, entry, &to_peer, u64::MAX));
         let hash = match peer_rx.try_recv().unwrap() {
             Message::BlobRequest { hash, offset } => {
                 assert_eq!(offset, 0);
@@ -1212,7 +1202,7 @@ mod tests {
             f.write_all(b"01234").unwrap();
         }
         let (to_peer, mut peer_rx) = tokio::sync::mpsc::unbounded_channel();
-        receiver.request_missing(&set, entry, &to_peer, u64::MAX, &r_hist);
+        receiver.request_missing(&set, entry, &to_peer, u64::MAX);
         match peer_rx.try_recv().unwrap() {
             Message::BlobRequest { offset, .. } => {
                 assert_eq!(offset, 5, "the request must resume from what we already have")
@@ -1280,10 +1270,10 @@ mod tests {
         let entry = r_hist.record_files(Arc::new(set.clone()), true, ClipStatus::Remote).unwrap();
         let (to_peer, mut peer_rx) = tokio::sync::mpsc::unbounded_channel();
 
-        assert!(receiver.request_missing(&set, entry, &to_peer, u64::MAX, &r_hist));
+        assert!(receiver.request_missing(&set, entry, &to_peer, u64::MAX));
         assert!(peer_rx.try_recv().is_ok());
         assert!(
-            !receiver.request_missing(&set, entry, &to_peer, u64::MAX, &r_hist),
+            !receiver.request_missing(&set, entry, &to_peer, u64::MAX),
             "a second click must not start the same download again"
         );
         assert!(peer_rx.try_recv().is_err());
@@ -1402,7 +1392,7 @@ mod tests {
             .record_files(Arc::new(set.clone()), true, ClipStatus::Remote)
             .unwrap();
         let (to_peer, mut peer_rx) = tokio::sync::mpsc::unbounded_channel();
-        assert!(receiver.request_missing(&set, entry, &to_peer, u64::MAX, &r_hist));
+        assert!(receiver.request_missing(&set, entry, &to_peer, u64::MAX));
         let _ = peer_rx.try_recv();
 
         assert!(receiver.cancel_entry(entry, &to_peer));
@@ -1413,7 +1403,7 @@ mod tests {
         // The request is forgotten, so clicking again really asks again rather than being
         // swallowed as a duplicate. That is what makes the entry usable after Stop.
         assert!(
-            receiver.request_missing(&set, entry, &to_peer, u64::MAX, &r_hist),
+            receiver.request_missing(&set, entry, &to_peer, u64::MAX),
             "after cancelling, clicking the entry must start a fresh request"
         );
         let _ = fs::remove_dir_all(&root);
@@ -1521,7 +1511,7 @@ mod progress_tests {
             .unwrap();
 
         let (to_peer, _rx) = tokio::sync::mpsc::unbounded_channel();
-        assert!(t.request_missing(&set, entry, &to_peer, u64::MAX, &hist));
+        assert!(t.request_missing(&set, entry, &to_peer, u64::MAX));
 
         // Open all three at once, exactly as the sender does.
         for (i, size) in sizes.iter().enumerate() {
@@ -1579,11 +1569,11 @@ mod budget_tests {
     use super::*;
     use std::fs;
 
-    /// A folder bigger than the whole cache budget used to be accepted, downloaded, and
-    /// partially evicted forever without ever completing. Refusing with a fixable reason
-    /// is the only honest answer.
+    /// A set bigger than the cache budget is the owner's call, not ours to refuse — but
+    /// it must not silently fail either. The old failure was eviction deleting completed
+    /// files while the rest of the set was still arriving, so it never finished.
     #[test]
-    fn a_set_larger_than_the_cache_budget_is_refused_with_a_reason() {
+    fn a_set_larger_than_the_budget_still_transfers() {
         let root = std::env::temp_dir().join("mouse-rs-budget-test");
         let _ = fs::remove_dir_all(&root);
         let cache = Arc::new(BlobCache::new(root.join("cache")).unwrap());
@@ -1608,19 +1598,40 @@ mod budget_tests {
 
         let budget = 2 * 1024 * 1024 * 1024;
         assert!(
-            !t.request_missing(&set, entry, &to_peer, budget, &hist),
-            "a set that cannot fit must not be requested"
+            t.request_missing(&set, entry, &to_peer, budget),
+            "an oversized set is the owner's decision and must still be requested"
         );
-        assert!(rx.try_recv().is_err(), "nothing should have been asked for");
-        match hist.status(entry) {
-            Some(ClipStatus::Unavailable(why)) => {
-                assert!(why.contains("disk budget"), "the reason must be actionable: {why}");
-            }
-            other => panic!("expected an explained Unavailable, got {other:?}"),
-        }
+        assert!(rx.try_recv().is_ok(), "it should really have been asked for");
+    }
 
-        // Raising the budget above the set makes it work — the reason really is the cap.
-        assert!(t.request_missing(&set, entry, &to_peer, 8 * 1024 * 1024 * 1024, &hist));
-        let _ = fs::remove_dir_all(&root);
+    /// The bug that made an oversized set impossible: files that arrived were evicted to
+    /// stay under the budget while the rest were still in flight, so the set was never
+    /// complete and asked for itself again forever.
+    #[test]
+    fn eviction_never_takes_files_from_a_transfer_still_running() {
+        let hist = ClipboardHistory::new();
+        let hash = "c".repeat(64);
+        let set = FileSet {
+            files: vec![FileRef {
+                name: "ep.mkv".into(),
+                size: 10,
+                hash: hash.clone(),
+                source_path: None,
+                rel: String::new(),
+            }],
+            dirs: Vec::new(),
+            origin: "laptop".into(),
+        };
+        let entry = hist
+            .record_files(Arc::new(set), true, ClipStatus::Fetching { done: 1, total: 10 })
+            .unwrap();
+        assert!(
+            hist.pinned_hashes().contains(&hash),
+            "a file being fetched right now must be protected from eviction"
+        );
+
+        // Once it is finished and unpinned, it is fair game again.
+        hist.set_status(entry, ClipStatus::Ready);
+        assert!(!hist.pinned_hashes().contains(&hash));
     }
 }
