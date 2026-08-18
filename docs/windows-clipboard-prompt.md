@@ -1,17 +1,21 @@
 Install the current mouse-rs build, **run it as administrator**, keep log shipping on,
 and then stop and wait.
 
-This build is about removing steps between Ctrl+C and Ctrl+V, and about a paste
-costing what the file costs rather than twice that. Three defaults changed:
+This build changes *when* a file crosses. Copying no longer transfers anything: only the
+description crosses, and the bytes move when the file is **pasted**. Anything under
+16 MB is still fetched straight away, because that finishes before anyone notices.
 
-* files no longer wait for a button press before transferring;
-* a copied image now lands as a file as well as pixels, so it pastes into Explorer;
-* **pasting a received file moves it to where you pasted**, rather than copying it out
-  of the cache. Explorer is told `Preferred DropEffect = MOVE`, so a relocation within
-  one volume is a rename — a 40 GB paste moves no bytes and leaves no second copy.
+Alongside that:
 
-None of the three needs setup here; they are defaults an existing config picks up on
-its own. **One exception, in Step 3.**
+* a copied image lands as a file as well as pixels, so it pastes into Explorer;
+* **pasting a received file moves it to where you pasted** rather than copying it out of
+  the cache — Explorer is told `Preferred DropEffect = MOVE`, so within one volume it is
+  a rename and a large paste moves no bytes;
+* a running transfer now reports speed and time remaining.
+
+None of it needs setup here; they are defaults an existing config picks up. **One
+exception, in Step 3** — and it is the opposite of last time, so read it rather than
+repeating what you did before.
 
 Two things still matter for the install itself:
 
@@ -84,25 +88,25 @@ $c | Add-Member -NotePropertyName log_upload_secs -NotePropertyValue 30 -Force
 $c | ConvertTo-Json -Depth 10 | Set-Content $p -Encoding UTF8
 ```
 
-**`clipboard_auto_transfer_max` needs removing if it is present.** It is the
-"ask before bringing over anything larger than" limit. The default changed from 1 MB to
-"never ask", but a value already written to the file wins over the new default — so
-without this the old 1 MB limit survives the upgrade and files keep stopping to wait for
-a button press, which is the exact thing this build exists to remove. Deleting the key
-lets the new default apply:
+**`clipboard_auto_transfer_max` must be set to 16 MB.** It is the "fetch without being
+asked" limit, and a value already in the file wins over the default, so it has to be
+written rather than removed.
+
+Last round this key was *deleted*, which let it default to unlimited — and that turned
+out to be wrong in the other direction: copying a 7 GB folder immediately pulled 7 GB
+across before anything was pasted. 16 MB is the line. Below it a fetch is over before
+anyone could notice; above it only the description crosses and the transfer starts when
+a paste asks for the content.
 
 ```powershell
 $p = "$env:USERPROFILE\.mouse_share\config.json"
 $c = Get-Content $p -Raw | ConvertFrom-Json
-if ($null -ne $c.clipboard_auto_transfer_max) {
-    "was: $($c.clipboard_auto_transfer_max)"
-    $c.PSObject.Properties.Remove('clipboard_auto_transfer_max')
-    $c | ConvertTo-Json -Depth 10 | Set-Content $p -Encoding UTF8
-    "removed — the new 'never ask' default now applies"
-} else { "not set — nothing to do" }
+$c | Add-Member -NotePropertyName clipboard_auto_transfer_max -NotePropertyValue 16777216 -Force
+$c | ConvertTo-Json -Depth 10 | Set-Content $p -Encoding UTF8
+(Get-Content $p -Raw | ConvertFrom-Json).clipboard_auto_transfer_max
 ```
 
-Report which of the two it printed.
+The last line must print `16777216`. Report what it printed.
 
 ## Step 4 — launch it **elevated**
 
@@ -165,11 +169,13 @@ You do not need to act on any of these; they are here so you can report them acc
   mouse-rs is elevated, say so loudly: it would mean something beyond elevation is blocking
   the hooks, most likely an anti-cheat driver.
 - `DECISION: fetching now` — a file arrived under the ask-first limit and is being pulled.
-- `DECISION: WAITING FOR YOU` — a file is over the ask-first limit and **nothing transfers**
-  until the owner presses "Bring it over". With this build's defaults this should no longer
-  appear at all. **If it does, Step 3 did not take** — an old `clipboard_auto_transfer_max`
-  is still in the config. Say so; it is the difference between copy-paste working by itself
-  and needing a button press every time.
+- `DECISION: WAITING FOR YOU` — expected now for anything over 16 MB, and no longer a
+  problem: it means only the description crossed and the bytes wait for a paste. If it
+  reports a *small* size, Step 3 did not take.
+- `described on the clipboard — paste it and the transfer starts then` — the new normal
+  for a large copy. Nothing has transferred; Ctrl+V is what starts it.
+- `paste asked for it — fetching now` — a paste triggered the transfer, which is the
+  whole design of this build working.
 - `PUBLISHED files to the … clipboard` — files really are on the clipboard and Paste should be
   enabled. It now names the mode too: `mode=move` means Explorer will relocate the file to
   wherever it is pasted rather than copy it, which is what keeps a large paste from costing
