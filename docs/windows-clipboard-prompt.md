@@ -1,7 +1,13 @@
 Install the current mouse-rs build, **run it as administrator**, keep log shipping on,
 and then stop and wait.
 
-Two things matter this round:
+This build is about removing steps between Ctrl+C and Ctrl+V. Two defaults changed:
+files no longer wait for a button press before transferring, and a copied image now
+lands as a file as well as pixels so it pastes into Explorer. Neither needs any setup
+here — they are defaults, and an existing config picks them up on its own. **One
+exception, in Step 3.**
+
+Two things still matter for the install itself:
 
 1. **Elevation.** Windows does not deliver low-level mouse or keyboard hooks to a process
    running at a lower integrity level than the window in front. So while an elevated window
@@ -50,14 +56,15 @@ Must be exactly size `12024320` bytes, SHA256
 `E621C7FE67711B46A4ED4F437C03B9B198FC3334702C2247EF67E0381FE3918E`.
 If either differs, stop and say so — do not launch it.
 
-## Step 3 — confirm the config survived
+## Step 3 — confirm the config, and clear one stale value
 
-Log shipping was set last round and should still be there. Nothing needs editing.
+Log shipping was set last round and should still be there.
 
 ```powershell
 $c = Get-Content $env:USERPROFILE\.mouse_share\config.json -Raw | ConvertFrom-Json
 $c | Select-Object name, screen_width, screen_height, autoconnect, server_host, listen_port
 $c.log_upload_url
+$c.clipboard_auto_transfer_max
 ```
 
 Expected: `name = laptop`, `1920x1080`, and `http://192.168.137.2:8001`. **Do not print
@@ -70,6 +77,26 @@ $c | Add-Member -NotePropertyName log_upload_url  -NotePropertyValue "http://192
 $c | Add-Member -NotePropertyName log_upload_secs -NotePropertyValue 30 -Force
 $c | ConvertTo-Json -Depth 10 | Set-Content $p -Encoding UTF8
 ```
+
+**`clipboard_auto_transfer_max` needs removing if it is present.** It is the
+"ask before bringing over anything larger than" limit. The default changed from 1 MB to
+"never ask", but a value already written to the file wins over the new default — so
+without this the old 1 MB limit survives the upgrade and files keep stopping to wait for
+a button press, which is the exact thing this build exists to remove. Deleting the key
+lets the new default apply:
+
+```powershell
+$p = "$env:USERPROFILE\.mouse_share\config.json"
+$c = Get-Content $p -Raw | ConvertFrom-Json
+if ($null -ne $c.clipboard_auto_transfer_max) {
+    "was: $($c.clipboard_auto_transfer_max)"
+    $c.PSObject.Properties.Remove('clipboard_auto_transfer_max')
+    $c | ConvertTo-Json -Depth 10 | Set-Content $p -Encoding UTF8
+    "removed — the new 'never ask' default now applies"
+} else { "not set — nothing to do" }
+```
+
+Report which of the two it printed.
 
 ## Step 4 — launch it **elevated**
 
@@ -132,8 +159,11 @@ You do not need to act on any of these; they are here so you can report them acc
   mouse-rs is elevated, say so loudly: it would mean something beyond elevation is blocking
   the hooks, most likely an anti-cheat driver.
 - `DECISION: fetching now` — a file arrived under the ask-first limit and is being pulled.
-- `DECISION: WAITING FOR YOU` — a file is over the limit and **nothing transfers** until the
-  owner presses "Bring it over" in the panel's Clipboard tab.
+- `DECISION: WAITING FOR YOU` — a file is over the ask-first limit and **nothing transfers**
+  until the owner presses "Bring it over". With this build's defaults this should no longer
+  appear at all. **If it does, Step 3 did not take** — an old `clipboard_auto_transfer_max`
+  is still in the config. Say so; it is the difference between copy-paste working by itself
+  and needing a button press every time.
 - `PUBLISHED files to the … clipboard` — files really are on the clipboard and Paste should be
   enabled. If this line is present and Paste is still greyed, that is a genuine bug.
 - `our own window had focus … could NOT be handed off` — should no longer appear; the hand-off
