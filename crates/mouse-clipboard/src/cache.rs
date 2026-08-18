@@ -895,3 +895,51 @@ mod deliver_tests {
         let _ = fs::remove_dir_all(&root);
     }
 }
+
+#[cfg(all(test, unix))]
+mod move_paste_tests {
+    use super::*;
+    use std::os::unix::fs::MetadataExt;
+
+    /// What a "move" paste actually does, and why it is free: the file manager renames
+    /// the link we published. No bytes move, the destination is wherever the user
+    /// pasted, and the cache still holds the data afterwards.
+    #[test]
+    fn a_moved_paste_relocates_the_link_and_leaves_the_data_in_the_cache() {
+        let root = std::env::temp_dir().join("mouse-rs-movepaste");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let c = BlobCache::new(root.join("cache")).unwrap();
+
+        let src = root.join("big.iso");
+        fs::write(&src, vec![4u8; 131_072]).unwrap();
+        let (hash, _) = c.ingest(&src, u64::MAX).unwrap();
+        let published = c.materialize(&hash, "big.iso").unwrap();
+        let blob = c.blob_path(&hash);
+        assert_eq!(fs::metadata(&published).unwrap().ino(), fs::metadata(&blob).unwrap().ino());
+
+        // The file manager pasting with "cut" is exactly this rename.
+        let downloads = root.join("Downloads");
+        fs::create_dir_all(&downloads).unwrap();
+        let landed = downloads.join("big.iso");
+        fs::rename(&published, &landed).unwrap();
+
+        assert!(landed.is_file(), "the file is where it was pasted");
+        assert_eq!(fs::read(&landed).unwrap().len(), 131_072);
+        assert!(blob.is_file(), "and the cache still has the data for another paste");
+        assert_eq!(
+            fs::metadata(&landed).unwrap().ino(),
+            fs::metadata(&blob).unwrap().ino(),
+            "same inode: the paste moved a name, not 128 KB of data"
+        );
+
+        // A second paste needs the link back. This is what `Publish::relink` rebuilds,
+        // and it must not disturb the file already delivered by the first paste.
+        assert!(!published.exists(), "the first paste consumed the published link");
+        fs::create_dir_all(published.parent().unwrap()).unwrap();
+        fs::hard_link(&blob, &published).unwrap();
+        assert!(published.is_file(), "relinked, so pasting again works");
+        assert!(landed.is_file(), "and the first paste is untouched");
+        let _ = fs::remove_dir_all(&root);
+    }
+}

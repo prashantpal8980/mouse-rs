@@ -754,6 +754,19 @@ impl Transfers {
             .collect()
     }
 
+    /// `(published path, blob path)` for a set, so a paste that *moved* our link can
+    /// have it rebuilt before the next one.
+    pub fn relink_pairs(&self, list: &FileList, set: &FileSet) -> Vec<(PathBuf, PathBuf)> {
+        // Paired positionally: `materialize` walks the set in order, so the nth path
+        // published is the nth file. Matching by name would break on a folder holding
+        // two files with the same name in different subdirectories.
+        list.paths
+            .iter()
+            .zip(set.files.iter())
+            .map(|(p, f)| (p.clone(), self.cache.blob_path(&f.hash)))
+            .collect()
+    }
+
     pub fn materialize(&self, set: &FileSet) -> Option<FileList> {
         let items: Vec<(String, String)> = set
             .files

@@ -86,6 +86,7 @@ enum Message {
     ClipSyncImagesToggled(bool),
     ClipItemsChanged(String),
     ClipDeliverDirChanged(String),
+    ClipMoveOnPasteToggled(bool),
     ClipItemMbChanged(String),
     ClipMemMbChanged(String),
     ClipImagePxChanged(String),
@@ -180,6 +181,7 @@ fn pending_restart_changes(live: &Config, now: &Config) -> Vec<&'static str> {
     chk(live.clipboard_follow_symlinks != now.clipboard_follow_symlinks, "following shortcuts");
     chk(live.clipboard_images_also_as_file != now.clipboard_images_also_as_file, "images as a file");
     chk(live.clipboard_deliver_dir != now.clipboard_deliver_dir, "folder for received files");
+    chk(live.clipboard_move_on_paste != now.clipboard_move_on_paste, "move on paste");
     chk(live.clipboard_quick_send_secs != now.clipboard_quick_send_secs, "don't-ask-if-quick");
     chk(live.clipboard_persist_history != now.clipboard_persist_history, "keep history after restart");
     chk(live.bulk_enabled != now.bulk_enabled, "separate transfer lane");
@@ -663,6 +665,7 @@ impl App {
             // The numeric settings keep their own string buffer so a half-typed value is
             // never parsed; an unparseable buffer simply leaves `cfg` alone.
             Message::ClipDeliverDirChanged(s) => self.cfg.clipboard_deliver_dir = s,
+            Message::ClipMoveOnPasteToggled(v) => self.cfg.clipboard_move_on_paste = v,
             Message::ClipItemsChanged(s) => {
                 if let Ok(v) = s.trim().parse::<usize>() {
                     self.cfg.clipboard_history_size = v.max(1);
@@ -1797,13 +1800,20 @@ impl App {
                 self.cfg.clipboard_sync,
                 Message::ClipboardToggled
             ),
+            toggle_row(
+                p,
+                "Pasting a received file moves it there",
+                "on: the folder you paste into IS the destination, and a big file costs nothing to paste. Off: it is copied out of the cache, so a 40 GB file briefly uses 80 GB.",
+                self.cfg.clipboard_move_on_paste,
+                Message::ClipMoveOnPasteToggled
+            ),
             labeled(
                 p,
-                "Put received files straight into this folder",
+                "Or put received files straight into this folder",
                 input(p, "/home/you/Desktop — blank to keep them on the clipboard only", &self.cfg.clipboard_deliver_dir, Message::ClipDeliverDirChanged)
             ),
             text(if self.cfg.clipboard_deliver_dir.trim().is_empty() {
-                "Blank: files only reach the clipboard, so you paste them somewhere. Set a folder and they simply appear there when the transfer finishes.".to_string()
+                "Blank is normal — paste wherever you want it and that is where it goes. Set a folder only if you would rather files arrived automatically, with no paste at all.".to_string()
             } else {
                 format!(
                     "Files land in {} as they arrive — nothing to paste. They are linked, not copied, so a 40 GB file uses 40 GB and not 80.",

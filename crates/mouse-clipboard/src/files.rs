@@ -19,6 +19,30 @@
 
 use std::path::PathBuf;
 
+/// How a paste should behave, and what to rebuild if it consumed the file.
+///
+/// ## Why "move" is the interesting one
+///
+/// A paste is the file manager copying from whatever path we hand it, and it never
+/// tells us where it is pasting to. So we cannot write the bytes to the destination
+/// ourselves — but we do not have to. Publishing the selection as a **cut** makes the
+/// file manager *relocate* our file instead of duplicating it, and a relocation within
+/// one filesystem is a rename: no bytes move, and the file ends up exactly where the
+/// user pressed Ctrl+V. That is how a 40 GB paste costs nothing instead of 40 GB.
+///
+/// What we publish is a hard link to the cached blob, so the move takes the link while
+/// the cache keeps the data. `relink` is what lets a second paste work: after the first
+/// the link is gone, and X11 asks us live for every paste, so it can be recreated.
+#[derive(Clone, Default)]
+pub struct Publish {
+    /// Move rather than copy, where the platform can express it.
+    pub move_on_paste: bool,
+    /// `(published path, blob to relink it from)`, so a consumed path can be rebuilt.
+    pub relink: Vec<(PathBuf, PathBuf)>,
+    /// Pixels to advertise alongside the files, for a copied image.
+    pub png: Option<Vec<u8>>,
+}
+
 /// A file list on the clipboard.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FileList {
@@ -99,6 +123,53 @@ mod imp {
                 false
             }
         }
+    }
+
+    /// Publish a file list, optionally asking Explorer to *move* rather than copy.
+    ///
+    /// Explorer reads the `Preferred DropEffect` format to decide. `DROPEFFECT_MOVE`
+    /// makes it relocate the file we published — a rename within the same volume, so a
+    /// large paste costs nothing and lands where the user pressed Ctrl+V, instead of
+    /// duplicating gigabytes out of our cache.
+    pub fn publish(list: &FileList, how: super::Publish) -> bool {
+        use clipboard_win::{formats, raw, Clipboard, Setter};
+        const DROPEFFECT_MOVE: u32 = 2;
+
+        let strings: Vec<String> = list
+            .paths
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        let _clip = match Clipboard::new_attempts(10) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!("could not open the clipboard to publish files: {e}");
+                return false;
+            }
+        };
+        if let Err(e) = formats::FileList.write_clipboard(strings.as_slice()) {
+            tracing::warn!("could not put files on the clipboard: {e}");
+            return false;
+        }
+        if how.move_on_paste {
+            match raw::register_format("Preferred DropEffect") {
+                Some(fmt) => {
+                    let effect = DROPEFFECT_MOVE.to_le_bytes();
+                    if let Err(e) = raw::set_without_clear(fmt.get(), &effect) {
+                        // Not fatal: the paste still works, it just copies.
+                        tracing::warn!("could not ask Explorer to move rather than copy: {e}");
+                    }
+                }
+                None => tracing::warn!("could not register the drop-effect format"),
+            }
+        }
+        tracing::info!(
+            count = strings.len(),
+            mode = if how.move_on_paste { "move" } else { "copy" },
+            paths = %strings.join(" | "),
+            "PUBLISHED files to the Windows clipboard (CF_HDROP) — Explorer's Paste should now be enabled"
+        );
+        true
     }
 
     /// Put a file list on the clipboard as `CF_HDROP`, so Explorer pastes real files.
@@ -324,6 +395,11 @@ mod imp {
     /// a browser and as a file into Thunar. Doing it in two separate calls could not
     /// work: the second owner would take the selection from the first.
     pub fn write_files_with_image(list: &FileList, png: Option<Vec<u8>>) -> bool {
+        publish(list, super::Publish { png, ..Default::default() })
+    }
+
+    /// Publish a file list with a paste mode and relink data.
+    pub fn publish(list: &FileList, how: super::Publish) -> bool {
         let uris: Vec<String> = list
             .paths
             .iter()
@@ -333,18 +409,28 @@ mod imp {
             return false;
         }
         let uri_list = format!("{}\r\n", uris.join("\r\n"));
-        let gnome = format!("copy\n{}", uris.join("\n"));
+        // The verb the file manager obeys. "cut" makes it relocate our hard link rather
+        // than duplicate the data — the whole point on a large file.
+        let verb = if how.move_on_paste { "cut" } else { "copy" };
+        let gnome = format!("{verb}\n{}", uris.join("\n"));
+        let png = how.png;
+        let relink = how.relink;
 
         std::thread::Builder::new()
             .name("clip-files-owner".into())
-            .spawn(move || serve_selection(uri_list, gnome, png))
+            .spawn(move || serve_selection(uri_list, gnome, png, relink))
             .is_ok()
     }
 
     /// Own the selection until someone else takes it. Returns when we lose ownership,
     /// which is exactly when the user copies something else — including via our own
     /// text/image path.
-    fn serve_selection(uri_list: String, gnome: String, png: Option<Vec<u8>>) {
+    fn serve_selection(
+        uri_list: String,
+        gnome: String,
+        png: Option<Vec<u8>>,
+        relink: Vec<(PathBuf, PathBuf)>,
+    ) {
         let Some(x) = open() else { return };
         let Some(targets_atom) = intern(&x.conn, "TARGETS") else { return };
         let mut serve: Vec<(u32, Vec<u8>)> = Vec::new();
@@ -384,6 +470,20 @@ mod imp {
             let Ok(event) = x.conn.wait_for_event() else { return };
             match event {
                 Event::SelectionRequest(req) => {
+                    // A previous paste may have *moved* the file we published. Rebuild
+                    // the link before answering, so pasting the same item into a second
+                    // place works exactly like the first.
+                    for (link, blob) in &relink {
+                        if !link.exists() && blob.exists() {
+                            if let Some(parent) = link.parent() {
+                                let _ = std::fs::create_dir_all(parent);
+                            }
+                            match std::fs::hard_link(blob, link) {
+                                Ok(()) => tracing::debug!(path = %link.display(), "relinked for another paste"),
+                                Err(e) => tracing::warn!(path = %link.display(), "could not relink: {e}"),
+                            }
+                        }
+                    }
                     let ok = answer(&x, &req, targets_atom, utf8, &serve, &uri_list);
                     // Which target a file manager actually asked for, and whether we
                     // could answer it. A paste that silently does nothing is usually a
@@ -479,6 +579,9 @@ mod imp {
     pub fn write_files_with_image(_list: &FileList, _png: Option<Vec<u8>>) -> bool {
         false
     }
+    pub fn publish(_list: &FileList, _how: super::Publish) -> bool {
+        false
+    }
     pub fn add_files_keeping_rest(_list: &FileList) -> bool {
         false
     }
@@ -495,6 +598,14 @@ pub fn read_files() -> Option<FileList> {
 /// Put a file list on the system clipboard.
 pub fn write_files(list: &FileList) -> bool {
     imp::write_files(list)
+}
+
+/// Put a file list on the clipboard with an explicit paste mode.
+///
+/// `move_on_paste` is what makes a large file cost nothing to paste: the file manager
+/// relocates the hard link we published instead of duplicating the data behind it.
+pub fn publish(list: &FileList, how: Publish) -> bool {
+    imp::publish(list, how)
 }
 
 /// Put an image on the clipboard **and** the same content as a file, so one copy can be

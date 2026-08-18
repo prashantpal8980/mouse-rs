@@ -213,7 +213,23 @@ pub struct Config {
     /// prompt would resurrect the keyboard leak.
     #[serde(default = "default_true")]
     pub clipboard_notify: bool,
+    /// Pasting a received file **moves** it to where it was pasted, instead of copying.
+    ///
+    /// This is what makes the paste destination the real destination, at no cost. The
+    /// file manager never tells us where a paste is going, so we cannot write the bytes
+    /// there ourselves — but publishing the selection as a *cut* makes it relocate our
+    /// file instead of duplicating it, and a relocation within one filesystem is a
+    /// rename. A 40 GB paste therefore moves no bytes and leaves no second copy.
+    ///
+    /// What is published is a hard link to the cached content, so the move takes the
+    /// link and the cache keeps the data — the entry stays usable afterwards.
+    #[serde(default = "default_true")]
+    pub clipboard_move_on_paste: bool,
     /// Folder that received files are delivered into, e.g. `/home/you/Desktop`.
+    ///
+    /// Optional and off by default: with `clipboard_move_on_paste` doing the work, the
+    /// place you paste *is* the destination. This is for the different want — files
+    /// arriving somewhere automatically, with no paste at all.
     ///
     /// Empty = off, and files only reach the clipboard. Set it and a copied file simply
     /// *appears* there when the transfer finishes, with nothing to paste.
@@ -344,6 +360,7 @@ impl Default for Config {
             clipboard_follow_symlinks: false,
             clipboard_images_also_as_file: true,
             clipboard_deliver_dir: String::new(),
+            clipboard_move_on_paste: true,
             clipboard_notify: true,
             elevation_notice_seen: false,
             log_upload_url: String::new(),

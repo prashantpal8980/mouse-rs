@@ -600,6 +600,8 @@ pub struct ClipboardSettings {
     pub images_also_as_file: bool,
     /// Folder received files are delivered into. Empty = clipboard only.
     pub deliver_dir: Option<std::path::PathBuf>,
+    /// Paste *moves* a received file to where it was pasted, rather than copying it.
+    pub move_on_paste: bool,
     /// Skip the prompt when a transfer is measured to finish this fast. 0 disables it.
     pub quick_send_secs: f64,
     /// Keep history across restarts.
@@ -622,6 +624,7 @@ impl Default for ClipboardSettings {
             follow_symlinks: false,
             images_also_as_file: true,
             deliver_dir: None,
+            move_on_paste: true,
             quick_send_secs: 3.0,
             persist_history: false,
         }
@@ -1067,7 +1070,16 @@ fn run(
                                 .and_then(|dir| t.deliver(&set, dir));
                             let list = delivered.or_else(|| t.materialize(&set));
                             if let Some(list) = list {
-                                if files::write_files(&list) {
+                                // Published as a *move* when asked for: the file manager
+                                // then relocates our hard link to wherever the paste
+                                // happened, which is a rename rather than a copy — so a
+                                // big file lands where the user chose and costs nothing.
+                                let how = files::Publish {
+                                    move_on_paste: settings.move_on_paste,
+                                    relink: t.relink_pairs(&list, &set),
+                                    png: None,
+                                };
+                                if files::publish(&list, how) {
                                     last_files = Some(files::list_key(&list));
                                     tracing::info!(
                                         count = set.files.len(),

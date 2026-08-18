@@ -613,6 +613,7 @@ fn clipboard_settings(cfg: &Config) -> ClipboardSettings {
         max_files_per_copy: cfg.clipboard_max_files_per_copy.max(1),
         follow_symlinks: cfg.clipboard_follow_symlinks,
         images_also_as_file: cfg.clipboard_images_also_as_file,
+        move_on_paste: cfg.clipboard_move_on_paste,
         deliver_dir: {
             let d = cfg.clipboard_deliver_dir.trim();
             (!d.is_empty()).then(|| std::path::PathBuf::from(d))
