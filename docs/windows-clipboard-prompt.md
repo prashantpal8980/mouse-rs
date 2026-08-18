@@ -15,6 +15,11 @@ Alongside that:
 * several panel fixes on the receiving side — the progress text had been squeezed out
   of existence by a layout bug, and clicking an entry that was still fetching claimed
   to have copied it while leaving the clipboard untouched;
+* the panel no longer says "click to bring it over" — the paths go on the clipboard as
+  soon as the description arrives, so Ctrl+V is all that was ever needed and the label
+  was describing a design that had already been replaced;
+* transfer speed is measured per entry rather than from the lane, which reset its clock
+  on every file in a folder and so timed a fragment rather than the transfer;
 * the receiving cache no longer deletes a transfer the moment it completes. A folder
   larger than the disk budget was trimmed to fit as soon as its status turned ready, so
   the entry claimed to be ready with most of its files gone and clicking it restarted
