@@ -973,6 +973,11 @@ fn run(
                                 };
                                 if files::publish(&list, how) {
                                     last_files = Some(files::list_key(&list));
+                                    // Our own selection answers UTF8_STRING with these
+                                    // paths, so without this the next text poll reads
+                                    // them straight back and records a `file:///…cache/
+                                    // trees/…` entry as if the user had copied it.
+                                    last = Some(files::uri_text(&list));
                                     tracing::info!(
                                         count = set.files.len(),
                                         bytes = set.total_bytes(),
@@ -1049,6 +1054,12 @@ fn run(
                     }
                 };
                 if let Some(h) = &history {
+                    // Registered before the click so a paste that follows it has
+                    // something to raise — the transfer it starts may still be running.
+                    let sig = paste_signals
+                        .entry(id)
+                        .or_insert_with(|| Arc::new(files::PasteSignal::default()))
+                        .clone();
                     reuse_entry(
                         &mut clipboard,
                         &mut last,
@@ -1060,6 +1071,7 @@ fn run(
                         &settings,
                         transfers.as_mut(),
                         &mut last_files,
+                        Some(sig),
                     );
                 }
             }
@@ -1110,6 +1122,11 @@ fn run(
                                 };
                                 if files::publish(&list, how) {
                                     last_files = Some(files::list_key(&list));
+                                    // Our own selection answers UTF8_STRING with these
+                                    // paths, so without this the next text poll reads
+                                    // them straight back and records a `file:///…cache/
+                                    // trees/…` entry as if the user had copied it.
+                                    last = Some(files::uri_text(&list));
                                     tracing::info!(
                                         count = set.files.len(),
                                         "files received and put on the clipboard"
@@ -1228,6 +1245,7 @@ fn reuse_entry<C: SystemClipboard>(
     settings: &ClipboardSettings,
     transfers: Option<&mut transfer::Transfers>,
     last_files: &mut Option<u64>,
+    paste_signal: Option<Arc<files::PasteSignal>>,
 ) -> bool {
     let Some(payload) = history.payload(id) else {
         tracing::debug!(id, "re-use asked for a clipboard entry that no longer exists");
@@ -1314,6 +1332,22 @@ fn reuse_entry<C: SystemClipboard>(
                     id,
                     ClipStatus::Fetching { done: 0, total: set.total_bytes() },
                 );
+                // Put the paths on the clipboard *now*, even though the content is still
+                // coming. Without this the click reported "copied" and left the clipboard
+                // untouched, so pasting did nothing — the entry was fetching and there
+                // was no way to tell. The paste blocks until the bytes land.
+                if let Some(list) = t.placeholder_paths(&set) {
+                    let how = files::Publish {
+                        move_on_paste: settings.move_on_paste,
+                        relink: Vec::new(),
+                        png: None,
+                        on_paste: paste_signal,
+                    };
+                    if files::publish(&list, how) {
+                        *last_files = Some(files::list_key(&list));
+                        *last = Some(files::uri_text(&list));
+                    }
+                }
                 if !t.request_missing(&set, id, to_peer, settings.cache_budget) {
                     // Nothing new to ask for: a request is already in flight.
                     tracing::debug!(id, "a transfer for this entry is already running");
@@ -1923,7 +1957,7 @@ mod tests {
         let old = h.record_text(txt("older"), false).unwrap();
         h.record_text(txt("newer"), false);
 
-        assert!(reuse_entry(&mut cb, &mut last, &mut last_img, &h, &tx, true, old, &set(), None, &mut None));
+        assert!(reuse_entry(&mut cb, &mut last, &mut last_img, &h, &tx, true, old, &set(), None, &mut None, None));
         assert_eq!(cb.content.as_deref(), Some("older"), "clipboard was set");
         assert_eq!(
             rx.try_recv().unwrap(),
@@ -1946,7 +1980,7 @@ mod tests {
         let h = ClipboardHistory::new();
         let id = h.record_text(txt("offline"), false).unwrap();
 
-        assert!(reuse_entry(&mut cb, &mut None, &mut None, &h, &tx, false, id, &set(), None, &mut None));
+        assert!(reuse_entry(&mut cb, &mut None, &mut None, &h, &tx, false, id, &set(), None, &mut None, None));
         assert_eq!(cb.content.as_deref(), Some("offline"));
         assert!(rx.try_recv().is_err(), "nothing goes to a peer that isn't connected");
     }
@@ -2152,7 +2186,7 @@ mod tests {
         let (tx, _rx) = unbounded_channel();
         let mut cb = Fake::default();
         let h = ClipboardHistory::new();
-        assert!(!reuse_entry(&mut cb, &mut None, &mut None, &h, &tx, true, 999, &set(), None, &mut None));
+        assert!(!reuse_entry(&mut cb, &mut None, &mut None, &h, &tx, true, 999, &set(), None, &mut None, None));
         assert!(cb.content.is_none());
     }
 

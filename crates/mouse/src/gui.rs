@@ -286,6 +286,26 @@ fn mb_of(bytes: usize) -> String {
     (bytes as f64 / (1024.0 * 1024.0)).round().to_string()
 }
 
+/// Wrap a control in hover text explaining what it does.
+///
+/// An icon is compact and says nothing; a word is clearer and still says very little.
+/// Hovering is where the actual sentence belongs, which is what was being asked for.
+fn hint<'a>(
+    p: Palette,
+    control: impl Into<Element<'a, Message>>,
+    text_: &'a str,
+) -> Element<'a, Message> {
+    iced::widget::tooltip(
+        control,
+        container(text(text_).size(11.5).color(p.txt2))
+            .style(move |_| ui_theme::well(p))
+            .padding([6.0, 9.0])
+            .max_width(260.0),
+        iced::widget::tooltip::Position::Top,
+    )
+    .into()
+}
+
 /// Seconds as something a person reads at a glance while waiting.
 fn human_duration(secs: u64) -> String {
     match secs {
@@ -590,7 +610,11 @@ impl App {
             Message::ClipReuse(id) => {
                 if let Some(e) = &self.engine {
                     e.clipboard_reuse(id);
-                    self.feedback = "copied — paste it anywhere".into();
+                    // Accurate for both cases: a complete entry is on the clipboard now, and
+                    // an incomplete one has its paths there with the transfer starting on
+                    // paste. Saying "copied" when nothing was on the clipboard was simply
+                    // untrue, and the user found out by pasting nothing.
+                    self.feedback = "on the clipboard — paste it where you want it".into();
                 }
             }
             Message::ClipTogglePin(id) => {
@@ -1686,12 +1710,19 @@ impl App {
                     let fetching = matches!(m.status, mouse_clipboard::ClipStatus::Fetching { .. });
                     // The row itself is the re-use action — the thing the user wants
                     // nine times out of ten needs no menu and no second click.
+                    // The name flexes and the status gets a column of its own. Without a
+                    // width the status was squeezed into a few pixels and wrapped one
+                    // word per line — "299.5 MB · click to bring it over" stacked
+                    // vertically, which is how a status line stops being readable.
                     let head = row![
                         text(kind).size(12.0).color(p.txt3),
                         text(arrow).size(11.0).color(col),
-                        text(m.preview.clone()).size(13.0).color(p.txt2),
-                        Space::new().width(Length::Fill),
-                        text(note).size(11.0).color(note_col),
+                        text(m.preview.clone()).size(13.0).color(p.txt2).width(Length::Fill),
+                        text(note)
+                            .size(11.0)
+                            .color(note_col)
+                            .width(Length::Fixed(150.0))
+                            .align_x(iced::alignment::Horizontal::Right),
                     ]
                     .spacing(10.0)
                     .align_y(Alignment::Center);
@@ -1716,30 +1747,42 @@ impl App {
                         .width(Length::Fill)
                         .on_press(Message::ClipReuse(m.id));
 
-                    // Worded, not glyphed. A pin icon told the user nothing about what it
-                    // did, and hovering it said nothing either — iced has no tooltip on
-                    // these, so the label has to be the explanation.
-                    let pin = button(
-                        text(if m.pinned { "Unpin" } else { "Keep" }).size(11.5),
-                    )
-                    .style(ui_theme::ghost(p))
-                    .padding([10.0, 12.0])
-                    .on_press(Message::ClipTogglePin(m.id));
-                    let del = button(text("Remove").size(11.5))
-                        .style(ui_theme::ghost(p))
-                        .padding([10.0, 12.0])
-                        .on_press(Message::ClipRemove(m.id));
+                    // Icons with real hover text. Renaming them to words was the wrong
+                    // fix for "hovering tells me nothing" — it cost the compactness and
+                    // still explained less than a sentence can.
+                    let pin = hint(
+                        p,
+                        button(text(if m.pinned { "📌" } else { "📍" }).size(12.0))
+                            .style(ui_theme::ghost(p))
+                            .padding([9.0, 10.0])
+                            .on_press(Message::ClipTogglePin(m.id)),
+                        if m.pinned {
+                            "Pinned — kept when the history fills up or is cleared. Click to unpin."
+                        } else {
+                            "Pin this, so it is kept when the history fills up or is cleared."
+                        },
+                    );
+                    let del = hint(
+                        p,
+                        button(text("✕").size(12.0))
+                            .style(ui_theme::ghost(p))
+                            .padding([9.0, 10.0])
+                            .on_press(Message::ClipRemove(m.id)),
+                        "Remove this entry. Files already transferred stay on your disk.",
+                    );
 
                     let mut controls = row![reuse].spacing(6.0).align_y(Alignment::Center);
                     // Stop only exists while there is something to stop. What has already
                     // arrived is kept, so pressing it is cheap to undo.
                     if fetching {
-                        controls = controls.push(
+                        controls = controls.push(hint(
+                            p,
                             button(text("Stop").size(11.5))
                                 .style(ui_theme::ghost(p))
-                                .padding([10.0, 10.0])
+                                .padding([9.0, 10.0])
                                 .on_press(Message::ClipCancel(m.id)),
-                        );
+                            "Stop this transfer. What has arrived is kept, so clicking the entry resumes it.",
+                        ));
                     }
                     list = list.push(controls.push(pin).push(del));
                 }

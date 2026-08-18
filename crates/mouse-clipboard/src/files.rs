@@ -667,6 +667,36 @@ pub fn write_files(list: &FileList) -> bool {
     imp::write_files(list)
 }
 
+/// The plain-text form a published file list also answers with.
+///
+/// The selection owner serves this for `UTF8_STRING`, so a paste into a text editor
+/// gives the paths rather than nothing. That is useful — and it is also read straight
+/// back by our own text poll, which then records it as something the user copied and
+/// syncs a `file:///…/cache/trees/…` string to the other machine. Knowing the exact
+/// string is what lets that be suppressed instead of appearing as junk history.
+pub fn uri_text(list: &FileList) -> String {
+    // Encoded here rather than borrowed from the X11 module: the same string has to be
+    // computable on Windows, where that module does not exist.
+    let enc = |path: &str| -> String {
+        let mut out = String::with_capacity(path.len());
+        for b in path.bytes() {
+            match b {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
+                    out.push(b as char)
+                }
+                _ => out.push_str(&format!("%{b:02X}")),
+            }
+        }
+        out
+    };
+    let uris: Vec<String> = list
+        .paths
+        .iter()
+        .map(|p| format!("file://{}", enc(&p.to_string_lossy())))
+        .collect();
+    format!("{}\r\n", uris.join("\r\n"))
+}
+
 /// Put a file list on the clipboard with an explicit paste mode.
 ///
 /// `move_on_paste` is what makes a large file cost nothing to paste: the file manager
