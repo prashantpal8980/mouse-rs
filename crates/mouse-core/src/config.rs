@@ -83,8 +83,17 @@ fn default_clip_memory() -> usize {
 fn default_clip_image_px() -> usize {
     4096
 }
+/// No prompt by default.
+///
+/// This was 1 MB, which meant essentially every real file — a photo, a document, an
+/// episode — stopped and waited for someone to open the panel and press a button.
+/// Copying something *is* the decision to copy it; asking again is a second decision
+/// the user never wanted to make, and it turned Ctrl+C / Ctrl+V into a chore.
+///
+/// The prompt still exists for anyone on a metered or slow link: set a limit and
+/// anything above it asks. It is opt-in rather than in everyone's way.
 fn default_auto_transfer() -> u64 {
-    1024 * 1024
+    u64::MAX
 }
 fn default_cache_budget() -> u64 {
     2 * 1024 * 1024 * 1024
@@ -204,6 +213,14 @@ pub struct Config {
     /// prompt would resurrect the keyboard leak.
     #[serde(default = "default_true")]
     pub clipboard_notify: bool,
+    /// Put a received image on the clipboard as a `.png` file as well as pixels.
+    ///
+    /// On by default because without it the everyday case fails: no file manager on
+    /// either OS can paste pixels, so copy-an-image then paste-into-a-folder did
+    /// nothing, and the only way round it was to open the panel and click the entry.
+    /// Ctrl+C then Ctrl+V should work wherever you are pasting.
+    #[serde(default = "default_true")]
+    pub clipboard_images_also_as_file: bool,
     /// Follow symbolic links found inside a copied folder instead of skipping them.
     ///
     /// Off by default because a link pointing outside the folder quietly copies files
@@ -314,6 +331,7 @@ impl Default for Config {
             clipboard_inline_image_max: default_inline_image(),
             clipboard_max_files_per_copy: default_max_files(),
             clipboard_follow_symlinks: false,
+            clipboard_images_also_as_file: true,
             clipboard_notify: true,
             elevation_notice_seen: false,
             log_upload_url: String::new(),

@@ -66,8 +66,8 @@ Invoke-WebRequest -Uri http://192.168.137.2:8000/mouse-rs.exe -OutFile $HOME\mou
 Get-FileHash $HOME\mouse-rs\mouse-rs.exe -Algorithm SHA256
 ```
 
-Must match exactly — size `12021248` bytes, SHA256
-`70B9965F119817EB6AEAEA80FE68AF8D9FF4770D0172E80EC4D0AA11EB690FA6`.
+Must match exactly — size `12024320` bytes, SHA256
+`E621C7FE67711B46A4ED4F437C03B9B198FC3334702C2247EF67E0381FE3918E`.
 If it doesn't match, stop and tell me.
 
 **Start the log clean** so the trial numbering below lines up with the file — move the old

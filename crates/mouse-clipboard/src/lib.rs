@@ -594,6 +594,8 @@ pub struct ClipboardSettings {
     pub max_files_per_copy: usize,
     /// Follow symlinks inside a copied folder rather than skipping them.
     pub follow_symlinks: bool,
+    /// Also offer a received image as a .png file, so it pastes into a file manager.
+    pub images_also_as_file: bool,
     /// Skip the prompt when a transfer is measured to finish this fast. 0 disables it.
     pub quick_send_secs: f64,
     /// Keep history across restarts.
@@ -614,6 +616,7 @@ impl Default for ClipboardSettings {
             inline_image_max: DEFAULT_INLINE_IMAGE_MAX,
             max_files_per_copy: DEFAULT_MAX_FILES_PER_COPY,
             follow_symlinks: false,
+            images_also_as_file: true,
             quick_send_secs: 3.0,
             persist_history: false,
         }
@@ -904,17 +907,19 @@ fn run(
             // A large image: fetch the pixels over the bulk lane rather than letting
             // megabytes of base64 sit in front of the next mouse packet.
             Ok(Message::ClipboardImageRef { hash, w, h, .. }) if settings.sync_images => {
-                if let Some(t) = transfers.as_mut() {
-                    if let Some(png) = t.want_image(&hash, w.max(0) as usize, h.max(0) as usize, &to_peer)
-                    {
-                        apply_encoded_image(
-                            &mut clipboard,
-                            &mut last_img,
-                            &png,
-                            history.as_ref(),
-                            settings,
-                        );
-                    }
+                let got = transfers
+                    .as_mut()
+                    .and_then(|t| t.want_image(&hash, w.max(0) as usize, h.max(0) as usize, &to_peer));
+                if let Some(png) = got {
+                    apply_encoded_image(
+                        &mut clipboard,
+                        &mut last_img,
+                        &mut last_files,
+                        &png,
+                        history.as_ref(),
+                        settings,
+                        transfers.as_ref(),
+                    );
                 }
             }
             // Files copied on the other machine: record the description, then decide
@@ -1031,7 +1036,15 @@ fn run(
                 let entry_opt = t.on_bulk_frame(frame, h);
                 if let Some(done) = t.take_last_completed() {
                     if let Some((png, _w, _h)) = t.take_completed_image(&done) {
-                        apply_encoded_image(&mut clipboard, &mut last_img, &png, Some(h), settings);
+                        apply_encoded_image(
+                            &mut clipboard,
+                            &mut last_img,
+                            &mut last_files,
+                            &png,
+                            Some(h),
+                            settings,
+                            None,
+                        );
                     }
                 }
                 if let Some(entry) = entry_opt {
@@ -1415,18 +1428,45 @@ fn poll_local_image<C: SystemClipboard>(
 /// Shared by the inline path and the bulk path so both end with identical state — in
 /// particular the same `last_img` anchor, without which a received image is read back
 /// by the next poll and echoed straight to the peer.
+#[allow(clippy::too_many_arguments)] // every one is per-application state
 fn apply_encoded_image<C: SystemClipboard>(
     clipboard: &mut C,
     last_img: &mut Option<u64>,
+    last_files: &mut Option<u64>,
     png: &[u8],
     history: Option<&ClipboardHistory>,
     settings: ClipboardSettings,
+    transfers: Option<&transfer::Transfers>,
 ) -> bool {
     let Some(img) = decode_png(png, settings.max_image_px) else {
         tracing::warn!("a received image could not be decoded");
         return false;
     };
-    if !clipboard.write_image(&img) {
+    // Both forms, straight away, with nothing to click.
+    //
+    // An image on the clipboard is pixels, and no file manager on either OS can paste
+    // pixels — so copy-an-image-then-paste-into-a-folder simply did not work, and the
+    // only way round it was to open the panel and click the entry. That is a step the
+    // user should never have to know about: Ctrl+C on one machine, Ctrl+V on the other,
+    // wherever they are pasting. Writing the .png out as well costs one small file and
+    // removes the whole detour.
+    let as_file = if settings.images_also_as_file {
+        transfers.and_then(|t| stage_image_file(t, png, img.w, img.h))
+    } else {
+        None
+    };
+    let published = match as_file {
+        Some(path) => {
+            let list = files::FileList { paths: vec![path] };
+            let ok = files::write_image_and_file(&list, png.to_vec(), || clipboard.write_image(&img));
+            if ok {
+                *last_files = Some(files::list_key(&list));
+            }
+            ok
+        }
+        None => clipboard.write_image(&img),
+    };
+    if !published {
         tracing::warn!("could not put a received image on the clipboard");
         return false;
     }
@@ -2014,7 +2054,15 @@ mod tests {
         let mut cb = Fake::default();
         let mut last_img = None;
         let png = encode_png(&img(12, 12, 6), 4096).unwrap();
-        assert!(apply_encoded_image(&mut cb, &mut last_img, &png, None, set()));
+        assert!(apply_encoded_image(
+            &mut cb,
+            &mut last_img,
+            &mut None,
+            &png,
+            None,
+            set(),
+            None,
+        ));
         assert!(last_img.is_some());
         assert!(poll_local_image(&mut cb, &mut last_img, &tx, set(), None).is_none());
         assert!(rx.try_recv().is_err(), "an applied image must not echo back");

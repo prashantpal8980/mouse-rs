@@ -92,6 +92,7 @@ enum Message {
     BulkPortChanged(String),
     ClipSyncFilesToggled(bool),
     ClipFollowSymlinksToggled(bool),
+    ClipImagesAsFileToggled(bool),
     ClipNotifyToggled(bool),
     BulkBufferChanged(String),
     ClipAutoMbChanged(String),
@@ -176,6 +177,7 @@ fn pending_restart_changes(live: &Config, now: &Config) -> Vec<&'static str> {
     chk(live.clipboard_inline_image_max != now.clipboard_inline_image_max, "inline image size");
     chk(live.clipboard_max_files_per_copy != now.clipboard_max_files_per_copy, "files per copy");
     chk(live.clipboard_follow_symlinks != now.clipboard_follow_symlinks, "following shortcuts");
+    chk(live.clipboard_images_also_as_file != now.clipboard_images_also_as_file, "images as a file");
     chk(live.clipboard_quick_send_secs != now.clipboard_quick_send_secs, "don't-ask-if-quick");
     chk(live.clipboard_persist_history != now.clipboard_persist_history, "keep history after restart");
     chk(live.bulk_enabled != now.bulk_enabled, "separate transfer lane");
@@ -685,6 +687,7 @@ impl App {
             Message::BulkEnabledToggled(v) => self.cfg.bulk_enabled = v,
             Message::ClipSyncFilesToggled(v) => self.cfg.clipboard_sync_files = v,
             Message::ClipFollowSymlinksToggled(v) => self.cfg.clipboard_follow_symlinks = v,
+            Message::ClipImagesAsFileToggled(v) => self.cfg.clipboard_images_also_as_file = v,
             Message::ClipNotifyToggled(v) => self.cfg.clipboard_notify = v,
             Message::BulkBufferChanged(s) => {
                 // Floored at 1 MB: below one chunk the sender would have nowhere to put
@@ -1797,7 +1800,10 @@ impl App {
                 "Ask before bringing over anything larger than (MB)",
                 input(p, "1", &self.clip_auto_mb_s, Message::ClipAutoMbChanged)
             ),
-            text(if self.cfg.clipboard_auto_transfer_max == 0 {
+            text(if self.cfg.clipboard_auto_transfer_max == u64::MAX {
+                "Never asks — copying is the decision, so anything you copy just comes over. \
+                 Set a size here if you are on a slow or metered link.".to_string()
+            } else if self.cfg.clipboard_auto_transfer_max == 0 {
                 "0 — always ask, whatever the size.".to_string()
             } else {
                 format!(
@@ -1846,6 +1852,13 @@ impl App {
                     text("Bounds a stray click on an enormous folder. The rest is left behind, and the log says so.")
                         .size(11.0)
                         .color(p.txt3),
+                    toggle_row(
+                        p,
+                        "Also copy images as a .png file",
+                        "on: a copied image pastes into a browser AND into a file manager. Off: pixels only, and pasting into Explorer or Thunar does nothing.",
+                        self.cfg.clipboard_images_also_as_file,
+                        Message::ClipImagesAsFileToggled
+                    ),
                     toggle_row(
                         p,
                         "Follow shortcuts inside copied folders",

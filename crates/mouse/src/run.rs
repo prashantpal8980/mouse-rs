@@ -607,6 +607,7 @@ fn clipboard_settings(cfg: &Config) -> ClipboardSettings {
         inline_image_max: cfg.clipboard_inline_image_max.max(1),
         max_files_per_copy: cfg.clipboard_max_files_per_copy.max(1),
         follow_symlinks: cfg.clipboard_follow_symlinks,
+        images_also_as_file: cfg.clipboard_images_also_as_file,
         quick_send_secs: cfg.clipboard_quick_send_secs as f64,
         persist_history: cfg.clipboard_persist_history,
     }
