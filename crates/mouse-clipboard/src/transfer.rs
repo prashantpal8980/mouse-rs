@@ -83,6 +83,25 @@ struct Incoming {
     entry: Option<u64>,
 }
 
+/// Aggregate progress for one history entry, across every file in it.
+///
+/// A folder is requested as many blobs at once, and they all stream together — 23
+/// episodes were genuinely in flight simultaneously in the case that exposed this. Each
+/// arriving chunk belongs to one of them, so reporting *that blob's* progress made the
+/// entry's percentage jump between whichever files happened to be furthest and least far
+/// along: 40%, 25%, 55%, 29%. Nothing was wrong with the transfer; the number was
+/// answering a different question every time it was asked.
+///
+/// Tracked incrementally rather than recomputed: at ~500 chunks a second, summing the
+/// set and stat-ing the cache per chunk would cost more than the transfer.
+#[derive(Debug, Clone, Copy)]
+struct EntryProgress {
+    /// Bytes of this entry we hold or have received, across all its files.
+    done: u64,
+    /// Bytes the whole entry will be when finished.
+    total: u64,
+}
+
 /// Sending side of one in-flight blob: just the handle needed to stop it.
 struct Serving {
     /// Set to stop the serving thread at the next chunk boundary.
@@ -108,6 +127,9 @@ pub struct Transfers {
     requested: HashMap<String, u64>,
     /// Blobs we are currently streaming out, keyed by hash.
     serving: HashMap<String, Serving>,
+    /// Whole-entry progress, so a multi-file transfer reports one number that only ever
+    /// goes up. Keyed by history entry id.
+    entry_progress: HashMap<u64, EntryProgress>,
     /// Hashes that are clipboard *images* rather than files, with their dimensions.
     /// They take the same transfer path but are applied to the clipboard as pixels
     /// rather than published as a path.
@@ -125,6 +147,7 @@ impl Transfers {
             next_id: 0,
             requested: HashMap::new(),
             serving: HashMap::new(),
+            entry_progress: HashMap::new(),
             pending_images: HashMap::new(),
             last_completed: None,
         }
@@ -341,7 +364,52 @@ impl Transfers {
         set: &FileSet,
         entry: u64,
         to_peer: &UnboundedSender<Message>,
+        cache_budget: u64,
+        history: &ClipboardHistory,
     ) -> bool {
+        // A set larger than the whole cache budget can never be held all at once: files
+        // arrive, the budget evicts the oldest to stay under it, and the set is never
+        // complete — so it re-requests them, forever. Refusing with an explanation beats
+        // downloading gigabytes in a loop and never finishing, which is what happened to
+        // a 6.9 GB folder against the 2 GB default.
+        let total = set.total_bytes();
+        if cache_budget > 0 && total > cache_budget {
+            tracing::warn!(
+                bytes = total,
+                cache_budget,
+                files = set.files.len(),
+                "TOO BIG FOR THE CACHE — {} of files against a {} disk budget. Completed files \
+                 would be evicted to stay under the budget before the rest arrived, so this can \
+                 never finish. Raise 'Disk for transferred files' in Clipboard settings above {} \
+                 and click the entry again.",
+                human(total),
+                human(cache_budget),
+                human(total),
+            );
+            history.set_status(
+                entry,
+                ClipStatus::Unavailable(format!(
+                    "{} needs more than the {} disk budget — raise it in Clipboard settings",
+                    human(total),
+                    human(cache_budget)
+                )),
+            );
+            return false;
+        }
+        // Whole-entry baseline, computed once here rather than per chunk: everything we
+        // already hold counts as done, because it does — the user is waiting for the set,
+        // not for one file.
+        let already: u64 = set
+            .files
+            .iter()
+            .filter(|f| self.cache.contains(&f.hash))
+            .map(|f| f.size)
+            .sum();
+        self.entry_progress.insert(
+            entry,
+            EntryProgress { done: already, total: set.total_bytes() },
+        );
+
         let mut asked = false;
         for f in &set.files {
             if self.cache.contains(&f.hash) || self.requested.contains_key(&f.hash) {
@@ -384,6 +452,9 @@ impl Transfers {
             // Only the sender can actually stop the bytes.
             let _ = to_peer.send(Message::BlobCancel { hash: hash.clone() });
         }
+        // Dropped rather than kept: a resumed request recomputes the baseline from what
+        // is actually on disk, which is the only number that stays true across a pause.
+        self.entry_progress.remove(&entry);
         tracing::info!(entry, files = hashes.len(), "transfer cancelled by the user");
         true
     }
@@ -557,6 +628,14 @@ impl Transfers {
                     return None;
                 }
                 let entry = history.find_by_hash(&meta.hash);
+                // A resumed file arrives with bytes already on disk. They are part of
+                // what the user is waiting for, so they count towards the entry — and
+                // they are not in the baseline, which only counted *complete* files.
+                if got > 0 {
+                    if let Some(agg) = entry.and_then(|id| self.entry_progress.get_mut(&id)) {
+                        agg.done = agg.done.saturating_add(got).min(agg.total);
+                    }
+                }
                 self.incoming
                     .insert(transfer, Incoming { hash: meta.hash, file, got, total, entry });
                 self.next_id = self.next_id.wrapping_add(1);
@@ -578,8 +657,21 @@ impl Transfers {
                     return None;
                 }
                 inc.got += data.len() as u64;
-                let (done, total, entry) = (inc.got, inc.total, inc.entry);
+                let n = data.len() as u64;
+                let entry = inc.entry;
                 if let Some(id) = entry {
+                    // The entry's number, not this blob's. With every file in a folder
+                    // streaming at once, reporting the blob that happened to deliver the
+                    // last chunk is what made the percentage jump backwards.
+                    let (done, total) = match self.entry_progress.get_mut(&id) {
+                        Some(agg) => {
+                            agg.done = agg.done.saturating_add(n).min(agg.total);
+                            (agg.done, agg.total)
+                        }
+                        // No baseline (a resumed session, say): the blob's own numbers are
+                        // still better than nothing, and the next request re-establishes it.
+                        None => (inc.got, inc.total),
+                    };
                     history.set_status(id, ClipStatus::Fetching { done, total });
                 }
                 entry
@@ -901,7 +993,7 @@ mod tests {
             .record_files(Arc::new(set.clone()), true, ClipStatus::Remote)
             .unwrap();
         let (to_peer, mut peer_rx) = tokio::sync::mpsc::unbounded_channel();
-        assert!(receiver.request_missing(&set, entry, &to_peer));
+        assert!(receiver.request_missing(&set, entry, &to_peer, u64::MAX, &r_hist));
         let hash = match peer_rx.try_recv().unwrap() {
             Message::BlobRequest { hash, offset } => {
                 assert_eq!(offset, 0);
@@ -1120,7 +1212,7 @@ mod tests {
             f.write_all(b"01234").unwrap();
         }
         let (to_peer, mut peer_rx) = tokio::sync::mpsc::unbounded_channel();
-        receiver.request_missing(&set, entry, &to_peer);
+        receiver.request_missing(&set, entry, &to_peer, u64::MAX, &r_hist);
         match peer_rx.try_recv().unwrap() {
             Message::BlobRequest { offset, .. } => {
                 assert_eq!(offset, 5, "the request must resume from what we already have")
@@ -1188,10 +1280,10 @@ mod tests {
         let entry = r_hist.record_files(Arc::new(set.clone()), true, ClipStatus::Remote).unwrap();
         let (to_peer, mut peer_rx) = tokio::sync::mpsc::unbounded_channel();
 
-        assert!(receiver.request_missing(&set, entry, &to_peer));
+        assert!(receiver.request_missing(&set, entry, &to_peer, u64::MAX, &r_hist));
         assert!(peer_rx.try_recv().is_ok());
         assert!(
-            !receiver.request_missing(&set, entry, &to_peer),
+            !receiver.request_missing(&set, entry, &to_peer, u64::MAX, &r_hist),
             "a second click must not start the same download again"
         );
         assert!(peer_rx.try_recv().is_err());
@@ -1310,7 +1402,7 @@ mod tests {
             .record_files(Arc::new(set.clone()), true, ClipStatus::Remote)
             .unwrap();
         let (to_peer, mut peer_rx) = tokio::sync::mpsc::unbounded_channel();
-        assert!(receiver.request_missing(&set, entry, &to_peer));
+        assert!(receiver.request_missing(&set, entry, &to_peer, u64::MAX, &r_hist));
         let _ = peer_rx.try_recv();
 
         assert!(receiver.cancel_entry(entry, &to_peer));
@@ -1321,7 +1413,7 @@ mod tests {
         // The request is forgotten, so clicking again really asks again rather than being
         // swallowed as a duplicate. That is what makes the entry usable after Stop.
         assert!(
-            receiver.request_missing(&set, entry, &to_peer),
+            receiver.request_missing(&set, entry, &to_peer, u64::MAX, &r_hist),
             "after cancelling, clicking the entry must start a fresh request"
         );
         let _ = fs::remove_dir_all(&root);
@@ -1389,6 +1481,146 @@ mod tests {
             .describe_local(&FileList { paths: vec![tree] }, "laptop", 10_000, true, u64::MAX)
             .unwrap();
         assert_eq!(set.files.len(), 1, "the loop must be detected, not walked: {:?}", set.files);
+        let _ = fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod progress_tests {
+    use super::*;
+    use std::fs;
+
+    /// The reported bug: copying a 23-file folder showed a percentage that jumped
+    /// backwards — 40%, 25%, 55%, 29% — because every file was streaming at once and
+    /// each chunk reported *its own* file's progress rather than the set's.
+    #[test]
+    fn progress_across_many_files_only_ever_moves_forward() {
+        let root = std::env::temp_dir().join("mouse-rs-progress-test");
+        let _ = fs::remove_dir_all(&root);
+        let cache = Arc::new(BlobCache::new(root.join("cache")).unwrap());
+        let mut t = Transfers::new(cache);
+        let hist = ClipboardHistory::new();
+
+        // Three files of very different sizes, as episodes and subtitles would be.
+        let sizes = [900_000u64, 300_000, 60_000];
+        let files: Vec<FileRef> = sizes
+            .iter()
+            .enumerate()
+            .map(|(i, size)| FileRef {
+                name: format!("ep{i}.mkv"),
+                size: *size,
+                hash: format!("{:0>64}", i + 1),
+                source_path: None,
+                rel: String::new(),
+            })
+            .collect();
+        let set = FileSet { files, dirs: Vec::new(), origin: "laptop".into() };
+        let total: u64 = sizes.iter().sum();
+        let entry = hist
+            .record_files(Arc::new(set.clone()), true, ClipStatus::Remote)
+            .unwrap();
+
+        let (to_peer, _rx) = tokio::sync::mpsc::unbounded_channel();
+        assert!(t.request_missing(&set, entry, &to_peer, u64::MAX, &hist));
+
+        // Open all three at once, exactly as the sender does.
+        for (i, size) in sizes.iter().enumerate() {
+            let meta = serde_json::to_vec(&BlobMeta {
+                hash: set.files[i].hash.clone(),
+                name: set.files[i].name.clone(),
+                offset: 0,
+            })
+            .unwrap();
+            t.on_bulk_frame(
+                BulkFrame::Begin { transfer: i as u64, total: *size, meta },
+                &hist,
+            );
+        }
+
+        // Interleave chunks in a deliberately unhelpful order: the big file races ahead,
+        // then the small one delivers, then the big one again. Under the old code this
+        // is precisely the sequence that made the number fall.
+        let order = [0usize, 0, 0, 2, 1, 0, 2, 1, 0, 1, 2, 0];
+        let mut last_pct = 0u64;
+        let mut saw_progress = false;
+        for i in order {
+            t.on_bulk_frame(
+                BulkFrame::Chunk {
+                    transfer: i as u64,
+                    seq: 0,
+                    data: vec![0u8; 20_000],
+                },
+                &hist,
+            );
+            let Some(ClipStatus::Fetching { done, total: reported }) = hist.status(entry) else {
+                panic!("expected a Fetching status");
+            };
+            assert_eq!(
+                reported, total,
+                "the total must be the whole set, not whichever file just delivered"
+            );
+            let pct = done * 100 / reported;
+            assert!(
+                pct >= last_pct,
+                "progress went backwards: {last_pct}% then {pct}% — this is the reported bug"
+            );
+            if pct > last_pct {
+                saw_progress = true;
+            }
+            last_pct = pct;
+        }
+        assert!(saw_progress, "the percentage should actually advance, not just not regress");
+        let _ = fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+    use std::fs;
+
+    /// A folder bigger than the whole cache budget used to be accepted, downloaded, and
+    /// partially evicted forever without ever completing. Refusing with a fixable reason
+    /// is the only honest answer.
+    #[test]
+    fn a_set_larger_than_the_cache_budget_is_refused_with_a_reason() {
+        let root = std::env::temp_dir().join("mouse-rs-budget-test");
+        let _ = fs::remove_dir_all(&root);
+        let cache = Arc::new(BlobCache::new(root.join("cache")).unwrap());
+        let mut t = Transfers::new(cache);
+        let hist = ClipboardHistory::new();
+
+        let set = FileSet {
+            files: vec![FileRef {
+                name: "series.mkv".into(),
+                size: 7 * 1024 * 1024 * 1024,
+                hash: "a".repeat(64),
+                source_path: None,
+                rel: String::new(),
+            }],
+            dirs: Vec::new(),
+            origin: "laptop".into(),
+        };
+        let entry = hist
+            .record_files(Arc::new(set.clone()), true, ClipStatus::Remote)
+            .unwrap();
+        let (to_peer, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let budget = 2 * 1024 * 1024 * 1024;
+        assert!(
+            !t.request_missing(&set, entry, &to_peer, budget, &hist),
+            "a set that cannot fit must not be requested"
+        );
+        assert!(rx.try_recv().is_err(), "nothing should have been asked for");
+        match hist.status(entry) {
+            Some(ClipStatus::Unavailable(why)) => {
+                assert!(why.contains("disk budget"), "the reason must be actionable: {why}");
+            }
+            other => panic!("expected an explained Unavailable, got {other:?}"),
+        }
+
+        // Raising the budget above the set makes it work — the reason really is the cap.
+        assert!(t.request_missing(&set, entry, &to_peer, 8 * 1024 * 1024 * 1024, &hist));
         let _ = fs::remove_dir_all(&root);
     }
 }

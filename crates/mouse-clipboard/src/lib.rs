@@ -931,7 +931,7 @@ fn run(
                     );
                     if let Some(id) = h.record_files(set.clone(), true, status.clone()) {
                         if status == ClipStatus::Remote {
-                            t.request_missing(&set, id, &to_peer);
+                            t.request_missing(&set, id, &to_peer, settings.cache_budget, h);
                         }
                     }
                 }
@@ -1215,7 +1215,7 @@ fn reuse_entry<C: SystemClipboard>(
                     id,
                     ClipStatus::Fetching { done: 0, total: set.total_bytes() },
                 );
-                if !t.request_missing(&set, id, to_peer) {
+                if !t.request_missing(&set, id, to_peer, settings.cache_budget, history) {
                     // Nothing new to ask for: a request is already in flight.
                     tracing::debug!(id, "a transfer for this entry is already running");
                 }
