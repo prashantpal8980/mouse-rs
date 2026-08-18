@@ -1,11 +1,17 @@
 Install the current mouse-rs build, **run it as administrator**, keep log shipping on,
 and then stop and wait.
 
-This build is about removing steps between Ctrl+C and Ctrl+V. Two defaults changed:
-files no longer wait for a button press before transferring, and a copied image now
-lands as a file as well as pixels so it pastes into Explorer. Neither needs any setup
-here — they are defaults, and an existing config picks them up on its own. **One
-exception, in Step 3.**
+This build is about removing steps between Ctrl+C and Ctrl+V, and about a paste
+costing what the file costs rather than twice that. Three defaults changed:
+
+* files no longer wait for a button press before transferring;
+* a copied image now lands as a file as well as pixels, so it pastes into Explorer;
+* **pasting a received file moves it to where you pasted**, rather than copying it out
+  of the cache. Explorer is told `Preferred DropEffect = MOVE`, so a relocation within
+  one volume is a rename — a 40 GB paste moves no bytes and leaves no second copy.
+
+None of the three needs setup here; they are defaults an existing config picks up on
+its own. **One exception, in Step 3.**
 
 Two things still matter for the install itself:
 
@@ -165,7 +171,15 @@ You do not need to act on any of these; they are here so you can report them acc
   is still in the config. Say so; it is the difference between copy-paste working by itself
   and needing a button press every time.
 - `PUBLISHED files to the … clipboard` — files really are on the clipboard and Paste should be
-  enabled. If this line is present and Paste is still greyed, that is a genuine bug.
+  enabled. It now names the mode too: `mode=move` means Explorer will relocate the file to
+  wherever it is pasted rather than copy it, which is what keeps a large paste from costing
+  the file's size twice. `mode=copy` means the setting is off.
+- `could not ask Explorer to move rather than copy` — the drop-effect hint was refused. Not
+  fatal: pasting still works, it just copies, so a big file uses its size twice. Worth
+  reporting if it appears.
+- `DELIVERED files straight into your folder` — only if a delivery folder was configured.
+  It is off by default; with move-on-paste doing the work, where you paste is the
+  destination.
 - `our own window had focus … could NOT be handed off` — should no longer appear; the hand-off
   now falls back to the shell window, then the desktop, then minimising our own window. If it
   does appear, report it.
