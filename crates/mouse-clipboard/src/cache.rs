@@ -159,6 +159,82 @@ impl BlobCache {
         before.saturating_sub(after)
     }
 
+    /// Put a received set into a folder the user chose, under real names.
+    ///
+    /// ## Why this exists, and why it costs nothing
+    ///
+    /// The complaint it answers: copying a 40 GB file used to mean 40 GB in the cache
+    /// *plus* 40 GB wherever it was pasted, because the file manager copies from
+    /// whatever path the clipboard hands it. Twice the disk for one file.
+    ///
+    /// A hard link removes that entirely. The blob and the delivered file are the same
+    /// inode — one copy of the data with two names — so a 40 GB file delivered to the
+    /// Desktop occupies 40 GB, not 80. Nothing has to be pasted at all: the file is
+    /// already where it was wanted, by the time the transfer finishes.
+    ///
+    /// Eviction becomes free as well. Deleting the cached blob afterwards just drops one
+    /// name; the delivered file keeps the data. So the disk budget can do its job without
+    /// ever taking away something the user was given.
+    ///
+    /// Falls back to a copy only across filesystems, where the OS gives no other option —
+    /// and says so, because that is the one case where the old cost returns.
+    pub fn deliver(
+        &self,
+        dest_root: &Path,
+        items: &[(String, String)],
+        dirs: &[String],
+    ) -> io::Result<Vec<PathBuf>> {
+        fs::create_dir_all(dest_root)?;
+        for rel in dirs {
+            let parts = safe_components(rel);
+            if parts.is_empty() {
+                continue;
+            }
+            let mut d = dest_root.to_path_buf();
+            for part in &parts {
+                d.push(part);
+            }
+            fs::create_dir_all(&d)?;
+        }
+
+        let mut out = Vec::new();
+        for (hash, rel) in items {
+            let parts = safe_components(rel);
+            if parts.is_empty() {
+                continue;
+            }
+            let mut dest = dest_root.to_path_buf();
+            for part in &parts {
+                dest.push(part);
+            }
+            if let Some(parent) = dest.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            // Never overwrite something already there. A delivered file landing on top
+            // of the user's own work would be a far worse bug than a suffixed name.
+            let dest = unique_path(dest);
+            let blob = self.blob_path(hash);
+            match fs::hard_link(&blob, &dest) {
+                Ok(()) => {}
+                Err(_) => {
+                    // Different filesystem, or a filesystem without links. This is the
+                    // only path that costs the space twice, so it is worth saying.
+                    tracing::info!(
+                        dest = %dest.display(),
+                        "delivering by copy rather than link — the destination is on a \
+                         different filesystem, so this file briefly uses twice its size"
+                    );
+                    fs::copy(&blob, &dest)?;
+                }
+            }
+            out.push(dest);
+        }
+        if out.is_empty() {
+            return Err(io::Error::new(io::ErrorKind::NotFound, "nothing to deliver"));
+        }
+        Ok(out)
+    }
+
     /// Discard a partial transfer.
     pub fn abandon(&self, hash: &str) {
         if is_safe_hash(hash) {
@@ -554,6 +630,26 @@ pub fn stream_copy(src: &mut impl Read, dst: &mut impl Write) -> io::Result<u64>
     Ok(total)
 }
 
+/// `name.ext` → `name (2).ext` and upward, until nothing is in the way.
+///
+/// Silently replacing a file that is already there would be the worst possible failure
+/// mode for a feature whose whole job is to put files on someone's desktop.
+fn unique_path(path: PathBuf) -> PathBuf {
+    if !path.exists() {
+        return path;
+    }
+    let parent = path.parent().map(Path::to_path_buf).unwrap_or_default();
+    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("file").to_string();
+    let ext = path.extension().and_then(|s| s.to_str()).map(|e| format!(".{e}")).unwrap_or_default();
+    for n in 2..10_000 {
+        let candidate = parent.join(format!("{stem} ({n}){ext}"));
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    path
+}
+
 /// Add up a directory tree's file sizes, ignoring anything unreadable.
 ///
 /// Errors are skipped rather than propagated: this feeds a display, and a permission
@@ -731,6 +827,71 @@ mod tests {
         // Known SHA-256 of "abc".
         assert_eq!(h, "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
         assert_eq!(hash_bytes(b"abc"), h, "file and in-memory hashing must agree");
+        let _ = fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod deliver_tests {
+    use super::*;
+
+    /// The complaint this answers: a 40 GB file used to cost 40 GB in the cache plus
+    /// 40 GB wherever it was pasted. Delivering by hard link makes it one copy under two
+    /// names — same inode, same blocks — so the second name is free.
+    #[test]
+    fn a_delivered_file_shares_its_blocks_with_the_cached_one() {
+        let root = std::env::temp_dir().join("mouse-rs-deliver-test");
+        let _ = fs::remove_dir_all(&root);
+        let c = BlobCache::new(root.join("cache")).unwrap();
+
+        let src = root.join("episode.mkv");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(&src, vec![9u8; 65_536]).unwrap();
+        let (hash, _) = c.ingest(&src, u64::MAX).unwrap();
+
+        let dest = root.join("Desktop");
+        let out = c
+            .deliver(&dest, &[(hash.clone(), "episode.mkv".into())], &[])
+            .expect("delivered");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].file_name().unwrap(), "episode.mkv");
+
+        // Same inode = one copy of the data. This is the whole claim.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let a = fs::metadata(c.blob_path(&hash)).unwrap();
+            let b = fs::metadata(&out[0]).unwrap();
+            assert_eq!(a.ino(), b.ino(), "delivery must link, not copy");
+            assert_eq!(b.nlink(), 2, "two names, one file");
+        }
+
+        // And the delivered file survives the cache being cleared — dropping one name
+        // does not touch the data while another name still holds it.
+        c.clear_except(&HashSet::new());
+        assert!(out[0].is_file(), "clearing the cache must not take the delivered file");
+        assert_eq!(fs::read(&out[0]).unwrap().len(), 65_536);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Landing on top of the user's own file would be far worse than an awkward name.
+    #[test]
+    fn delivery_never_overwrites_something_already_there() {
+        let root = std::env::temp_dir().join("mouse-rs-deliver-clash");
+        let _ = fs::remove_dir_all(&root);
+        let c = BlobCache::new(root.join("cache")).unwrap();
+        fs::create_dir_all(&root).unwrap();
+        let src = root.join("notes.txt");
+        fs::write(&src, b"from the peer").unwrap();
+        let (hash, _) = c.ingest(&src, u64::MAX).unwrap();
+
+        let dest = root.join("Desktop");
+        fs::create_dir_all(&dest).unwrap();
+        fs::write(dest.join("notes.txt"), b"MINE - do not lose this").unwrap();
+
+        let out = c.deliver(&dest, &[(hash, "notes.txt".into())], &[]).unwrap();
+        assert_eq!(out[0].file_name().unwrap(), "notes (2).txt");
+        assert_eq!(fs::read(dest.join("notes.txt")).unwrap(), b"MINE - do not lose this");
         let _ = fs::remove_dir_all(&root);
     }
 }

@@ -569,7 +569,9 @@ pub struct BulkLink {
 }
 
 /// The clipboard-thread half of the user's settings.
-#[derive(Clone, Copy, Debug, PartialEq)]
+/// Not `Copy`: `deliver_dir` is a path, and a path is worth more here than the
+/// convenience of implicit copies.
+#[derive(Clone, Debug, PartialEq)]
 pub struct ClipboardSettings {
     pub sync_text: bool,
     pub sync_images: bool,
@@ -596,6 +598,8 @@ pub struct ClipboardSettings {
     pub follow_symlinks: bool,
     /// Also offer a received image as a .png file, so it pastes into a file manager.
     pub images_also_as_file: bool,
+    /// Folder received files are delivered into. Empty = clipboard only.
+    pub deliver_dir: Option<std::path::PathBuf>,
     /// Skip the prompt when a transfer is measured to finish this fast. 0 disables it.
     pub quick_send_secs: f64,
     /// Keep history across restarts.
@@ -617,6 +621,7 @@ impl Default for ClipboardSettings {
             max_files_per_copy: DEFAULT_MAX_FILES_PER_COPY,
             follow_symlinks: false,
             images_also_as_file: true,
+            deliver_dir: None,
             quick_send_secs: 3.0,
             persist_history: false,
         }
@@ -891,7 +896,7 @@ fn run(
             }
             Ok(Message::ClipboardImage { data, w, h }) if settings.sync_images => {
                 if let Some(got) =
-                    apply_remote_image(&mut clipboard, &mut last_img, &data, w, h, settings)
+                    apply_remote_image(&mut clipboard, &mut last_img, &data, w, h, &settings)
                 {
                     tracing::info!(
                         w = got.w,
@@ -917,7 +922,7 @@ fn run(
                         &mut last_files,
                         &png,
                         history.as_ref(),
-                        settings,
+                        &settings,
                         transfers.as_ref(),
                     );
                 }
@@ -1021,7 +1026,7 @@ fn run(
                         &to_peer,
                         connected.load(Ordering::SeqCst),
                         id,
-                        settings,
+                        &settings,
                         transfers.as_mut(),
                         &mut last_files,
                     );
@@ -1042,7 +1047,7 @@ fn run(
                             &mut last_files,
                             &png,
                             Some(h),
-                            settings,
+                            &settings,
                             None,
                         );
                     }
@@ -1051,7 +1056,17 @@ fn run(
                     if let Some(ClipPayload::Files(set)) = h.payload(entry) {
                         if t.is_complete(&set) {
                             h.set_status(entry, ClipStatus::Ready);
-                            if let Some(list) = t.materialize(&set) {
+                            // Delivered into the user's folder when they named one, so
+                            // the file is simply *there* and needs no paste at all —
+                            // and, being a hard link, costs its own size once rather
+                            // than twice. The clipboard is then pointed at those same
+                            // files, so Ctrl+V still works and still refers to one copy.
+                            let delivered = settings
+                                .deliver_dir
+                                .as_deref()
+                                .and_then(|dir| t.deliver(&set, dir));
+                            let list = delivered.or_else(|| t.materialize(&set));
+                            if let Some(list) = list {
                                 if files::write_files(&list) {
                                     last_files = Some(files::list_key(&list));
                                     tracing::info!(
@@ -1073,7 +1088,7 @@ fn run(
         // reconnect the first poll naturally syncs the current clipboard once.
         if connected.load(Ordering::SeqCst) {
             if settings.sync_text && tick % TEXT_POLL_TICKS == 0 {
-                if let Some(sent) = poll_local(&mut clipboard, &mut last, &to_peer, settings) {
+                if let Some(sent) = poll_local(&mut clipboard, &mut last, &to_peer, &settings) {
                     tracing::info!(bytes = sent.len(), "clipboard text sent to the peer");
                     if let Some(h) = &history {
                         h.record_text(sent, false);
@@ -1109,7 +1124,7 @@ fn run(
             // text rather than an image the read fails fast, so the expensive path only
             // runs when there is actually an image to copy.
             if settings.sync_images && tick % IMAGE_POLL_TICKS == 0 {
-                if let Some(sent) = poll_local_image(&mut clipboard, &mut last_img, &to_peer, settings, transfers.as_ref())
+                if let Some(sent) = poll_local_image(&mut clipboard, &mut last_img, &to_peer, &settings, transfers.as_ref())
                 {
                     tracing::info!(
                         w = sent.w,
@@ -1146,7 +1161,7 @@ fn reuse_entry<C: SystemClipboard>(
     to_peer: &UnboundedSender<Message>,
     connected: bool,
     id: u64,
-    settings: ClipboardSettings,
+    settings: &ClipboardSettings,
     transfers: Option<&mut transfer::Transfers>,
     last_files: &mut Option<u64>,
 ) -> bool {
@@ -1277,7 +1292,7 @@ fn poll_local<C: SystemClipboard>(
     clipboard: &mut C,
     last: &mut Option<String>,
     to_peer: &UnboundedSender<Message>,
-    settings: ClipboardSettings,
+    settings: &ClipboardSettings,
 ) -> Option<Arc<String>> {
     let text = clipboard.read_text()?; // empty or non-text (e.g. an image): nothing to forward
     if text.is_empty() || last.as_deref() == Some(text.as_str()) {
@@ -1320,7 +1335,7 @@ fn apply_remote_image<C: SystemClipboard>(
     data: &str,
     w: i32,
     h: i32,
-    settings: ClipboardSettings,
+    settings: &ClipboardSettings,
 ) -> Option<SyncedImage> {
     use base64::Engine as _;
     let raw = base64::engine::general_purpose::STANDARD.decode(data).ok()?;
@@ -1367,7 +1382,7 @@ fn poll_local_image<C: SystemClipboard>(
     clipboard: &mut C,
     last_img: &mut Option<u64>,
     to_peer: &UnboundedSender<Message>,
-    settings: ClipboardSettings,
+    settings: &ClipboardSettings,
     transfers: Option<&transfer::Transfers>,
 ) -> Option<SyncedImage> {
     use base64::Engine as _;
@@ -1435,7 +1450,7 @@ fn apply_encoded_image<C: SystemClipboard>(
     last_files: &mut Option<u64>,
     png: &[u8],
     history: Option<&ClipboardHistory>,
-    settings: ClipboardSettings,
+    settings: &ClipboardSettings,
     transfers: Option<&transfer::Transfers>,
 ) -> bool {
     let Some(img) = decode_png(png, settings.max_image_px) else {
@@ -1587,10 +1602,10 @@ mod tests {
         let source = img(16, 16, 9);
         let png = encode_png(&source, TEST_PX).unwrap();
 
-        assert!(apply_remote_image(&mut cb, &mut last_img, &b64(&png), 16, 16, set()).is_some());
+        assert!(apply_remote_image(&mut cb, &mut last_img, &b64(&png), 16, 16, &set()).is_some());
         assert_eq!(cb.image.as_ref(), Some(&source));
         // The poll now reads back exactly what we just applied.
-        assert!(poll_local_image(&mut cb, &mut last_img, &tx, set(), None).is_none());
+        assert!(poll_local_image(&mut cb, &mut last_img, &tx, &set(), None).is_none());
         assert!(rx.try_recv().is_err(), "applied image must not echo back to the peer");
     }
 
@@ -1603,7 +1618,7 @@ mod tests {
         };
         let mut last_img = None;
 
-        assert!(poll_local_image(&mut cb, &mut last_img, &tx, set(), None).is_some());
+        assert!(poll_local_image(&mut cb, &mut last_img, &tx, &set(), None).is_some());
         match rx.try_recv() {
             Ok(Message::ClipboardImage { w, h, data }) => {
                 assert_eq!((w, h), (8, 8));
@@ -1615,12 +1630,12 @@ mod tests {
             other => panic!("expected a ClipboardImage, got {other:?}"),
         }
         // Unchanged clipboard: no repeat send on the next poll.
-        assert!(poll_local_image(&mut cb, &mut last_img, &tx, set(), None).is_none());
+        assert!(poll_local_image(&mut cb, &mut last_img, &tx, &set(), None).is_none());
         assert!(rx.try_recv().is_err());
 
         // A genuinely different image does go out.
         cb.image = Some(img(8, 8, 200));
-        assert!(poll_local_image(&mut cb, &mut last_img, &tx, set(), None).is_some());
+        assert!(poll_local_image(&mut cb, &mut last_img, &tx, &set(), None).is_some());
         assert!(rx.try_recv().is_ok());
     }
 
@@ -1631,18 +1646,18 @@ mod tests {
         let mut cb = Fake::default();
         let mut last_img = None;
 
-        assert!(apply_remote_image(&mut cb, &mut last_img, "not base64!!", 4, 4, set()).is_none());
-        assert!(apply_remote_image(&mut cb, &mut last_img, &b64(b"not a png"), 4, 4, set()).is_none());
-        assert!(apply_remote_image(&mut cb, &mut last_img, "", 0, 0, set()).is_none());
+        assert!(apply_remote_image(&mut cb, &mut last_img, "not base64!!", 4, 4, &set()).is_none());
+        assert!(apply_remote_image(&mut cb, &mut last_img, &b64(b"not a png"), 4, 4, &set()).is_none());
+        assert!(apply_remote_image(&mut cb, &mut last_img, "", 0, 0, &set()).is_none());
 
         // A valid PNG whose real dimensions contradict the declared ones is refused:
         // trusting the header over the payload is how buffer-size bugs start.
         let png = encode_png(&img(8, 8, 3), TEST_PX).unwrap();
-        assert!(apply_remote_image(&mut cb, &mut last_img, &b64(&png), 4096, 4096, set()).is_none());
+        assert!(apply_remote_image(&mut cb, &mut last_img, &b64(&png), 4096, 4096, &set()).is_none());
 
         // And an image beyond the user's own edge limit is refused before decoding.
         let small = ClipboardSettings { max_image_px: 4, ..set() };
-        assert!(apply_remote_image(&mut cb, &mut last_img, &b64(&png), 8, 8, small).is_none());
+        assert!(apply_remote_image(&mut cb, &mut last_img, &b64(&png), 8, 8, &small).is_none());
 
         assert!(cb.image.is_none(), "nothing should have reached the clipboard");
         assert_eq!(last_img, None);
@@ -1659,7 +1674,7 @@ mod tests {
             ..Default::default()
         };
         let mut last_img = None;
-        assert!(poll_local_image(&mut cb, &mut last_img, &tx, set(), None).is_none());
+        assert!(poll_local_image(&mut cb, &mut last_img, &tx, &set(), None).is_none());
         assert!(last_img.is_some(), "the rejected image must still be fingerprinted");
     }
 
@@ -1675,7 +1690,7 @@ mod tests {
         assert_eq!(cb.content.as_deref(), Some("hello"));
         assert_eq!(last.as_deref(), Some("hello"));
 
-        poll_local(&mut cb, &mut last, &tx, set());
+        poll_local(&mut cb, &mut last, &tx, &set());
         assert!(rx.try_recv().is_err(), "applied-remote text must not echo back");
     }
 
@@ -1687,11 +1702,11 @@ mod tests {
 
         // User copies something locally.
         cb.content = Some("world".to_string());
-        poll_local(&mut cb, &mut last, &tx, set());
+        poll_local(&mut cb, &mut last, &tx, &set());
         assert_eq!(rx.try_recv().unwrap(), Message::Clipboard { text: "world".to_string() });
 
         // Polling again with no change must not resend.
-        poll_local(&mut cb, &mut last, &tx, set());
+        poll_local(&mut cb, &mut last, &tx, &set());
         assert!(rx.try_recv().is_err(), "unchanged clipboard must not resend");
     }
 
@@ -1702,12 +1717,12 @@ mod tests {
         let mut last = None;
 
         apply_remote(&mut cb, &mut last, &txt("A"));
-        poll_local(&mut cb, &mut last, &tx, set());
+        poll_local(&mut cb, &mut last, &tx, &set());
         assert!(rx.try_recv().is_err(), "no echo for A");
 
         // A genuinely new local copy is forwarded.
         cb.content = Some("B".to_string());
-        poll_local(&mut cb, &mut last, &tx, set());
+        poll_local(&mut cb, &mut last, &tx, &set());
         assert_eq!(rx.try_recv().unwrap(), Message::Clipboard { text: "B".to_string() });
         assert!(rx.try_recv().is_err());
     }
@@ -1718,7 +1733,7 @@ mod tests {
         let mut cb = Fake::default();
         let mut last = None;
         cb.content = Some("x".repeat(set().max_item_bytes + 1));
-        poll_local(&mut cb, &mut last, &tx, set());
+        poll_local(&mut cb, &mut last, &tx, &set());
         assert!(rx.try_recv().is_err(), "oversized clipboard must not be synced");
         // And it's remembered so we don't re-evaluate it forever.
         assert!(last.is_some());
@@ -1729,7 +1744,7 @@ mod tests {
         let (tx, mut rx) = unbounded_channel();
         let mut cb = Fake { content: Some(String::new()), ..Default::default() };
         let mut last = None;
-        poll_local(&mut cb, &mut last, &tx, set());
+        poll_local(&mut cb, &mut last, &tx, &set());
         assert!(rx.try_recv().is_err());
     }
 
@@ -1844,7 +1859,7 @@ mod tests {
         let old = h.record_text(txt("older"), false).unwrap();
         h.record_text(txt("newer"), false);
 
-        assert!(reuse_entry(&mut cb, &mut last, &mut last_img, &h, &tx, true, old, set(), None, &mut None));
+        assert!(reuse_entry(&mut cb, &mut last, &mut last_img, &h, &tx, true, old, &set(), None, &mut None));
         assert_eq!(cb.content.as_deref(), Some("older"), "clipboard was set");
         assert_eq!(
             rx.try_recv().unwrap(),
@@ -1856,7 +1871,7 @@ mod tests {
         // `last` now holds what we wrote, so the next poll must not send it again —
         // otherwise every re-use would cost two sends.
         cb.content = Some("older".into());
-        assert!(poll_local(&mut cb, &mut last, &tx, set()).is_none());
+        assert!(poll_local(&mut cb, &mut last, &tx, &set()).is_none());
         assert!(rx.try_recv().is_err(), "re-use must not echo on the next poll");
     }
 
@@ -1867,7 +1882,7 @@ mod tests {
         let h = ClipboardHistory::new();
         let id = h.record_text(txt("offline"), false).unwrap();
 
-        assert!(reuse_entry(&mut cb, &mut None, &mut None, &h, &tx, false, id, set(), None, &mut None));
+        assert!(reuse_entry(&mut cb, &mut None, &mut None, &h, &tx, false, id, &set(), None, &mut None));
         assert_eq!(cb.content.as_deref(), Some("offline"));
         assert!(rx.try_recv().is_err(), "nothing goes to a peer that isn't connected");
     }
@@ -1990,7 +2005,7 @@ mod tests {
         // A screenshot that crosses in milliseconds must not pay for a round trip.
         let (tx, mut rx) = unbounded_channel();
         let mut cb = Fake { image: Some(img(8, 8, 1)), ..Default::default() };
-        let sent = poll_local_image(&mut cb, &mut None, &tx, set(), None).expect("sent");
+        let sent = poll_local_image(&mut cb, &mut None, &tx, &set(), None).expect("sent");
         assert!(sent.inline, "a tiny image should go inline");
         assert!(
             matches!(rx.try_recv(), Ok(Message::ClipboardImage { .. })),
@@ -2017,7 +2032,7 @@ mod tests {
 
         let (tx, mut rx) = unbounded_channel();
         let mut cb = Fake { image: Some(big), ..Default::default() };
-        let sent = poll_local_image(&mut cb, &mut None, &tx, set(), Some(&t)).expect("sent");
+        let sent = poll_local_image(&mut cb, &mut None, &tx, &set(), Some(&t)).expect("sent");
         assert!(!sent.inline, "a large image should go by reference");
         match rx.try_recv() {
             Ok(Message::ClipboardImageRef { hash, w, h, size }) => {
@@ -2060,11 +2075,11 @@ mod tests {
             &mut None,
             &png,
             None,
-            set(),
+            &set(),
             None,
         ));
         assert!(last_img.is_some());
-        assert!(poll_local_image(&mut cb, &mut last_img, &tx, set(), None).is_none());
+        assert!(poll_local_image(&mut cb, &mut last_img, &tx, &set(), None).is_none());
         assert!(rx.try_recv().is_err(), "an applied image must not echo back");
     }
 
@@ -2073,7 +2088,7 @@ mod tests {
         let (tx, _rx) = unbounded_channel();
         let mut cb = Fake::default();
         let h = ClipboardHistory::new();
-        assert!(!reuse_entry(&mut cb, &mut None, &mut None, &h, &tx, true, 999, set(), None, &mut None));
+        assert!(!reuse_entry(&mut cb, &mut None, &mut None, &h, &tx, true, 999, &set(), None, &mut None));
         assert!(cb.content.is_none());
     }
 
@@ -2086,8 +2101,8 @@ mod tests {
         assert!(!apply_remote(&mut cb, &mut last, &Arc::new("in".to_string())), "same remote -> false");
 
         cb.content = Some("out".into());
-        assert_eq!(poll_local(&mut cb, &mut last, &tx, set()).as_deref().map(|s| s.as_str()), Some("out"));
-        assert!(poll_local(&mut cb, &mut last, &tx, set()).is_none(), "unchanged -> None");
+        assert_eq!(poll_local(&mut cb, &mut last, &tx, &set()).as_deref().map(|s| s.as_str()), Some("out"));
+        assert!(poll_local(&mut cb, &mut last, &tx, &set()).is_none(), "unchanged -> None");
     }
 }
 

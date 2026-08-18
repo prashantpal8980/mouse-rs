@@ -213,6 +213,17 @@ pub struct Config {
     /// prompt would resurrect the keyboard leak.
     #[serde(default = "default_true")]
     pub clipboard_notify: bool,
+    /// Folder that received files are delivered into, e.g. `/home/you/Desktop`.
+    ///
+    /// Empty = off, and files only reach the clipboard. Set it and a copied file simply
+    /// *appears* there when the transfer finishes, with nothing to paste.
+    ///
+    /// This is what makes a large copy cost its own size once instead of twice. The
+    /// delivered file is a hard link to the cached blob — the same data under two names,
+    /// not two copies — so a 40 GB file uses 40 GB. Only a destination on a different
+    /// filesystem forces a real copy, and that case says so in the log.
+    #[serde(default)]
+    pub clipboard_deliver_dir: String,
     /// Put a received image on the clipboard as a `.png` file as well as pixels.
     ///
     /// On by default because without it the everyday case fails: no file manager on
@@ -332,6 +343,7 @@ impl Default for Config {
             clipboard_max_files_per_copy: default_max_files(),
             clipboard_follow_symlinks: false,
             clipboard_images_also_as_file: true,
+            clipboard_deliver_dir: String::new(),
             clipboard_notify: true,
             elevation_notice_seen: false,
             log_upload_url: String::new(),

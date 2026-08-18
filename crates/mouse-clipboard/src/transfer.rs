@@ -719,6 +719,41 @@ impl Transfers {
     ///
     /// A folder is rebuilt as a folder — pasting gives you the directory, not its
     /// contents scattered loose — and a plainly-copied file comes back as itself.
+    /// Hand a completed set to a folder the user chose, under real names and structure.
+    ///
+    /// Returns the delivered paths. Hard-linked from the cache where the filesystem
+    /// allows it, which is why this costs nothing: the file exists once, under two
+    /// names. See [`crate::cache::BlobCache::deliver`].
+    pub fn deliver(&self, set: &FileSet, dest: &std::path::Path) -> Option<FileList> {
+        let items = self.tree_items(set);
+        match self.cache.deliver(dest, &items, &set.dirs) {
+            Ok(paths) => {
+                tracing::info!(
+                    count = paths.len(),
+                    dir = %dest.display(),
+                    "DELIVERED files straight into your folder — nothing to paste"
+                );
+                Some(FileList { paths })
+            }
+            Err(e) => {
+                tracing::warn!(dir = %dest.display(), "could not deliver the files: {e}");
+                None
+            }
+        }
+    }
+
+    /// `(hash, relative path)` for every file in a set, with a plain file's own name
+    /// standing in when it has no relative path.
+    fn tree_items(&self, set: &FileSet) -> Vec<(String, String)> {
+        set.files
+            .iter()
+            .map(|f| {
+                let rel = if f.rel.is_empty() { f.name.clone() } else { f.rel.clone() };
+                (f.hash.clone(), rel)
+            })
+            .collect()
+    }
+
     pub fn materialize(&self, set: &FileSet) -> Option<FileList> {
         let items: Vec<(String, String)> = set
             .files

@@ -85,6 +85,7 @@ enum Message {
     ClipSyncTextToggled(bool),
     ClipSyncImagesToggled(bool),
     ClipItemsChanged(String),
+    ClipDeliverDirChanged(String),
     ClipItemMbChanged(String),
     ClipMemMbChanged(String),
     ClipImagePxChanged(String),
@@ -178,6 +179,7 @@ fn pending_restart_changes(live: &Config, now: &Config) -> Vec<&'static str> {
     chk(live.clipboard_max_files_per_copy != now.clipboard_max_files_per_copy, "files per copy");
     chk(live.clipboard_follow_symlinks != now.clipboard_follow_symlinks, "following shortcuts");
     chk(live.clipboard_images_also_as_file != now.clipboard_images_also_as_file, "images as a file");
+    chk(live.clipboard_deliver_dir != now.clipboard_deliver_dir, "folder for received files");
     chk(live.clipboard_quick_send_secs != now.clipboard_quick_send_secs, "don't-ask-if-quick");
     chk(live.clipboard_persist_history != now.clipboard_persist_history, "keep history after restart");
     chk(live.bulk_enabled != now.bulk_enabled, "separate transfer lane");
@@ -660,6 +662,7 @@ impl App {
             Message::ClipSyncImagesToggled(v) => self.cfg.clipboard_sync_images = v,
             // The numeric settings keep their own string buffer so a half-typed value is
             // never parsed; an unparseable buffer simply leaves `cfg` alone.
+            Message::ClipDeliverDirChanged(s) => self.cfg.clipboard_deliver_dir = s,
             Message::ClipItemsChanged(s) => {
                 if let Ok(v) = s.trim().parse::<usize>() {
                     self.cfg.clipboard_history_size = v.max(1);
@@ -1794,6 +1797,21 @@ impl App {
                 self.cfg.clipboard_sync,
                 Message::ClipboardToggled
             ),
+            labeled(
+                p,
+                "Put received files straight into this folder",
+                input(p, "/home/you/Desktop — blank to keep them on the clipboard only", &self.cfg.clipboard_deliver_dir, Message::ClipDeliverDirChanged)
+            ),
+            text(if self.cfg.clipboard_deliver_dir.trim().is_empty() {
+                "Blank: files only reach the clipboard, so you paste them somewhere. Set a folder and they simply appear there when the transfer finishes.".to_string()
+            } else {
+                format!(
+                    "Files land in {} as they arrive — nothing to paste. They are linked, not copied, so a 40 GB file uses 40 GB and not 80.",
+                    self.cfg.clipboard_deliver_dir.trim()
+                )
+            })
+            .size(11.0)
+            .color(p.txt3),
             labeled(p, "Keep this many entries", input(p, "25", &self.clip_items_s, Message::ClipItemsChanged)),
             labeled(
                 p,
