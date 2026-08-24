@@ -1105,6 +1105,9 @@ fn run(
                     if let Some(ClipPayload::Files(set)) = h.payload(entry) {
                         if t.is_complete(&set) {
                             h.set_status(entry, ClipStatus::Ready);
+                            // Whether a paste is sitting in the selection owner right
+                            // now waiting for exactly these files to appear.
+                            let paste_waiting = paste_signals.contains_key(&entry);
                             // Delivered into the user's folder when they named one, so
                             // the file is simply *there* and needs no paste at all —
                             // and, being a hard link, costs its own size once rather
@@ -1116,6 +1119,21 @@ fn run(
                                 .and_then(|dir| t.deliver(&set, dir));
                             let list = delivered.or_else(|| t.materialize(&set));
                             if let Some(list) = list {
+                                // Re-publishing would take the selection from the owner
+                                // that is still holding the paste open, and that paste
+                                // would then answer from a dead owner — so the transfer
+                                // it triggered would finish and the paste still produce
+                                // nothing. The paths are identical either way (both are
+                                // `trees/<set key>/…`), so the existing publication is
+                                // already correct now that the files exist.
+                                if paste_waiting {
+                                    tracing::info!(
+                                        count = set.files.len(),
+                                        "files are here; the waiting paste can complete"
+                                    );
+                                    paste_signals.remove(&entry);
+                                    continue;
+                                }
                                 // Published as a *move* when asked for: the file manager
                                 // then relocates our hard link to wherever the paste
                                 // happened, which is a rename rather than a copy — so a

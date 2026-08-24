@@ -771,8 +771,14 @@ impl Transfers {
     ///
     /// This is what makes copy cheap and paste the moment of truth: the clipboard can
     /// carry real, final paths straight away, and the bytes only have to exist by the
-    /// time a paste asks for them. The directories are created so a file manager
-    /// inspecting the parent does not see a broken location.
+    /// time a paste asks for them.
+    ///
+    /// **Nothing is created here, and that is load-bearing.** The paste waits by testing
+    /// whether the published paths exist yet. For a folder the published path is the
+    /// folder itself, so pre-creating it made that test pass immediately: the wait was
+    /// skipped, the transfer never started, and the file manager cheerfully copied an
+    /// empty directory. A single file happened to work only because a file is not
+    /// created by `create_dir_all`.
     pub fn placeholder_paths(&self, set: &FileSet) -> Option<FileList> {
         let items = self.tree_items(set);
         let root = self.cache.tree_root(&set_key(set));
@@ -785,9 +791,6 @@ impl Transfers {
             let mut dest = root.clone();
             for part in &parts {
                 dest.push(part);
-            }
-            if let Some(parent) = dest.parent() {
-                let _ = std::fs::create_dir_all(parent);
             }
             let top = root.join(&parts[0]);
             if !tops.contains(&top) {
@@ -1721,5 +1724,101 @@ mod budget_tests {
         // Only removing the entry releases them.
         hist.remove(entry);
         assert!(!hist.referenced_hashes().contains(&hash));
+    }
+}
+
+#[cfg(test)]
+mod placeholder_tests {
+    use super::*;
+    use std::fs;
+
+    /// A paste waits by checking whether the published paths exist yet. Creating them up
+    /// front made that check pass instantly for a *folder* — whose published path is the
+    /// folder itself — so the wait was skipped, no transfer started, and the file manager
+    /// copied an empty directory. A single file only worked by accident, `create_dir_all`
+    /// not creating files.
+    #[test]
+    fn placeholder_paths_do_not_exist_yet_for_a_folder_or_a_file() {
+        let root = std::env::temp_dir().join("mouse-rs-placeholder");
+        let _ = fs::remove_dir_all(&root);
+        let cache = Arc::new(BlobCache::new(root.join("cache")).unwrap());
+        let t = Transfers::new(cache);
+
+        let folder = FileSet {
+            files: vec![
+                FileRef {
+                    name: "ep01.mkv".into(),
+                    size: 10,
+                    hash: "1".repeat(64),
+                    source_path: None,
+                    rel: "Season 1/ep01.mkv".into(),
+                },
+                FileRef {
+                    name: "ep02.mkv".into(),
+                    size: 10,
+                    hash: "2".repeat(64),
+                    source_path: None,
+                    rel: "Season 1/ep02.mkv".into(),
+                },
+            ],
+            dirs: vec!["Season 1".into()],
+            origin: "laptop".into(),
+        };
+        let list = t.placeholder_paths(&folder).expect("paths");
+        assert_eq!(list.paths.len(), 1, "a folder publishes one top-level path");
+        assert!(
+            !list.paths[0].exists(),
+            "the folder must NOT exist yet, or the paste stops waiting and copies nothing"
+        );
+
+        let single = FileSet {
+            files: vec![FileRef {
+                name: "film.mkv".into(),
+                size: 10,
+                hash: "3".repeat(64),
+                source_path: None,
+                rel: String::new(),
+            }],
+            dirs: Vec::new(),
+            origin: "laptop".into(),
+        };
+        let list = t.placeholder_paths(&single).expect("paths");
+        assert!(!list.paths[0].exists(), "nor may a single file");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// And once the content arrives, `materialize` must produce exactly the paths that
+    /// were published — otherwise the waiting paste watches the wrong location for ever.
+    #[test]
+    fn materialize_lands_on_the_same_paths_that_were_published() {
+        let root = std::env::temp_dir().join("mouse-rs-placeholder-match");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let cache = Arc::new(BlobCache::new(root.join("cache")).unwrap());
+        let t = Transfers::new(cache.clone());
+
+        let src = root.join("film.mkv");
+        fs::write(&src, b"the actual bytes").unwrap();
+        let (hash, size) = cache.ingest(&src, u64::MAX).unwrap();
+        let set = FileSet {
+            files: vec![FileRef {
+                name: "film.mkv".into(),
+                size,
+                hash,
+                source_path: None,
+                rel: String::new(),
+            }],
+            dirs: Vec::new(),
+            origin: "laptop".into(),
+        };
+
+        let promised = t.placeholder_paths(&set).expect("promised");
+        let delivered = t.materialize(&set).expect("materialised");
+        assert_eq!(
+            promised.paths, delivered.paths,
+            "the paste is waiting on the promised path; materialise must use it"
+        );
+        assert!(delivered.paths[0].is_file(), "and it exists now");
+        let _ = fs::remove_dir_all(&root);
     }
 }
