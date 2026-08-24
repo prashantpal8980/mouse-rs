@@ -1260,8 +1260,7 @@ impl App {
         // Theme swatches used to sit here — six colour dots directly beside the one line
         // of status a user actually reads. They live in the ⋯ menu now.
         row![
-            text("mouse-rs").size(22.0).color(p.txt),
-            Space::new().width(Length::Fill),
+            text("mouse-rs").size(22.0).color(p.txt).width(Length::Fill),
             status,
             button(text("⋯").size(16.0).color(p.txt2))
                 .style(ui_theme::ghost(p))
@@ -1452,8 +1451,8 @@ impl App {
                         "Permissions: administrator"
                     })
                     .size(12.0)
-                    .color(if limited { p.txt2 } else { p.good }),
-                    Space::new().width(Length::Fill),
+                    .color(if limited { p.txt2 } else { p.good })
+                    .width(Length::Fill),
                     button(text(if limited { "Restart as administrator" } else { "Restart as normal user" }).size(11.5))
                         .style(ui_theme::ghost(p))
                         .padding([7.0, 12.0])
@@ -1642,8 +1641,8 @@ impl App {
                         .size(11.0)
                         .color(p.txt3),
                     ]
-                    .spacing(3.0),
-                    Space::new().width(Length::Fill),
+                    .spacing(3.0)
+                    .width(Length::Fill),
                     // Three answers, because "yes" and "no" are not the only ones: the
                     // third says "stop asking me about files this size", which is the
                     // real request behind repeatedly pressing the first.
@@ -1755,22 +1754,24 @@ impl App {
                     let fetching = matches!(m.status, mouse_clipboard::ClipStatus::Fetching { .. });
                     // The row itself is the re-use action — the thing the user wants
                     // nine times out of ten needs no menu and no second click.
-                    // The name flexes and the status gets a column of its own. Without a
-                    // width the status was squeezed into a few pixels and wrapped one
-                    // word per line — "299.5 MB · click to bring it over" stacked
-                    // vertically, which is how a status line stops being readable.
-                    let head = row![
-                        text(kind).size(12.0).color(p.txt3),
-                        text(arrow).size(11.0).color(col),
-                        text(m.preview.clone()).size(13.0).color(p.txt2).width(Length::Fill),
-                        text(note)
-                            .size(11.0)
-                            .color(note_col)
-                            .width(Length::Fixed(150.0))
-                            .align_x(iced::alignment::Horizontal::Right),
+                    // Stacked, not side by side. Sharing one line means the two texts
+                    // compete for width at every window size, and one of them always
+                    // loses — either the status is crushed into a one-word-per-line
+                    // column, or a long status ("no longer at the recorded path on the
+                    // other machine") runs straight over the file name. On its own line
+                    // each can simply use the width available, at any size down to a
+                    // phone.
+                    let head = column![
+                        row![
+                            text(kind).size(12.0).color(p.txt3),
+                            text(arrow).size(11.0).color(col),
+                            text(m.preview.clone()).size(13.0).color(p.txt2).width(Length::Fill),
+                        ]
+                        .spacing(8.0)
+                        .align_y(Alignment::Center),
+                        text(note).size(11.0).color(note_col).width(Length::Fill),
                     ]
-                    .spacing(10.0)
-                    .align_y(Alignment::Center);
+                    .spacing(4.0);
                     // A bar while it is moving: a percentage answers "how far", a bar
                     // answers "is it still going", which is the one being asked while
                     // watching a long transfer.
@@ -1850,8 +1851,8 @@ impl App {
         };
 
         let header = row![
-            field_label(p, "History — newest first · click any entry to copy it again"),
-            Space::new().width(Length::Fill),
+            container(field_label(p, "History — newest first · click any entry to copy it again"))
+                .width(Length::Fill),
             button(text("Clear").size(12.0))
                 .style(ui_theme::ghost(p))
                 .padding([7.0, 12.0])
@@ -1891,8 +1892,8 @@ impl App {
                     if count == 1 { "" } else { "s" }
                 ))
                 .size(11.0)
-                .color(if bytes > self.cfg.clipboard_cache_budget { p.warn } else { p.txt3 }),
-                Space::new().width(Length::Fill),
+                .color(if bytes > self.cfg.clipboard_cache_budget { p.warn } else { p.txt3 })
+                .width(Length::Fill),
                 button(text("Clear").size(11.0))
                     .style(ui_theme::ghost(p))
                     .padding([5.0, 10.0])
@@ -2140,8 +2141,7 @@ impl App {
         };
 
         row![
-            text(&self.feedback).size(12.0).color(p.txt3),
-            Space::new().width(Length::Fill),
+            text(&self.feedback).size(12.0).color(p.txt3).width(Length::Fill),
             button(text("Save").size(13.0))
                 .style(ui_theme::ghost(p))
                 .padding([11.0, 16.0])
@@ -2279,17 +2279,22 @@ fn toggle_row<'a>(
     value: bool,
     on_toggle: impl Fn(bool) -> Message + 'a,
 ) -> Element<'a, Message> {
+    // The label column takes the free space and the switch keeps its own, so a long
+    // description wraps inside its column instead of growing the row until it runs over
+    // the control beside it. A spacer cannot do this: it only pushes, and what is needed
+    // is for the text to be *allowed to be narrow*.
     let labels = column![
         text(title.to_string()).size(14.0).color(p.txt),
         text(desc.to_string()).size(11.0).color(p.txt3),
     ]
-    .spacing(2.0);
+    .spacing(2.0)
+    .width(Length::Fill);
     container(
         row![
             labels,
-            Space::new().width(Length::Fill),
             toggler(value).on_toggle(on_toggle).style(ui_theme::switch(p)).size(24.0),
         ]
+        .spacing(12.0)
         .align_y(Alignment::Center),
     )
     .style(move |_| ui_theme::well(p))
@@ -2332,8 +2337,7 @@ fn edge_picker(p: Palette, current: Edge, on_pick: impl Fn(Edge) -> Message + Co
 fn machine_chip(p: Palette, name: &str, res: &str, active: bool) -> Element<'static, Message> {
     container(
         row![
-            text(name.to_string()).size(13.0).color(p.txt),
-            Space::new().width(Length::Fill),
+            text(name.to_string()).size(13.0).color(p.txt).width(Length::Fill),
             text(res.to_string()).size(11.0).color(p.txt3),
         ]
         .align_y(Alignment::Center),
@@ -2435,7 +2439,16 @@ pub fn launch(cfg: Config) -> anyhow::Result<()> {
         .title("mouse-rs")
         .subscription(App::subscription)
         .theme(App::theme)
-        .window_size(iced::Size::new(560.0, 720.0))
+        .window(iced::window::Settings {
+            size: iced::Size::new(560.0, 720.0),
+            // A floor, not a target. Every row now lets its text shrink and wrap rather
+            // than grow until it runs over the control beside it, so the panel stays
+            // usable well below the default — but under roughly a phone's width there is
+            // genuinely nowhere for a label and its switch to both go, and allowing it
+            // to be dragged narrower only produces a window that looks broken.
+            min_size: Some(iced::Size::new(360.0, 420.0)),
+            ..Default::default()
+        })
         .run()
         .map_err(|e| anyhow::anyhow!("control panel: {e}"))
 }

@@ -303,15 +303,7 @@ impl BlobCache {
             let (hash, size) = self.ingest(src, budget)?;
             return Ok((hash, size, true));
         }
-        let mtime = meta
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        // Same shape as a content hash — 64 hex characters — so every path that
-        // validates or stores an id keeps working unchanged.
-        let id = hash_bytes(format!("{}|{size}|{mtime}", src.to_string_lossy()).as_bytes());
+        let id = quick_id(src, &meta);
         tracing::debug!(
             path = %src.display(),
             size,
@@ -516,6 +508,25 @@ impl BlobCache {
             }
         }
     }
+}
+
+/// A file's identity without reading it: path, size and modification time.
+///
+/// Same shape as a content hash — 64 hex characters — so everything that validates or
+/// stores an id keeps working unchanged. Stable for an unmodified file, which is what
+/// makes dedup and resume survive without hashing gigabytes.
+///
+/// Exposed because the *serving* side has to recompute it. Checking a quick id against
+/// a content hash can only ever fail, and when it did the peer was told the file was
+/// "no longer at the recorded path" while it sat exactly where it always had.
+pub fn quick_id(path: &Path, meta: &fs::Metadata) -> String {
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    hash_bytes(format!("{}|{}|{mtime}", path.to_string_lossy(), meta.len()).as_bytes())
 }
 
 /// Hash a file's contents, streaming. Returns the hex digest and the byte count.

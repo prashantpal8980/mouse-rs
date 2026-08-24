@@ -572,16 +572,32 @@ impl Transfers {
             let name = self.name_for(hash, history).unwrap_or_else(|| "file".into());
             return Some((std::fs::File::open(&path).ok()?, len, name));
         }
-        // Not cached: fall back to the source path, but only if it still hashes to what
-        // was advertised. A path that now holds *different* content is not the file the
+        // Not cached: fall back to the source path, but only if it is still the file
+        // that was advertised. A path that now holds *different* content is not what the
         // peer asked for, and sending it anyway would silently paste the wrong version.
+        //
+        // **The check has to match the kind of id.** A large file is identified by path,
+        // size and modification time rather than by hashing it, and comparing that
+        // against a content hash can only ever fail — which made every file over the
+        // hash limit unservable, reported to the peer as "no longer at the recorded
+        // path" while it sat exactly where it always had.
         let (path, name) = self.source_for(hash, history)?;
-        let (actual, len) = cache::hash_file(&PathBuf::from(&path)).ok()?;
-        if actual != hash {
-            tracing::warn!(path = %path, "the file at the recorded path has changed since it was copied");
+        let content_hashed = history.file_ref(hash).map(|f| f.content_hashed).unwrap_or(true);
+        let p = PathBuf::from(&path);
+        if content_hashed {
+            let (actual, len) = cache::hash_file(&p).ok()?;
+            if actual != hash {
+                tracing::warn!(path = %path, "the file at the recorded path has changed since it was copied");
+                return None;
+            }
+            return Some((std::fs::File::open(&p).ok()?, len, name));
+        }
+        let meta = std::fs::metadata(&p).ok()?;
+        if cache::quick_id(&p, &meta) != hash {
+            tracing::warn!(path = %path, "the file at the recorded path has changed size or timestamp since it was copied");
             return None;
         }
-        Some((std::fs::File::open(&path).ok()?, len, name))
+        Some((std::fs::File::open(&p).ok()?, meta.len(), name))
     }
 
     fn name_for(&self, hash: &str, history: &ClipboardHistory) -> Option<String> {
@@ -983,7 +999,7 @@ mod tests {
     /// Serving runs on its own thread so it can wait for the network without stalling
     /// the clipboard, which means a test can no longer assume the frames are already
     /// queued the moment `serve_request` returns.
-    fn drain_bulk(
+    pub(super) fn drain_bulk(
         rx: &mut tokio::sync::mpsc::UnboundedReceiver<BulkFrame>,
     ) -> Vec<BulkFrame> {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -1839,6 +1855,85 @@ mod placeholder_tests {
             "the paste is waiting on the promised path; materialise must use it"
         );
         assert!(delivered.paths[0].is_file(), "and it exists now");
+        let _ = fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod quick_id_tests {
+    use super::tests::drain_bulk;
+    use super::*;
+    use std::fs;
+
+    /// The regression this exists to prevent: a file identified without hashing could
+    /// not be served at all. `open_for_serving` re-hashed the source and compared it to
+    /// the advertised id, which for a quick id can only ever differ — so the peer was
+    /// told "no longer at the recorded path" about a file that had never moved, and
+    /// every file over the hash limit was unservable.
+    #[test]
+    fn a_file_identified_without_hashing_can_still_be_served() {
+        let root = std::env::temp_dir().join("mouse-rs-quickid-serve");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let cache = Arc::new(BlobCache::new(root.join("cache")).unwrap());
+        let mut t = Transfers::new(cache);
+        let hist = ClipboardHistory::new();
+
+        let src = root.join("film.mkv");
+        fs::write(&src, vec![1u8; 4096]).unwrap();
+
+        // hash_limit of 0 forces the quick-id path, as a large file would.
+        let set = t
+            .describe_local(&FileList { paths: vec![src.clone()] }, "laptop", 10, false, u64::MAX, 0)
+            .expect("described");
+        assert!(!set.files[0].content_hashed, "this must be the quick-id path");
+        let hash = set.files[0].hash.clone();
+        hist.record_files(Arc::new(set), false, ClipStatus::Ready);
+
+        let (to_peer, mut peer_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (to_bulk, mut bulk_rx) = tokio::sync::mpsc::unbounded_channel();
+        t.serve_request(&hash, 0, &hist, &to_peer, &to_bulk, &Arc::new(BulkQueue::new(1 << 20)));
+
+        assert!(
+            peer_rx.try_recv().is_err(),
+            "it must not answer BlobUnavailable for a file that is exactly where it was"
+        );
+        let frames = drain_bulk(&mut bulk_rx);
+        assert!(
+            frames.iter().any(|f| matches!(f, BulkFrame::End { .. })),
+            "the file should have been streamed in full: {frames:?}"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// And the check must still catch a file that really did change underneath.
+    #[test]
+    fn a_quick_identified_file_that_changed_is_still_refused() {
+        let root = std::env::temp_dir().join("mouse-rs-quickid-changed");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let cache = Arc::new(BlobCache::new(root.join("cache")).unwrap());
+        let mut t = Transfers::new(cache);
+        let hist = ClipboardHistory::new();
+
+        let src = root.join("notes.bin");
+        fs::write(&src, vec![1u8; 4096]).unwrap();
+        let set = t
+            .describe_local(&FileList { paths: vec![src.clone()] }, "laptop", 10, false, u64::MAX, 0)
+            .expect("described");
+        let hash = set.files[0].hash.clone();
+        hist.record_files(Arc::new(set), false, ClipStatus::Ready);
+
+        // A different length is a different file, whatever the timestamp says.
+        fs::write(&src, vec![2u8; 8192]).unwrap();
+
+        let (to_peer, mut peer_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (to_bulk, _bulk_rx) = tokio::sync::mpsc::unbounded_channel();
+        t.serve_request(&hash, 0, &hist, &to_peer, &to_bulk, &Arc::new(BulkQueue::new(1 << 20)));
+        assert!(
+            matches!(peer_rx.try_recv(), Ok(Message::BlobUnavailable { .. })),
+            "a changed file must not be sent as if it were the original"
+        );
         let _ = fs::remove_dir_all(&root);
     }
 }
