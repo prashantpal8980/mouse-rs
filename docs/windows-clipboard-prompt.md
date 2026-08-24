@@ -7,6 +7,14 @@ description crosses, and the bytes move when the file is **pasted**. Anything un
 
 Alongside that:
 
+* **a copy is announced immediately.** Hashing every byte before telling the other
+  machine a copy existed took 65 seconds on a 12.6 GB folder — measured — and for all of
+  that time nothing had appeared on the other side and nothing was on the network. Files
+  over 64 MB are now identified by path, size and modification time instead, which is
+  instant. This is the sending side, so it needs *this* build to take effect;
+* **Stop is answered promptly.** The receiving side drained incoming file data until the
+  channel emptied, which during a fast transfer never happens — so Stop clicks queued up
+  behind it and took several presses to land;
 * a copied image lands as a file as well as pixels, so it pastes into Explorer;
 * **pasting a received file moves it to where you pasted** rather than copying it out of
   the cache — Explorer is told `Preferred DropEffect = MOVE`, so within one volume it is
