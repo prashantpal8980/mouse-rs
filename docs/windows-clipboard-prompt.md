@@ -7,6 +7,12 @@ description crosses, and the bytes move when the file is **pasted**. Anything un
 
 Alongside that:
 
+* **files over 64 MB can be sent again.** The previous build identified a large file by
+  path, size and timestamp so a copy could be announced immediately — but the sending
+  side still verified by re-hashing it, and a content hash can never equal that. Every
+  file over the limit was refused with "no longer at the recorded path" about a file
+  that had never moved, so a folder of large files could not be copied at all. **This is
+  the sending side: without this build that folder still fails.**
 * **a copy is announced immediately.** Hashing every byte before telling the other
   machine a copy existed took 65 seconds on a 12.6 GB folder — measured — and for all of
   that time nothing had appeared on the other side and nothing was on the network. Files
