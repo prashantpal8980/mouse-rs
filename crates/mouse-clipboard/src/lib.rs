@@ -606,6 +606,8 @@ pub struct ClipboardSettings {
     pub images_also_as_file: bool,
     /// Folder received files are delivered into. Empty = clipboard only.
     pub deliver_dir: Option<std::path::PathBuf>,
+    /// Largest file whose contents are hashed before a copy is announced.
+    pub hash_limit: u64,
     /// Paste *moves* a received file to where it was pasted, rather than copying it.
     pub move_on_paste: bool,
     /// Skip the prompt when a transfer is measured to finish this fast. 0 disables it.
@@ -630,6 +632,7 @@ impl Default for ClipboardSettings {
             follow_symlinks: false,
             images_also_as_file: true,
             deliver_dir: None,
+            hash_limit: 64 * 1024 * 1024,
             move_on_paste: true,
             quick_send_secs: 3.0,
             persist_history: false,
@@ -651,6 +654,13 @@ const TEXT_POLL_TICKS: u32 = 5;
 /// burn measurable CPU in a process that must never be slow. Text stays on the fast
 /// tick because reading it is trivially cheap.
 const IMAGE_POLL_TICKS: u32 = 20; // 20 × 100 ms = every 2 s, as before
+
+/// Bulk frames handled before this thread goes back to look at the panel's requests.
+///
+/// 32 chunks is 8 MB — a few tens of milliseconds of a gigabit link, so a transfer stays
+/// saturated while Stop and every other command are answered promptly instead of waiting
+/// for the whole transfer to finish.
+const BULK_FRAMES_PER_PASS: usize = 32;
 
 /// An RGBA8 image — the common currency between the OS clipboard and the PNG codec.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1086,7 +1096,15 @@ fn run(
         // clipboard here, on the one thread allowed to touch it.
         if let (Some(fb), Some(t), Some(h)) = (from_bulk.as_ref(), transfers.as_mut(), history.as_ref())
         {
+            // Bounded per pass, and that is the point. This used to drain until the
+            // channel ran dry, and during a fast multi-file transfer it never does:
+            // frames arrive faster than they are written to disk, so the loop kept
+            // going and this thread never returned to the command channel. Stop did
+            // nothing until the flood happened to pause — the clicks were queued, not
+            // lost — and everything else the panel asked for was stuck behind it too.
+            let mut drained = 0usize;
             while let Ok(frame) = fb.try_recv() {
+                drained += 1;
                 let entry_opt = t.on_bulk_frame(frame, h);
                 if let Some(done) = t.take_last_completed() {
                     if let Some((png, _w, _h)) = t.take_completed_image(&done) {
@@ -1160,6 +1178,11 @@ fn run(
                         }
                     }
                 }
+                // Enough per pass to keep the disk busy, few enough that a click is
+                // answered in milliseconds rather than at the end of a 12 GB transfer.
+                if drained >= BULK_FRAMES_PER_PASS {
+                    break;
+                }
             }
             // A paste is waiting on content: start fetching it now. This is the only
             // thing that begins a large transfer, which is what keeps copying cheap.
@@ -1208,7 +1231,7 @@ fn run(
                         let key = files::list_key(&list);
                         if last_files != Some(key) {
                             last_files = Some(key);
-                            if let Some(set) = t.describe_local(&list, settings.machine, settings.max_files_per_copy, settings.follow_symlinks, settings.cache_budget) {
+                            if let Some(set) = t.describe_local(&list, settings.machine, settings.max_files_per_copy, settings.follow_symlinks, settings.cache_budget, settings.hash_limit) {
                                 tracing::info!(
                                     count = set.files.len(),
                                     bytes = set.total_bytes(),
@@ -2079,6 +2102,7 @@ mod tests {
                 name: "big.iso".into(),
                 size: 100 * 1024 * 1024,
                 hash: "e".repeat(64),
+                content_hashed: true,
                 source_path: None,
                 rel: String::new(),
             }],
@@ -2436,6 +2460,7 @@ mod persist_tests {
                 name: "ep01.mkv".into(),
                 size: 314_000_000,
                 hash: "d".repeat(64),
+                content_hashed: true,
                 source_path: None,
                 rel: String::new(),
             }],

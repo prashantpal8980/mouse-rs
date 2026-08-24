@@ -283,6 +283,65 @@ impl BlobCache {
         Ok((hash, size))
     }
 
+    /// Identify a file for the wire, hashing its contents only when that is affordable.
+    ///
+    /// Returns `(id, size, content_hashed)`.
+    ///
+    /// Hashing reads every byte. Doing it before a copy can even be announced cost 65
+    /// seconds on a 12.6 GB folder — the copy did not appear on the other machine for
+    /// over a minute, which reads as the software being broken rather than being careful.
+    ///
+    /// So above `hash_limit` the identity is derived from the path, size and
+    /// modification time. That is instant, and stable for the same file, so dedup and
+    /// resume still work. What is given up is content verification, replaced on receipt
+    /// by a length check — which still catches the realistic failure of a truncated or
+    /// interrupted transfer, over a link that is authenticated and encrypted anyway.
+    pub fn identify(&self, src: &Path, budget: u64, hash_limit: u64) -> io::Result<(String, u64, bool)> {
+        let meta = fs::metadata(src)?;
+        let size = meta.len();
+        if size <= hash_limit {
+            let (hash, size) = self.ingest(src, budget)?;
+            return Ok((hash, size, true));
+        }
+        let mtime = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        // Same shape as a content hash — 64 hex characters — so every path that
+        // validates or stores an id keeps working unchanged.
+        let id = hash_bytes(format!("{}|{size}|{mtime}", src.to_string_lossy()).as_bytes());
+        tracing::debug!(
+            path = %src.display(),
+            size,
+            "identified without hashing: over the hash limit, so the copy is announced immediately"
+        );
+        Ok((id, size, false))
+    }
+
+    /// Promote a completed partial, verifying contents when the id is a content hash and
+    /// length when it is not.
+    ///
+    /// The length check is not a formality. It is what catches the failure that actually
+    /// happens — a transfer cut short — and without it a half-received film would be
+    /// promoted and pasted as if it were whole.
+    pub fn finish_checked(&self, hash: &str, content_hashed: bool, expect: u64) -> io::Result<()> {
+        if content_hashed {
+            return self.finish(hash);
+        }
+        let part = self.part_path(hash);
+        let got = fs::metadata(&part)?.len();
+        if got != expect {
+            let _ = fs::remove_file(&part);
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("received {got} bytes but the file is {expect}"),
+            ));
+        }
+        fs::rename(&part, self.blob_path(hash))
+    }
+
     /// A path to this content **under its original filename**, ready to be put on the
     /// clipboard. Hard-linked when the filesystem allows it, copied when it does not.
     pub fn materialize(&self, hash: &str, name: &str) -> io::Result<PathBuf> {

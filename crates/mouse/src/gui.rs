@@ -182,6 +182,7 @@ fn pending_restart_changes(live: &Config, now: &Config) -> Vec<&'static str> {
     chk(live.clipboard_images_also_as_file != now.clipboard_images_also_as_file, "images as a file");
     chk(live.clipboard_deliver_dir != now.clipboard_deliver_dir, "folder for received files");
     chk(live.clipboard_move_on_paste != now.clipboard_move_on_paste, "move on paste");
+    chk(live.clipboard_hash_limit != now.clipboard_hash_limit, "hash limit");
     chk(live.clipboard_quick_send_secs != now.clipboard_quick_send_secs, "don't-ask-if-quick");
     chk(live.clipboard_persist_history != now.clipboard_persist_history, "keep history after restart");
     chk(live.bulk_enabled != now.bulk_enabled, "separate transfer lane");

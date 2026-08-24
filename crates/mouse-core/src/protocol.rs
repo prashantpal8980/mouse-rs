@@ -37,6 +37,10 @@ pub enum Lane {
     Bulk,
 }
 
+fn default_true() -> bool {
+    true
+}
+
 /// A file copied to the clipboard: what it is, and where it came from.
 ///
 /// Only this description crosses the input link. The contents travel on the bulk lane,
@@ -46,9 +50,23 @@ pub enum Lane {
 pub struct FileRef {
     pub name: String,
     pub size: u64,
-    /// SHA-256 of the contents: the cache key, the integrity check, and the reason a
-    /// file the peer already holds needs no transfer at all.
+    /// The file's identity: the cache key, and — when `content_hashed` — the integrity
+    /// check and the reason a file the peer already holds needs no transfer at all.
     pub hash: String,
+    /// Whether `hash` is a SHA-256 of the contents, or a cheap stand-in.
+    ///
+    /// Hashing reads every byte, and doing it before a copy can even be *announced* cost
+    /// 65 seconds on a 12.6 GB folder — the file simply did not appear on the other
+    /// machine for over a minute. Above a size limit the identity is derived from the
+    /// path, size and modification time instead, which is instant and still stable for
+    /// the same file, so dedup and resume keep working.
+    ///
+    /// What it costs is content verification, which is then replaced by a length check.
+    /// That still catches the realistic failure — a truncated or interrupted transfer —
+    /// and the bytes crossed an authenticated TLS connection either way. Defaulted true
+    /// so an older peer's messages still parse as fully hashed, which they are.
+    #[serde(default = "default_true")]
+    pub content_hashed: bool,
     /// Where it lived on the machine it was copied from. Used to re-read it on request,
     /// and to say something true once it has moved.
     #[serde(default)]

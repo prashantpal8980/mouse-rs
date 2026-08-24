@@ -219,6 +219,7 @@ impl Transfers {
         max_files: usize,
         follow_symlinks: bool,
         cache_budget: u64,
+        hash_limit: u64,
     ) -> Option<FileSet> {
         let mut files = Vec::new();
         let mut dirs: Vec<String> = Vec::new();
@@ -259,14 +260,15 @@ impl Transfers {
             };
             budget = budget.saturating_sub(members.len());
             for (member, rel) in members {
-                match self.cache.ingest(&member, cache_budget) {
-                    Ok((hash, size)) => files.push(FileRef {
+                match self.cache.identify(&member, cache_budget, hash_limit) {
+                    Ok((hash, size, content_hashed)) => files.push(FileRef {
                         name: member
                             .file_name()
                             .map(|n| n.to_string_lossy().into_owned())
                             .unwrap_or_else(|| "file".into()),
                         size,
                         hash,
+                        content_hashed,
                         source_path: Some(member.to_string_lossy().into_owned()),
                         rel,
                     }),
@@ -671,7 +673,13 @@ impl Transfers {
                 drop(inc.file);
                 self.requested.remove(&inc.hash);
                 self.last_completed = Some(inc.hash.clone());
-                match self.cache.finish(&inc.hash) {
+                // Verified by content when the sender hashed it, by length when it did
+                // not — see `BlobCache::identify` for why a large file is not hashed.
+                let content_hashed = history
+                    .file_ref(&inc.hash)
+                    .map(|f| f.content_hashed)
+                    .unwrap_or(true);
+                match self.cache.finish_checked(&inc.hash, content_hashed, inc.total) {
                     Ok(()) => {
                         tracing::info!(hash = %inc.hash, bytes = inc.got, "content received and verified");
                         inc.entry
@@ -1004,7 +1012,7 @@ mod tests {
         let a = root.join("one.txt");
         fs::write(&a, b"hello").unwrap();
         let set = t
-            .describe_local(&FileList { paths: vec![a.clone()] }, "kali", 10_000, false, u64::MAX)
+            .describe_local(&FileList { paths: vec![a.clone()] }, "kali", 10_000, false, u64::MAX, u64::MAX)
             .expect("a file list");
         assert_eq!(set.files.len(), 1);
         assert_eq!(set.files[0].name, "one.txt");
@@ -1020,7 +1028,7 @@ mod tests {
         let (root, t, _h) = setup("dedup");
         let a = root.join("known.bin");
         fs::write(&a, vec![7u8; 4096]).unwrap();
-        let set = t.describe_local(&FileList { paths: vec![a] }, "kali", 10_000, false, u64::MAX).unwrap();
+        let set = t.describe_local(&FileList { paths: vec![a] }, "kali", 10_000, false, u64::MAX, u64::MAX).unwrap();
         // Tiny auto-limit, so only the cache hit can explain a Ready verdict.
         assert_eq!(t.initial_status(&set, 1, None), ClipStatus::Ready);
         let _ = fs::remove_dir_all(&root);
@@ -1034,6 +1042,7 @@ mod tests {
                 name: "big.iso".into(),
                 size: 100 * 1024 * 1024,
                 hash: "b".repeat(64),
+                content_hashed: true,
                 source_path: None,
                 rel: String::new(),
             }],
@@ -1055,7 +1064,7 @@ mod tests {
         let content: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
         fs::write(&src, &content).unwrap();
         let set = sender
-            .describe_local(&FileList { paths: vec![src] }, "laptop", 10_000, false, u64::MAX)
+            .describe_local(&FileList { paths: vec![src] }, "laptop", 10_000, false, u64::MAX, u64::MAX)
             .unwrap();
         s_hist.record_files(Arc::new(set.clone()), false, ClipStatus::Ready);
 
@@ -1109,7 +1118,7 @@ mod tests {
         fs::write(proj.join("src").join("deep").join("x.txt"), b"deep").unwrap();
 
         let set = t
-            .describe_local(&FileList { paths: vec![proj.clone()] }, "laptop", 10_000, false, u64::MAX)
+            .describe_local(&FileList { paths: vec![proj.clone()] }, "laptop", 10_000, false, u64::MAX, u64::MAX)
             .expect("a folder should describe");
         assert_eq!(set.files.len(), 3, "every file in the tree");
 
@@ -1142,7 +1151,7 @@ mod tests {
         fs::write(&loose, b"loose").unwrap();
 
         let set = t
-            .describe_local(&FileList { paths: vec![dir, loose] }, "laptop", 10_000, false, u64::MAX)
+            .describe_local(&FileList { paths: vec![dir, loose] }, "laptop", 10_000, false, u64::MAX, u64::MAX)
             .unwrap();
         let list = t.materialize(&set).unwrap();
         let names: std::collections::HashSet<_> = list
@@ -1163,7 +1172,7 @@ mod tests {
             fs::write(dir.join(format!("f{i}.txt")), format!("{i}")).unwrap();
         }
         let set = t
-            .describe_local(&FileList { paths: vec![dir] }, "laptop", 5, false, u64::MAX)
+            .describe_local(&FileList { paths: vec![dir] }, "laptop", 5, false, u64::MAX, u64::MAX)
             .unwrap();
         assert_eq!(set.files.len(), 5, "a stray click on a huge folder must be bounded");
         let _ = fs::remove_dir_all(&root);
@@ -1187,6 +1196,7 @@ mod tests {
                 name: "evil.desktop".into(),
                 size: content.len() as u64,
                 hash,
+                content_hashed: true,
                 source_path: None,
                 rel: "../../../.config/autostart/evil.desktop".into(),
             }],
@@ -1209,7 +1219,7 @@ mod tests {
         let src = root.join("temporary.txt");
         fs::write(&src, b"here for now").unwrap();
         let set = sender
-            .describe_local(&FileList { paths: vec![src.clone()] }, "laptop", 10_000, false, u64::MAX)
+            .describe_local(&FileList { paths: vec![src.clone()] }, "laptop", 10_000, false, u64::MAX, u64::MAX)
             .unwrap();
         let hash = set.files[0].hash.clone();
         s_hist.record_files(Arc::new(set), false, ClipStatus::Ready);
@@ -1240,7 +1250,7 @@ mod tests {
         let src = root.join("notes.txt");
         fs::write(&src, b"version one").unwrap();
         let set = sender
-            .describe_local(&FileList { paths: vec![src.clone()] }, "laptop", 10_000, false, u64::MAX)
+            .describe_local(&FileList { paths: vec![src.clone()] }, "laptop", 10_000, false, u64::MAX, u64::MAX)
             .unwrap();
         let hash = set.files[0].hash.clone();
         s_hist.record_files(Arc::new(set), false, ClipStatus::Ready);
@@ -1267,6 +1277,7 @@ mod tests {
                 name: "x.bin".into(),
                 size: 10,
                 hash: hash.clone(),
+                content_hashed: true,
                 source_path: None,
                 rel: String::new(),
             }],
@@ -1310,7 +1321,7 @@ mod tests {
         let (root, mut receiver, r_hist) = setup("corrupt");
         let hash = cache::hash_bytes(b"the real content");
         let set = FileSet {
-            files: vec![FileRef { name: "f".into(), size: 16, hash: hash.clone(), source_path: None, rel: String::new() }],
+            files: vec![FileRef { name: "f".into(), size: 16, hash: hash.clone(), content_hashed: true, source_path: None, rel: String::new() }],
             dirs: Vec::new(),
             origin: "laptop".into(),
         };
@@ -1342,6 +1353,7 @@ mod tests {
                 name: "f".into(),
                 size: 10,
                 hash: "c".repeat(64),
+                content_hashed: true,
                 source_path: None,
                 rel: String::new(),
             }],
@@ -1366,7 +1378,7 @@ mod tests {
         let (root, mut receiver, r_hist) = setup("unavail");
         let hash = "d".repeat(64);
         let set = FileSet {
-            files: vec![FileRef { name: "f".into(), size: 1, hash: hash.clone(), source_path: None, rel: String::new() }],
+            files: vec![FileRef { name: "f".into(), size: 1, hash: hash.clone(), content_hashed: true, source_path: None, rel: String::new() }],
             dirs: Vec::new(),
             origin: "laptop".into(),
         };
@@ -1390,7 +1402,7 @@ mod tests {
         let content = vec![7u8; 4 * CHUNK_BYTES];
         fs::write(&src, &content).unwrap();
         let set = sender
-            .describe_local(&FileList { paths: vec![src] }, "laptop", 10_000, false, u64::MAX)
+            .describe_local(&FileList { paths: vec![src] }, "laptop", 10_000, false, u64::MAX, u64::MAX)
             .unwrap();
         let hash = set.files[0].hash.clone();
         s_hist.record_files(Arc::new(set), false, ClipStatus::Ready);
@@ -1432,7 +1444,7 @@ mod tests {
         let src = root.join("film.mkv");
         fs::write(&src, vec![3u8; 3 * CHUNK_BYTES]).unwrap();
         let set = sender
-            .describe_local(&FileList { paths: vec![src] }, "laptop", 10_000, false, u64::MAX)
+            .describe_local(&FileList { paths: vec![src] }, "laptop", 10_000, false, u64::MAX, u64::MAX)
             .unwrap();
         let hash = set.files[0].hash.clone();
         s_hist.record_files(Arc::new(set), false, ClipStatus::Ready);
@@ -1463,6 +1475,7 @@ mod tests {
                 name: "iso".into(),
                 size: 999,
                 hash: hash.clone(),
+                content_hashed: true,
                 source_path: None,
                 rel: String::new(),
             }],
@@ -1499,7 +1512,7 @@ mod tests {
         fs::write(tree.join("src").join("main.rs"), b"fn main() {}").unwrap();
 
         let set = sender
-            .describe_local(&FileList { paths: vec![tree] }, "laptop", 10_000, false, u64::MAX)
+            .describe_local(&FileList { paths: vec![tree] }, "laptop", 10_000, false, u64::MAX, u64::MAX)
             .unwrap();
         assert!(
             set.dirs.iter().any(|d| d.ends_with("project/logs")),
@@ -1526,12 +1539,12 @@ mod tests {
         std::os::unix::fs::symlink(&outside, tree.join("link.txt")).unwrap();
 
         let skipped = sender
-            .describe_local(&FileList { paths: vec![tree.clone()] }, "laptop", 10_000, false, u64::MAX)
+            .describe_local(&FileList { paths: vec![tree.clone()] }, "laptop", 10_000, false, u64::MAX, u64::MAX)
             .unwrap();
         assert_eq!(skipped.files.len(), 1, "the link must not be copied by default");
 
         let followed = sender
-            .describe_local(&FileList { paths: vec![tree] }, "laptop", 10_000, true, u64::MAX)
+            .describe_local(&FileList { paths: vec![tree] }, "laptop", 10_000, true, u64::MAX, u64::MAX)
             .unwrap();
         assert_eq!(followed.files.len(), 2, "with following on, the link's target is included");
         let _ = fs::remove_dir_all(&root);
@@ -1549,7 +1562,7 @@ mod tests {
         std::os::unix::fs::symlink(&tree, tree.join("inner").join("back")).unwrap();
 
         let set = sender
-            .describe_local(&FileList { paths: vec![tree] }, "laptop", 10_000, true, u64::MAX)
+            .describe_local(&FileList { paths: vec![tree] }, "laptop", 10_000, true, u64::MAX, u64::MAX)
             .unwrap();
         assert_eq!(set.files.len(), 1, "the loop must be detected, not walked: {:?}", set.files);
         let _ = fs::remove_dir_all(&root);
@@ -1581,6 +1594,7 @@ mod progress_tests {
                 name: format!("ep{i}.mkv"),
                 size: *size,
                 hash: format!("{:0>64}", i + 1),
+                content_hashed: true,
                 source_path: None,
                 rel: String::new(),
             })
@@ -1666,6 +1680,7 @@ mod budget_tests {
                 name: "series.mkv".into(),
                 size: 7 * 1024 * 1024 * 1024,
                 hash: "a".repeat(64),
+                content_hashed: true,
                 source_path: None,
                 rel: String::new(),
             }],
@@ -1697,6 +1712,7 @@ mod budget_tests {
                 name: "ep.mkv".into(),
                 size: 10,
                 hash: hash.clone(),
+                content_hashed: true,
                 source_path: None,
                 rel: String::new(),
             }],
@@ -1750,6 +1766,7 @@ mod placeholder_tests {
                     name: "ep01.mkv".into(),
                     size: 10,
                     hash: "1".repeat(64),
+                    content_hashed: true,
                     source_path: None,
                     rel: "Season 1/ep01.mkv".into(),
                 },
@@ -1757,6 +1774,7 @@ mod placeholder_tests {
                     name: "ep02.mkv".into(),
                     size: 10,
                     hash: "2".repeat(64),
+                    content_hashed: true,
                     source_path: None,
                     rel: "Season 1/ep02.mkv".into(),
                 },
@@ -1776,6 +1794,7 @@ mod placeholder_tests {
                 name: "film.mkv".into(),
                 size: 10,
                 hash: "3".repeat(64),
+                content_hashed: true,
                 source_path: None,
                 rel: String::new(),
             }],
@@ -1805,6 +1824,7 @@ mod placeholder_tests {
                 name: "film.mkv".into(),
                 size,
                 hash,
+                content_hashed: true,
                 source_path: None,
                 rel: String::new(),
             }],

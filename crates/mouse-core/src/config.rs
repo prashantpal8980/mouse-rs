@@ -98,6 +98,10 @@ fn default_clip_image_px() -> usize {
 fn default_auto_transfer() -> u64 {
     16 * 1024 * 1024
 }
+/// 64 MB: a document or a photo is hashed in well under a second, a film is not.
+fn default_hash_limit() -> u64 {
+    64 * 1024 * 1024
+}
 fn default_cache_budget() -> u64 {
     2 * 1024 * 1024 * 1024
 }
@@ -216,6 +220,18 @@ pub struct Config {
     /// prompt would resurrect the keyboard leak.
     #[serde(default = "default_true")]
     pub clipboard_notify: bool,
+    /// Largest file whose contents are hashed before a copy is announced, in bytes.
+    ///
+    /// Hashing reads every byte: a 12.6 GB folder took 65 seconds to hash, and for all
+    /// of that time the copy simply had not appeared on the other machine. Above this
+    /// limit the file is identified by path, size and modification time instead, which
+    /// is instant and still stable, so dedup and resume keep working — and the transfer
+    /// is verified by length on arrival rather than by content.
+    ///
+    /// Raise it if you would rather have content verification than a fast announcement;
+    /// set it very high to always hash, as earlier builds did.
+    #[serde(default = "default_hash_limit")]
+    pub clipboard_hash_limit: u64,
     /// Pasting a received file **moves** it to where it was pasted, instead of copying.
     ///
     /// This is what makes the paste destination the real destination, at no cost. The
@@ -364,6 +380,7 @@ impl Default for Config {
             clipboard_images_also_as_file: true,
             clipboard_deliver_dir: String::new(),
             clipboard_move_on_paste: true,
+            clipboard_hash_limit: default_hash_limit(),
             clipboard_notify: true,
             elevation_notice_seen: false,
             log_upload_url: String::new(),
