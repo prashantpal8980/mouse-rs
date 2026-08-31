@@ -319,17 +319,38 @@ impl BlobCache {
     /// happens — a transfer cut short — and without it a half-received film would be
     /// promoted and pasted as if it were whole.
     pub fn finish_checked(&self, hash: &str, content_hashed: bool, expect: u64) -> io::Result<()> {
-        if content_hashed {
-            return self.finish(hash);
-        }
         let part = self.part_path(hash);
-        let got = fs::metadata(&part)?.len();
-        if got != expect {
+        let got = fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
+
+        // **A short file is kept.** Whatever arrived is a valid prefix of the file, and
+        // deleting it throws away everything already paid for: two 2 GB partials were
+        // destroyed this way, so every retry began at offset 0 and the transfer appeared
+        // to restart from nothing, repeatedly, with no error shown. Resuming is the whole
+        // reason the partial exists.
+        if got < expect {
+            tracing::warn!(
+                hash,
+                got,
+                expect,
+                "the transfer ended early — keeping what arrived so a retry resumes from \
+                 there rather than starting again"
+            );
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!("received {got} of {expect} bytes; kept for resume"),
+            ));
+        }
+        if got > expect {
+            // Longer than the file it claims to be: not a prefix of anything, so there is
+            // nothing here worth resuming from.
             let _ = fs::remove_file(&part);
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("received {got} bytes but the file is {expect}"),
             ));
+        }
+        if content_hashed {
+            return self.finish(hash);
         }
         fs::rename(&part, self.blob_path(hash))
     }
@@ -1058,6 +1079,62 @@ mod move_paste_tests {
         fs::hard_link(&blob, &published).unwrap();
         assert!(published.is_file(), "relinked, so pasting again works");
         assert!(landed.is_file(), "and the first paste is untouched");
+        let _ = fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod resume_tests {
+    use super::*;
+
+    /// Two 2 GB partials were deleted because the transfer ended short, so every retry
+    /// began at offset 0 and an 11 GB copy appeared to restart from nothing, repeatedly,
+    /// with nothing shown to explain it. What arrived is a valid prefix; throwing it away
+    /// discards exactly the work the partial exists to preserve.
+    #[test]
+    fn a_transfer_that_ends_early_keeps_what_arrived() {
+        let root = std::env::temp_dir().join("mouse-rs-resume-short");
+        let _ = fs::remove_dir_all(&root);
+        let c = BlobCache::new(root.join("cache")).unwrap();
+        let hash = "a".repeat(64);
+
+        let mut f = c.open_partial(&hash).unwrap();
+        f.write_all(&vec![7u8; 4096]).unwrap();
+        drop(f);
+
+        // Claimed to be 8192 bytes; only 4096 arrived.
+        let err = c.finish_checked(&hash, false, 8192).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+        assert_eq!(
+            c.partial_len(&hash),
+            4096,
+            "the prefix must survive, or the retry starts from zero"
+        );
+        assert!(!c.contains(&hash), "and it must not be promoted as if complete");
+
+        // The retry resumes: the rest arrives and it completes.
+        let mut f = c.open_partial(&hash).unwrap();
+        f.write_all(&vec![7u8; 4096]).unwrap();
+        drop(f);
+        c.finish_checked(&hash, false, 8192).unwrap();
+        assert!(c.contains(&hash));
+        assert_eq!(c.size_of(&hash), Some(8192));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Longer than it claims is not a prefix of anything, so there is nothing to resume
+    /// from and keeping it would only waste the space.
+    #[test]
+    fn a_partial_longer_than_the_file_is_discarded() {
+        let root = std::env::temp_dir().join("mouse-rs-resume-long");
+        let _ = fs::remove_dir_all(&root);
+        let c = BlobCache::new(root.join("cache")).unwrap();
+        let hash = "b".repeat(64);
+        let mut f = c.open_partial(&hash).unwrap();
+        f.write_all(&vec![7u8; 9000]).unwrap();
+        drop(f);
+        assert!(c.finish_checked(&hash, false, 8192).is_err());
+        assert_eq!(c.partial_len(&hash), 0, "an over-long partial is not worth keeping");
         let _ = fs::remove_dir_all(&root);
     }
 }

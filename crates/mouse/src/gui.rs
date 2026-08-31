@@ -1614,19 +1614,30 @@ impl App {
     }
 
     fn pending_files_banner(&self, p: Palette) -> Option<Element<'_, Message>> {
+        // Fetching counts too, and that is the point. The banner used to show only
+        // while an entry was waiting for consent — a state a paste ends within
+        // milliseconds — so "Always allow this size" flashed past before it could be
+        // read, let alone clicked. A transfer that has just started is exactly when
+        // someone wants to say "don't ask me about this size again", and the answer is
+        // still useful: it applies to every file after this one.
         let waiting: Vec<_> = self
             .engine
             .as_ref()?
             .clipboard_meta()
             .into_iter()
-            .filter(|m| m.status == mouse_clipboard::ClipStatus::NeedsConsent)
+            .filter(|m| {
+                m.status == mouse_clipboard::ClipStatus::NeedsConsent
+                    || matches!(m.status, mouse_clipboard::ClipStatus::Fetching { .. })
+            })
             .collect();
         let first = waiting.first()?;
+        let fetching = matches!(first.status, mouse_clipboard::ClipStatus::Fetching { .. });
         let more = waiting.len().saturating_sub(1);
-        let title = if more > 0 {
-            format!("{} (and {more} more) is waiting", first.preview)
-        } else {
-            format!("{} is waiting", first.preview)
+        let title = match (fetching, more) {
+            (true, 0) => format!("{} is coming over", first.preview),
+            (true, n) => format!("{} (and {n} more) is coming over", first.preview),
+            (false, 0) => format!("{} is waiting", first.preview),
+            (false, n) => format!("{} (and {n} more) is waiting", first.preview),
         };
         Some(
             container(
@@ -1634,7 +1645,7 @@ impl App {
                     column![
                         text(title).size(13.5).color(p.txt),
                         text(format!(
-                            "{} — over your {} limit, so it hasn't been brought over yet.",
+                            "{} — over your {} limit. Set a bigger limit and files this size come over without being asked.",
                             human_bytes(first.disk_bytes as usize),
                             human_bytes(self.cfg.clipboard_auto_transfer_max as usize)
                         ))
@@ -1646,11 +1657,11 @@ impl App {
                     // Three answers, because "yes" and "no" are not the only ones: the
                     // third says "stop asking me about files this size", which is the
                     // real request behind repeatedly pressing the first.
-                    button(text("Bring it over").size(12.5))
+                    button(text(if fetching { "Fetching…" } else { "Bring it over" }).size(12.5))
                         .style(ui_theme::primary(p))
                         .padding([9.0, 14.0])
-                        .on_press(Message::ClipReuse(first.id)),
-                    button(text("Not now").size(12.5))
+                        .on_press_maybe((!fetching).then_some(Message::ClipReuse(first.id))),
+                    button(text(if fetching { "Dismiss" } else { "Not now" }).size(12.5))
                         .style(ui_theme::ghost(p))
                         .padding([9.0, 12.0])
                         .on_press(Message::ClipDecline(first.id)),
