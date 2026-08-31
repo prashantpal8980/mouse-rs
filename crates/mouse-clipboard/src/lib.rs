@@ -942,6 +942,7 @@ fn run(
                     apply_encoded_image(
                         &mut clipboard,
                         &mut last_img,
+                        &mut last,
                         &mut last_files,
                         &png,
                         history.as_ref(),
@@ -1111,6 +1112,7 @@ fn run(
                         apply_encoded_image(
                             &mut clipboard,
                             &mut last_img,
+                            &mut last,
                             &mut last_files,
                             &png,
                             Some(h),
@@ -1326,11 +1328,14 @@ fn reuse_entry<C: SystemClipboard>(
             let published = match as_file {
                 Some(path) => {
                     let list = files::FileList { paths: vec![path.clone()] };
-                    let ok = files::write_image_and_file(&list, png.to_vec(), || {
-                        clipboard.write_image(&img)
-                    });
+                    let ok = publish_image_and_file(
+                        &list,
+                        png.to_vec(),
+                        || clipboard.write_image(&img),
+                        last,
+                        last_files,
+                    );
                     if ok {
-                        *last_files = Some(files::list_key(&list));
                         tracing::info!(id, path = %path.display(), "image copied as pixels and as a file");
                     }
                     ok
@@ -1361,11 +1366,16 @@ fn reuse_entry<C: SystemClipboard>(
             // for what is missing and let the arriving transfer publish it later.
             if t.is_complete(&set) {
                 let Some(list) = t.materialize(&set) else { return false };
-                if !files::write_files(&list) {
+                let how = files::Publish {
+                    move_on_paste: settings.move_on_paste,
+                    relink: t.relink_pairs(&list, &set),
+                    png: None,
+                    on_paste: None,
+                };
+                if !publish_files(&list, how, last, last_files) {
                     tracing::warn!(id, "could not put the files on the clipboard");
                     return false;
                 }
-                *last_files = Some(files::list_key(&list));
                 history.set_status(id, ClipStatus::Ready);
                 if connected {
                     let _ = to_peer.send(Message::ClipboardFiles {
@@ -1592,6 +1602,9 @@ fn poll_local_image<C: SystemClipboard>(
 fn apply_encoded_image<C: SystemClipboard>(
     clipboard: &mut C,
     last_img: &mut Option<u64>,
+    // Needed because publishing the image as a file also makes the selection answer a
+    // plain-text request with that path, which our own poll would otherwise read back.
+    last: &mut Option<String>,
     last_files: &mut Option<u64>,
     png: &[u8],
     history: Option<&ClipboardHistory>,
@@ -1618,11 +1631,13 @@ fn apply_encoded_image<C: SystemClipboard>(
     let published = match as_file {
         Some(path) => {
             let list = files::FileList { paths: vec![path] };
-            let ok = files::write_image_and_file(&list, png.to_vec(), || clipboard.write_image(&img));
-            if ok {
-                *last_files = Some(files::list_key(&list));
-            }
-            ok
+            publish_image_and_file(
+                &list,
+                png.to_vec(),
+                || clipboard.write_image(&img),
+                last,
+                last_files,
+            )
         }
         None => clipboard.write_image(&img),
     };
@@ -1635,6 +1650,46 @@ fn apply_encoded_image<C: SystemClipboard>(
     if let Some(h) = history {
         h.record_image(Arc::new(png.to_vec()), img.w, img.h, true);
     }
+    true
+}
+
+/// Publish a file list **and** remember what that publication makes the clipboard say.
+///
+/// Our own X11 selection answers a plain-text request with the file paths, so a paste
+/// into a text editor gives something useful. The cost is that our own text poll reads
+/// those paths straight back and records them as something the user copied — which is
+/// how `file:///home/…/.mouse_share/cache/trees/…` kept appearing in the history as an
+/// outgoing text entry, and getting synced to the other machine.
+///
+/// The two have to be set together, and every site that forgot produced exactly that
+/// junk. Doing both here is what stops the next one forgetting.
+fn publish_files(
+    list: &files::FileList,
+    how: files::Publish,
+    last: &mut Option<String>,
+    last_files: &mut Option<u64>,
+) -> bool {
+    if !files::publish(list, how) {
+        return false;
+    }
+    *last_files = Some(files::list_key(list));
+    *last = Some(files::uri_text(list));
+    true
+}
+
+/// As [`publish_files`], for the image-plus-file case.
+fn publish_image_and_file(
+    list: &files::FileList,
+    png: Vec<u8>,
+    write_image: impl FnOnce() -> bool,
+    last: &mut Option<String>,
+    last_files: &mut Option<u64>,
+) -> bool {
+    if !files::write_image_and_file(list, png, write_image) {
+        return false;
+    }
+    *last_files = Some(files::list_key(list));
+    *last = Some(files::uri_text(list));
     true
 }
 
@@ -2219,6 +2274,7 @@ mod tests {
             &mut cb,
             &mut last_img,
             &mut None,
+            &mut None,
             &png,
             None,
             &set(),
@@ -2483,5 +2539,52 @@ mod persist_tests {
             metas[0].preview
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod self_read_tests {
+    use super::*;
+
+    /// Publishing a file list makes our own selection answer a plain-text request with
+    /// those paths — useful for pasting into an editor, and the reason
+    /// `file:///home/…/.mouse_share/cache/trees/…` kept appearing in the history as
+    /// something the user had apparently copied, and being synced to the other machine.
+    ///
+    /// The suppression works by remembering the exact string the selection will hand
+    /// out, so the next poll recognises it as our own. That only holds if the two are
+    /// built identically — this asserts they are, because a one-character divergence
+    /// brings the junk entries straight back.
+    #[test]
+    fn the_text_we_remember_matches_the_text_the_selection_serves() {
+        let list = files::FileList {
+            paths: vec![
+                std::path::PathBuf::from("/home/kalip/.mouse_share/cache/trees/abc/a file.mkv"),
+                std::path::PathBuf::from("/home/kalip/plain.txt"),
+            ],
+        };
+        let remembered = files::uri_text(&list);
+
+        // What the X11 owner answers UTF8_STRING with, built the same way `publish` does.
+        let served: String = list
+            .paths
+            .iter()
+            .map(|p| {
+                let mut out = String::from("file://");
+                for b in p.to_string_lossy().bytes() {
+                    match b {
+                        b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~'
+                        | b'/' => out.push(b as char),
+                        _ => out.push_str(&format!("%{b:02X}")),
+                    }
+                }
+                out
+            })
+            .collect::<Vec<_>>()
+            .join("\r\n");
+        let served = format!("{served}\r\n");
+
+        assert_eq!(remembered, served, "a divergence here reintroduces the junk entries");
+        assert!(remembered.contains("a%20file.mkv"), "the space must be encoded the same way");
     }
 }
