@@ -471,7 +471,9 @@ impl Transfers {
         // sequences under one transfer id and corrupt the result. The first serve is
         // still running and will finish the job.
         if self.serving.contains_key(hash) {
-            tracing::debug!(hash, "already streaming this file; ignoring the repeat request");
+            // Info, not debug. A request that is silently ignored looks identical to one
+            // that never arrived, and telling those apart from the far end is impossible.
+            tracing::info!(hash, "already streaming this file; ignoring the repeat request");
             return;
         }
 
@@ -502,6 +504,11 @@ impl Transfers {
         })
         .unwrap_or_default();
 
+        // Logged when it *starts*, not only when it finishes. A 4 GB file takes minutes,
+        // and until it completed there was nothing in the log to say the request had even
+        // been accepted — so a transfer that was working and one that never began looked
+        // exactly the same from the other machine.
+        tracing::info!(hash, bytes = total, offset, "serving a file to the peer");
         let cancel = Arc::new(AtomicBool::new(false));
         let done = Arc::new(AtomicBool::new(false));
         self.serving.insert(

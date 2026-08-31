@@ -59,7 +59,7 @@ Invoke-WebRequest -Uri http://192.168.137.2:8000/mouse-rs.exe -OutFile $HOME\mou
 ```
 
 Must be exactly size `12080128` bytes, SHA256
-`862085F0AF240CB775FD5F2C452827486E5BD6AC8ED899C61DEED9F8FB7BD005`.
+`B1BB69B9020A5450463311EDE56F982A985BE0C4F55D83D38CE778EABEC08F08`.
 If either differs, stop and say so — do not launch it.
 
 ## Step 3 — check the config was not damaged

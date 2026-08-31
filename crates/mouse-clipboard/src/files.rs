@@ -347,7 +347,7 @@ mod imp {
     /// do not exist yet makes the file manager paste nothing, or half a file. Bounded
     /// all the same — a peer that has gone away must not leave the paste hanging for
     /// ever.
-    fn fetch_for_paste(sig: &super::PasteSignal, paths: &[PathBuf]) {
+    pub(super) fn fetch_for_paste(sig: &super::PasteSignal, paths: &[PathBuf]) {
         use std::sync::atomic::Ordering;
         let missing = || paths.iter().any(|p| !p.exists());
         if !missing() {
@@ -536,12 +536,19 @@ mod imp {
             let Ok(event) = x.conn.wait_for_event() else { return };
             match event {
                 Event::SelectionRequest(req) => {
-                    // The paste is the moment the bytes are actually wanted. Until now
-                    // only the description crossed, so ask for the content and hold the
-                    // answer until it is here — a paste from another machine taking as
-                    // long as the transfer is exactly what it should do.
-                    if let Some(sig) = &on_paste {
-                        fetch_for_paste(sig, &wanted_paths);
+                    // Only a request for the *file* targets is a paste. Everything else
+                    // is a passer-by: a clipboard manager asks for TARGETS the instant a
+                    // selection changes, and XFCE's does exactly that — which raised this
+                    // signal one millisecond after every publish, so a 4 GB transfer
+                    // began without anybody pasting anything, and the entry left
+                    // "waiting for you" so fast the panel never showed the prompt at all.
+                    // That is why the banner appeared on one machine and not the other:
+                    // one of them runs a clipboard manager.
+                    let wants_the_files = serve.iter().any(|(a, _)| *a == req.target);
+                    if wants_the_files {
+                        if let Some(sig) = &on_paste {
+                            fetch_for_paste(sig, &wanted_paths);
+                        }
                     }
                     // A previous paste may have *moved* the file we published. Rebuild
                     // the link before answering, so pasting the same item into a second
@@ -801,5 +808,56 @@ mod tests {
             let back = imp::parse_uri_list(uri.as_bytes()).expect("parses");
             assert_eq!(back.paths, vec![PathBuf::from(raw)], "round trip failed for {raw}");
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod paste_trigger_tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    /// A clipboard manager asks for TARGETS the moment a selection changes, and XFCE's
+    /// does. Treating that as a paste started a multi-gigabyte transfer one millisecond
+    /// after every copy, and moved the entry out of "waiting for you" so fast the panel
+    /// never showed the prompt — which is why the banner appeared on the machine without
+    /// a clipboard manager and not on the one with it.
+    ///
+    /// The rule is simply: only a request for the file targets is a paste.
+    #[test]
+    fn only_a_request_for_the_file_targets_counts_as_a_paste() {
+        // Stand-ins for interned atoms; the identity is all that matters here.
+        const TARGETS: u32 = 1;
+        const TIMESTAMP: u32 = 2;
+        const SAVE_TARGETS: u32 = 3;
+        const URI_LIST: u32 = 10;
+        const GNOME_COPIED: u32 = 11;
+
+        let serve: Vec<(u32, Vec<u8>)> = vec![(URI_LIST, vec![]), (GNOME_COPIED, vec![])];
+        let is_paste = |target: u32| serve.iter().any(|(a, _)| *a == target);
+
+        assert!(!is_paste(TARGETS), "a clipboard manager enumerating targets is not a paste");
+        assert!(!is_paste(TIMESTAMP), "nor is a timestamp probe");
+        assert!(!is_paste(SAVE_TARGETS), "nor is a manager offering to store the selection");
+        assert!(is_paste(URI_LIST), "but asking for the files is");
+        assert!(is_paste(GNOME_COPIED), "in either dialect");
+    }
+
+    /// And the signal itself must only fire when the content is genuinely absent, so a
+    /// second paste of something already here answers immediately.
+    #[test]
+    fn nothing_is_fetched_when_the_files_are_already_present() {
+        let dir = std::env::temp_dir().join("mouse-rs-paste-present");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let here = dir.join("already.mkv");
+        std::fs::write(&here, b"present").unwrap();
+
+        let sig = PasteSignal::default();
+        imp::fetch_for_paste(&sig, &[here]);
+        assert!(
+            !sig.wanted.load(Ordering::SeqCst),
+            "asking for content we already hold must not start a transfer"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
