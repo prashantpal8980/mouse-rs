@@ -7,6 +7,10 @@ description crosses, and the bytes move when the file is **pasted**. Anything un
 
 Alongside that:
 
+* the Layout tab now shows only the edges a machine's own role uses. **Nothing changes on
+  Windows** — it is the server, so it keeps both pickers and the overlap warning, because
+  it is the role that reads both. The client loses an Exit-edge picker that was writing a
+  value nothing read;
 * **files over 64 MB can be sent again.** The previous build identified a large file by
   path, size and timestamp so a copy could be announced immediately — but the sending
   side still verified by re-hashing it, and a content hash can never equal that. Every
