@@ -1496,30 +1496,54 @@ impl App {
         }
     }
 
+    /// The Layout tab, showing only what this machine's role actually uses.
+    ///
+    /// The client engine reads `entry_edge` and nothing else — it never looks at
+    /// `exit_edge` (`client.rs:37`). So on a client the Exit-edge picker was a dial
+    /// wired to nothing: it wrote a config value no code would ever read. Worse, the
+    /// overlap warning compared that dead value against the live one, so it could
+    /// contradict a pair that was configured perfectly.
+    ///
+    /// Deciding where to *leave* from is the server's business, because the server is
+    /// what watches its own edges and hands control over. The client's only edge
+    /// question is where control comes back.
     fn tab_layout(&self, p: Palette) -> Element<'_, Message> {
-        // Leaving through one edge means arriving through the facing one; anything else
-        // puts the two screens on top of each other, so say so instead of saving it silently.
-        let want = self.cfg.exit_edge.opposite();
-        let edge_warning: Element<'_, Message> = if self.cfg.entry_edge == want {
-            Space::new().height(0.0).into()
-        } else {
-            text(format!(
-                "⚠ Leaving at the {} edge should bring the cursor in at the {} edge of the other screen — {} will feel like the screens overlap.",
-                self.cfg.exit_edge.label(),
-                want.label(),
-                self.cfg.entry_edge.label(),
-            ))
-            .size(11.0)
-            .color(p.warn)
-            .into()
-        };
+        let mut body = column![].spacing(14.0);
 
-        card(p, column![
-            field_label(p, "Exit edge — this machine leaves here"),
-            edge_picker(p, self.cfg.exit_edge, Message::ExitEdgePicked),
-            field_label(p, "Entry edge — client appears here"),
-            edge_picker(p, self.cfg.entry_edge, Message::EntryEdgePicked),
-            edge_warning,
+        if shows_exit_edge(self.cfg.role) {
+            // Leaving through one edge means arriving through the facing one; anything
+            // else puts the two screens on top of each other, so say so instead of
+            // saving it silently. Only meaningful here: the server is the only role that
+            // reads both, and so the only one that can be inconsistent.
+            let want = self.cfg.exit_edge.opposite();
+            body = body
+                .push(field_label(p, "Exit edge — the pointer leaves this screen here"))
+                .push(edge_picker(p, self.cfg.exit_edge, Message::ExitEdgePicked));
+            if self.cfg.entry_edge != want {
+                body = body.push(
+                    text(format!(
+                        "⚠ Leaving at the {} edge should bring the cursor in at the {} edge of the other screen — {} will feel like the screens overlap.",
+                        self.cfg.exit_edge.label(),
+                        want.label(),
+                        self.cfg.entry_edge.label(),
+                    ))
+                    .size(11.0)
+                    .color(p.warn),
+                );
+            }
+        }
+
+        body = body
+            .push(field_label(p, entry_edge_label(self.cfg.role)))
+            .push(edge_picker(p, self.cfg.entry_edge, Message::EntryEdgePicked))
+            .push(
+                text(entry_edge_hint(self.cfg.role))
+                    .size(11.0)
+                    .color(p.txt3)
+                    .width(Length::Fill),
+            );
+
+        card(p, body.push(column![
             field_label(p, "Screen size (px)"),
             row![
                 input(p, "1920", &self.screen_w_s, Message::ScreenWChanged),
@@ -1531,7 +1555,7 @@ impl App {
             .align_y(Alignment::Center),
             text("The engine re-detects this on Start; edit only to override.").size(11.0).color(p.txt3),
         ]
-        .spacing(14.0))
+        .spacing(14.0)))
     }
 
     fn tab_security(&self, p: Palette) -> Element<'_, Message> {
@@ -2397,6 +2421,44 @@ fn status_pill(p: Palette, running: bool, snap: Option<&StatusSnapshot>) -> (ice
     }
 }
 
+/// Does this role decide where the pointer *leaves* from?
+///
+/// Only the server. It watches its own edges and hands control over when the pointer
+/// reaches one, so `exit_edge` is the question it has to answer. The client engine never
+/// reads that value (`client.rs:37`), so offering the control there was a dial wired to
+/// nothing — and the warning beside it compared the dead value against the live one,
+/// which is how it could contradict a pair that was set up correctly.
+fn shows_exit_edge(role: Role) -> bool {
+    role == Role::Server
+}
+
+/// What `entry_edge` means to this role, in the terms that role experiences.
+///
+/// The same setting, honestly, does two different jobs. On the server it is where the
+/// *other* screen picks the pointer up. On the client it is both where the pointer
+/// arrives and the edge to push back against to send control home — which is the only
+/// thing about it the person at the client keyboard actually does.
+fn entry_edge_label(role: Role) -> &'static str {
+    match role {
+        Role::Server => "Entry edge — the pointer appears here on the other screen",
+        Role::Client => "Entry edge — where the pointer arrives, and where to push back",
+    }
+}
+
+fn entry_edge_hint(role: Role) -> &'static str {
+    match role {
+        Role::Server => {
+            "Set this to the edge facing this machine, so the two screens sit side by \
+             side rather than overlapping."
+        }
+        Role::Client => {
+            "Push the pointer back into this edge to hand control home. Where it leaves \
+             from is decided on the other machine, which is why there is no exit edge \
+             here."
+        }
+    }
+}
+
 /// Compact hover text for the tray icon: a mirror of the header status.
 ///
 /// Files waiting for an answer take precedence over connection state, because they are
@@ -2587,5 +2649,57 @@ mod tests {
         now.screen_width += 100;
         now.screen_height += 100;
         assert_eq!(pending_restart_changes(&live, &now), vec!["screen size"]);
+    }
+}
+
+#[cfg(test)]
+mod layout_role_tests {
+    use super::*;
+
+    /// R16. The client engine reads `entry_edge` and never `exit_edge`, so offering an
+    /// Exit-edge picker on a client wrote a value nothing would read — the original dead
+    /// knob, and the reason every later rule about not shipping controls the code ignores
+    /// was written.
+    #[test]
+    fn only_the_server_is_asked_where_the_pointer_leaves() {
+        assert!(shows_exit_edge(Role::Server), "the server watches its own edges");
+        assert!(
+            !shows_exit_edge(Role::Client),
+            "the client never reads exit_edge, so asking for it is a dial wired to nothing"
+        );
+    }
+
+    /// The overlap warning compares exit against entry. On a client the exit half is
+    /// dead, so the comparison could contradict a correctly-configured pair — it must
+    /// only ever appear where both values are real.
+    #[test]
+    fn the_overlap_warning_cannot_appear_on_a_client() {
+        // The warning is rendered inside the `shows_exit_edge` branch, so this is the
+        // property that keeps it honest: no exit edge shown, no comparison made.
+        assert!(
+            !shows_exit_edge(Role::Client),
+            "a warning about exit vs entry has nothing true to say on a client"
+        );
+    }
+
+    /// Each role is told what the setting does *for it*. The client's job is pushing
+    /// back to go home, which is the wording agreed for R16.
+    #[test]
+    fn each_role_gets_wording_that_describes_its_own_job() {
+        assert!(
+            entry_edge_hint(Role::Client).contains("push the pointer back")
+                || entry_edge_hint(Role::Client).contains("Push the pointer back"),
+            "the client's entry edge is the one it pushes back into: {}",
+            entry_edge_hint(Role::Client)
+        );
+        assert!(
+            entry_edge_hint(Role::Client).contains("no exit edge"),
+            "and it should say why the other control is absent, not just omit it"
+        );
+        assert_ne!(
+            entry_edge_label(Role::Server),
+            entry_edge_label(Role::Client),
+            "the same setting does two different jobs and should not claim otherwise"
+        );
     }
 }
