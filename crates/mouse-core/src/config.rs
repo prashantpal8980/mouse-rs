@@ -102,8 +102,12 @@ fn default_auto_transfer() -> u64 {
 fn default_hash_limit() -> u64 {
     64 * 1024 * 1024
 }
+/// 16 GB. The cache is a staging area for files that are usually on their way somewhere
+/// else, and 2 GB was smaller than a single item people actually move — one 4 GB archive
+/// put it permanently over budget, which made every later transfer fight the evictor for
+/// room it could never win.
 fn default_cache_budget() -> u64 {
-    2 * 1024 * 1024 * 1024
+    16 * 1024 * 1024 * 1024
 }
 fn default_inline_image() -> usize {
     256 * 1024

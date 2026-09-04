@@ -92,6 +92,21 @@ struct Incoming {
 /// along: 40%, 25%, 55%, 29%. Nothing was wrong with the transfer; the number was
 /// answering a different question every time it was asked.
 ///
+/// What a paste's request for a set actually started.
+///
+/// The distinction that matters is the middle one: "nothing was asked for" and "nothing
+/// is coming" are not the same thing, and collapsing them into one `false` made a paste
+/// report failure over a transfer that was running perfectly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FetchStart {
+    /// New requests went out to the peer.
+    Asked,
+    /// Nothing new to ask for: every file still missing is already on its way.
+    AlreadyInFlight,
+    /// Nothing was asked for and nothing is coming.
+    Idle,
+}
+
 /// Tracked incrementally rather than recomputed: at ~500 chunks a second, summing the
 /// set and stat-ing the cache per chunk would cost more than the transfer.
 #[derive(Debug, Clone, Copy)]
@@ -367,7 +382,7 @@ impl Transfers {
         entry: u64,
         to_peer: &UnboundedSender<Message>,
         cache_budget: u64,
-    ) -> bool {
+    ) -> FetchStart {
         // A set larger than the cache budget is allowed. It is the owner's disk and
         // their decision; the job here is to say what it will cost, not to refuse it.
         // What must not happen is the silent version of the failure: completed files
@@ -391,20 +406,35 @@ impl Transfers {
         // Whole-entry baseline, computed once here rather than per chunk: everything we
         // already hold counts as done, because it does — the user is waiting for the set,
         // not for one file.
+        // Partly-received files count too. Excluding them meant a paste retried during a
+        // download recomputed the baseline as "nothing yet" and reset the progress bar to
+        // zero, over and over, on a transfer that was gigabytes in.
         let already: u64 = set
             .files
             .iter()
-            .filter(|f| self.cache.contains(&f.hash))
-            .map(|f| f.size)
+            .map(|f| {
+                if self.cache.contains(&f.hash) {
+                    f.size
+                } else {
+                    self.cache.partial_len(&f.hash).min(f.size)
+                }
+            })
             .sum();
-        self.entry_progress.insert(
-            entry,
-            EntryProgress { done: already, total: set.total_bytes() },
-        );
+        let done = self
+            .entry_progress
+            .get(&entry)
+            .map_or(already, |p| p.done.max(already));
+        self.entry_progress
+            .insert(entry, EntryProgress { done, total: set.total_bytes() });
 
         let mut asked = false;
+        let mut in_flight = false;
         for f in &set.files {
-            if self.cache.contains(&f.hash) || self.requested.contains_key(&f.hash) {
+            if self.cache.contains(&f.hash) {
+                continue;
+            }
+            if self.requested.contains_key(&f.hash) {
+                in_flight = true;
                 continue;
             }
             // Resume from whatever a previous attempt already wrote.
@@ -417,7 +447,19 @@ impl Transfers {
             tracing::info!(name = %f.name, size = f.size, offset, "requested a file from the peer");
             asked = true;
         }
-        asked
+        match (asked, in_flight) {
+            (true, _) => FetchStart::Asked,
+            (false, true) => FetchStart::AlreadyInFlight,
+            (false, false) => FetchStart::Idle,
+        }
+    }
+
+    /// Bytes received and bytes expected for an entry currently being fetched.
+    ///
+    /// The receiving side's own count, which is the only one that survives a paste being
+    /// retried mid-transfer.
+    pub fn entry_progress(&self, entry: u64) -> Option<(u64, u64)> {
+        self.entry_progress.get(&entry).map(|p| (p.done, p.total))
     }
 
     /// Stop fetching everything belonging to entry `entry`.
@@ -1096,7 +1138,7 @@ mod tests {
             .record_files(Arc::new(set.clone()), true, ClipStatus::Remote)
             .unwrap();
         let (to_peer, mut peer_rx) = tokio::sync::mpsc::unbounded_channel();
-        assert!(receiver.request_missing(&set, entry, &to_peer, u64::MAX));
+        assert_eq!(receiver.request_missing(&set, entry, &to_peer, u64::MAX), FetchStart::Asked);
         let hash = match peer_rx.try_recv().unwrap() {
             Message::BlobRequest { hash, offset } => {
                 assert_eq!(offset, 0);
@@ -1369,6 +1411,60 @@ mod tests {
     }
 
     #[test]
+    fn a_paste_retried_mid_transfer_keeps_the_progress_it_had() {
+        // The receiving side re-asks for a set every time the file manager re-checks the
+        // clipboard, which during a large paste is constantly. Recomputing the baseline
+        // as "only whole files count" threw away the partial in progress and snapped the
+        // bar back to zero — the reported symptom was a transfer that climbed to 3% and
+        // appeared to stop, over and over, while the bytes were in fact still arriving.
+        let (root, mut receiver, r_hist) = setup("retry-progress");
+        let hash = "d".repeat(64);
+        let set = FileSet {
+            files: vec![FileRef {
+                name: "big".into(),
+                size: 1000,
+                hash: hash.clone(),
+                content_hashed: true,
+                source_path: None,
+                rel: String::new(),
+            }],
+            dirs: Vec::new(),
+            origin: "laptop".into(),
+        };
+        let entry = r_hist
+            .record_files(Arc::new(set.clone()), true, ClipStatus::Remote)
+            .unwrap();
+        let (to_peer, _peer_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        assert_eq!(receiver.request_missing(&set, entry, &to_peer, u64::MAX), FetchStart::Asked);
+        assert_eq!(receiver.entry_progress(entry), Some((0, 1000)));
+
+        // 400 of 1000 bytes land.
+        let meta =
+            serde_json::to_vec(&BlobMeta { hash: hash.clone(), name: "big".into(), offset: 0 })
+                .unwrap();
+        receiver.on_bulk_frame(BulkFrame::Begin { transfer: 1, total: 1000, meta }, &r_hist);
+        receiver.on_bulk_frame(
+            BulkFrame::Chunk { transfer: 1, seq: 0, data: vec![0u8; 400] },
+            &r_hist,
+        );
+        assert_eq!(receiver.entry_progress(entry), Some((400, 1000)));
+
+        // The paste re-asks while those 400 bytes are still only a partial.
+        assert_eq!(
+            receiver.request_missing(&set, entry, &to_peer, u64::MAX),
+            FetchStart::AlreadyInFlight
+        );
+        let (done, total) = receiver.entry_progress(entry).expect("still tracked");
+        assert_eq!(total, 1000);
+        assert!(
+            done >= 400,
+            "a retry must not report less progress than already arrived; got {done}"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn asking_twice_only_downloads_once() {
         let (root, mut receiver, r_hist) = setup("twice");
         let set = FileSet {
@@ -1386,11 +1482,13 @@ mod tests {
         let entry = r_hist.record_files(Arc::new(set.clone()), true, ClipStatus::Remote).unwrap();
         let (to_peer, mut peer_rx) = tokio::sync::mpsc::unbounded_channel();
 
-        assert!(receiver.request_missing(&set, entry, &to_peer, u64::MAX));
+        assert_eq!(receiver.request_missing(&set, entry, &to_peer, u64::MAX), FetchStart::Asked);
         assert!(peer_rx.try_recv().is_ok());
-        assert!(
-            !receiver.request_missing(&set, entry, &to_peer, u64::MAX),
-            "a second click must not start the same download again"
+        assert_eq!(
+            receiver.request_missing(&set, entry, &to_peer, u64::MAX),
+            FetchStart::AlreadyInFlight,
+            "a second click must not re-request, and must say the transfer is running \
+             rather than report nothing happened — a paste reads this as failure"
         );
         assert!(peer_rx.try_recv().is_err());
         let _ = fs::remove_dir_all(&root);
@@ -1509,7 +1607,7 @@ mod tests {
             .record_files(Arc::new(set.clone()), true, ClipStatus::Remote)
             .unwrap();
         let (to_peer, mut peer_rx) = tokio::sync::mpsc::unbounded_channel();
-        assert!(receiver.request_missing(&set, entry, &to_peer, u64::MAX));
+        assert_eq!(receiver.request_missing(&set, entry, &to_peer, u64::MAX), FetchStart::Asked);
         let _ = peer_rx.try_recv();
 
         assert!(receiver.cancel_entry(entry, &to_peer));
@@ -1519,8 +1617,9 @@ mod tests {
         }
         // The request is forgotten, so clicking again really asks again rather than being
         // swallowed as a duplicate. That is what makes the entry usable after Stop.
-        assert!(
+        assert_eq!(
             receiver.request_missing(&set, entry, &to_peer, u64::MAX),
+            FetchStart::Asked,
             "after cancelling, clicking the entry must start a fresh request"
         );
         let _ = fs::remove_dir_all(&root);
@@ -1629,7 +1728,7 @@ mod progress_tests {
             .unwrap();
 
         let (to_peer, _rx) = tokio::sync::mpsc::unbounded_channel();
-        assert!(t.request_missing(&set, entry, &to_peer, u64::MAX));
+        assert_eq!(t.request_missing(&set, entry, &to_peer, u64::MAX), FetchStart::Asked);
 
         // Open all three at once, exactly as the sender does.
         for (i, size) in sizes.iter().enumerate() {
@@ -1716,8 +1815,9 @@ mod budget_tests {
         let (to_peer, mut rx) = tokio::sync::mpsc::unbounded_channel();
 
         let budget = 2 * 1024 * 1024 * 1024;
-        assert!(
+        assert_eq!(
             t.request_missing(&set, entry, &to_peer, budget),
+            FetchStart::Asked,
             "an oversized set is the owner's decision and must still be requested"
         );
         assert!(rx.try_recv().is_ok(), "it should really have been asked for");

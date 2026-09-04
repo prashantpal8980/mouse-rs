@@ -30,6 +30,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use sha2::{Digest, Sha256};
 
@@ -40,6 +41,10 @@ const IO_BUF: usize = 128 * 1024;
 /// A content-addressed store for transferred file contents.
 pub struct BlobCache {
     root: PathBuf,
+    /// Unix seconds when the over-budget notice was last written. The eviction pass runs
+    /// on the tick loop, so an unreclaimable overrun would otherwise log ten times a
+    /// second for as long as the condition lasts.
+    over_budget_logged: AtomicU64,
 }
 
 impl BlobCache {
@@ -47,7 +52,21 @@ impl BlobCache {
     pub fn new(root: PathBuf) -> io::Result<BlobCache> {
         fs::create_dir_all(root.join("blobs"))?;
         fs::create_dir_all(root.join("names"))?;
-        Ok(BlobCache { root })
+        Ok(BlobCache { root, over_budget_logged: AtomicU64::new(0) })
+    }
+
+    /// True at most once a minute, so a standing overrun states itself without flooding.
+    fn should_report_overrun(&self) -> bool {
+        const QUIET_SECS: u64 = 60;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        let last = self.over_budget_logged.load(Ordering::Relaxed);
+        if now.saturating_sub(last) < QUIET_SECS {
+            return false;
+        }
+        self.over_budget_logged.store(now, Ordering::Relaxed);
+        true
     }
 
     /// The default location: alongside the config, not in the user's documents.
@@ -501,7 +520,7 @@ impl BlobCache {
             })
             .map(|(_, len, _)| *len)
             .sum();
-        if total.saturating_sub(reclaimable) > budget {
+        if total.saturating_sub(reclaimable) > budget && self.should_report_overrun() {
             tracing::info!(
                 total,
                 budget,

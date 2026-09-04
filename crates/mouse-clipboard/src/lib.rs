@@ -1195,10 +1195,29 @@ fn run(
                 }
                 match h.payload(*id) {
                     Some(ClipPayload::Files(set)) => {
-                        tracing::info!(id, bytes = set.total_bytes(), "paste asked for it — fetching now");
-                        h.set_status(*id, ClipStatus::Fetching { done: 0, total: set.total_bytes() });
-                        if !t.request_missing(&set, *id, &to_peer, settings.cache_budget) && !t.is_complete(&set) {
-                            sig.failed.store(true, O::SeqCst);
+                        // Ask first, then read progress back: request_missing is what
+                        // establishes the baseline, and the status must reflect bytes
+                        // actually held rather than restarting the bar at zero.
+                        let started = t.request_missing(&set, *id, &to_peer, settings.cache_budget);
+                        let (done, total) = t
+                            .entry_progress(*id)
+                            .unwrap_or((0, set.total_bytes()));
+                        h.set_status(*id, ClipStatus::Fetching { done, total });
+                        match started {
+                            transfer::FetchStart::Asked => {
+                                tracing::info!(id, bytes = total, "paste asked for it — fetching now");
+                            }
+                            // Already on its way. Not a failure, and saying so once per
+                            // retry drowned the log during every large transfer.
+                            transfer::FetchStart::AlreadyInFlight => {
+                                tracing::debug!(id, done, total, "paste is waiting on a transfer already running");
+                            }
+                            transfer::FetchStart::Idle => {
+                                if !t.is_complete(&set) {
+                                    tracing::warn!(id, "nothing to request and nothing in flight");
+                                    sig.failed.store(true, O::SeqCst);
+                                }
+                            }
                         }
                         true
                     }
@@ -1405,8 +1424,9 @@ fn reuse_entry<C: SystemClipboard>(
                         *last = Some(files::uri_text(&list));
                     }
                 }
-                if !t.request_missing(&set, id, to_peer, settings.cache_budget) {
-                    // Nothing new to ask for: a request is already in flight.
+                if t.request_missing(&set, id, to_peer, settings.cache_budget)
+                    == transfer::FetchStart::AlreadyInFlight
+                {
                     tracing::debug!(id, "a transfer for this entry is already running");
                 }
                 return true; // the click did something; publishing happens on arrival

@@ -1,0 +1,329 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Why the RAR crawled</title>
+<style>
+  :root{
+    --bg:#0d1117; --panel:#161b22; --panel2:#1c2230; --line:#2a3441;
+    --ink:#e6edf3; --dim:#8b98a5; --faint:#5c6773;
+    --bad:#f85149; --badbg:#2d1417; --good:#3fb950; --goodbg:#0f2416;
+    --warn:#d29922; --accent:#58a6ff;
+    --mono:ui-monospace,"SF Mono",Menlo,Consolas,monospace;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+       font:16px/1.65 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+       -webkit-font-smoothing:antialiased}
+  .wrap{max-width:920px;margin:0 auto;padding:56px 22px 90px}
+  h1{font-size:clamp(28px,5vw,42px);line-height:1.15;margin:0 0 12px;letter-spacing:-.02em}
+  h2{font-size:clamp(19px,3vw,23px);margin:56px 0 14px;letter-spacing:-.01em;
+     padding-bottom:9px;border-bottom:1px solid var(--line)}
+  h3{font-size:16px;margin:26px 0 8px;color:var(--dim);
+     text-transform:uppercase;letter-spacing:.09em;font-weight:600}
+  p{margin:0 0 15px}
+  .lede{font-size:18px;color:var(--dim);margin-bottom:8px}
+  .sub{color:var(--faint);font-size:14px;margin-bottom:34px}
+  code{font-family:var(--mono);font-size:.9em;background:#21262d;
+       padding:2px 6px;border-radius:4px;color:#a5d6ff}
+
+  /* headline numbers */
+  .nums{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));
+        gap:14px;margin:30px 0 10px}
+  .num{background:var(--panel);border:1px solid var(--line);
+       border-radius:11px;padding:20px 18px}
+  .num .k{font-size:12px;text-transform:uppercase;letter-spacing:.09em;
+          color:var(--faint);margin-bottom:9px}
+  .num .v{font-family:var(--mono);font-size:32px;font-weight:600;line-height:1;
+          letter-spacing:-.02em}
+  .num .n{font-size:13px;color:var(--dim);margin-top:8px}
+  .num.bad{border-color:#5a2226;background:var(--badbg)} .num.bad .v{color:var(--bad)}
+  .num.ok{border-color:#1d4429;background:var(--goodbg)} .num.ok .v{color:var(--good)}
+
+  .card{background:var(--panel);border:1px solid var(--line);
+        border-radius:11px;padding:22px;margin:20px 0}
+
+  /* cadence */
+  .cad{display:flex;flex-direction:column;gap:20px}
+  .lane .lbl{display:flex;justify-content:space-between;align-items:baseline;
+             font-size:13px;margin-bottom:9px;flex-wrap:wrap;gap:6px}
+  .lane .lbl b{font-weight:600;font-size:14px}
+  .lane .lbl span{color:var(--faint);font-family:var(--mono);font-size:12px}
+  .ticks{position:relative;height:40px;background:var(--panel2);
+         border:1px solid var(--line);border-radius:7px;overflow:hidden}
+  .ticks i{position:absolute;top:0;bottom:0;width:2px;background:var(--accent)}
+  .ticks.dense i{width:1px;background:var(--warn);opacity:.55}
+  .ticks .tag{position:absolute;right:9px;top:50%;transform:translateY(-50%);
+              font-size:11px;font-family:var(--mono);color:var(--dim);
+              background:var(--panel2);padding:2px 6px;border-radius:4px}
+  .ratio{text-align:center;font-size:14px;color:var(--dim);
+         padding:13px;background:var(--badbg);border:1px solid #5a2226;
+         border-radius:8px}
+  .ratio b{color:var(--bad);font-family:var(--mono);font-size:17px}
+
+  /* collapse chart */
+  .chart{width:100%;height:auto;display:block}
+  .cap{font-size:13px;color:var(--faint);margin-top:11px;text-align:center}
+
+  /* code */
+  pre{background:#0b0f14;border:1px solid var(--line);border-radius:9px;
+      padding:16px;overflow-x:auto;margin:0;font-family:var(--mono);
+      font-size:13px;line-height:1.6}
+  pre .del{color:var(--bad);display:block;background:rgba(248,81,73,.09)}
+  pre .add{color:var(--good);display:block;background:rgba(63,185,80,.09)}
+  pre .c{color:var(--faint)}
+  .two{display:grid;grid-template-columns:1fr;gap:16px}
+  @media(min-width:760px){.two{grid-template-columns:1fr 1fr}}
+  .two > div > .h{font-size:13px;font-weight:600;margin-bottom:8px;
+                  display:flex;align-items:center;gap:7px}
+  .dot{width:8px;height:8px;border-radius:50%;flex:none}
+  .dot.b{background:var(--bad)} .dot.g{background:var(--good)}
+
+  /* steps */
+  ol.steps{list-style:none;counter-reset:s;padding:0;margin:18px 0}
+  ol.steps li{counter-increment:s;position:relative;padding:0 0 22px 46px;
+              border-left:2px solid var(--line);margin-left:14px}
+  ol.steps li:last-child{border-left-color:transparent;padding-bottom:0}
+  ol.steps li::before{content:counter(s);position:absolute;left:-15px;top:-2px;
+       width:28px;height:28px;border-radius:50%;background:var(--panel2);
+       border:1px solid var(--line);color:var(--dim);font-family:var(--mono);
+       font-size:13px;display:flex;align-items:center;justify-content:center}
+  ol.steps li b{display:block;margin-bottom:3px}
+  ol.steps li span{color:var(--dim);font-size:15px}
+
+  table{width:100%;border-collapse:collapse;font-size:15px}
+  th,td{text-align:left;padding:11px 10px;border-bottom:1px solid var(--line)}
+  th{font-size:12px;text-transform:uppercase;letter-spacing:.08em;color:var(--faint)}
+  td.n{font-family:var(--mono)}
+  .scroll{overflow-x:auto}
+  .foot{margin-top:60px;padding-top:20px;border-top:1px solid var(--line);
+        color:var(--faint);font-size:13px}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <h1>Why the RAR crawled</h1>
+  <p class="lede">The congestion control acted on one measurement hundreds of times.</p>
+  <p class="sub">mouse-rs &middot; fixed in <code>38593c1</code> &middot; 4 September 2026</p>
+
+  <div class="nums">
+    <div class="num bad">
+      <div class="k">What you saw</div>
+      <div class="v">8.1<small style="font-size:16px"> MB/s</small></div>
+      <div class="n">4.28 GB took 507 seconds</div>
+    </div>
+    <div class="num ok">
+      <div class="k">What the link does</div>
+      <div class="v">88<small style="font-size:16px"> MB/s</small></div>
+      <div class="n">measured on the same cable</div>
+    </div>
+    <div class="num">
+      <div class="k">Throughput lost</div>
+      <div class="v" style="color:var(--warn)">91%</div>
+      <div class="n">to a bug, not to the network</div>
+    </div>
+  </div>
+
+  <p>The transfer was not slow because of the RAR, the disk, or the link. Those were fine.
+  It was slow because the code that decides <em>how fast to send</em> was reading a
+  two-second-old latency reading and treating it as fresh news, over and over.</p>
+
+  <h2>The mismatch</h2>
+  <p>Two clocks run inside a transfer, and they run at wildly different speeds.</p>
+
+  <div class="card cad">
+    <div class="lane">
+      <div class="lbl"><b>Latency is measured</b><span>heartbeat &mdash; every 2 s</span></div>
+      <div class="ticks" id="hb"><div class="tag">1 sample</div></div>
+    </div>
+    <div class="lane">
+      <div class="lbl"><b>The rate is re-decided</b><span>once per 256 KB chunk</span></div>
+      <div class="ticks dense" id="ch"><div class="tag">~800 decisions</div></div>
+    </div>
+    <div class="ratio">
+      In one heartbeat window at full speed, <b>one</b> measurement is available and
+      <b>800</b> decisions are made from it.
+    </div>
+  </div>
+
+  <p>That is fine as long as each decision <em>reads</em> the measurement. The bug was that
+  each decision <em>acted</em> on it &mdash; and the action was to halve the send rate.</p>
+
+  <h2>The collapse</h2>
+  <p>One slow heartbeat, and the rate is cut in half 800 times in a row before a second
+  opinion can possibly arrive. It only takes eleven of those to hit the floor.</p>
+
+  <div class="card">
+    <svg class="chart" viewBox="0 0 800 300" role="img"
+         aria-label="Send rate collapsing from 100 MB/s to the 64 KB/s floor within eleven chunks">
+      <defs>
+        <linearGradient id="fall" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0%" stop-color="#f85149" stop-opacity=".38"/>
+          <stop offset="100%" stop-color="#f85149" stop-opacity="0"/>
+        </linearGradient>
+      </defs>
+      <!-- grid -->
+      <g stroke="#2a3441" stroke-width="1">
+        <line x1="70" y1="30"  x2="770" y2="30"/>
+        <line x1="70" y1="80"  x2="770" y2="80"/>
+        <line x1="70" y1="130" x2="770" y2="130"/>
+        <line x1="70" y1="180" x2="770" y2="180"/>
+        <line x1="70" y1="230" x2="770" y2="230"/>
+      </g>
+      <g fill="#5c6773" font-size="11" font-family="ui-monospace,monospace" text-anchor="end">
+        <text x="60" y="34">100 MB/s</text>
+        <text x="60" y="84">12 MB/s</text>
+        <text x="60" y="134">1.5 MB/s</text>
+        <text x="60" y="184">200 KB/s</text>
+        <text x="60" y="234">64 KB/s</text>
+      </g>
+      <!-- floor -->
+      <line x1="70" y1="230" x2="770" y2="230" stroke="#f85149"
+            stroke-width="1.5" stroke-dasharray="5 4" opacity=".7"/>
+      <text x="765" y="248" fill="#f85149" font-size="11"
+            font-family="ui-monospace,monospace" text-anchor="end">MIN_RATE floor</text>
+      <!-- the fall -->
+      <path d="M70,30 L134,47 L198,64 L262,81 L326,98 L390,115 L454,132
+               L518,149 L582,166 L646,183 L710,200 L770,230 L770,260 L70,260 Z"
+            fill="url(#fall)"/>
+      <polyline points="70,30 134,47 198,64 262,81 326,98 390,115 454,132
+                        518,149 582,166 646,183 710,200 770,230"
+                fill="none" stroke="#f85149" stroke-width="2.5"
+                stroke-linejoin="round"/>
+      <g fill="#f85149">
+        <circle cx="70"  cy="30"  r="4"/><circle cx="198" cy="64"  r="3"/>
+        <circle cx="326" cy="98"  r="3"/><circle cx="454" cy="132" r="3"/>
+        <circle cx="582" cy="166" r="3"/><circle cx="710" cy="200" r="3"/>
+        <circle cx="770" cy="230" r="4.5"/>
+      </g>
+      <!-- x axis -->
+      <line x1="70" y1="260" x2="770" y2="260" stroke="#2a3441"/>
+      <g fill="#5c6773" font-size="11" font-family="ui-monospace,monospace"
+         text-anchor="middle">
+        <text x="70"  y="278">chunk 1</text>
+        <text x="326" y="278">4</text>
+        <text x="582" y="278">8</text>
+        <text x="770" y="278">11</text>
+      </g>
+      <text x="420" y="296" fill="#8b98a5" font-size="12" text-anchor="middle"
+            font-family="system-ui,sans-serif">
+        all eleven inside a single 2-second heartbeat gap
+      </text>
+    </svg>
+    <p class="cap">Halving is instant. Recovery adds 1 MB/s <em>per chunk</em> &mdash;
+    and at the floor, one 256 KB chunk takes <strong>4 seconds</strong>.</p>
+  </div>
+
+  <p>That last line is the trap. The collapse destroys the very thing recovery depends on.
+  At full speed the pacer gets 400 chances a second to climb back; at the floor it gets one
+  every four seconds. So it sat near the bottom until the next heartbeat, climbed a little,
+  and was flattened again by the next stale sample. Averaged over the RAR, that sawtooth
+  came out at 8.1 MB/s.</p>
+
+  <h2>The fix</h2>
+  <p>Number the measurements. A back-off remembers which sample caused it and refuses to
+  fire twice on the same one &mdash; <strong>one measurement, one halving</strong>.
+  Between samples the rate is held rather than cut again on evidence already acted upon.</p>
+
+  <div class="two">
+    <div>
+      <div class="h"><span class="dot b"></span>Before</div>
+<pre><span class="c">// once per 256 KB chunk</span>
+if health.is_congested() {
+<span class="del">    rate = (rate / 2)
+        .max(MIN_RATE);</span>
+}
+<span class="c">// 800 chunks per sample
+// = 800 halvings</span></pre>
+    </div>
+    <div>
+      <div class="h"><span class="dot g"></span>After</div>
+<pre><span class="c">// once per 256 KB chunk</span>
+if health.is_congested() {
+<span class="add">  let s = health.sample_id();
+  if s != self.backed_off_on {
+    self.backed_off_on = s;
+    rate = (rate / 2)
+        .max(MIN_RATE);
+  }</span>
+}</pre>
+    </div>
+  </div>
+
+  <p><code>LinkHealth</code> gained a <code>samples: AtomicU64</code> counter that ticks on
+  every round-trip measurement; <code>Pacer</code> gained <code>backed_off_on</code> to
+  remember the last one it responded to.</p>
+
+  <h3>A test was asserting the bug</h3>
+  <p>Worth saying plainly: an existing test, <code>the_pacer_backs_off_hard_and_recovers_gently</code>,
+  <em>required</em> the rate to collapse to the floor after 100 reads of one sample. It passed
+  the whole time. The defect had been written down as intended behaviour, which is why nothing
+  caught it. That test now asserts one halving per sample.</p>
+
+  <h2>A second, smaller brake</h2>
+  <p>While your pointer is on the other machine, transfers are capped so the mouse stays
+  responsive. That ceiling was set at 2 MB/s back when the alternative was stopping
+  transfers dead &mdash; against a full stop, anything moving looked generous.</p>
+
+  <div class="scroll">
+  <table>
+    <tr><th>Ceiling while crossed</th><th>Old</th><th>New</th></tr>
+    <tr><td>Rate cap</td><td class="n" style="color:var(--bad)">2 MB/s</td>
+        <td class="n" style="color:var(--good)">16 MB/s</td></tr>
+    <tr><td>4 GB file takes</td><td class="n" style="color:var(--bad)">~34 min</td>
+        <td class="n" style="color:var(--good)">~4 min</td></tr>
+    <tr><td>Share of a gigabit link</td><td class="n">2%</td><td class="n">13%</td></tr>
+  </table>
+  </div>
+
+  <p>It is a hard cap that ignores how good the link actually is, so on a wired gigabit
+  connection it was discarding 90% of the line during the exact minutes you are most likely
+  to be watching. The real protection against lag is the pacer backing off when latency
+  genuinely rises &mdash; this is only a belt-and-braces ceiling, and 16 MB/s is still a
+  small share of the cable.</p>
+
+  <h2>How this was found</h2>
+  <ol class="steps">
+    <li><b>Read the shipped logs, not the symptom</b>
+        <span>Both machines upload their own logs. 4.28 GB / 507 s came straight out of
+        the transfer records &mdash; no guessing, and nobody had to be asked.</span></li>
+    <li><b>Rule out the obvious suspect</b>
+        <span>The 2 MB/s crossed-cap would explain it &mdash; but control was on Kali for
+        only 10% of that window, so it could not account for the other 90%.</span></li>
+    <li><b>Compare the two clocks</b>
+        <span>Heartbeat every 2 s; <code>Pacer::step()</code> once per 256 KB. That ratio
+        is the whole bug.</span></li>
+    <li><b>Check the arithmetic against the observation</b>
+        <span>Eleven halvings reach the floor; the floor makes a chunk take 4 s. The
+        sawtooth that predicts averages out near 8 MB/s &mdash; which is what was measured.</span></li>
+  </ol>
+
+  <h2>Where it stands</h2>
+  <p>Both machines are running the fixed build
+  (<code>E8A7C3FE…</code>, 12,080,128 bytes). Kali reconnected at 11:47:02 with the bulk
+  lane up and log shipping on. 185 tests pass, clippy clean on both targets.</p>
+  <p>The next large copy should hold near line rate instead of sawtoothing. If it does not,
+  the logs will already be on the server &mdash; nothing needs to be captured by hand.</p>
+
+  <div class="foot">
+    <code>crates/mouse-core/src/bulk.rs</code> &middot; commit <code>38593c1</code>
+    &mdash; &ldquo;Stop one stale measurement throttling the whole transfer&rdquo;
+  </div>
+</div>
+
+<script>
+  // heartbeat: 1 tick across the window
+  var hb = document.getElementById('hb');
+  [8].forEach(function(p){
+    var i=document.createElement('i'); i.style.left=p+'%'; hb.appendChild(i);
+  });
+  // chunks: dense ticks
+  var ch = document.getElementById('ch');
+  for (var p=2; p<72; p+=1.1){
+    var i=document.createElement('i'); i.style.left=p+'%'; ch.appendChild(i);
+  }
+</script>
+</body>
+</html>
