@@ -207,6 +207,14 @@ pub struct LinkHealth {
     /// finished yet. Used to answer "will this be quick?" with a measurement rather
     /// than a guess — round-trip time says nothing about bandwidth.
     throughput_bps: AtomicU64,
+    /// How many round-trip samples have been recorded.
+    ///
+    /// The pacer reacts *per sample*, not per chunk. Without this it read the same
+    /// two-second-old measurement hundreds of times a second and treated each read as
+    /// fresh evidence of congestion — halving the rate on every chunk until it hit the
+    /// floor. A single late heartbeat therefore collapsed a 100 MB/s transfer to 64 KB/s
+    /// in about eleven chunks, and one chunk then took four seconds.
+    samples: AtomicU64,
 }
 
 impl LinkHealth {
@@ -214,10 +222,17 @@ impl LinkHealth {
         Arc::new(LinkHealth::default())
     }
 
+    /// Which measurement the latest reading belongs to, so a decision can be taken
+    /// once per sample rather than once per read.
+    pub fn sample_id(&self) -> u64 {
+        self.samples.load(Ordering::Relaxed)
+    }
+
     /// Record a heartbeat round-trip.
     pub fn record_rtt(&self, rtt: Duration) {
         let us = rtt.as_micros().min(u64::MAX as u128) as u64;
         self.latest_us.store(us, Ordering::Relaxed);
+        self.samples.fetch_add(1, Ordering::Relaxed);
         // Baseline tracks the best sample seen. It only ever ratchets down here; it is
         // relaxed upward by `decay_baseline` so that moving to a genuinely slower
         // network doesn't leave us pacing against a baseline we can never reach again.
@@ -314,10 +329,16 @@ const START_RATE_BYTES_PER_SEC: u64 = 2 * 1024 * 1024;
 const RATE_STEP_BYTES_PER_SEC: u64 = 1024 * 1024;
 /// Ceiling while the user is driving the other machine.
 ///
-/// 2 MB/s keeps a 3 GB transfer visibly moving rather than frozen, while using a small
-/// enough share of even a hotspot that pointer latency is unaffected. The previous
-/// behaviour here was a full stop, which was indistinguishable from a hang.
-const CROSSED_RATE_BYTES_PER_SEC: u64 = 2 * 1024 * 1024;
+/// 16 MB/s. This was 2 MB/s, chosen when the alternative being replaced was a full stop
+/// — against that, anything moving looked generous. But it is a *hard* cap that ignores
+/// how good the link is, and on a gigabit cable it throws away 90% of it during the
+/// exact minutes someone is most likely to be watching the transfer.
+///
+/// The pacer already backs off when latency actually rises, which is the real protection;
+/// this is only a belt-and-braces ceiling for the moment lag is most noticeable. 16 MB/s
+/// is a small share of a wired link and still finishes a 4 GB file in about four minutes
+/// rather than half an hour.
+const CROSSED_RATE_BYTES_PER_SEC: u64 = 16 * 1024 * 1024;
 
 /// How the owner wants the bulk lane to behave.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -347,6 +368,14 @@ pub struct Pacer {
     health: Arc<LinkHealth>,
     rate: u64,
     user_cap: Option<u64>,
+    /// The round-trip sample the last slow-down was based on.
+    ///
+    /// Additive increase happens per chunk, so a transfer reaches full speed quickly.
+    /// Multiplicative decrease happens per *measurement*, because that is how much
+    /// evidence there is: reacting once per chunk to a reading that only changes every
+    /// two seconds is not congestion control, it is the same number applied hundreds of
+    /// times.
+    backed_off_on: u64,
 }
 
 impl Pacer {
@@ -354,6 +383,7 @@ impl Pacer {
     pub fn new(health: Arc<LinkHealth>, user_cap: Option<u64>) -> Pacer {
         Pacer {
             rate: user_cap.unwrap_or(START_RATE_BYTES_PER_SEC),
+            backed_off_on: health.sample_id(),
             health,
             user_cap,
         }
@@ -369,7 +399,13 @@ impl Pacer {
             return; // pinned by the user: adapt nothing
         }
         if self.health.is_congested() {
-            self.rate = (self.rate / 2).max(MIN_RATE_BYTES_PER_SEC);
+            // One measurement, one back-off. Between samples the rate is held rather
+            // than cut again on evidence already acted upon.
+            let sample = self.health.sample_id();
+            if sample != self.backed_off_on {
+                self.backed_off_on = sample;
+                self.rate = (self.rate / 2).max(MIN_RATE_BYTES_PER_SEC);
+            }
         } else {
             self.rate = self
                 .rate
@@ -688,6 +724,60 @@ pub async fn run_bulk_client(
 mod tests {
     use super::*;
 
+    /// The rate collapse behind an 8 MB/s transfer on a gigabit link.
+    ///
+    /// Heartbeats arrive every two seconds; `step` runs once per 256 KB chunk, so
+    /// hundreds of times a second. Treating each read of the same stale measurement as
+    /// fresh evidence halved the rate on every chunk — from 100 MB/s to the floor in
+    /// about eleven chunks, after which a single chunk took four seconds.
+    #[test]
+    fn one_stale_measurement_causes_one_back_off_not_hundreds() {
+        let health = LinkHealth::new();
+        health.record_rtt(Duration::from_micros(300));
+
+        let mut p = Pacer::new(health.clone(), None);
+        // Climb on a healthy link first, so there is something to lose.
+        for _ in 0..200 {
+            p.step();
+        }
+        let climbed = p.rate();
+
+        // Now one bad measurement arrives, and stays the latest for two seconds.
+        health.record_rtt(Duration::from_millis(50));
+        assert!(health.is_congested());
+        assert!(climbed > 50 * 1024 * 1024, "should reach a real rate first: {climbed}");
+
+        // Now hammer it while the measurement stays exactly as stale as it was.
+        for _ in 0..500 {
+            p.step();
+        }
+        assert_eq!(
+            p.rate(),
+            climbed / 2,
+            "one measurement must cost one halving, however many chunks read it"
+        );
+
+        // A *new* measurement that is still bad earns one more.
+        health.record_rtt(Duration::from_millis(50));
+        for _ in 0..500 {
+            p.step();
+        }
+        assert_eq!(p.rate(), climbed / 4, "and the next sample earns the next one");
+    }
+
+    /// Recovery must not depend on congestion clearing at a sample boundary: once the
+    /// link is healthy the rate climbs again on every chunk, which is what makes a
+    /// transfer reach full speed in the first place.
+    #[test]
+    fn a_healthy_link_climbs_on_every_chunk() {
+        let health = LinkHealth::new();
+        health.record_rtt(Duration::from_micros(300));
+        let mut p = Pacer::new(health.clone(), None);
+        let before = p.rate();
+        p.step();
+        assert!(p.rate() > before, "an uncongested link should speed up immediately");
+    }
+
     #[test]
     fn the_queue_reports_full_and_drains_back_down() {
         let q = BulkQueue::new(1024 * 1024);
@@ -834,8 +924,19 @@ mod tests {
         p.step();
         assert_eq!(p.rate(), before / 2);
 
-        // And it never collapses to a standstill.
+        // Reading that same measurement again changes nothing. This assertion used to
+        // require the opposite — a collapse to the floor after 100 further reads — which
+        // was the defect written down as an expectation: at 8 ms of staleness and
+        // hundreds of chunks a second, it is what turned a gigabit link into 8 MB/s.
         for _ in 0..100 {
+            p.step();
+        }
+        assert_eq!(p.rate(), before / 2, "one measurement, one back-off");
+
+        // Sustained congestion still drives it down — one halving per new sample — and
+        // floors rather than reaching a standstill.
+        for _ in 0..100 {
+            h.record_rtt(Duration::from_millis(200));
             p.step();
         }
         assert_eq!(p.rate(), MIN_RATE_BYTES_PER_SEC);
