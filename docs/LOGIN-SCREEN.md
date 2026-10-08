@@ -53,7 +53,31 @@ and the active keymap decides what they produce. `a` becomes `KEY_A`, which type
 under a US layout. A layout that moves the A key types something else. Every KVM that
 injects at this level makes the same trade.
 
-## Setting it up
+## Turning it on
+
+**From the panel.** Startup tab → **Share input at the login screen**. The first time it
+is switched on, a one-time panel explains what it costs and asks to confirm; after that
+the toggle acts immediately. Either answer is remembered, so the explanation never
+appears twice.
+
+Setting up a system service needs administrator rights, which the panel does not have —
+so it asks `pkexec` to do it, and your desktop's own authentication agent prompts for the
+password. That password goes to polkit, never through mouse-rs.
+
+The toggle reads its state back from systemd rather than from a saved setting, so it also
+reflects a change made with `systemctl` outside the app, and it does **not** move if the
+password prompt is dismissed. A toggle that moved anyway would claim the login screen was
+covered when it was not — and the way you would find out is by being locked out with no
+keyboard.
+
+Note that the toggle shows ON while the service is installed and enabled, even though it
+is *stopped* for as long as you are logged in. That is the hand-over working, not a fault.
+
+**From a terminal**, if you prefer, or if `pkexec` is unavailable:
+
+```bash
+mouse-rs greeter-status      # what it is currently doing; needs no privilege
+```
 
 The machine that receives input is the one that needs this — here, the Kali desktop.
 Pair the two machines normally first, so a shared secret exists.

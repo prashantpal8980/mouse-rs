@@ -102,6 +102,8 @@ fn main() -> anyhow::Result<()> {
         Some("greeter-uninstall") => greeter::uninstall(),
         #[cfg(target_os = "linux")]
         Some("greeter-selftest") => greeter::selftest(),
+        #[cfg(target_os = "linux")]
+        Some("greeter-status") => greeter::status(),
 
         Some(other) => {
             eprintln!("unknown argument: {other}");
@@ -110,7 +112,8 @@ fn main() -> anyhow::Result<()> {
             eprintln!(
                 "       mouse-rs greeter-install [config]   share input at the login screen\n\
                  \x20      mouse-rs greeter-uninstall          undo that\n\
-                 \x20      mouse-rs greeter-selftest           prove uinput works"
+                 \x20      mouse-rs greeter-selftest           prove uinput works\n\
+                 \x20      mouse-rs greeter-status             what it is currently doing"
             );
             std::process::exit(2);
         }

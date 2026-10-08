@@ -110,6 +110,20 @@ enum Message {
     AutostartElevatedToggled(bool),
     RelaunchElevated,
     DismissElevationNotice,
+    /// The login-screen toggle was flipped. Turning it on may be intercepted by the
+    /// one-time explanation first.
+    ///
+    /// Linux-only, and so is the variant itself: declaring it everywhere while handling
+    /// it only here made the Windows build fail on a non-exhaustive match, which is the
+    /// compiler correctly pointing out a message nothing could answer.
+    #[cfg(target_os = "linux")]
+    LoginScreenToggled(bool),
+    /// "Yes, turn it on" from that explanation.
+    #[cfg(target_os = "linux")]
+    ConfirmLoginScreen,
+    /// "No, leave it off" from that explanation.
+    #[cfg(target_os = "linux")]
+    CancelLoginScreen,
     AutoconnectToggled(bool),
     StartMinimizedToggled(bool),
     LockHotkeyChanged(String),
@@ -233,6 +247,15 @@ struct App {
     /// because the user may have removed it outside the app.
     autostart_on: bool,
     autostart_elevated_on: bool,
+    /// Live state of the login-screen service, read from systemd rather than `cfg`: it
+    /// is a system service and could have been changed with `systemctl` outside the app.
+    #[cfg(target_os = "linux")]
+    login_screen: crate::greeter::State,
+    /// Set while the one-time explanation is on screen, waiting for an answer. The
+    /// toggle does not move until it is answered, so the panel never shows a state the
+    /// system is not actually in.
+    #[cfg(target_os = "linux")]
+    login_screen_asking: bool,
     /// One-shot latch for the `autoconnect` / `start_minimized` launch actions, so they
     /// fire once on the first tick and never again (e.g. after a manual Stop).
     launch_done: bool,
@@ -377,6 +400,10 @@ impl App {
             clip_progress: std::collections::HashMap::new(),
             autostart_on: crate::autostart::is_enabled(),
             autostart_elevated_on: crate::autostart::elevated_is_enabled(),
+            #[cfg(target_os = "linux")]
+            login_screen: crate::greeter::state(),
+            #[cfg(target_os = "linux")]
+            login_screen_asking: false,
             launch_done: false,
             log_path: crate::logging::log_path().display().to_string(),
             live_cfg: None,
@@ -851,6 +878,34 @@ impl App {
                     Err(e) => format!("could not save that choice: {e}"),
                 };
             }
+            // Linux. The explanation gates the first enable only; after that the
+            // toggle acts immediately, because the answer has been given.
+            #[cfg(target_os = "linux")]
+            Message::LoginScreenToggled(v) => {
+                if v && !self.cfg.login_screen_notice_seen {
+                    self.login_screen_asking = true;
+                } else {
+                    self.apply_login_screen(v);
+                }
+            }
+            #[cfg(target_os = "linux")]
+            Message::ConfirmLoginScreen => {
+                // Recorded before the attempt: they have been told, whether or not the
+                // install then succeeds or the password prompt is dismissed.
+                self.cfg.login_screen_notice_seen = true;
+                let _ = self.cfg.save(&Config::default_path());
+                self.login_screen_asking = false;
+                self.apply_login_screen(true);
+            }
+            #[cfg(target_os = "linux")]
+            Message::CancelLoginScreen => {
+                // Also a decision, so it is also remembered. Re-asking would be
+                // ignoring the answer; the toggle is still there if they change it.
+                self.cfg.login_screen_notice_seen = true;
+                let _ = self.cfg.save(&Config::default_path());
+                self.login_screen_asking = false;
+                self.feedback = "left off — the toggle is in Startup if you want it later".into();
+            }
             Message::RelaunchElevated => {
                 // Remember the answer first: whichever way this goes, they have now been
                 // asked, and a UAC prompt they declined must not reappear next launch.
@@ -1147,6 +1202,10 @@ impl App {
             content = content.push(banner);
         }
         if let Some(banner) = self.elevation_notice(p) {
+            content = content.push(banner);
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(banner) = self.login_screen_notice(p) {
             content = content.push(banner);
         }
         let content = content.push(self.tab_bar(p)).push(
@@ -1469,6 +1528,32 @@ impl App {
             ));
         }
 
+        // Linux only, and the counterpart to the Windows block above: the same shape of
+        // question — what this machine does before anyone has signed in — answered by a
+        // different mechanism. There is no Windows equivalent built yet.
+        #[cfg(target_os = "linux")]
+        {
+            startup = startup.push(toggle_row(
+                p,
+                "Share input at the login screen",
+                "starts before the password prompt, as a system service, so the other \
+                 machine's keyboard can type it. Needs your password to set up, and \
+                 accepts keystrokes over the network before anyone has signed in.",
+                self.login_screen.on(),
+                Message::LoginScreenToggled,
+            ));
+            // Only worth a line when it says something the toggle does not. Installed
+            // but not enabled is the state a stray `systemctl disable` leaves behind,
+            // and it would otherwise look identical to off.
+            if self.login_screen.installed && !self.login_screen.enabled {
+                startup = startup.push(
+                    text("installed but disabled in systemd — turn it off and on to fix")
+                        .size(11.0)
+                        .color(p.warn),
+                );
+            }
+        }
+
         // The panel has no console behind it, so name the log file here — otherwise a user
         // hitting a problem has nothing to look at and nothing to send.
         let logs = column![
@@ -1484,6 +1569,85 @@ impl App {
             self.profiles_section(p),
         ]
         .spacing(14.0))
+    }
+
+    /// Install or remove the login-screen service, then re-read what systemd actually
+    /// says rather than assuming the click worked.
+    ///
+    /// Re-reading matters: the password prompt can be dismissed, and a toggle that moved
+    /// anyway would claim the login screen was covered when it was not — the one claim
+    /// this feature must never get wrong, because the way you discover it is false is by
+    /// being locked out with no keyboard.
+    #[cfg(target_os = "linux")]
+    fn apply_login_screen(&mut self, on: bool) {
+        let res = crate::greeter::set_enabled(on);
+        self.login_screen = crate::greeter::state();
+        self.feedback = match res {
+            Ok(()) if self.login_screen.on() == on => {
+                tracing::info!(enabled = on, "login-screen service changed from the panel");
+                if on {
+                    "the login screen now accepts the other machine's keyboard".into()
+                } else {
+                    "login-screen sharing removed".into()
+                }
+            }
+            // No error, but systemd disagrees. Report what is true, not what was asked.
+            Ok(()) => "that did not take effect — see the log".into(),
+            Err(e) => format!("{e}"),
+        };
+    }
+
+    /// The one-time explanation, shown only when turning the login-screen service on for
+    /// the first time.
+    ///
+    /// Not a permanent banner and not shown while it is off: off is the safe default and
+    /// warning about a thing nobody has asked for is noise. It appears once, at the
+    /// moment the decision is actually being made, which is when the information is
+    /// worth something.
+    #[cfg(target_os = "linux")]
+    fn login_screen_notice(&self, p: Palette) -> Option<Element<'_, Message>> {
+        if !self.login_screen_asking {
+            return None;
+        }
+        Some(
+            container(
+                column![
+                    text("Share the keyboard before anyone logs in?").size(13.5).color(p.txt),
+                    text(
+                        "This installs a small system service that starts at boot, like \
+                         NetworkManager does, so the other machine's keyboard works at the \
+                         password screen and you no longer need a second one plugged in here."
+                    )
+                    .size(11.0)
+                    .color(p.txt3),
+                    text(
+                        "What it costs: this machine will accept keystrokes over the network \
+                         before anyone has signed in. Anything holding your shared secret \
+                         could type at the password prompt, so that secret becomes what \
+                         stands between your network and this login. The service needs \
+                         administrator rights to install, and asks for your password now."
+                    )
+                    .size(11.0)
+                    .color(p.warn),
+                    row![
+                        button(text("Turn it on").size(12.5))
+                            .style(ui_theme::primary(p))
+                            .padding([9.0, 14.0])
+                            .on_press(Message::ConfirmLoginScreen),
+                        button(text("Leave it off").size(12.5))
+                            .style(ui_theme::ghost(p))
+                            .padding([9.0, 12.0])
+                            .on_press(Message::CancelLoginScreen),
+                    ]
+                    .spacing(8.0),
+                ]
+                .spacing(8.0),
+            )
+            .style(move |_| ui_theme::well(p))
+            .padding([11.0, 14.0])
+            .width(Length::Fill)
+            .into(),
+        )
     }
 
     /// Sub-label for the Start-at-login toggle: says where the entry actually lives, so

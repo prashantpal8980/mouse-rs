@@ -189,6 +189,7 @@ pub fn run() -> anyhow::Result<()> {
 
 /// Where the unit lives. `/etc`, not `/usr/lib`: this is local configuration, not
 /// something a package shipped.
+const UNIT_NAME: &str = "mouse-rs-greeter.service";
 const UNIT_PATH: &str = "/etc/systemd/system/mouse-rs-greeter.service";
 
 /// Where the service's copy of the binary lives.
@@ -318,7 +319,7 @@ pub fn install(source: Option<PathBuf>) -> anyhow::Result<()> {
     std::fs::write(UNIT_PATH, unit_text(&exe))?;
 
     run_systemctl(&["daemon-reload"])?;
-    run_systemctl(&["enable", "mouse-rs-greeter.service"])?;
+    run_systemctl(&["enable", UNIT_NAME])?;
 
     println!("Installed.");
     println!("  config  {}  (root-only; holds a copy of the shared secret)", dest.display());
@@ -337,7 +338,7 @@ pub fn install(source: Option<PathBuf>) -> anyhow::Result<()> {
 pub fn uninstall() -> anyhow::Result<()> {
     require_root("removing the login-screen service")?;
     // Best effort in order: a half-installed state must still clean up.
-    let _ = run_systemctl(&["disable", "--now", "mouse-rs-greeter.service"]);
+    let _ = run_systemctl(&["disable", "--now", UNIT_NAME]);
     let mut removed = Vec::new();
     if std::fs::remove_file(UNIT_PATH).is_ok() {
         removed.push(UNIT_PATH.to_string());
@@ -372,6 +373,131 @@ fn run_systemctl(args: &[&str]) -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+// ------------------------------------------------------- status, for the panel
+
+/// What the panel needs to know about the login-screen service.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct State {
+    /// The unit file and the root-owned config are both in place.
+    pub installed: bool,
+    /// systemd will start it at boot.
+    pub enabled: bool,
+    /// It is running right now. Normally **false** while you are logged in — the service
+    /// stands down during a session on purpose — so this is not a health indicator.
+    pub active: bool,
+}
+
+impl State {
+    /// Is the login screen covered? Enablement is what survives a reboot, which is the
+    /// question the toggle is actually asking; whether it happens to be running right
+    /// now is not, because during a desktop session it is *meant* to be stopped.
+    pub fn on(self) -> bool {
+        self.installed && self.enabled
+    }
+}
+
+/// Read the current state. Cheap enough to call on a panel redraw: one file check and
+/// two `systemctl` queries that do not touch the network.
+pub fn state() -> State {
+    let installed = Path::new(UNIT_PATH).is_file() && config_path().is_file();
+    State {
+        installed,
+        enabled: installed && systemctl_says(&["is-enabled", UNIT_NAME], "enabled"),
+        active: installed && systemctl_says(&["is-active", UNIT_NAME], "active"),
+    }
+}
+
+/// `systemctl <args>` printed exactly `want`.
+///
+/// Matched on stdout rather than exit status because `is-enabled` exits non-zero for
+/// several different "no" answers (disabled, static, masked) and we only care that it
+/// is not the one "yes".
+fn systemctl_says(args: &[&str], want: &str) -> bool {
+    std::process::Command::new("systemctl")
+        .args(args)
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim() == want)
+        .unwrap_or(false)
+}
+
+/// Turn the login-screen service on or off from the panel, asking for the password
+/// through polkit.
+///
+/// The panel runs as the user and this installs a root-owned service, so privilege has
+/// to come from somewhere. `pkexec` is that somewhere: it prompts through the desktop's
+/// own authentication agent, which means the password goes to polkit and never through
+/// mouse-rs. We get an exit status and nothing else, which is the right amount.
+///
+/// Blocks until the user answers the prompt. The caller is the panel's update loop, so
+/// the window is unresponsive while the dialog is up — acceptable for a deliberate
+/// one-off action with a modal prompt of its own, and the alternative (a background task
+/// posting back a result) buys nothing when there is nothing else to do meanwhile.
+pub fn set_enabled(on: bool) -> anyhow::Result<()> {
+    if which_pkexec().is_none() {
+        anyhow::bail!(
+            "pkexec is not installed, so the panel cannot ask for permission. Run this \
+             in a terminal instead:\n  sudo mouse-rs greeter-{}",
+            if on { "install" } else { "uninstall" }
+        );
+    }
+    let exe = std::env::current_exe()?;
+    let mut cmd = std::process::Command::new("pkexec");
+    cmd.arg(&exe);
+    if on {
+        // Pass our own config explicitly: under pkexec, SUDO_USER is not set and $HOME
+        // is root's, so the install command could not find it to copy from.
+        cmd.arg("greeter-install").arg(Config::default_path());
+    } else {
+        cmd.arg("greeter-uninstall");
+    }
+    let out = cmd.output()?;
+    if out.status.success() {
+        return Ok(());
+    }
+    // 126/127 are pkexec's own: the user dismissed the prompt, or authorisation failed.
+    // Those are answers rather than faults and should not read like a crash.
+    let code = out.status.code().unwrap_or(-1);
+    if code == 126 || code == 127 {
+        anyhow::bail!("cancelled — nothing was changed");
+    }
+    let err = String::from_utf8_lossy(&out.stderr);
+    let detail = err.lines().rfind(|l| !l.trim().is_empty()).unwrap_or("unknown error");
+    anyhow::bail!("{detail}")
+}
+
+fn which_pkexec() -> Option<PathBuf> {
+    let p = PathBuf::from("/usr/bin/pkexec");
+    p.is_file().then_some(p)
+}
+
+/// Print what the login-screen service is doing. Needs no privilege.
+///
+/// Exists because every other way to ask is indirect: the panel's toggle shows one bit,
+/// and `systemctl status` says nothing about whether the root-owned config is in place.
+pub fn status() -> anyhow::Result<()> {
+    let st = state();
+    println!("login-screen sharing: {}", if st.on() { "ON" } else { "off" });
+    println!("  unit         {}  {}", UNIT_PATH, yes_no(Path::new(UNIT_PATH).is_file()));
+    println!("  config       {}  {}", config_path().display(), yes_no(config_path().is_file()));
+    println!("  starts at boot              {}", yes_no(st.enabled));
+    println!("  running now                 {}", yes_no(st.active));
+    if st.on() && !st.active {
+        println!();
+        println!("Not running is normal while you are logged in: the service stands down");
+        println!("during a session so input is not injected twice, and comes back at logout.");
+    }
+    if !st.installed {
+        println!();
+        println!("Turn it on from the panel (Startup tab), or:");
+        println!("  sudo mouse-rs greeter-install");
+    }
+    Ok(())
+}
+
+fn yes_no(b: bool) -> &'static str {
+    if b { "yes" } else { "no" }
 }
 
 /// Prove the virtual devices work, without involving the network or the login screen.
@@ -458,6 +584,39 @@ mod tests {
         assert!(!is_graphical_user_session(""));
         assert!(!is_graphical_user_session("CLASS=user\n"), "no TYPE, no ACTIVE");
         assert!(!is_graphical_user_session("TYPE=x11\nACTIVE=1\n"), "no CLASS");
+    }
+
+    #[test]
+    fn on_means_it_will_come_back_after_a_reboot() {
+        // "On" is about surviving a reboot, not about this instant. Reading `active`
+        // as the answer would show the toggle off for the entire time someone is
+        // logged in, because that is exactly when the service is meant to be stopped.
+        let installed_enabled = State { installed: true, enabled: true, active: false };
+        assert!(installed_enabled.on(), "stopped during a session is still ON");
+
+        let running = State { installed: true, enabled: true, active: true };
+        assert!(running.on());
+    }
+
+    #[test]
+    fn a_half_installed_service_is_not_on() {
+        // Each of these is a state `systemctl disable` or a partial removal can leave
+        // behind, and claiming any of them is ON would promise a login screen that
+        // accepts the peer's keyboard when it does not — discovered by being locked out.
+        assert!(!State { installed: true, enabled: false, active: false }.on());
+        assert!(!State { installed: false, enabled: true, active: false }.on());
+        assert!(!State { installed: false, enabled: false, active: true }.on());
+    }
+
+    #[test]
+    fn the_live_system_reports_a_coherent_state() {
+        // Against real systemd on this machine. Not asserting on/off — that depends on
+        // whether it happens to be installed — but the invariant must hold either way.
+        let st = state();
+        if !st.installed {
+            assert!(!st.enabled && !st.active, "nothing can be enabled or active unless installed");
+            assert!(!st.on());
+        }
     }
 
     #[test]

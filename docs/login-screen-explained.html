@@ -1,0 +1,264 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Starting before the password</title>
+<style>
+  :root{
+    --bg:#0d1117; --panel:#161b22; --panel2:#1c2230; --line:#2a3441;
+    --ink:#e6edf3; --dim:#8b98a5; --faint:#5c6773;
+    --bad:#f85149; --badbg:#2d1417; --good:#3fb950; --goodbg:#0f2416;
+    --warn:#d29922; --warnbg:#2a2111; --accent:#58a6ff;
+    --mono:ui-monospace,"SF Mono",Menlo,Consolas,monospace;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+       font:16px/1.65 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+       -webkit-font-smoothing:antialiased}
+  .wrap{max-width:940px;margin:0 auto;padding:54px 22px 90px}
+  h1{font-size:clamp(28px,5vw,42px);line-height:1.15;margin:0 0 12px;letter-spacing:-.02em}
+  h2{font-size:clamp(19px,3vw,23px);margin:54px 0 14px;letter-spacing:-.01em;
+     padding-bottom:9px;border-bottom:1px solid var(--line)}
+  p{margin:0 0 15px}
+  .lede{font-size:19px;color:var(--dim)}
+  .sub{color:var(--faint);font-size:14px;margin-bottom:30px}
+  code{font-family:var(--mono);font-size:.9em;background:#21262d;
+       padding:2px 6px;border-radius:4px;color:#a5d6ff}
+  .card{background:var(--panel);border:1px solid var(--line);
+        border-radius:11px;padding:22px;margin:20px 0}
+
+  /* answer banner */
+  .answer{display:flex;gap:16px;align-items:flex-start;
+          background:var(--goodbg);border:1px solid #1d4429;
+          border-radius:12px;padding:22px;margin:28px 0}
+  .answer .tick{flex:none;width:34px;height:34px;border-radius:50%;
+       background:var(--good);color:#0d1117;display:flex;align-items:center;
+       justify-content:center;font-size:19px;font-weight:700}
+  .answer b{color:var(--good)}
+
+  /* boot timeline */
+  .tl{margin:0}
+  .tl h3{font-size:13px;text-transform:uppercase;letter-spacing:.09em;
+         margin:0 0 16px;display:flex;align-items:center;gap:9px}
+  .tl h3 .dot{width:9px;height:9px;border-radius:50%;flex:none}
+  .steps{list-style:none;margin:0;padding:0;position:relative}
+  .steps li{position:relative;padding:0 0 20px 34px;border-left:2px solid var(--line)}
+  .steps li:last-child{border-left-color:transparent;padding-bottom:0}
+  .steps li::before{content:"";position:absolute;left:-7px;top:5px;
+       width:12px;height:12px;border-radius:50%;background:var(--panel2);
+       border:2px solid var(--faint)}
+  .steps li.hit::before{background:var(--bad);border-color:var(--bad)}
+  .steps li.win::before{background:var(--good);border-color:var(--good)}
+  .steps li b{display:block;font-size:15px;margin-bottom:2px}
+  .steps li span{color:var(--dim);font-size:14px}
+  .steps li.hit span{color:#ffa198}
+  .steps li.win span{color:#7ee787}
+  .two{display:grid;grid-template-columns:1fr;gap:16px}
+  @media(min-width:800px){.two{grid-template-columns:1fr 1fr}}
+  .two > div{background:var(--panel);border:1px solid var(--line);
+             border-radius:11px;padding:20px}
+  .two > div.before{border-color:#4a2126}
+  .two > div.after{border-color:#1d4429}
+
+  /* service table */
+  .scroll{overflow-x:auto;-webkit-overflow-scrolling:touch}
+  table{width:100%;border-collapse:collapse;font-size:15px;min-width:520px}
+  th,td{text-align:left;padding:11px 10px;border-bottom:1px solid var(--line)}
+  th{font-size:12px;text-transform:uppercase;letter-spacing:.08em;color:var(--faint)}
+  td.n{font-family:var(--mono);font-size:13px}
+  tr.me td{background:rgba(63,185,80,.07)}
+  tr.me td:first-child{color:var(--good);font-weight:600}
+
+  /* handover */
+  .hand{display:grid;grid-template-columns:1fr;gap:14px;align-items:stretch}
+  @media(min-width:720px){.hand{grid-template-columns:1fr auto 1fr}}
+  .box{background:var(--panel2);border:1px solid var(--line);
+       border-radius:9px;padding:16px;text-align:center}
+  .box .who{font-size:13px;color:var(--faint);text-transform:uppercase;
+            letter-spacing:.08em;margin-bottom:7px}
+  .box .what{font-size:15px;font-weight:600;margin-bottom:5px}
+  .box .note{font-size:13px;color:var(--dim)}
+  .arrow{display:flex;align-items:center;justify-content:center;
+         color:var(--faint);font-size:22px;padding:4px}
+  @media(max-width:719px){.arrow{transform:rotate(90deg)}}
+
+  pre{background:#0b0f14;border:1px solid var(--line);border-radius:9px;
+      padding:16px;overflow-x:auto;margin:0 0 14px;font-family:var(--mono);
+      font-size:13.5px;line-height:1.75}
+  pre .c{color:var(--faint)}
+  pre .p{color:var(--good)}
+
+  .warn{background:var(--warnbg);border:1px solid #4a3a16;border-radius:11px;
+        padding:20px;margin:20px 0}
+  .warn b{color:var(--warn)}
+  .foot{margin-top:56px;padding-top:20px;border-top:1px solid var(--line);
+        color:var(--faint);font-size:13px}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <h1>Starting before the password</h1>
+  <p class="lede">You asked whether this makes mouse-rs start on its own at boot, like other
+  services, with nobody logged in. That is exactly what it does.</p>
+  <p class="sub">mouse-rs &middot; commit <code>61b0d72</code> &middot; 8 October 2026</p>
+
+  <div class="answer">
+    <div class="tick">✓</div>
+    <div>
+      <p style="margin:0 0 8px"><b>Yes — it becomes a real system service.</b></p>
+      <p style="margin:0;color:var(--dim)">The same kind of thing as NetworkManager or cron
+      on this machine: started by the system at boot, running before anyone logs in, not
+      tied to any person's account. It does not wait for you, so it is already there when
+      the password box appears.</p>
+    </div>
+  </div>
+
+  <h2>What changes at boot</h2>
+
+  <div class="two">
+    <div class="before">
+      <div class="tl">
+        <h3><span class="dot" style="background:var(--bad)"></span>Before</h3>
+        <ul class="steps">
+          <li><b>Power on</b><span>Kernel, then system services start</span></li>
+          <li><b>SDDM shows the password box</b><span>mouse-rs is not running</span></li>
+          <li class="hit"><b>Nothing to type with</b>
+            <span>You plug a keyboard into this machine, just for the password</span></li>
+          <li><b>You log in</b><span>XFCE session starts</span></li>
+          <li><b>Autostart finally runs mouse-rs</b>
+            <span>The shared keyboard works — one step too late</span></li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="after">
+      <div class="tl">
+        <h3><span class="dot" style="background:var(--good)"></span>After</h3>
+        <ul class="steps">
+          <li><b>Power on</b><span>Kernel, then system services start</span></li>
+          <li class="win"><b>mouse-rs starts here</b>
+            <span>As a system service, alongside the others. It connects to the laptop
+            on its own</span></li>
+          <li><b>SDDM shows the password box</b><span>mouse-rs is already connected</span></li>
+          <li class="win"><b>You type from the laptop</b>
+            <span>No second keyboard. Nothing to plug in</span></li>
+          <li><b>You log in</b>
+            <span>The service steps aside, your own copy takes over</span></li>
+        </ul>
+      </div>
+    </div>
+  </div>
+
+  <h2>"Like other services" — exactly which ones</h2>
+  <p>These are real services on this machine. The new one is listed the same way, started
+  at the same point, by the same mechanism.</p>
+
+  <div class="card scroll">
+    <table>
+      <tr>
+        <th>Service</th><th>Starts at</th><th>Needs a login?</th><th>What it does</th>
+      </tr>
+      <tr>
+        <td>NetworkManager</td><td class="n">multi-user.target</td><td>no</td>
+        <td>Brings up the network</td>
+      </tr>
+      <tr>
+        <td>cron</td><td class="n">multi-user.target</td><td>no</td>
+        <td>Runs scheduled jobs</td>
+      </tr>
+      <tr>
+        <td>sddm</td><td class="n">graphical.target</td><td>no</td>
+        <td>Draws the login screen itself</td>
+      </tr>
+      <tr class="me">
+        <td>mouse-rs-greeter</td><td class="n">multi-user.target</td><td>no</td>
+        <td>Receives the laptop's keyboard and mouse</td>
+      </tr>
+    </table>
+  </div>
+
+  <p>Same <code>multi-user.target</code> as NetworkManager and cron — meaning it is up
+  before the login screen is even drawn.</p>
+
+  <h2>Why it steps aside when you log in</h2>
+  <p>Once you are logged in, your own mouse-rs starts too. If both kept running you would
+  have <strong>two copies receiving the same keystrokes</strong>, and every letter would be
+  typed twice. So exactly one runs at a time.</p>
+
+  <div class="card">
+    <div class="hand">
+      <div class="box">
+        <div class="who">Login screen</div>
+        <div class="what">The service</div>
+        <div class="note">Runs as the system. Keyboard and mouse only — no clipboard,
+        no panel</div>
+      </div>
+      <div class="arrow">→</div>
+      <div class="box">
+        <div class="who">You log in</div>
+        <div class="what">Hand-over</div>
+        <div class="note">The service notices a real session and stops itself</div>
+      </div>
+      <div class="arrow">→</div>
+      <div class="box">
+        <div class="who">Your desktop</div>
+        <div class="what">Your own copy</div>
+        <div class="note">The full thing — panel, clipboard, file transfer</div>
+      </div>
+    </div>
+    <p style="margin:18px 0 0;color:var(--dim);font-size:14px">
+      Log out and it reverses: your copy ends with the session, the service starts again,
+      and the login screen has the shared keyboard once more.</p>
+  </div>
+
+  <h2>Is it a settings change?</h2>
+  <p>Not a tick-box in the panel — it needed new code, because the old way could never have
+  worked. Previously mouse-rs typed by talking to <em>your</em> X server, which does not
+  exist until you have logged in. It now talks to the kernel instead, which is running the
+  whole time. That is the actual change; the service is just what starts it.</p>
+
+  <p>For you it is <strong>three commands, once</strong>. After that it is permanent and
+  survives reboots on its own.</p>
+
+  <div class="card">
+<pre><span class="c"># 1. Check it works while you still have a terminal to see errors in.</span>
+<span class="c">#    Put the cursor in a text editor — it types `mouse-rs ok`.</span>
+<span class="p">sudo</span> ./target/release/mouse-rs greeter-selftest
+
+<span class="c"># 2. Install the service.</span>
+<span class="p">sudo</span> ./target/release/mouse-rs greeter-install
+
+<span class="c"># 3. Start it now instead of waiting for a reboot.</span>
+<span class="p">sudo</span> systemctl start mouse-rs-greeter</pre>
+    <p style="margin:0;color:var(--dim);font-size:14px">Then log out and try the password
+    from the laptop. To undo all of it:
+    <code>sudo mouse-rs greeter-uninstall</code></p>
+  </div>
+
+  <h2>What you are agreeing to</h2>
+
+  <div class="warn">
+    <p style="margin:0 0 10px"><b>It can accept keystrokes before anyone has logged in.</b></p>
+    <p style="margin:0 0 10px;color:var(--dim)">That is the whole point — but it is worth
+    saying plainly. Anything on your network that holds the shared secret can type at this
+    machine's login screen. That secret is now the thing standing between the network and
+    your password prompt.</p>
+    <p style="margin:0;color:var(--dim)">It is off until you run the install command, the
+    secret file is readable only by root, and the service is locked down to the network,
+    its own folder and the one device it needs.</p>
+  </div>
+
+  <p>Two smaller things. It sends <em>key positions</em>, not letters, so the keyboard
+  layout set at the login screen decides what appears — normal ASCII on a US layout is
+  fine. And <code>/etc/mouse-rs/config.json</code> is a copy, so re-run the install after
+  changing the shared secret or the laptop's address.</p>
+
+  <div class="foot">
+    Full write-up in <code>docs/LOGIN-SCREEN.md</code> &middot; tracked as R21 in
+    <code>docs/UI-REQUIREMENTS.md</code> &middot; 203 tests passing, Windows untouched.
+  </div>
+</div>
+</body>
+</html>

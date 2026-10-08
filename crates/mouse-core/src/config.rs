@@ -218,6 +218,14 @@ pub struct Config {
     /// not a permanent banner nagging about a decision already made.
     #[serde(default)]
     pub elevation_notice_seen: bool,
+    /// Whether the owner has already been told what the login-screen service costs.
+    ///
+    /// Linux. Turning it on means this machine will accept keystrokes over the network
+    /// before anyone has authenticated, which is worth saying once and insulting to say
+    /// twice — so the explanation gates the *first* enable and never appears again,
+    /// whichever way they answer.
+    #[serde(default)]
+    pub login_screen_notice_seen: bool,
     /// Show a desktop notification when a file is waiting for a decision.
     ///
     /// Never a dialog — see `crates/mouse/src/notify.rs` for why a focus-stealing
@@ -387,6 +395,7 @@ impl Default for Config {
             clipboard_hash_limit: default_hash_limit(),
             clipboard_notify: true,
             elevation_notice_seen: false,
+            login_screen_notice_seen: false,
             log_upload_url: String::new(),
             log_upload_secs: default_log_upload_secs(),
             bulk_pause_while_crossed: true,
