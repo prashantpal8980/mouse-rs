@@ -30,6 +30,9 @@ mod motion;
 #[cfg(target_os = "linux")]
 mod linux;
 
+#[cfg(target_os = "linux")]
+pub mod uinput;
+
 #[cfg(target_os = "windows")]
 mod windows;
 
@@ -140,6 +143,19 @@ pub trait InputCapture: Send {
     fn set_suppress(&self, on: bool);
     /// Stop capturing and release everything.
     fn stop(self: Box<Self>);
+}
+
+/// Create an injector that works with no desktop session of its own.
+///
+/// Only meaningful on Linux, where the normal backend is bound to one X server and so
+/// cannot reach a display-manager greeter. `w`/`h` are the screen bounds the virtual
+/// pointer is declared over; they are passed in because the whole point of this backend
+/// is that there is no X server available to ask.
+///
+/// Requires privilege — see [`uinput`].
+#[cfg(target_os = "linux")]
+pub fn new_sessionless_injector(w: i32, h: i32) -> Result<Box<dyn InputInjector>, InputError> {
+    Ok(Box::new(uinput::UinputInjector::new(w, h)?))
 }
 
 /// Create the injector for the current platform.

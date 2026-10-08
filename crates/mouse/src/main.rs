@@ -1,6 +1,9 @@
 //! mouse-rs entry point.
 //!
 //! * `mouse-rs server` / `mouse-rs client` — headless KVM link for that role.
+//! * `mouse-rs greeter` — the login-screen instance (Linux): input only, injected
+//!   through uinput so it works before anyone has a session. Run by the system service
+//!   that `greeter-install` sets up, not by hand.
 //! * `mouse-rs` (bare) or `mouse-rs gui` — open the egui control panel (Phase 6),
 //!   which edits config and Start/Stops the engine over the same [`run`] lifecycle.
 //!
@@ -14,6 +17,9 @@ use tokio_util::sync::CancellationToken;
 mod logging;
 mod logship;
 mod run;
+
+#[cfg(target_os = "linux")]
+mod greeter;
 
 #[cfg(feature = "gui")]
 mod autostart;
@@ -29,6 +35,13 @@ mod notify;
 fn main() -> anyhow::Result<()> {
     let sub = std::env::args().nth(1);
     let is_gui = matches!(sub.as_deref(), None | Some("gui"));
+    // The login-screen service logs to a file like the GUI does, because the file is
+    // what gets shipped — a service that only logged to the journal would be the one
+    // part of the system nobody could see from the other machine.
+    #[cfg(target_os = "linux")]
+    let to_file = is_gui && cfg!(feature = "gui") || sub.as_deref() == Some("greeter");
+    #[cfg(not(target_os = "linux"))]
+    let to_file = is_gui && cfg!(feature = "gui");
 
     // On Windows the binary stays a *console* subsystem app so `server`/`client` run in
     // the foreground with logs and Ctrl-C. For a GUI launch we instead drop the console
@@ -42,7 +55,7 @@ fn main() -> anyhow::Result<()> {
 
     // Must follow the FreeConsole above: a GUI launch has no console left to log to, so it
     // logs to a file instead (see `logging`). Headless runs keep stdout.
-    logging::init(is_gui && cfg!(feature = "gui"));
+    logging::init(to_file);
 
     let cfg = Config::load_or_default();
 
@@ -77,9 +90,28 @@ fn main() -> anyhow::Result<()> {
             None,
         ),
         Some("gui") | None => launch_gui(cfg),
+
+        // --- the login-screen instance and its setup (Linux only) ---
+        #[cfg(target_os = "linux")]
+        Some("greeter") => greeter::run(),
+        #[cfg(target_os = "linux")]
+        Some("greeter-install") => {
+            greeter::install(std::env::args().nth(2).map(std::path::PathBuf::from))
+        }
+        #[cfg(target_os = "linux")]
+        Some("greeter-uninstall") => greeter::uninstall(),
+        #[cfg(target_os = "linux")]
+        Some("greeter-selftest") => greeter::selftest(),
+
         Some(other) => {
             eprintln!("unknown argument: {other}");
             eprintln!("usage: mouse-rs [server|client|gui]");
+            #[cfg(target_os = "linux")]
+            eprintln!(
+                "       mouse-rs greeter-install [config]   share input at the login screen\n\
+                 \x20      mouse-rs greeter-uninstall          undo that\n\
+                 \x20      mouse-rs greeter-selftest           prove uinput works"
+            );
             std::process::exit(2);
         }
     }

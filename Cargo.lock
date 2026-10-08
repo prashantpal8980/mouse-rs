@@ -2188,6 +2188,7 @@ dependencies = [
  "anyhow",
  "gtk",
  "iced",
+ "libc",
  "mouse-clipboard",
  "mouse-core",
  "mouse-engine",

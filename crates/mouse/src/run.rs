@@ -17,12 +17,51 @@ use mouse_input::{new_injector, screen_size, start_capture, NamedKey};
 use tokio::sync::mpsc::unbounded_channel;
 use tokio_util::sync::CancellationToken;
 
+/// Whether this process has a desktop session of its own to inject into.
+///
+/// The distinction only bites on Linux. X11 injection talks to one specific X server
+/// through `DISPLAY` and an auth cookie, which is unavailable before anyone has logged
+/// in — so an instance meant to serve the login screen has to reach the input stack
+/// underneath the session instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Session {
+    /// The normal case: running inside the user's session.
+    #[default]
+    Desktop,
+    /// Running before login, with no session of our own. Injects through the kernel's
+    /// uinput device, which is session-independent but needs privilege.
+    Greeter,
+}
+
 /// Run the engine for `cfg.role` on the **current thread** until `cancel` fires.
 /// Blocks until the link/engine tasks finish and the input backends are torn down.
 ///
 /// `install_ctrl_c` wires Ctrl-C → `cancel` (the headless CLI uses it; the GUI owns
 /// its own Stop button and passes `false`).
 pub fn run_blocking(
+    cfg: Config,
+    cancel: CancellationToken,
+    install_ctrl_c: bool,
+    status: Option<StatusHandle>,
+    clip_history: Option<ClipboardHistory>,
+    clip_commands: Option<ClipCommandRx>,
+    health: Option<std::sync::Arc<LinkHealth>>,
+) -> anyhow::Result<()> {
+    run_blocking_in(
+        cfg,
+        cancel,
+        install_ctrl_c,
+        status,
+        clip_history,
+        clip_commands,
+        health,
+        Session::Desktop,
+    )
+}
+
+/// As [`run_blocking`], naming the kind of session this process is running in.
+#[allow(clippy::too_many_arguments)]
+pub fn run_blocking_in(
     mut cfg: Config,
     cancel: CancellationToken,
     install_ctrl_c: bool,
@@ -30,6 +69,7 @@ pub fn run_blocking(
     clip_history: Option<ClipboardHistory>,
     clip_commands: Option<ClipCommandRx>,
     health: Option<std::sync::Arc<LinkHealth>>,
+    session: Session,
 ) -> anyhow::Result<()> {
     // Use the real screen size for edge geometry and the handshake, so crossing
     // math matches the surface the OS actually clamps the cursor against.
@@ -64,6 +104,13 @@ pub fn run_blocking(
 
     match cfg.role {
         Role::Server => {
+            if session == Session::Greeter {
+                anyhow::bail!(
+                    "the login-screen instance can only be a client: serving would mean \
+                     capturing this machine's own keyboard before anyone has logged in, \
+                     which is a different capability from injecting and is not offered"
+                );
+            }
             let (cap_tx, cap_rx) = unbounded_channel();
             // Pass the configured lock/return hotkey so the Windows capture failsafe
             // can self-release suppression on it (the Linux backend ignores it).
@@ -140,7 +187,7 @@ pub fn run_blocking(
             }
         }
         Role::Client => {
-            let injector = Injector::spawn(new_injector()?)?;
+            let injector = Injector::spawn(injector_for(session, local_dims)?)?;
             let inject_tx = injector.sender();
             let (clip_route, clipboard) = setup_clipboard(
                 &cfg,
@@ -404,6 +451,24 @@ impl Drop for EngineHandle {
 }
 
 /// Detect the live screen size and reconcile it with config.
+/// Pick the injection backend for the session we are running in.
+fn injector_for(
+    session: Session,
+    dims: (i32, i32),
+) -> anyhow::Result<Box<dyn mouse_input::InputInjector>> {
+    match session {
+        Session::Desktop => Ok(new_injector()?),
+        #[cfg(target_os = "linux")]
+        Session::Greeter => Ok(mouse_input::new_sessionless_injector(dims.0, dims.1)?),
+        // Nothing but Linux has a greeter in this sense; the caller never builds one.
+        #[cfg(not(target_os = "linux"))]
+        Session::Greeter => {
+            let _ = dims;
+            Ok(new_injector()?)
+        }
+    }
+}
+
 pub fn resolve_dims(cfg: &mut Config) -> (i32, i32) {
     match screen_size() {
         Ok((w, h)) => {

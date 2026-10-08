@@ -38,6 +38,11 @@ tray-icon = { version = "0.24", optional = true }
 # Random secret generation for the GUI's "Generate" button.
 rand = { workspace = true, optional = true }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# `geteuid`, to refuse the greeter setup commands before they half-apply, and to set
+# 0700 on the directory holding the root-owned copy of the shared secret.
+libc.workspace = true
+
 [target.'cfg(unix)'.dependencies]
 # tray-icon on Linux needs gtk initialised with a running gtk main loop (its own
 # thread — see src/tray.rs). Version pinned to what tray-icon/libappindicator use.
