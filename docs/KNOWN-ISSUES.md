@@ -5,8 +5,9 @@ surprises later. `docs/UI-REQUIREMENTS.md` tracks what was *agreed*; this tracks
 *broken or unfinished*.
 
 Status values: **open** (not started) · **unverified** (built, never proven on real
-hardware) · **deferred** (known, deliberately not now) · **awaiting detail** (reported,
-not yet described well enough to act on).
+hardware) · **deferred** (known, deliberately not now) · **parked** (the owner has said to
+stop work on it; say what would restart it) · **awaiting detail** (reported, not yet
+described well enough to act on).
 
 ---
 
@@ -101,7 +102,36 @@ instead of resetting.
 ## Open defects
 
 ### B13 — Alt+Tab sticks: a modifier release is lost and the key stays logically down
-**open** · reported 2026-10-09 · **diagnosed, cause found**
+**parked 2026-10-09 by the owner** · reported 2026-10-09 · **cause unknown**
+
+> "Alt tab issue comes up very rarely and I think it only happens due to some trigger,
+> but till the trigger is unknown keep it down right now and park the issue."
+
+**Do not work on this.** It is rare, it self-recovers, and the previous attempt to fix it
+blind cost six hours of unusable keyboard ([B14](#b14--modifiers-were-released-8-ms-after-the-press-regression-fixed)).
+Two failed diagnoses in one day is the signal to stop guessing and wait for data.
+
+**What stays in place while it is parked** — both already shipped and working, neither
+needs touching:
+
+* the five-second idle sweep on the receiving side (confirmed firing in the field);
+* `ReleaseAll` on `Message::Leave`, so a stuck modifier cannot outlive a crossing.
+
+**What would unpark it:** the trigger. The one thing no log has yet is what the owner was
+*doing* when it happened. Both machines upload logs automatically, so if it recurs there
+is nothing to capture by hand — just a note of roughly what was going on (which app had
+focus, whether a volume/Fn key or a notification was involved, whether it had just
+crossed). The 46 recorded instances all look alike in the logs, which is exactly why the
+missing piece is outside them.
+
+**Resist the obvious next guess.** Anything that polls "is this key really held?" on the
+Windows side is already disproven — see B14 for the measurement. A future fix has to come
+from knowing the trigger, or from the receiving side.
+
+---
+
+<details>
+<summary>Earlier investigation, kept for the record — note the diagnosis below was wrong</summary>
 
 Intermittent, and the owner's description is exact:
 
@@ -226,6 +256,8 @@ knows what it is still holding:
 `our_level="0x2000 (normal)"` against blockers at ordinary elevated admin. Note this is
 now a *lead*, not a known cure — those warnings concern crossing start, and the counters
 above show the hook was alive during every crossing.
+
+</details>
 
 ### B14 — modifiers were released 8 ms after the press (regression, fixed)
 **fixed 2026-10-09** · shipped and withdrawn the same day
