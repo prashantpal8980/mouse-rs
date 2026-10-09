@@ -27,39 +27,49 @@ What it therefore does *not* have, all of which this machine never had anyway: t
 login-screen work (Linux-only), the transfer-progress fix, and today's broken modifier
 code.
 
-## Step 1 — stop the running instance, by process
+## Steps 1–3 — one block, safe to re-run
+
+This verifies the download **before** it replaces anything, so a bad or interrupted
+download cannot cost you the working exe, and it keeps the old one as `mouse-rs.exe.bak`.
 
 ```powershell
+$dir  = "$HOME\mouse-rs"
+$exe  = "$dir\mouse-rs.exe"
+$new  = "$dir\mouse-rs.exe.new"
+$want = "5076363C55AA0E7B16CE43AD11BDDCC4B3BFE42DDC9EBFE13003CBE54F9011F1"
+
 Get-Process mouse-rs -ErrorAction SilentlyContinue | Stop-Process -Force
 Start-Sleep -Seconds 2
-Get-Process mouse-rs -ErrorAction SilentlyContinue   # expect no output
+
+Invoke-WebRequest -Uri http://192.168.137.2:8000/mouse-rs.exe -OutFile $new
+$len = (Get-Item $new).Length
+$sha = (Get-FileHash $new -Algorithm SHA256).Hash
+"downloaded: $len bytes"
+"sha256:     $sha"
+
+if ($len -ne 12080128 -or $sha -ne $want) {
+    "MISMATCH - not installing. Your existing exe is untouched."
+    Remove-Item $new -Force
+} else {
+    if (Test-Path $exe) { Copy-Item $exe "$dir\mouse-rs.exe.bak" -Force }
+    Move-Item $new $exe -Force
+    "installed (previous exe kept as mouse-rs.exe.bak)"
+    Start-Process -FilePath $exe -Verb RunAs
+}
 ```
 
-## Step 2 — download and verify
+The last line asks Windows for elevation, so **a UAC prompt appears and only the owner can
+answer it.** If it is still waiting, say so and stop — do not try to click it.
+
+If the owner declines the prompt, start it without elevation instead and say that you did:
 
 ```powershell
-Invoke-WebRequest -Uri http://192.168.137.2:8000/mouse-rs.exe -OutFile $HOME\mouse-rs\mouse-rs.exe
-(Get-Item $HOME\mouse-rs\mouse-rs.exe).Length
-(Get-FileHash $HOME\mouse-rs\mouse-rs.exe -Algorithm SHA256).Hash
+Start-Process -FilePath "$HOME\mouse-rs\mouse-rs.exe"
 ```
 
-Must be exactly size `12080128` bytes, SHA256
-`5076363C55AA0E7B16CE43AD11BDDCC4B3BFE42DDC9EBFE13003CBE54F9011F1`.
-If either differs, stop and say so — do not launch it.
-
-## Step 3 — launch it elevated
-
-```powershell
-Start-Process -FilePath "$HOME\mouse-rs\mouse-rs.exe" -Verb RunAs
-```
-
-`-Verb RunAs` asks Windows for elevation, so **a UAC prompt appears on screen** and only
-the owner can answer it. If it is still waiting, say so and stop — do not try to click it.
-
-If the owner declines, launch it normally instead and say that you did. Elevation is worth
-having (this machine has never actually run elevated — every hook-blocked event in its log
-records `our_level="0x2000 (normal)"`), but it is not what this round is about, and a
-working keyboard matters more than elevation.
+Elevation is worth having — this machine has never actually run elevated, every
+hook-blocked event in its log records `our_level="0x2000 (normal)"` — but it is not what
+this round is about, and a working keyboard matters more.
 
 ## Step 4 — confirm it is up, then stop
 
