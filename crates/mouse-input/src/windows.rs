@@ -519,12 +519,6 @@ struct HookState {
     sink: UnboundedSender<CaptureSignal>,
     return_vk: u16,
     last_cursor: Option<(i32, i32)>,
-    /// Which tracked modifiers we have told the peer are held, one bit per entry of
-    /// [`TRACKED_MODIFIERS`].
-    ///
-    /// Not the physical state — what the *peer believes*. Those differ exactly when a
-    /// release was never delivered to our hook, which is the fault being corrected.
-    mods_sent_down: u8,
     /// Per-remote-session keyboard accounting, reset each time suppression engages.
     /// Exists to answer one question from real use: keys occasionally stay on this
     /// machine after the cursor has crossed, and nothing in the log said why.
@@ -577,15 +571,6 @@ impl HookState {
             focus: foreground_desc(),
         });
         emit_held_modifiers(&self.sink);
-        // Those presses were just forwarded, so they are now part of what the peer
-        // believes — and therefore part of what must be reconciled. Seeding this is what
-        // makes a modifier held *across* the start of a crossing recoverable too.
-        self.mods_sent_down = 0;
-        for (i, (v, _)) in TRACKED_MODIFIERS.iter().enumerate() {
-            if vk_physically_down(*v) {
-                self.mods_sent_down |= 1u8 << i;
-            }
-        }
     }
 
     /// Handle a mouse hook event. Returns `true` to swallow it.
@@ -671,16 +656,6 @@ impl HookState {
         }
 
         if let Some(key) = vk_to_key(vk, extended) {
-            // Remember modifier presses so a release that never reaches this hook can be
-            // noticed and invented later. Only what we actually send is recorded.
-            if let Some(slot) = modifier_slot(&key) {
-                let bit = 1u8 << slot;
-                if pressed {
-                    self.mods_sent_down |= bit;
-                } else {
-                    self.mods_sent_down &= !bit;
-                }
-            }
             let _ = self
                 .sink
                 .send(CaptureSignal::Input(InputEvent::Key { key, pressed }));
@@ -1060,12 +1035,6 @@ fn vk_physically_down(v: u16) -> bool {
     (unsafe { GetAsyncKeyState(v as i32) }) as u16 & 0x8000 != 0
 }
 
-/// Which entry of [`TRACKED_MODIFIERS`] this key is, if any.
-fn modifier_slot(key: &Key) -> Option<usize> {
-    let Key::Named(n) = key else { return None };
-    TRACKED_MODIFIERS.iter().position(|(_, m)| m == n)
-}
-
 fn emit_held_modifiers(sink: &UnboundedSender<CaptureSignal>) {
     for (v, named) in TRACKED_MODIFIERS {
         if vk_physically_down(v) {
@@ -1075,58 +1044,6 @@ fn emit_held_modifiers(sink: &UnboundedSender<CaptureSignal>) {
             }));
         }
     }
-}
-
-/// Forward releases for modifiers the peer thinks are held but which are physically up.
-///
-/// This is the cure for the stuck Alt-Tab (B13). Windows does not call a low-level
-/// keyboard hook belonging to a lower-integrity process while a higher-integrity window
-/// has the foreground — and those windows appear for a moment at a time: an OEM service
-/// broker, the Fn-key volume overlay. If one takes focus between Alt-down and Alt-up, the
-/// press was forwarded and **the release is never seen by us at all**. The peer then
-/// holds Alt for ever, which is exactly what jams the window switcher, because holding
-/// Alt is what keeps it open.
-///
-/// `GetAsyncKeyState` reads the real keyboard regardless of hooks, so it can see the
-/// release the hook missed. `sent_down` is what we actually told the peer, which is the
-/// only thing worth comparing against: the physical state alone cannot tell us whether a
-/// release got through.
-///
-/// Returns the modifiers released, for the log — a silent correction would hide how often
-/// this is happening.
-fn reconcile_modifiers(
-    sink: &UnboundedSender<CaptureSignal>,
-    sent_down: &mut u8,
-) -> Vec<NamedKey> {
-    let mut physical = 0u8;
-    for (i, (v, _)) in TRACKED_MODIFIERS.iter().enumerate() {
-        if vk_physically_down(*v) {
-            physical |= 1u8 << i;
-        }
-    }
-    let stuck = stuck_mask(*sent_down, physical);
-    let mut freed = Vec::new();
-    for (i, (_, named)) in TRACKED_MODIFIERS.iter().enumerate() {
-        if stuck & (1u8 << i) != 0 {
-            let _ = sink.send(CaptureSignal::Input(InputEvent::Key {
-                key: Key::Named(*named),
-                pressed: false,
-            }));
-            freed.push(*named);
-        }
-    }
-    *sent_down &= !stuck;
-    freed
-}
-
-/// Which modifiers the peer believes are held but which are physically up.
-///
-/// Pure, and separated from the Win32 calls so the one piece of reasoning here can be
-/// tested: a release is owed exactly when we said "down" and the keyboard says "up".
-/// Keys physically down that we never sent are **not** our business — control may be
-/// local, or they were pressed before the crossing began.
-fn stuck_mask(sent_down: u8, physically_down: u8) -> u8 {
-    sent_down & !physically_down
 }
 
 /// The capture thread: installs both LL hooks and pumps messages so the OS
@@ -1158,7 +1075,6 @@ fn capture_loop(
         *cell.borrow_mut() = Some(HookState {
             suppress: suppress.clone(),
             grabbed: false,
-            mods_sent_down: 0,
             sink: sink.clone(),
             return_vk,
             last_cursor: None,
@@ -1215,7 +1131,6 @@ fn capture_loop(
     // call and is harmless when the hook was alive.
     let mut last_tick = std::time::Instant::now();
     // Separate clock from `last_tick`: the reconcile runs far less often than the pump.
-    let mut last_mod_check = std::time::Instant::now();
     let mut prev_suppress = false;
     let mut last_rearm = std::time::Instant::now();
     // The most recent foreground window belonging to *another* process, and the window of
@@ -1284,33 +1199,15 @@ fn capture_loop(
         }
         last_tick = std::time::Instant::now();
 
-        // Invent the key-ups our hook never got to see (B13). Throttled to ~120 ms
-        // rather than run every 8 ms: this thread is TIME_CRITICAL and must never be the
-        // reason a hook callback misses its deadline, and a modifier stuck for an eighth
-        // of a second is not something anyone can perceive.
-        //
-        // Only while suppressing. With control local, the modifiers belong to this
-        // machine and the peer is not holding anything to correct.
-        if want && last_mod_check.elapsed() >= Duration::from_millis(120) {
-            last_mod_check = std::time::Instant::now();
-            let freed = HOOK_STATE.with(|cell| {
-                let mut st = cell.borrow_mut();
-                match st.as_mut() {
-                    Some(h) => {
-                        let sink = h.sink.clone();
-                        reconcile_modifiers(&sink, &mut h.mods_sent_down)
-                    }
-                    None => Vec::new(),
-                }
-            });
-            if !freed.is_empty() {
-                tracing::warn!(
-                    released = ?freed,
-                    "a modifier was physically up but the peer still believed it held — \
-                     our keyboard hook never saw the release. Sent it ourselves."
-                );
-            }
-        }
+        // NO MODIFIER RECONCILE HERE — and it must never be added back. See
+        // `stuck_modifiers_cannot_be_detected_here` below for the measurement that
+        // settles it: while this hook suppresses a key, *no* Win32 call can tell us the
+        // key is physically down, so "the peer thinks it is held but the keyboard says
+        // up" is the normal state of every held modifier, not a fault to correct.
+        // Acting on it released Ctrl 8 ms after the user pressed it, which broke every
+        // chord — Ctrl+Space never reached the peer at all. A lost key-up is recovered
+        // on the *receiving* side instead (`injector::MODIFIER_IDLE_RELEASE`), which is
+        // the only side that knows what it is still holding.
 
         // Re-arm on the rising edge of a crossing, and then once a second for as long as
         // control stays on the peer. The rising edge is the important one: it guarantees
@@ -2067,37 +1964,44 @@ mod tests {
 mod modifier_tests {
     use super::*;
 
-    // These compile for the Windows target only, so they do not execute on a Linux
-    // build host. The logic they pin is the whole of the B13 decision, which is why it
-    // was extracted out of the Win32 calls rather than left inline.
-
+    /// The sending side must never try to work out which modifiers are "really" held.
+    ///
+    /// Measured on the owner's hardware, 9 Oct 2026: across every crossing in the log,
+    /// `swallowed=414` / `hook_calls=768` while `raw_keys=0`. A key this hook suppresses
+    /// is reported by *nothing* — not `GetAsyncKeyState`, not Raw Input, which is
+    /// delivered on a separate path yet still never saw one of the 414. So for every
+    /// modifier the user holds, "we told the peer it is down" and "the OS says it is up"
+    /// is the **normal** state, and reading that as a lost key-up released Ctrl 8 ms
+    /// after the press — before the user could reach Space. Ctrl+Space, and every other
+    /// chord, stopped crossing at all.
+    ///
+    /// Recovery belongs on the receiving side, which is the only side that knows what it
+    /// is still holding: `mouse_engine::injector::MODIFIER_IDLE_RELEASE`.
+    ///
+    /// This test is the guard: `TRACKED_MODIFIERS` exists only to report what is held at
+    /// the *start* of a crossing, when this hook has suppressed nothing yet and the OS
+    /// state is therefore still truthful.
     #[test]
-    fn a_release_is_owed_only_when_we_said_down_and_the_keyboard_says_up() {
-        // The B13 case: Alt forwarded as pressed, physically released while our hook was
-        // not being called.
-        assert_eq!(stuck_mask(0b0001_0000, 0b0000_0000), 0b0001_0000);
-        // Still held: nothing owed.
-        assert_eq!(stuck_mask(0b0001_0000, 0b0001_0000), 0);
-        // Physically down but never forwarded by us: not ours to release.
-        assert_eq!(stuck_mask(0b0000_0000, 0b0001_0000), 0);
-        // Nothing anywhere.
-        assert_eq!(stuck_mask(0, 0), 0);
-        // Two stuck at once, one still genuinely held.
-        assert_eq!(stuck_mask(0b0000_0111, 0b0000_0100), 0b0000_0011);
-    }
-
-    #[test]
-    fn the_modifier_table_and_slots_agree() {
-        for (i, (_, named)) in TRACKED_MODIFIERS.iter().enumerate() {
-            assert_eq!(
-                modifier_slot(&Key::Named(*named)),
-                Some(i),
-                "{named:?} must map back to its own slot"
+    fn the_modifier_table_is_only_a_crossing_start_snapshot() {
+        assert!(
+            TRACKED_MODIFIERS
+                .iter()
+                .all(|(_, n)| n.modifier_token().is_some()),
+            "every tracked entry must really be a modifier"
+        );
+        let src = include_str!("windows.rs");
+        // Split so these needles never appear contiguously in this file's own source —
+        // otherwise the guard matches itself and can only ever fail.
+        let banned = [
+            concat!("fn ", "stuck_mask"),
+            concat!("fn ", "reconcile_modifiers"),
+            concat!("mods_", "sent_down"),
+        ];
+        for banned in banned {
+            assert!(
+                !src.contains(banned),
+                "`{banned}` is the per-key physical-state reconcile that broke every                  chord; it cannot work while this hook suppresses keys — see this                  test's docs"
             );
         }
-        assert_eq!(modifier_slot(&Key::Named(NamedKey::Tab)), None);
-        assert_eq!(modifier_slot(&Key::Char('a')), None);
-        // One bit per entry has to fit in the u8 mask.
-        assert!(TRACKED_MODIFIERS.len() <= 8);
     }
 }

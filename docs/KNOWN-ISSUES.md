@@ -171,26 +171,78 @@ This is a **safety net, not the cure.** It recovers within five seconds instead 
 requiring a crossing; it cannot know the release was lost any sooner, because only the
 sending machine ever saw it.
 
-**Cured on the sending side 2026-10-09** (`mouse-input/src/windows.rs`), once the owner
-lifted the Windows freeze. Every ~120 ms while control is on the peer, the capture thread
-compares what it has *told* the peer is held against what `GetAsyncKeyState` reports —
-which works regardless of hooks, and so can see the release the hook missed — and sends
-the release itself. Throttled to 120 ms rather than run on the 8 ms pump because that
-thread is `TIME_CRITICAL` and must never be why a hook callback misses its deadline.
+**The sending-side "cure" was wrong and has been withdrawn (2026-10-09).** It shipped as
+`22C7FC47…` and was pulled the same evening after the owner reported *"the software is not
+sharing ctrl now"* and *"alt+tab only works when I click like 5 times"*.
 
-The decision is extracted as a pure `stuck_mask(sent_down, physically_down)` so the one
-piece of reasoning is testable: a release is owed exactly when we said *down* and the
-keyboard says *up*. Keys physically down that we never forwarded are not ours to release.
-Two tests — but note they compile only for the Windows target and therefore **do not
-execute on the Linux build host**.
+It compared what we had told the peer was held against `GetAsyncKeyState`, on the premise
+that the async key state "reads the real keyboard regardless of hooks". **That premise is
+false for keys this program itself suppresses.** A key swallowed by our low-level hook is
+never dispatched, so it never reaches the async key state either — which means for every
+modifier the user holds, *"we said down, the OS says up"* is the **normal** state, not a
+lost key-up. The reconcile therefore fired on every chord:
 
-Shipped to the laptop as `22C7FC47…`. **Unverified in use:** the owner has to hit the
-fault again, and the fix logs a line naming the modifier each time it fires, which is
-also how we learn how often it was happening.
+```
+14:47:11.296  CtrlL  pressed=true    ← user presses Ctrl
+14:47:11.304  CtrlL  pressed=false   ← the reconcile, 8 ms later
+14:47:11.656  Space  pressed=true    ← Space arrives with no Ctrl held
+14:47:11.904  CtrlL  pressed=false   ← the user's real release, far too late
+```
+
+Ctrl+Space never reached the peer at all, and Alt+Tab worked only when Tab happened to
+land inside the few milliseconds before the sweep — hence "5 times". It fired 111 times in
+five minutes (`AltL` 59, `CtrlL` 33, `ShiftL` 18), two of them one tick apart, which is
+the tell: it was releasing a key the user was still holding.
+
+**The measurement that settles it, and that the earlier diagnosis above got wrong.** Per
+crossing on the owner's hardware: `swallowed=414`, `hook_calls=768`, **`raw_keys=0`**.
+Raw Input is a wholly separate delivery path from the hook chain, registered here as an
+independent witness (`RIDEV_INPUTSINK`), and it did not see a single one of those 414
+suppressed keys. So *no* Win32 call can observe a key we swallow, and no sending-side
+scheme of this shape can work.
+
+The same counters also undercut the UIPI explanation given above: **no crossing in the log
+ever had `hook_calls=0`**, and the "Raw Input saw keystrokes the hook never got"
+diagnostic has never once fired. A hook blackout mid-chord is therefore *not* the
+demonstrated cause of B13, however plausible it reads. The 46 crossings that ended with
+Alt still logically held are real and are recorded, but the mechanism behind them is
+**not yet established.**
+
+The guard against rebuilding this is a test in `windows.rs`
+(`the_modifier_table_is_only_a_crossing_start_snapshot`), which fails if
+`stuck_mask`/`reconcile_modifiers`/the per-key sent-down mask reappear in that file, and
+carries the measurement in its docs. `TRACKED_MODIFIERS` survives for its one sound use:
+reporting what is held at the *start* of a crossing, when nothing has been suppressed yet
+and the OS state is still truthful.
+
+**Where it stands.** Recovery lives only on the receiving side, which is the one side that
+knows what it is still holding:
+
+* the five-second idle sweep above — confirmed working in the field, one firing logged at
+  13:51:41 releasing a stuck `ShiftR`;
+* `ReleaseAll` on `Message::Leave`, so a stuck modifier can never outlive a crossing.
 
 **Still worth doing:** elevate mouse-rs on the laptop. All 24 hook-blocked events recorded
-`our_level="0x2000 (normal)"` against blockers at ordinary elevated admin, so elevation
-removes the most common cause outright rather than correcting after the fact.
+`our_level="0x2000 (normal)"` against blockers at ordinary elevated admin. Note this is
+now a *lead*, not a known cure — those warnings concern crossing start, and the counters
+above show the hook was alive during every crossing.
+
+### B14 — modifiers were released 8 ms after the press (regression, fixed)
+**fixed 2026-10-09** · shipped and withdrawn the same day
+
+The sending-side B13 "cure" broke every modifier chord: Ctrl was unusable, Alt+Tab took
+about five attempts. Full account under [B13](#b13--alttab-sticks-a-modifier-release-is-lost-and-the-key-stays-logically-down).
+
+Kept as its own entry for one reason worth not losing: **a fix built on an untested
+premise, shipped to hardware that is the only place it can run, did more damage than the
+bug it targeted.** B13 is intermittent and self-recovering; this made the keyboard
+unusable. The premise — "`GetAsyncKeyState` sees through hooks" — was stated in a doc
+comment and never checked against the `raw_keys` counter already in the same file, which
+disproved it.
+
+Guarded by `injector::tests::a_chord_held_while_the_user_keeps_typing_is_never_broken`,
+which runs on the Linux host (unlike the Windows-only tests that shipped the regression)
+and was confirmed to fail against the faulty behaviour before being kept.
 
 ### B4 — cut-and-paste across machines behaves as copy in Thunar
 **open**

@@ -460,6 +460,48 @@ mod tests {
     }
 
     #[test]
+    fn a_chord_held_while_the_user_keeps_typing_is_never_broken() {
+        // The regression that shipped on 9 Oct 2026 and had to be pulled: the *sending*
+        // side tried to work out which modifiers were really held and released Ctrl 8 ms
+        // after the press, so Ctrl+Space reached this side as a bare Space. The cure now
+        // lives only here, and this pins the half that must stay silent — a modifier is
+        // released after a true silence, never while input is still flowing.
+        let log = run_loop(
+            Duration::from_millis(120),
+            |tx| {
+                tx.send(InjectCmd::Apply(InputEvent::Key {
+                    key: Key::Named(NamedKey::CtrlL),
+                    pressed: true,
+                }))
+                .unwrap();
+                // Ctrl is held down across several ticks of the sweep while other input
+                // keeps arriving — exactly how a person types Ctrl+Space.
+                for _ in 0..4 {
+                    std::thread::sleep(Duration::from_millis(60));
+                    tx.send(InjectCmd::Apply(InputEvent::MouseMove { dx: 1, dy: 0 }))
+                        .unwrap();
+                }
+                tx.send(InjectCmd::Apply(InputEvent::Key {
+                    key: Key::Named(NamedKey::Space),
+                    pressed: true,
+                }))
+                .unwrap();
+            },
+            Duration::from_millis(0),
+            |_tx| {},
+        );
+        let space = log
+            .iter()
+            .position(|l| l == "key k:space true")
+            .unwrap_or_else(|| panic!("Space never arrived; got {log:?}"));
+        let ctrl_up = log.iter().position(|l| l == "key k:ctrl false");
+        assert!(
+            ctrl_up.is_none_or(|up| up > space),
+            "Ctrl was released before Space, so the chord arrived as a bare Space —              the exact 9 Oct regression; got {log:?}"
+        );
+    }
+
+    #[test]
     fn an_ordinary_key_is_not_released_on_a_guess() {
         // Only modifiers are worth inventing a release for. A stuck letter types one
         // wrong character; guessing wrongly on one would eat a real keypress.

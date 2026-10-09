@@ -1,46 +1,46 @@
 Install the current mouse-rs build, **run it as administrator**, confirm it really is
 elevated, and then stop and wait.
 
-Windows has been held back for several rounds while work went on on the Linux side. This
-build brings it level. The headline is a fix for something the owner has been living with:
+**This build undoes a fix that made things worse.** The build installed earlier today
+broke every modifier chord on this machine: Ctrl stopped crossing to Kali at all, so
+Ctrl+Space never reached it, and Alt+Tab needed about five attempts. If that is what you
+have been seeing, it was this. Installing this build is the fix.
 
-**Alt+Tab would sometimes stick.** The switcher opened, changed windows, and then refused
-to commit — the window stayed stuck until clicked with the mouse, and clearing it took a
-few taps of Ctrl. Diagnosed from the shipped logs: it is a **stuck Alt**, because holding
-Alt is what keeps the switcher open and it commits on release. The release was going
-missing.
+What went wrong, because it is worth stating plainly. The earlier build tried to detect a
+modifier whose release had been lost, by comparing what it had told Kali was held against
+what `GetAsyncKeyState` reported. That rested on the premise that the async key state sees
+the real keyboard regardless of hooks. **It does not — not for keys mouse-rs itself
+suppresses.** While control is on Kali this program swallows every keystroke so it does
+not also land on Windows, and a swallowed key is never dispatched, so it never updates the
+async key state either. The result: for every modifier the owner held, "we told Kali it is
+down" and "the OS says it is up" was the *normal* state, and the code read that as a lost
+release and cancelled the key. From Kali's own log:
 
-The cause is this machine, and it is the same rule behind the Genshin Impact problem.
-Windows does not call a low-level keyboard hook belonging to a lower-integrity process
-while a higher-integrity window has the foreground. When one takes focus **in the gap
-between Alt-down and Alt-up**, the press is forwarded and the release is never seen by us
-at all — so nothing ever tells the other machine that Alt came back up.
+```
+14:47:11.296  CtrlL  pressed=true    <- Ctrl pressed
+14:47:11.304  CtrlL  pressed=false   <- the faulty fix, 8 ms later
+14:47:11.656  Space  pressed=true    <- Space arrives with no Ctrl held
+14:47:11.904  CtrlL  pressed=false   <- the real release, far too late
+```
 
-It is intermittent because of *which* windows do it. Counted in this machine's own log:
+It fired 111 times in five minutes. This build removes it entirely.
 
-| Window in front | Times | What it is |
-|---|---|---|
-| `OmApSvcBroker` | 18 | an OEM service broker, elevated |
-| `OSD_FnKey` | 1 | the Fn-key / volume on-screen overlay |
-| `Task Manager`, `Windows Security`, others | 5 | transient system UI |
+The premise is also settled now, by this machine's own counters rather than by argument:
+per crossing, `swallowed=414` and `hook_calls=768` while **`raw_keys=0`**. Raw Input is a
+separate delivery path that mouse-rs already registers as an independent witness, and it
+saw none of those 414 suppressed keys. So nothing on this side can observe a key we
+swallow, and recovery has to live on the machine receiving the keys — which is where it
+now does, and only there.
 
-Those flash up for a moment, so it only bites when one lands inside that gap. **Pressing a
-volume key is enough to cause it.**
+**The original Alt+Tab stickiness is therefore back to being merely mitigated**, by Kali
+releasing a modifier that has been held through five seconds of total silence. That is
+confirmed working in the field. It is not a cure, and the real cause is now **unknown
+again** — the earlier explanation (a higher-integrity window killing our hook mid-chord)
+is contradicted by those same counters: no crossing in the log ever had `hook_calls=0`.
 
-Fixed in two places, and this build is the important half:
-
-* **Here (the sending side) — the actual cure.** Every ~120 ms while control is on the
-  peer, mouse-rs now compares what it has *told* the peer is held against what the
-  keyboard physically reports through `GetAsyncKeyState`, which works regardless of
-  hooks. Any modifier the peer thinks is down but which is really up gets its release
-  sent. **Without this build the fault is still there.**
-* On the receiving side, already shipped: a modifier held through five seconds of total
-  silence is released as a safety net.
-
-Also in this build, though none of it changes behaviour on Windows: a `uinput` injection
-backend and a login-screen service for Linux, and a stuck-transfer fix. **The
-login-screen work is on hold and is Linux-only — there is nothing to set up here for it,
-and nothing to report about it.**
+Nothing else in this build changes behaviour on Windows. The `uinput` backend and the
+login-screen service are Linux-only, and **the login-screen work is on hold — there is
+nothing to set up here for it and nothing to report about it.**
 
 ## Step 1 — stop the running instance, by process
 
@@ -61,8 +61,8 @@ Invoke-WebRequest -Uri http://192.168.137.2:8000/mouse-rs.exe -OutFile $HOME\mou
 (Get-FileHash $HOME\mouse-rs\mouse-rs.exe -Algorithm SHA256).Hash
 ```
 
-Must be exactly size `12087808` bytes, SHA256
-`22C7FC47018FFAD233C096333D6164FA916EBD913B2034848D13C72DDE94D7FF`.
+Must be exactly size `12083712` bytes, SHA256
+`BC4E8E38748D2FF907C8E2C253501159B3D1D604FD76C5FC1A18112D087A2496`.
 If either differs, stop and say so — do not launch it.
 
 ## Step 3 — confirm the config
@@ -102,12 +102,15 @@ Start-Process -FilePath "$HOME\mouse-rs\mouse-rs.exe" -Verb RunAs
 `-Verb RunAs` asks Windows for elevation, so **a UAC prompt appears on screen**. Only the
 owner can answer it. If it is still waiting, say so and stop — do not try to click it.
 
-Why it matters more than usual: every one of the 24 hook-blocked events in this machine's
-log recorded `our_level="0x2000 (normal)"` — **mouse-rs was not running elevated**, even
-though the last round asked for it. And 23 of the 24 blocking windows were
-`0x3000 (elevated (administrator))`, which is ordinary admin rather than SYSTEM. An
-elevated mouse-rs sits at the same level and keeps its hook, so elevation removes the
-most common cause of the Alt+Tab fault outright. The code fix above handles the rest.
+Why it still matters: every one of the 24 hook-blocked events in this machine's log
+recorded `our_level="0x2000 (normal)"` — **mouse-rs has never actually run elevated**,
+though the last two rounds asked for it. 23 of the 24 blocking windows were
+`0x3000 (elevated (administrator))`, ordinary admin rather than SYSTEM, so an elevated
+mouse-rs sits at the same level and keeps its hook.
+
+Treat this as worth doing on its own merits, **not** as a cure for Alt+Tab. Those
+warnings all concern the start of a crossing, and the counters above show the hook was
+alive throughout every crossing in the log — so elevation is a lead, not the answer.
 
 If the owner declines, report that plainly rather than falling back to a normal launch.
 
@@ -150,6 +153,21 @@ the log** — it uploads automatically, which is the entire point.
 Then **stay idle**. Do not copy files, do not open the panel, do not try Alt+Tab, do not
 launch or touch any game. The owner drives every crossing, copy and paste by hand.
 
+## What the owner will check, by hand, after you stop
+
+Do not attempt any of this yourself — it needs real key presses, and synthetic ones would
+land on Kali (see the rule below). It is here so you know what the round is for and do not
+get in the way:
+
+1. Cross to Kali and press **Ctrl+Space**. It should reach Kali and trigger what the owner
+   has bound to it. On the previous build nothing arrived but a bare Space.
+2. Cross to Kali and **Alt+Tab** once. It should switch on the first press, not the fifth.
+3. Hold **Ctrl** or **Shift** on its own for a few seconds while typing — the modifier
+   must stay held for as long as it is physically down.
+
+If any of those still fail, that is a real finding and the log will show it: the owner's
+machine uploads automatically, so **nothing needs pasting.**
+
 ## RULE — no synthetic input, at any point, for any reason
 
 **Do not send clicks or keystrokes. Do not use UI automation, UIA Invoke, `SendInput`,
@@ -170,9 +188,9 @@ and only the owner can answer it. Do not try to dismiss it — say it is waiting
 You do not need to act on any of these; they are here so you can report them accurately.
 
 - `a modifier was physically up but the peer still believed it held — our keyboard hook
-  never saw the release. Sent it ourselves.` — **the new fix doing its job.** Not an
-  error. It names which modifier. Worth reporting how often it appears, because that
-  number is how we know how bad the problem actually was.
+  never saw the release. Sent it ourselves.` — **this line must not appear at all.** It
+  belonged to the withdrawn fix. If you see it, the old build is still running: the
+  install did not take, and you should say so rather than continue.
 - `CROSSING WILL NOT WORK while this window is in front` — the focused window outranks us,
   so the OS is not delivering our input hooks. **Report the window name and both levels.**
   If this appears while mouse-rs is elevated, say so loudly: it would mean something beyond
