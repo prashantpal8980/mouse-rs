@@ -27,58 +27,29 @@ What it therefore does *not* have, all of which this machine never had anyway: t
 login-screen work (Linux-only), the transfer-progress fix, and today's broken modifier
 code.
 
-## Steps 1–3 — one block, in an **Administrator** PowerShell
+## Do it with one line, from an **Administrator** PowerShell
 
-**This must run in an elevated shell.** mouse-rs is itself running elevated, so an
-ordinary shell cannot stop it (`Stop-Process` returns *Access is denied*) and cannot
-replace the exe while it is still running. Open *Terminal (Admin)* or *Windows PowerShell
-(Admin)* from the Win+X menu, answer the UAC prompt, then paste this.
+Do not paste a multi-line block into the console — a blank line ends the `>>`
+continuation prompt, so parts of it silently never run. That has already happened once
+here. The script is served instead; this fetches and runs it.
 
-Every step stops on failure, so it cannot report success after an error. Safe to re-run.
+Open *Terminal (Admin)* or *Windows PowerShell (Admin)* from the Win+X menu, answer the
+UAC prompt, then paste this single line:
 
 ```powershell
-$ErrorActionPreference = "Stop"
-$dir  = "$HOME\mouse-rs"
-$exe  = "$dir\mouse-rs.exe"
-$new  = "$dir\mouse-rs.exe.new"
-$want = "5076363C55AA0E7B16CE43AD11BDDCC4B3BFE42DDC9EBFE13003CBE54F9011F1"
-
-# 1. Stop it, and prove it actually stopped.
-Get-Process mouse-rs -ErrorAction SilentlyContinue | Stop-Process -Force
-Start-Sleep -Seconds 2
-if (Get-Process mouse-rs -ErrorAction SilentlyContinue) {
-    throw "mouse-rs is still running - this shell is not elevated enough to stop it."
-}
-
-# 2. Fetch only if it is not already here, then verify before touching anything.
-if (-not (Test-Path $new)) {
-    Invoke-WebRequest -Uri http://192.168.137.2:8000/mouse-rs.exe -OutFile $new
-}
-$len = (Get-Item $new).Length
-$sha = (Get-FileHash $new -Algorithm SHA256).Hash
-"downloaded: $len bytes"
-"sha256:     $sha"
-if ($len -ne 12080128 -or $sha -ne $want) {
-    Remove-Item $new -Force
-    throw "MISMATCH - nothing installed, your existing exe is untouched."
-}
-
-# 3. Replace, then prove the file on disk is the one we verified.
-Remove-Item "$dir\mouse-rs.exe.bak" -Force -ErrorAction SilentlyContinue
-if (Test-Path $exe) { Move-Item $exe "$dir\mouse-rs.exe.bak" -Force }
-Move-Item $new $exe -Force
-if ((Get-FileHash $exe -Algorithm SHA256).Hash -ne $want) {
-    throw "the installed file is not the one that was verified."
-}
-"installed - previous (broken) exe kept as mouse-rs.exe.bak"
-
-# 4. Start it. This shell is already elevated, so mouse-rs inherits that
-#    and there is no second UAC prompt.
-Start-Process -FilePath $exe
+iwr http://192.168.137.2:8000/rollback.ps1 -OutFile $env:TEMP\mr.ps1 -UseBasicParsing; iex (Get-Content $env:TEMP\mr.ps1 -Raw)
 ```
 
-If step 1 throws, the shell is not elevated — close it and open an Administrator one.
-Nothing is changed before that check passes.
+`Get-Content -Raw` is deliberate: the server sends `.ps1` as binary, so
+`iex (iwr ...).Content` is handed a byte array and fails. Reading the saved file back as
+text avoids that, and avoids the execution policy too, since nothing invokes a `.ps1`
+directly.
+
+The script stops before touching anything if the shell is not elevated — mouse-rs runs
+elevated, so an ordinary shell can neither stop it nor replace the file it holds open. It
+also verifies the download against its hash before replacing the exe, keeps the build it
+replaces as `mouse-rs.exe.bak`, re-hashes the installed file, and starts mouse-rs with the
+elevation this shell already has. It prints what it did at each step and is safe to re-run.
 
 ## Step 4 — confirm it is up, then stop
 
