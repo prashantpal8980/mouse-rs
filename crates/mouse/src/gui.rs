@@ -1592,8 +1592,18 @@ impl App {
                 }
             }
             // No error, but systemd disagrees. Report what is true, not what was asked.
-            Ok(()) => "that did not take effect — see the log".into(),
-            Err(e) => format!("{e}"),
+            Ok(()) => {
+                tracing::warn!(
+                    asked = on,
+                    now = self.login_screen.on(),
+                    "the login-screen change reported success but systemd disagrees"
+                );
+                "that did not take effect — see the log".into()
+            }
+            Err(e) => {
+                tracing::warn!(asked = on, "login-screen change failed: {e}");
+                format!("{e}")
+            }
         };
     }
 

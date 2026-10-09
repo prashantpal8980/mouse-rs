@@ -60,9 +60,30 @@ feedback anyone gets is standing at a password prompt unable to type.
   normally autoload it on open, but relying on that from inside a sandboxed unit is how
   you get `ENODEV` at boot and no keyboard at the prompt.
 
-**Still needs the owner:** installing it requires root, which only they have. Turn on
-*Share input at the login screen* in the panel's Startup tab, then run `greeter-status`
-to confirm before rebooting.
+**2026-10-09, second round — the toggle worked and the panel said it had not.** The owner
+turned it on, saw no password prompt, and reported nothing had happened. It had: polkit
+authorised without prompting (they are in `sudo`), and `greeter-install` ran as root and
+succeeded. Reconstructed from systemd's journal, because nothing on our side logged it.
+
+Two real bugs, both fixed:
+
+* **`State::installed` tested `/etc/mouse-rs/config.json` with `Path::is_file`.** That
+  directory is `0700 root` because it holds the shared secret, so the panel — which runs
+  as the user — gets permission-denied, and `is_file` returns `false` for that exactly as
+  it does for a missing file. A fully installed, enabled service therefore reported itself
+  absent, which pinned `enabled` to false and left the toggle at **off** however many
+  times it was clicked. It now judges from the unit file and the settings *directory*,
+  both of which an unprivileged process can legitimately see. Two tests pin it, one
+  asserting the panel never disagrees with real systemd about enablement.
+* **A failed toggle was reported only into a transient panel banner and logged nowhere.**
+  `set_enabled` now logs the exit code, stdout and stderr either way, and the panel logs
+  the mismatch case. Diagnosing this took a journal dig that should have been a log line.
+
+`greeter-status` also no longer reports FAIL for the root-only config when run
+unprivileged — that was reporting our own lack of permission as the service's fault.
+
+**Current state: installed and enabled, confirmed against systemd.** Untested at a real
+login prompt, which needs a reboot.
 
 ### B3 — the stalled-transfer fixes were never confirmed on hardware
 **unverified** · built 2026-09-04 (`01555ac`)

@@ -203,9 +203,16 @@ const INSTALLED_EXE: &str = "/usr/local/bin/mouse-rs";
 /// Makes the kernel load `uinput` at boot, so the service never races the module.
 const MODULES_LOAD_PATH: &str = "/etc/modules-load.d/mouse-rs-uinput.conf";
 
-fn require_root(what: &str) -> anyhow::Result<()> {
+/// Are we root? Used to decide what a check can honestly claim to know.
+fn is_root() -> bool {
     // SAFETY: geteuid takes no arguments and cannot fail.
-    if unsafe { libc::geteuid() } != 0 {
+    // Parenthesised: an `unsafe` block in statement position is parsed as a statement,
+    // not an operand.
+    (unsafe { libc::geteuid() }) == 0
+}
+
+fn require_root(what: &str) -> anyhow::Result<()> {
+    if !is_root() {
         anyhow::bail!(
             "{what} needs root: it creates a root-owned config and a system service. \
              Re-run with sudo."
@@ -422,12 +429,29 @@ impl State {
 /// Read the current state. Cheap enough to call on a panel redraw: one file check and
 /// two `systemctl` queries that do not touch the network.
 pub fn state() -> State {
-    let installed = Path::new(UNIT_PATH).is_file() && config_path().is_file();
+    let installed = looks_installed(
+        Path::new(UNIT_PATH).is_file(),
+        config_path().parent().is_some_and(|d| d.is_dir()),
+    );
     State {
         installed,
         enabled: installed && systemctl_says(&["is-enabled", UNIT_NAME], "enabled"),
         active: installed && systemctl_says(&["is-active", UNIT_NAME], "active"),
     }
+}
+
+/// Is the service installed, judged only from what an unprivileged process can see?
+///
+/// Split out and given booleans rather than paths so the rule is testable: the panel runs
+/// as the user, and `/etc/mouse-rs` is `0700 root` because it holds the shared secret. So
+/// the settings *directory* can be stat-ed and the config inside it never can.
+///
+/// Testing the file was a real bug: `Path::is_file` returns `false` on permission-denied
+/// as readily as on absence, so a perfectly installed service reported itself missing,
+/// which pinned `enabled` to false and left the toggle sitting at off while systemd was
+/// quite happily set to start the thing at boot.
+fn looks_installed(unit_present: bool, settings_dir_present: bool) -> bool {
+    unit_present && settings_dir_present
 }
 
 /// `systemctl <args>` printed exactly `want`.
@@ -474,9 +498,23 @@ pub fn set_enabled(on: bool) -> anyhow::Result<()> {
         cmd.arg("greeter-uninstall");
     }
     let out = cmd.output()?;
+    // Logged either way. The first version reported failures only into a transient panel
+    // banner, so a silent failure left no trace anywhere and had to be reconstructed
+    // from systemd's journal.
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
     if out.status.success() {
+        tracing::info!(on, %stdout, "login-screen service {} via pkexec",
+                       if on { "installed" } else { "removed" });
         return Ok(());
     }
+    tracing::warn!(
+        on,
+        code = out.status.code().unwrap_or(-1),
+        %stdout,
+        %stderr,
+        "pkexec could not change the login-screen service"
+    );
     // 126/127 are pkexec's own: the user dismissed the prompt, or authorisation failed.
     // Those are answers rather than faults and should not read like a crash.
     let code = out.status.code().unwrap_or(-1);
@@ -518,8 +556,19 @@ pub fn status() -> anyhow::Result<()> {
               "installed but not enabled — run: sudo systemctl enable mouse-rs-greeter");
         check("binary in place", Path::new(INSTALLED_EXE).is_file(), &mut problems,
               &format!("{INSTALLED_EXE} is missing — re-run the install"));
-        check("settings in place", config_path().is_file(), &mut problems,
-              &format!("{} is missing — re-run the install", config_path().display()));
+        // Only root can see inside the settings directory, so an unprivileged run can
+        // confirm the directory and no more. Saying FAIL here would be reporting our own
+        // lack of permission as the service's fault.
+        let dir_ok = config_path().parent().is_some_and(|d| d.is_dir());
+        if is_root() {
+            check("settings in place", config_path().is_file(), &mut problems,
+                  &format!("{} is missing — re-run the install", config_path().display()));
+        } else {
+            check("settings directory", dir_ok, &mut problems,
+                  &format!("{} is missing — re-run the install",
+                           config_path().parent().unwrap_or(Path::new("/etc/mouse-rs")).display()));
+            println!("  -     settings file   (root-only; re-run with sudo to check)");
+        }
     } else {
         for label in ["starts at boot", "binary in place", "settings in place"] {
             println!("  -     {label}");
@@ -686,6 +735,34 @@ mod tests {
         assert!(!is_graphical_user_session(""));
         assert!(!is_graphical_user_session("CLASS=user\n"), "no TYPE, no ACTIVE");
         assert!(!is_graphical_user_session("TYPE=x11\nACTIVE=1\n"), "no CLASS");
+    }
+
+    #[test]
+    fn installed_is_judged_without_reading_the_root_only_config() {
+        // The bug this pins cost a working install. /etc/mouse-rs is 0700 root because it
+        // holds the shared secret, so the panel -- running as the user -- gets
+        // permission-denied on the config inside it. `Path::is_file` returns false for
+        // that just as it does for a missing file, so a fully installed, enabled service
+        // reported itself absent and the toggle stayed off however many times it was
+        // clicked. The directory is stat-able; the file is not, so only the directory may
+        // be part of the test.
+        assert!(looks_installed(true, true), "unit + settings dir is installed");
+        assert!(!looks_installed(false, true), "no unit means not installed");
+        assert!(!looks_installed(true, false), "no settings dir means not installed");
+    }
+
+    #[test]
+    fn the_live_state_agrees_with_systemd() {
+        // Against real systemd. If the unit is on disk and systemd says enabled, the
+        // panel must agree -- disagreeing is what made a working service look broken.
+        let st = state();
+        if Path::new(UNIT_PATH).is_file() {
+            let systemd_says = systemctl_says(&["is-enabled", UNIT_NAME], "enabled");
+            assert_eq!(
+                st.enabled, systemd_says,
+                "the panel and systemd must not disagree about enablement"
+            );
+        }
     }
 
     #[test]
