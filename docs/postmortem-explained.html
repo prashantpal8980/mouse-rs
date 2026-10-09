@@ -1,0 +1,305 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Why Ctrl Stopped Working</title>
+<style>
+  :root{
+    --bg:#0f1115; --panel:#171a21; --panel2:#1e222b; --line:#2b3140;
+    --ink:#e8ecf4; --dim:#9aa4b8; --faint:#6b7488;
+    --bad:#ff6b6b; --good:#4ade80; --warn:#fbbf24; --info:#60a5fa; --mag:#c084fc;
+    --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  }
+  @media (prefers-color-scheme: light){
+    :root:not([data-theme="dark"]){
+      --bg:#f7f8fa; --panel:#fff; --panel2:#f0f2f6; --line:#dde1e9;
+      --ink:#13161c; --dim:#525a6b; --faint:#8a92a3;
+      --bad:#d92d20; --good:#15803d; --warn:#b45309; --info:#1d4ed8; --mag:#7e22ce;
+    }
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+    font:16px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+    -webkit-font-smoothing:antialiased}
+  .wrap{max-width:900px;margin:0 auto;padding:48px 16px 96px}
+  h1{font-size:clamp(28px,5vw,44px);line-height:1.1;margin:0 0 8px;letter-spacing:-.02em}
+  .sub{color:var(--dim);font-size:18px;margin:0 0 10px}
+  .meta{color:var(--faint);font-size:14px;font-family:var(--mono)}
+  h2{font-size:clamp(20px,3.4vw,27px);margin:64px 0 6px;letter-spacing:-.01em}
+  h2 .n{color:var(--faint);font-family:var(--mono);font-size:.7em;margin-right:10px}
+  .lede{color:var(--dim);margin:0 0 22px}
+  p{margin:0 0 16px}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:22px 24px;margin:18px 0}
+  .rule{border-left:3px solid var(--good);background:var(--panel2);border-radius:0 12px 12px 0;
+    padding:16px 20px;margin:18px 0}
+  .rule b{color:var(--good)}
+  .kv{display:grid;grid-template-columns:auto 1fr;gap:6px 18px;font-family:var(--mono);font-size:14px}
+  .kv dt{color:var(--faint);white-space:nowrap}
+  .kv dd{margin:0}
+  code{font-family:var(--mono);font-size:.9em;background:var(--panel2);
+    border:1px solid var(--line);border-radius:5px;padding:1px 5px}
+  .hl-bad{color:var(--bad);font-weight:600}
+  .hl-good{color:var(--good);font-weight:600}
+
+  /* ---- timeline ---- */
+  .tl{list-style:none;margin:0;padding:0}
+  .tl li{display:grid;grid-template-columns:76px 22px 1fr;gap:0 14px;align-items:start}
+  .tl .t{font-family:var(--mono);font-size:13px;color:var(--faint);padding-top:14px;text-align:right}
+  .tl .ax{position:relative;justify-self:center}
+  .tl .ax::before{content:"";position:absolute;left:50%;top:0;bottom:0;width:2px;
+    background:var(--line);transform:translateX(-50%)}
+  .tl li:first-child .ax::before{top:18px}
+  .tl li:last-child .ax::before{bottom:calc(100% - 18px)}
+  .tl .dot{position:relative;width:11px;height:11px;border-radius:50%;background:var(--faint);
+    margin:18px auto 0;box-shadow:0 0 0 4px var(--bg)}
+  .tl .d{padding:12px 0 14px;color:var(--dim);font-size:15px}
+  .tl .d b{color:var(--ink);font-weight:600}
+  li.e-bad .dot{background:var(--bad)} li.e-bad .d b{color:var(--bad)}
+  li.e-good .dot{background:var(--good)} li.e-good .d b{color:var(--good)}
+  li.e-warn .dot{background:var(--warn)} li.e-warn .d b{color:var(--warn)}
+
+  /* ---- trace ---- */
+  .trace{background:#0b0d11;border:1px solid var(--line);border-radius:12px;overflow:hidden;margin:18px 0}
+  :root:not([data-theme="dark"]) .trace{background:#13161c}
+  .trace .row{display:grid;grid-template-columns:118px 1fr;gap:14px;padding:9px 18px;
+    font-family:var(--mono);font-size:13.5px;color:#cfd6e4;border-top:1px solid #1c212b}
+  .trace .row:first-child{border-top:0}
+  .trace .ts{color:#6b7488}
+  .trace .row.kill{background:rgba(255,107,107,.12)}
+  .trace .row.kill .ev{color:var(--bad);font-weight:700}
+  .trace .row.bare{background:rgba(251,191,36,.1)}
+  .trace .row.bare .ev{color:var(--warn)}
+  .trace .note{color:#6b7488;font-style:italic}
+
+  /* ---- counters ---- */
+  .counters{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin:20px 0}
+  .ctr{background:var(--panel2);border:1px solid var(--line);border-radius:12px;padding:16px 18px;text-align:center}
+  .ctr .v{font-family:var(--mono);font-size:30px;font-weight:700;line-height:1.1}
+  .ctr .l{color:var(--faint);font-size:12.5px;margin-top:5px;font-family:var(--mono)}
+  .ctr.zero{border-color:var(--bad)} .ctr.zero .v{color:var(--bad)}
+
+  /* ---- failures ---- */
+  .fails{display:grid;gap:14px;margin:20px 0}
+  .fail{background:var(--panel);border:1px solid var(--line);border-left:3px solid var(--bad);
+    border-radius:0 12px 12px 0;padding:18px 22px}
+  .fail h3{margin:0 0 10px;font-size:17px;display:flex;gap:10px;align-items:baseline}
+  .fail h3 .num{font-family:var(--mono);color:var(--bad);font-size:14px;flex:none}
+  .fail p{margin:0 0 10px;color:var(--dim);font-size:15px}
+  .fail p:last-child{margin:0}
+  .fail .ink{color:var(--ink)}
+  table{width:100%;border-collapse:collapse;margin:16px 0;font-size:14.5px}
+  th,td{text-align:left;padding:10px 12px;border-bottom:1px solid var(--line)}
+  th{color:var(--faint);font-weight:600;font-size:12.5px;text-transform:uppercase;letter-spacing:.05em}
+  td.m{font-family:var(--mono)}
+  figure{margin:24px 0}
+  figcaption{color:var(--faint);font-size:13.5px;margin-top:10px;text-align:center}
+  svg{display:block;width:100%;height:auto}
+  .foot{margin-top:72px;padding-top:24px;border-top:1px solid var(--line);
+    color:var(--faint);font-size:14px}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <h1>Why Ctrl stopped working</h1>
+  <p class="sub">A fix for an occasional stuck Alt made every modifier chord unusable for six hours.</p>
+  <p class="meta">mouse-rs &middot; 9 October 2026 &middot; post-mortem</p>
+
+  <div class="card">
+    <dl class="kv">
+      <dt>Impact</dt><dd>Ctrl never reached Kali at all &rarr; Ctrl+Space dead. Alt+Tab worked ~1 press in 5.</dd>
+      <dt>Duration</dt><dd>~6 hours, on the Windows laptop only</dd>
+      <dt>Trigger</dt><dd>A fix I shipped for B13 (the intermittent stuck Alt+Tab)</dd>
+      <dt>Resolved by</dt><dd>Withdrawing the fix, then rolling the laptop back to the 4 Sep build</dd>
+      <dt>Data loss</dt><dd>None</dd>
+    </dl>
+  </div>
+
+  <h2><span class="n">01</span>What happened</h2>
+  <ul class="tl">
+    <li><span class="t">18:18</span><span class="ax"><span class="dot"></span></span>
+      <span class="d"><b>B13 diagnosed</b> from the shipped logs. Cause recorded as a Windows hook blackout mid-chord. <em>This diagnosis was wrong.</em></span></li>
+    <li class="e-good"><span class="t">18:43</span><span class="ax"><span class="dot"></span></span>
+      <span class="d"><b>Receiving-side mitigation</b> — release a modifier held through 5&nbsp;s of total silence. Sound, and still in place today.</span></li>
+    <li class="e-bad"><span class="t">19:05</span><span class="ax"><span class="dot"></span></span>
+      <span class="d"><b>The &ldquo;cure&rdquo; shipped</b> to the laptop. Compared what we&rsquo;d told Kali was held against what Windows said was physically down.</span></li>
+    <li class="e-warn"><span class="t">~19:30</span><span class="ax"><span class="dot"></span></span>
+      <span class="d">Owner installs it. <b>Keyboard chords stop working.</b></span></li>
+    <li class="e-bad"><span class="t">20:11</span><span class="ax"><span class="dot"></span></span>
+      <span class="d"><b>Reported:</b> &ldquo;unable to use ctrl + space&rdquo;, then &ldquo;not sharing ctrl now&hellip; alt+tab only work when i click like 5 time&rdquo;.</span></li>
+    <li class="e-good"><span class="t">20:33</span><span class="ax"><span class="dot"></span></span>
+      <span class="d"><b>Cause found and fix withdrawn.</b> Guards added that run on the build host.</span></li>
+    <li><span class="t">21:56</span><span class="ax"><span class="dot"></span></span>
+      <span class="d">Owner asks to roll back rather than forward. The 4 Sep build is rebuilt and served.</span></li>
+    <li class="e-bad"><span class="t">22:2x</span><span class="ax"><span class="dot"></span></span>
+      <span class="d"><b>Three failed install attempts</b> — each for a different avoidable reason.</span></li>
+    <li class="e-good"><span class="t">22:4x</span><span class="ax"><span class="dot"></span></span>
+      <span class="d"><b>Working again.</b></span></li>
+  </ul>
+
+  <h2><span class="n">02</span>The mechanism</h2>
+  <p class="lede">The fix asked Windows &ldquo;is this key really held?&rdquo; — a question Windows cannot answer about a key we swallowed ourselves.</p>
+
+  <p>While control is on Kali, mouse-rs must stop keystrokes from <em>also</em> landing on Windows. It does that in a low-level keyboard hook by returning <code>1</code>, which tells Windows to discard the event. The crucial detail is <strong>where that hook sits</strong>: everything that could later report key state is <em>downstream</em> of it.</p>
+
+  <figure>
+  <svg viewBox="0 0 880 400" role="img" aria-label="Diagram: the keyboard hook discards the event before anything downstream can observe it">
+    <defs>
+      <marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+        <path d="M0,0 L10,5 L0,10 z" fill="currentColor"/>
+      </marker>
+    </defs>
+    <g font-family="ui-monospace,Menlo,Consolas,monospace" font-size="13">
+      <!-- keyboard -->
+      <rect x="20" y="168" width="128" height="58" rx="10" fill="none" stroke="currentColor" stroke-width="1.5" opacity=".75"/>
+      <text x="84" y="192" text-anchor="middle" fill="currentColor">keyboard</text>
+      <text x="84" y="210" text-anchor="middle" fill="currentColor" opacity=".55" font-size="11">Ctrl goes down</text>
+
+      <g color="currentColor" opacity=".55">
+        <line x1="148" y1="197" x2="206" y2="197" stroke="currentColor" stroke-width="1.5" marker-end="url(#ar)"/>
+      </g>
+
+      <!-- hook -->
+      <rect x="208" y="150" width="176" height="94" rx="10" fill="#ff6b6b" fill-opacity=".10" stroke="#ff6b6b" stroke-width="2"/>
+      <text x="296" y="178" text-anchor="middle" fill="#ff6b6b" font-weight="700">our LL hook</text>
+      <text x="296" y="198" text-anchor="middle" fill="currentColor" opacity=".8" font-size="11">forwards it to Kali,</text>
+      <text x="296" y="214" text-anchor="middle" fill="currentColor" opacity=".8" font-size="11">then returns 1 =</text>
+      <text x="296" y="231" text-anchor="middle" fill="#ff6b6b" font-size="11" font-weight="700">DISCARD</text>
+
+      <!-- the cut -->
+      <g stroke="#ff6b6b" stroke-width="2.5" stroke-dasharray="7 6">
+        <line x1="424" y1="56" x2="424" y2="340"/>
+      </g>
+      <text x="424" y="42" text-anchor="middle" fill="#ff6b6b" font-size="12" font-weight="700">the event stops here</text>
+
+      <!-- stubs -->
+      <g color="#ff6b6b" opacity=".75">
+        <line x1="384" y1="197" x2="416" y2="197" stroke="currentColor" stroke-width="1.5"/>
+      </g>
+
+      <!-- downstream, greyed -->
+      <g opacity=".45">
+        <rect x="470" y="70" width="248" height="54" rx="9" fill="none" stroke="currentColor" stroke-width="1.5" stroke-dasharray="5 4"/>
+        <text x="594" y="94" text-anchor="middle" fill="currentColor">async key state</text>
+        <text x="594" y="111" text-anchor="middle" fill="currentColor" font-size="11">what GetAsyncKeyState reads</text>
+
+        <rect x="470" y="170" width="248" height="54" rx="9" fill="none" stroke="currentColor" stroke-width="1.5" stroke-dasharray="5 4"/>
+        <text x="594" y="194" text-anchor="middle" fill="currentColor">Raw Input (WM_INPUT)</text>
+        <text x="594" y="211" text-anchor="middle" fill="currentColor" font-size="11">our independent witness</text>
+
+        <rect x="470" y="270" width="248" height="54" rx="9" fill="none" stroke="currentColor" stroke-width="1.5" stroke-dasharray="5 4"/>
+        <text x="594" y="294" text-anchor="middle" fill="currentColor">foreground window</text>
+        <text x="594" y="311" text-anchor="middle" fill="currentColor" font-size="11">the local app</text>
+      </g>
+
+      <text x="760" y="99" fill="#ff6b6b" font-size="12" font-weight="700">never</text>
+      <text x="760" y="199" fill="#ff6b6b" font-size="12" font-weight="700">never</text>
+      <text x="760" y="299" fill="#ff6b6b" font-size="12" font-weight="700">never</text>
+      <text x="760" y="318" fill="currentColor" font-size="11" opacity=".55">(by design)</text>
+
+      <text x="594" y="364" text-anchor="middle" fill="currentColor" opacity=".7" font-size="12">
+        Everything that could report &ldquo;this key is down&rdquo; lives on this side of the cut.
+      </text>
+    </g>
+  </svg>
+  <figcaption>The third box is the one we <em>want</em> blocked — that is the whole point of suppression. The first two are collateral: they go dark for the same reason.</figcaption>
+  </figure>
+
+  <p>So for <strong>every modifier the owner held</strong>, Windows reported it as up. My code read that as &ldquo;the release got lost&rdquo; and helpfully sent a release — about 8&nbsp;ms after the press.</p>
+
+  <figure>
+  <div class="trace">
+    <div class="row"><span class="ts">14:47:11.296</span><span><span class="ev">CtrlL&nbsp; down</span> <span class="note">&larr; owner presses Ctrl</span></span></div>
+    <div class="row kill"><span class="ts">14:47:11.304</span><span><span class="ev">CtrlL&nbsp; UP</span> <span class="note">&larr; my fix, 8 ms later. Nobody asked for this.</span></span></div>
+    <div class="row bare"><span class="ts">14:47:11.656</span><span><span class="ev">Space&nbsp; down</span> <span class="note">&larr; arrives with no Ctrl held &rarr; a bare Space</span></span></div>
+    <div class="row"><span class="ts">14:47:11.760</span><span><span class="ev">Space&nbsp; up</span></span></div>
+    <div class="row"><span class="ts">14:47:11.904</span><span><span class="ev">CtrlL&nbsp; up</span> <span class="note">&larr; the owner's real release, 600 ms too late</span></span></div>
+  </div>
+  <figcaption>From Kali&rsquo;s own log. This shape repeated every single time &mdash; 111 firings in five minutes.</figcaption>
+  </figure>
+
+  <p><strong>Alt+Tab &ldquo;works on the fifth try&rdquo; is the same bug.</strong> Tab only counted if it landed inside the few milliseconds before the sweep killed Alt. Pressing repeatedly eventually won that race.</p>
+
+  <h2><span class="n">03</span>The proof was already in the log</h2>
+  <p class="lede">A counter added months ago, for an unrelated question, settles it completely.</p>
+
+  <div class="counters">
+    <div class="ctr"><div class="v">768</div><div class="l">hook_calls</div></div>
+    <div class="ctr"><div class="v">414</div><div class="l">swallowed</div></div>
+    <div class="ctr zero"><div class="v">0</div><div class="l">raw_keys</div></div>
+  </div>
+
+  <p>Raw Input is a <em>separate delivery path</em> from the hook chain, which mouse-rs already registers as an independent witness. It saw <strong>none</strong> of the 414 suppressed keys. That is the measurement that proves no Windows API can observe a key we swallow — and therefore that <span class="hl-bad">no fix of that shape can ever work</span>.</p>
+  <p>It was one grep away, in the same source file, before I wrote a line of the fix.</p>
+
+  <div class="rule">
+    <p><b>It also refutes my diagnosis of the original bug.</b> I had claimed a higher-integrity window kills our hook mid-chord. But <code>hook_calls</code> was never once zero, and the purpose-built &ldquo;the hook was dead&rdquo; diagnostic has never fired. <strong>B13&rsquo;s real cause is still unknown</strong> — the bug list now says so instead of asserting a mechanism.</p>
+  </div>
+
+  <h2><span class="n">04</span>Five failures, not one</h2>
+  <p class="lede">The bug was the small part. Each of these is independently worth fixing.</p>
+
+  <div class="fails">
+    <div class="fail">
+      <h3><span class="num">01</span><span>A premise I never measured</span></h3>
+      <p>I believed <code>GetAsyncKeyState</code> sees through hooks, wrote that in a doc comment, and treated <span class="ink">having written it down as having established it.</span></p>
+      <p>The disproof was a counter in the same file.</p>
+    </div>
+    <div class="fail">
+      <h3><span class="num">02</span><span>Evidence about the wrong moment</span></h3>
+      <p>I cited 24 <code>CROSSING WILL NOT WORK</code> warnings as proof of a mid-chord hook blackout. Those fire at <span class="ink">crossing start</span>, about whether a crossing can begin at all.</p>
+      <p>I never went looking for evidence that would disconfirm the theory — though it was being logged all along.</p>
+    </div>
+    <div class="fail">
+      <h3><span class="num">03</span><span>Tests that couldn&rsquo;t catch it, twice over</span></h3>
+      <p><span class="ink">They never ran.</span> They live in <code>windows.rs</code>, which only compiles for the Windows target — on the Linux build host they compile and never execute. &ldquo;213 tests pass&rdquo; was true and meaningless.</p>
+      <p><span class="ink">They tested the wrong thing.</span> They pinned a pure function that encoded the false premise. A test of a false premise passes. Nothing asserted the behaviour that mattered: press Ctrl, press Space, Ctrl must still be held.</p>
+    </div>
+    <div class="fail">
+      <h3><span class="num">04</span><span>A constant fix for an occasional fault</span></h3>
+      <p>B13 was intermittent and self-recovering. The fix ran <span class="ink">every 120 ms, on every modifier, always.</span> Its failure mode was total.</p>
+      <p>I never asked what happens if it&rsquo;s wrong. The answer was &ldquo;the keyboard stops working&rdquo; — far worse than the symptom being treated.</p>
+    </div>
+    <div class="fail">
+      <h3><span class="num">05</span><span>A recovery that failed three more times</span></h3>
+      <p>Overwrote the only working exe <span class="ink">before</span> verifying the download. Printed <code>installed</code> after <code>Move-Item</code> had errored. Assumed a normal shell could stop an elevated process. Handed over multi-line blocks that PowerShell silently chops at blank lines.</p>
+      <p>Then the obvious one-liner was broken too: the server sends <code>.ps1</code> as binary, so <code>iex (iwr).Content</code> gets a byte array. Found by <span class="ink">running it</span>, not reading it.</p>
+    </div>
+  </div>
+
+  <h2><span class="n">05</span>The common cause</h2>
+  <div class="card">
+    <p style="font-size:19px;margin:0 0 14px"><strong>Reasoning substituted for measurement, in an environment where the code cannot be executed.</strong></p>
+    <p style="margin:0;color:var(--dim)">Windows code can&rsquo;t run on the Kali build box. The laptop is the only place it runs, and it&rsquo;s tested by hand. That makes confident-sounding prose the cheapest thing to produce and the least reliable thing to ship. <strong>Four of the five failures</strong> would have been caught by running or grepping something already present — <code>pwsh</code> is even installed locally, which is how the <code>iex</code> bug got caught before it was sent.</p>
+  </div>
+
+  <h2><span class="n">06</span>What changed</h2>
+  <table>
+    <thead><tr><th>Rule</th><th>Concretely</th></tr></thead>
+    <tbody>
+      <tr><td>State the premise, name the measurement</td><td>For any platform-API fix, write the premise <em>and</em> the evidence confirming it, before the code. No evidence &rarr; ship a diagnostic first.</td></tr>
+      <tr><td>Host-executable, or not tested</td><td>Input-path fixes need a test that runs on the Linux host and asserts user-visible behaviour. Windows-target tests are documentation.</td></tr>
+      <tr><td>Prove a guard bites</td><td>Confirm a new test fails against the faulty behaviour before keeping it. Done for the chord test.</td></tr>
+      <tr><td>Match blast radius to the fault</td><td>Nothing runs continuously to correct an occasional, self-recovering fault.</td></tr>
+      <tr><td>Don&rsquo;t say &ldquo;fixed&rdquo; first</td><td>Logs upload automatically. Read them after one crossing before using the word.</td></tr>
+      <tr><td>Never overwrite the last good artifact</td><td>Verify the replacement first; keep a <code>.bak</code>; check post-conditions instead of assuming the previous line worked.</td></tr>
+    </tbody>
+  </table>
+
+  <h2><span class="n">07</span>What worked, and is worth keeping</h2>
+  <div class="card">
+    <p><span class="hl-good">Log shipping made this conclusive in minutes.</span> Both machines upload to <code>~/mouse-reports</code>. The smoking-gun trace came from the receiver&rsquo;s own log with millisecond timestamps — nothing had to be reproduced or pasted.</p>
+    <p><span class="hl-good">A cheap counter paid for itself.</span> <code>raw_keys</code> was added to tell &ldquo;the hook was dead&rdquo; apart from &ldquo;nothing was typed&rdquo;. It&rsquo;s what proved no API can see a suppressed key.</p>
+    <p><span class="hl-good">The standing bug list preserved the history</span>, so a wrong diagnosis could be corrected in place rather than quietly forgotten.</p>
+    <p style="margin:0"><span class="hl-good">The report named both symptoms.</span> &ldquo;Ctrl isn&rsquo;t sharing&rdquo; <em>and</em> &ldquo;Alt+Tab takes 5 tries&rdquo; were two faces of one cause — having both made the shared mechanism obvious immediately.</p>
+  </div>
+
+  <p class="foot">
+    Full written version: <code>docs/POSTMORTEM-2026-10-09-modifier-regression.md</code><br>
+    Bug list: <code>docs/KNOWN-ISSUES.md</code> &mdash; B13 (cause now unknown), B14 (this regression)<br>
+    Fix withdrawn in <code>d907f27</code> &middot; guards in <code>mouse-engine/src/injector.rs</code> and <code>mouse-input/src/windows.rs</code>
+  </p>
+</div>
+</body>
+</html>
