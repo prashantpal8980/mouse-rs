@@ -13,7 +13,11 @@ not yet described well enough to act on).
 ## Awaiting detail from the owner
 
 ### B1 — something about keyboard/mouse sharing on the Windows side
-**awaiting detail** · raised 2026-10-09
+**closed 2026-10-09 as a duplicate of [B13](#b13--alttab-sticks-a-modifier-release-is-lost-and-the-key-stays-logically-down)** · raised 2026-10-09
+
+Kept for the trail. The owner described the Alt+Tab fault the following day, and it is on
+the Windows side and about input sharing, which is everything B1 said. Reopen if it turns
+out they meant something else.
 
 The owner reported a change or fault concerning input sharing on the Windows side and
 said they would describe it later. Not enough detail to act on, and **deliberately not
@@ -31,18 +35,34 @@ equivalent, or a distinct bug seen while sharing.
 
 ## Built but never proven on hardware
 
-### B2 — login-screen sharing has never been run for real
-**unverified** · built 2026-10-08 (`61b0d72`, `7b143a6`) · tracked as R21
+### B2 — login-screen sharing was never switched on, and nothing said so
+**open** · built 2026-10-08 (`61b0d72`, `7b143a6`) · tested by the owner 2026-10-09 · R21
 
-The uinput backend, the greeter service and the panel toggle are all written and tested,
-but nothing has run at an actual SDDM login prompt. Verification needs root and a logout,
-so only the owner can do it.
+The owner rebooted to try it, got the SDDM password prompt with no keyboard, and had to
+plug one in again. Checked afterwards: **no unit, no `/etc/mouse-rs`, and not one line
+mentioning the greeter in either log generation.** The feature had never been installed —
+it did not fail, it was never turned on. Building it and saying "the toggle is in the
+panel" was not enough to make that clear.
 
-`mouse-rs greeter-selftest` exists precisely because the real thing is only observable
-where there is no terminal to read an error from — run that first.
+The underlying defect is that it was **only testable by logging out**, so the first
+feedback anyone gets is standing at a password prompt unable to type.
 
-**Risk if wrong:** low. The service is off until installed, and failure means the login
-screen behaves as it does today rather than breaking further.
+**Fixed 2026-10-09:**
+
+* `mouse-rs greeter-status` now *verifies the whole chain* instead of listing files —
+  unit, enablement, binary, settings, `/dev/uinput`, whether anything loads the module,
+  and whether the peer answers on its port — and ends with a plain verdict on whether the
+  login screen will accept the other machine's keyboard. Checks cascade, so an
+  uninstalled service gives one instruction rather than four.
+* The unit now declares `Wants=`/`After=modprobe@uinput.service`, and the install writes
+  `/etc/modules-load.d/mouse-rs-uinput.conf`. `uinput` is a module on this kernel
+  (`CONFIG_INPUT_UINPUT=m`) and was **not loaded**; the static `/dev/uinput` node does
+  normally autoload it on open, but relying on that from inside a sandboxed unit is how
+  you get `ENODEV` at boot and no keyboard at the prompt.
+
+**Still needs the owner:** installing it requires root, which only they have. Turn on
+*Share input at the login screen* in the panel's Startup tab, then run `greeter-status`
+to confirm before rebooting.
 
 ### B3 — the stalled-transfer fixes were never confirmed on hardware
 **unverified** · built 2026-09-04 (`01555ac`)
@@ -119,13 +139,22 @@ mouse-rs would be at the same level and would keep its hook. The toggle already 
 Startup → *Start at login as administrator* (R20). **Not done — Windows is frozen by the
 owner's instruction until they ask.**
 
-**Fix we should build regardless**, because elevation only removes the most common cause
-and a lost release will still happen eventually: the sending side should **resync
-modifier state** rather than assume every release reaches us — on regaining the
-foreground, or on a timer, compare what it believes is held against the real key state
-and send releases for the difference. Today there is no such reconciliation anywhere; the
-only correction is `ReleaseAll` on a crossing, which is why the owner's workaround
-involves crossing.
+**Mitigated 2026-10-09 on the receiving side** (`mouse-engine/src/injector.rs`): a
+modifier still held after five seconds of complete silence is released, because a human
+holding Alt generates *something* — another key, a mouse movement — and total silence with
+Alt down means nobody is holding it. Only modifiers qualify, and not while a mouse button
+is down, since a modifier-drag is a real gesture someone can hold still in. Five tests,
+one of which proves the release comes from the idle sweep rather than from teardown.
+
+This is a **safety net, not the cure.** It recovers within five seconds instead of
+requiring a crossing; it cannot know the release was lost any sooner, because only the
+sending machine ever saw it.
+
+**Still open — the actual fix, on the sending side.** Windows should reconcile what it
+believes is held against the real key state (`GetAsyncKeyState`) when it regains the
+foreground, and send the releases it missed. Deliberately not built yet: it is Windows
+code, and Windows is frozen by the owner's instruction. Worth doing in the same pass as
+elevating the laptop.
 
 ### B4 — cut-and-paste across machines behaves as copy in Thunar
 **open**

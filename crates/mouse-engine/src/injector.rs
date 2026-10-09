@@ -23,7 +23,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::Arc;
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use mouse_input::{Button, InputError, InputEvent, InputInjector, Key};
 
@@ -131,17 +131,53 @@ fn join_bounded(handle: JoinHandle<()>, timeout: Duration) {
     }
 }
 
-fn injector_loop(mut inner: Box<dyn InputInjector>, rx: mpsc::Receiver<InjectCmd>, stop: Arc<AtomicBool>) {
+fn injector_loop(inner: Box<dyn InputInjector>, rx: mpsc::Receiver<InjectCmd>, stop: Arc<AtomicBool>) {
+    injector_loop_with(inner, rx, stop, MODIFIER_IDLE_RELEASE)
+}
+
+/// As [`injector_loop`], with the idle grace given — so a test can use a short one
+/// instead of waiting five seconds.
+fn injector_loop_with(
+    mut inner: Box<dyn InputInjector>,
+    rx: mpsc::Receiver<InjectCmd>,
+    stop: Arc<AtomicBool>,
+    idle_release: Duration,
+) {
     let mut keys: HashSet<Key> = HashSet::new();
     let mut buttons: HashSet<Button> = HashSet::new();
+    // Last time anything at all arrived. A modifier held across a long silence is the
+    // signature of a lost key-up, not of someone holding it.
+    let mut last_input = Instant::now();
 
     loop {
         if stop.load(Ordering::SeqCst) {
             break;
         }
         match rx.recv_timeout(Duration::from_millis(50)) {
-            Ok(cmd) => apply(&mut inner, &mut keys, &mut buttons, cmd),
-            Err(RecvTimeoutError::Timeout) => continue, // re-check stop
+            Ok(cmd) => {
+                last_input = Instant::now();
+                apply(&mut inner, &mut keys, &mut buttons, cmd);
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                // Buttons held means a drag is in progress, and a drag with a modifier
+                // down is a real thing someone can hold still mid-gesture.
+                if !idle_release.is_zero()
+                    && buttons.is_empty()
+                    && last_input.elapsed() >= idle_release
+                    && keys.iter().any(is_modifier)
+                {
+                    let freed = release_stuck_modifiers(&mut inner, &mut keys);
+                    if !freed.is_empty() {
+                        tracing::warn!(
+                            released = ?freed,
+                            idle_secs = last_input.elapsed().as_secs(),
+                            "released modifiers that were still held after a long silence \
+                             — the peer almost certainly lost their key-up (B13)"
+                        );
+                        last_input = Instant::now();
+                    }
+                }
+            }
             Err(RecvTimeoutError::Disconnected) => break, // engine gone (incl. panic)
         }
     }
@@ -187,6 +223,47 @@ fn apply(
     if let Err(e) = r {
         tracing::debug!("inject failed: {e}");
     }
+}
+
+/// How long a modifier may stay held with nothing else arriving before we conclude its
+/// release was lost in transit.
+///
+/// Five seconds. The sending side only forwards a key-up it was actually told about, and
+/// on Windows it is not always told: the OS stops calling a low-level hook while a
+/// higher-integrity window has the foreground, so a release pressed in that window is
+/// never captured and never sent (B13). The peer is then left holding Alt for ever, which
+/// is what jams the Alt-Tab switcher — holding Alt is what keeps it open.
+///
+/// Why idleness is the right signal: a human holding Alt is doing something with it, and
+/// anything they do — another key, a mouse movement — arrives here. Total silence with a
+/// modifier down means nobody is holding it. Five seconds is long enough that reading an
+/// open switcher does not trip it, and releasing a modifier we were wrong about costs
+/// only what releasing it early costs, which is what the user was trying to do anyway.
+pub const MODIFIER_IDLE_RELEASE: Duration = Duration::from_secs(5);
+
+/// Is this a key whose release we are willing to invent?
+///
+/// Modifiers only. A stuck modifier breaks every subsequent keystroke, so guessing is
+/// worth it; a stuck ordinary key types one wrong character and auto-repeat would keep
+/// arriving anyway, so there is nothing to detect and nothing to gain.
+fn is_modifier(key: &Key) -> bool {
+    matches!(key, Key::Named(n) if n.modifier_token().is_some())
+}
+
+/// Release modifiers we are probably wrong about still holding.
+///
+/// Returns the ones released, for the log — a silent correction would hide how often the
+/// sending side is losing key-ups, which is the number that says whether B13 is fixed.
+fn release_stuck_modifiers(
+    inner: &mut Box<dyn InputInjector>,
+    keys: &mut HashSet<Key>,
+) -> Vec<Key> {
+    let stuck: Vec<Key> = keys.iter().filter(|k| is_modifier(k)).cloned().collect();
+    for key in &stuck {
+        let _ = inner.key(key, false);
+        keys.remove(key);
+    }
+    stuck
 }
 
 fn release_all(
@@ -309,5 +386,169 @@ mod tests {
 
         injector.shutdown();
     }
+    /// Drive `injector_loop_with` directly with a short grace, so the stuck-modifier
+    /// path is exercised without a five-second test.
+    fn run_loop(
+        grace: Duration,
+        feed: impl FnOnce(&mpsc::Sender<InjectCmd>),
+        settle: Duration,
+        after: impl FnOnce(&mpsc::Sender<InjectCmd>),
+    ) -> Vec<String> {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let inner: Box<dyn InputInjector> = Box::new(FakeInjector { log: log.clone() });
+        let (tx, rx) = mpsc::channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        let s2 = stop.clone();
+        let h = std::thread::spawn(move || injector_loop_with(inner, rx, s2, grace));
+        feed(&tx);
+        std::thread::sleep(settle);
+        // Anything sent here lands *after* the idle sweep would have run, so its
+        // position in the log separates an idle release from the teardown one.
+        after(&tx);
+        std::thread::sleep(Duration::from_millis(120));
+        stop.store(true, Ordering::SeqCst);
+        // Dropping the sender would also end it; stop flag is what the engine uses.
+        let _ = h.join();
+        // Bound rather than returned inline: the guard is a temporary and the tail
+        // expression would outlive it.
+        let out = log.lock().unwrap().clone();
+        out
+    }
+
+    #[test]
+    fn a_modifier_left_held_through_a_long_silence_is_released() {
+        // B13: Windows stops delivering our hook while a higher-integrity window has
+        // focus, so an Alt-up pressed in that moment is never captured and never sent.
+        // The peer is left holding Alt, which is exactly what jams the Alt-Tab switcher.
+        let log = run_loop(
+            Duration::from_millis(120),
+            |tx| {
+                tx.send(InjectCmd::Apply(InputEvent::Key {
+                    key: Key::Named(NamedKey::AltL),
+                    pressed: true,
+                }))
+                .unwrap();
+                tx.send(InjectCmd::Apply(InputEvent::Key {
+                    key: Key::Named(NamedKey::Tab),
+                    pressed: true,
+                }))
+                .unwrap();
+                tx.send(InjectCmd::Apply(InputEvent::Key {
+                    key: Key::Named(NamedKey::Tab),
+                    pressed: false,
+                }))
+                .unwrap();
+                // ...and then nothing. The Alt-up never arrives.
+            },
+            Duration::from_millis(500),
+            |tx| {
+                // A marker that lands after the sweep should have fired.
+                tx.send(InjectCmd::Apply(InputEvent::Key {
+                    key: Key::Named(NamedKey::F(9)),
+                    pressed: true,
+                }))
+                .unwrap();
+            },
+        );
+        let released = log.iter().position(|l| l == "key k:alt false");
+        let marker = log.iter().position(|l| l == "key k:f9 true");
+        assert!(released.is_some(), "Alt was never released; got {log:?}");
+        assert!(
+            released < marker,
+            "Alt must be released by the idle sweep, not merely at teardown; got {log:?}"
+        );
+    }
+
+    #[test]
+    fn an_ordinary_key_is_not_released_on_a_guess() {
+        // Only modifiers are worth inventing a release for. A stuck letter types one
+        // wrong character; guessing wrongly on one would eat a real keypress.
+        let log = run_loop(
+            Duration::from_millis(120),
+            |tx| {
+                tx.send(InjectCmd::Apply(InputEvent::Key {
+                    key: Key::Char('a'),
+                    pressed: true,
+                }))
+                .unwrap();
+            },
+            Duration::from_millis(400),
+            |_| {},
+        );
+        // Teardown releases it; the sweep must not have done so before that.
+        assert_eq!(
+            log,
+            vec!["key c:a true".to_string(), "key c:a false".to_string()],
+            "an ordinary key must only be released at teardown; got {log:?}"
+        );
+    }
+
+    #[test]
+    fn a_modifier_held_during_a_drag_is_left_alone() {
+        // Shift-drag is a real gesture and someone can hold still in the middle of it.
+        // A held button means a human is demonstrably still there.
+        let log = run_loop(
+            Duration::from_millis(120),
+            |tx| {
+                tx.send(InjectCmd::Apply(InputEvent::Key {
+                    key: Key::Named(NamedKey::ShiftL),
+                    pressed: true,
+                }))
+                .unwrap();
+                tx.send(InjectCmd::Apply(InputEvent::MouseButton {
+                    button: Button::Left,
+                    pressed: true,
+                }))
+                .unwrap();
+            },
+            Duration::from_millis(400),
+            |_| {},
+        );
+        let released_early = log
+            .iter()
+            .position(|l| l == "key k:shift_l false")
+            .zip(log.iter().position(|l| l == "btn Left false"))
+            .map(|(shift, btn)| shift < btn)
+            .unwrap_or(false);
+        assert!(
+            !released_early,
+            "Shift must survive until the drag ends; got {log:?}"
+        );
+    }
+
+    #[test]
+    fn a_zero_grace_turns_the_sweep_off() {
+        let log = run_loop(
+            Duration::ZERO,
+            |tx| {
+                tx.send(InjectCmd::Apply(InputEvent::Key {
+                    key: Key::Named(NamedKey::AltL),
+                    pressed: true,
+                }))
+                .unwrap();
+            },
+            Duration::from_millis(300),
+            |_| {},
+        );
+        // Only the teardown release at the end, never an idle one mid-run.
+        assert_eq!(
+            log,
+            vec!["key k:alt true".to_string(), "key k:alt false".to_string()],
+            "with the sweep off, the only release is teardown; got {log:?}"
+        );
+    }
+
+    #[test]
+    fn modifiers_are_identified_and_ordinary_keys_are_not() {
+        assert!(is_modifier(&Key::Named(NamedKey::AltL)));
+        assert!(is_modifier(&Key::Named(NamedKey::AltGr)));
+        assert!(is_modifier(&Key::Named(NamedKey::CtrlR)));
+        assert!(is_modifier(&Key::Named(NamedKey::SuperL)));
+        assert!(!is_modifier(&Key::Named(NamedKey::Tab)));
+        assert!(!is_modifier(&Key::Named(NamedKey::Enter)));
+        assert!(!is_modifier(&Key::Char('a')));
+        assert!(!is_modifier(&Key::Raw(0x1234)));
+    }
+
 }
 

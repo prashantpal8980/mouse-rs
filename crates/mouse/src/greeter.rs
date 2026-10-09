@@ -200,6 +200,9 @@ const UNIT_PATH: &str = "/etc/systemd/system/mouse-rs-greeter.service";
 /// working. So the binary is copied somewhere stable and the unit names that.
 const INSTALLED_EXE: &str = "/usr/local/bin/mouse-rs";
 
+/// Makes the kernel load `uinput` at boot, so the service never races the module.
+const MODULES_LOAD_PATH: &str = "/etc/modules-load.d/mouse-rs-uinput.conf";
+
 fn require_root(what: &str) -> anyhow::Result<()> {
     // SAFETY: geteuid takes no arguments and cannot fail.
     if unsafe { libc::geteuid() } != 0 {
@@ -229,6 +232,13 @@ fn unit_text(exe: &Path) -> String {
          # Needs a route to the peer, and logind to notice when a session takes over.\n\
          After=network-online.target systemd-logind.service\n\
          Wants=network-online.target\n\
+         # uinput is a module on a stock kernel (CONFIG_INPUT_UINPUT=m) and is usually\n\
+         # not loaded. Opening the static /dev/uinput node normally autoloads it, but\n\
+         # relying on that from inside a sandboxed unit is how you get an ENODEV at boot\n\
+         # and no keyboard at the login screen. Ask for it explicitly, outside our\n\
+         # namespace, before we start.\n\
+         Wants=modprobe@uinput.service\n\
+         After=modprobe@uinput.service\n\
          \n\
          [Service]\n\
          Type=simple\n\
@@ -318,6 +328,14 @@ pub fn install(source: Option<PathBuf>) -> anyhow::Result<()> {
     }
     std::fs::write(UNIT_PATH, unit_text(&exe))?;
 
+    // Belt and braces alongside the unit's `modprobe@uinput` dependency: this loads the
+    // module at boot whether or not systemd's modprobe@ template exists, and costs
+    // nothing on a kernel that has uinput built in.
+    let _ = std::fs::create_dir_all("/etc/modules-load.d");
+    if let Err(e) = std::fs::write(MODULES_LOAD_PATH, "# added by mouse-rs greeter-install\nuinput\n") {
+        tracing::warn!("could not write {MODULES_LOAD_PATH}: {e}");
+    }
+
     run_systemctl(&["daemon-reload"])?;
     run_systemctl(&["enable", UNIT_NAME])?;
 
@@ -351,6 +369,9 @@ pub fn uninstall() -> anyhow::Result<()> {
     // which is why the path is fixed rather than "whatever is on PATH".
     if std::fs::remove_file(INSTALLED_EXE).is_ok() {
         removed.push(INSTALLED_EXE.to_string());
+    }
+    if std::fs::remove_file(MODULES_LOAD_PATH).is_ok() {
+        removed.push(MODULES_LOAD_PATH.to_string());
     }
     let _ = run_systemctl(&["daemon-reload"]);
     if removed.is_empty() {
@@ -472,33 +493,114 @@ fn which_pkexec() -> Option<PathBuf> {
     p.is_file().then_some(p)
 }
 
-/// Print what the login-screen service is doing. Needs no privilege.
+/// Check every link in the chain and say whether the login screen will actually work.
 ///
-/// Exists because every other way to ask is indirect: the panel's toggle shows one bit,
-/// and `systemctl status` says nothing about whether the root-owned config is in place.
+/// Needs no privilege. This exists because the feature is otherwise only testable by
+/// logging out — and if it does not work, the way you find out is standing at a password
+/// prompt with no keyboard. Everything here is checked rather than assumed.
 pub fn status() -> anyhow::Result<()> {
     let st = state();
-    println!("login-screen sharing: {}", if st.on() { "ON" } else { "off" });
-    println!("  unit         {}  {}", UNIT_PATH, yes_no(Path::new(UNIT_PATH).is_file()));
-    println!("  config       {}  {}", config_path().display(), yes_no(config_path().is_file()));
-    println!("  starts at boot              {}", yes_no(st.enabled));
-    println!("  running now                 {}", yes_no(st.active));
-    if st.on() && !st.active {
-        println!();
-        println!("Not running is normal while you are logged in: the service stands down");
-        println!("during a session so input is not injected twice, and comes back at logout.");
+    let mut problems: Vec<String> = Vec::new();
+
+    println!("Login-screen sharing\n");
+
+    // --- is it installed and will it start ---
+    //
+    // Cascading on purpose. When nothing is installed, every one of these fails and
+    // listing four remedies for one cause buries the only instruction that matters —
+    // and "installed but not enabled" is simply untrue at that point.
+    let unit = Path::new(UNIT_PATH).is_file();
+    check("service installed", unit, &mut problems,
+          "not installed — turn on 'Share input at the login screen' in the panel's \
+           Startup tab, or run: sudo mouse-rs greeter-install");
+    if unit {
+        check("starts at boot", st.enabled, &mut problems,
+              "installed but not enabled — run: sudo systemctl enable mouse-rs-greeter");
+        check("binary in place", Path::new(INSTALLED_EXE).is_file(), &mut problems,
+              &format!("{INSTALLED_EXE} is missing — re-run the install"));
+        check("settings in place", config_path().is_file(), &mut problems,
+              &format!("{} is missing — re-run the install", config_path().display()));
+    } else {
+        for label in ["starts at boot", "binary in place", "settings in place"] {
+            println!("  -     {label}");
+        }
     }
-    if !st.installed {
-        println!();
-        println!("Turn it on from the panel (Startup tab), or:");
-        println!("  sudo mouse-rs greeter-install");
+
+    // --- can it inject at all ---
+    let node = Path::new("/dev/uinput").exists();
+    check("/dev/uinput present", node, &mut problems,
+          "the kernel has no uinput device — load it with: sudo modprobe uinput");
+    let loaded = module_loaded("uinput");
+    // Not a failure on its own: the node autoloads the module on first open, and some
+    // kernels build it in. Only worth saying when nothing has arranged for it.
+    let arranged = loaded || Path::new(MODULES_LOAD_PATH).is_file();
+    check("uinput module arranged", arranged || !unit, &mut problems,
+          "uinput is a module, is not loaded, and nothing loads it at boot — re-run the \
+           install, which writes /etc/modules-load.d/mouse-rs-uinput.conf");
+
+    // --- can it reach the peer ---
+    match peer_target() {
+        Some((host, port)) => {
+            let ok = tcp_reachable(&host, port);
+            check(&format!("peer reachable ({host}:{port})"), ok, &mut problems,
+                  "cannot reach the other machine — it will retry, but the login screen \
+                   has no keyboard until it connects");
+        }
+        None => println!("  ?  peer address    could not read any config to find it"),
+    }
+
+    println!();
+    if st.on() && problems.is_empty() {
+        println!("The login screen will accept the other machine's keyboard.");
+        if !st.active {
+            println!();
+            println!("Not running right now is normal while you are logged in: the service stands");
+            println!("down during a session so input is not injected twice, and returns at logout.");
+        }
+    } else {
+        println!("The login screen will NOT accept the other machine's keyboard yet.");
+        for p in &problems {
+            println!("  - {p}");
+        }
     }
     Ok(())
 }
 
-fn yes_no(b: bool) -> &'static str {
-    if b { "yes" } else { "no" }
+/// Print one check line and record the remedy if it failed.
+fn check(label: &str, ok: bool, problems: &mut Vec<String>, remedy: &str) {
+    println!("  {}  {label}", if ok { "ok  " } else { "FAIL" });
+    if !ok {
+        problems.push(remedy.to_string());
+    }
 }
+
+fn module_loaded(name: &str) -> bool {
+    std::fs::read_to_string("/proc/modules")
+        .map(|m| m.lines().any(|l| l.split_whitespace().next() == Some(name)))
+        .unwrap_or(false)
+}
+
+/// The peer to test against: the service's own config if we can read it, otherwise the
+/// invoking user's, which names the same machine.
+fn peer_target() -> Option<(String, u16)> {
+    for p in [config_path(), Config::default_path()] {
+        if let Ok(c) = Config::load(&p) {
+            if !c.server_host.is_empty() {
+                return Some((c.server_host, c.listen_port));
+            }
+        }
+    }
+    None
+}
+
+fn tcp_reachable(host: &str, port: u16) -> bool {
+    use std::net::{TcpStream, ToSocketAddrs};
+    let Ok(mut addrs) = (host, port).to_socket_addrs() else {
+        return false;
+    };
+    addrs.any(|a| TcpStream::connect_timeout(&a, Duration::from_millis(600)).is_ok())
+}
+
 
 /// Prove the virtual devices work, without involving the network or the login screen.
 ///
