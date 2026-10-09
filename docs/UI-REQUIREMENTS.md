@@ -9,6 +9,9 @@ implemented — an unwritten requirement is indistinguishable from one that was 
 
 Status values: **done** · **open** · **deferred** (agreed, deliberately not now).
 
+This file tracks what was **agreed**. What is **broken or unproven** lives in
+[KNOWN-ISSUES.md](KNOWN-ISSUES.md) — check both before assuming a feature works.
+
 ---
 
 ## Settings feedback
