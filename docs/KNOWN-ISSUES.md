@@ -233,6 +233,10 @@ above show the hook was alive during every crossing.
 The sending-side B13 "cure" broke every modifier chord: Ctrl was unusable, Alt+Tab took
 about five attempts. Full account under [B13](#b13--alttab-sticks-a-modifier-release-is-lost-and-the-key-stays-logically-down).
 
+Full analysis: **[POSTMORTEM-2026-10-09-modifier-regression.md](POSTMORTEM-2026-10-09-modifier-regression.md)**
+— five separate failures had to line up for it to reach the hardware, and the install and
+recovery steps failed three more times on their own.
+
 Kept as its own entry for one reason worth not losing: **a fix built on an untested
 premise, shipped to hardware that is the only place it can run, did more damage than the
 bug it targeted.** B13 is intermittent and self-recovering; this made the keyboard
