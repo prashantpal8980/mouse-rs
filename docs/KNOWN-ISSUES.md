@@ -25,6 +25,8 @@ equivalent, or a distinct bug seen while sharing.
 
 **Next step:** ask what happens, on which machine, and what should happen instead.
 
+**Possibly already answered by [B13](#b13--alttab-sticks-a-modifier-release-is-lost-and-the-key-stays-logically-down)**, reported the following day and definitely on the Windows side. Confirm with the owner before closing this.
+
 ---
 
 ## Built but never proven on hardware
@@ -56,6 +58,74 @@ instead of resetting.
 ---
 
 ## Open defects
+
+### B13 — Alt+Tab sticks: a modifier release is lost and the key stays logically down
+**open** · reported 2026-10-09 · **diagnosed, cause found**
+
+Intermittent, and the owner's description is exact:
+
+> "If I click on alt and tab it is changing the window, but as soon as we are supposed to
+> release the alt and tab button it is supposed to change the window normally — but it
+> don't do that, it will keep the window stuck and I have to click manually from the
+> mouse. To correct it I go to the Windows and click control two or three times, and
+> again alt-tab and everything works correctly."
+
+That is a **stuck Alt**. Holding Alt is what keeps the window switcher open; the switcher
+commits and closes on Alt *release*. If the release never arrives, the switcher stays up
+and the window appears frozen until a mouse click breaks it out.
+
+**Measured, not guessed.** From the shipped logs:
+
+* **100 crossings happened while a modifier was still logically held** — `AltL` and
+  `CtrlL` most often. The signature is an `AltL pressed=true` followed by
+  `peer released control` with no matching release.
+* **24 warnings on the laptop that Windows was refusing to deliver our keyboard hook**,
+  each naming the window in front and both integrity levels.
+* Press/release counts are lopsided (`CtrlL` 257/55, `AltL` 203/121). Treat that figure
+  as *suggestive only* — auto-repeat inflates it badly for keys that are held
+  (`Backspace` 52/9 is repeat, not loss). The two points above are the real evidence.
+
+**Cause.** Windows does not call a low-level keyboard hook belonging to a lower-integrity
+process while a higher-integrity window has the foreground — the same UIPI rule behind
+R20. When such a window takes focus *in the gap between Alt-down and Alt-up*:
+
+1. the Alt press was captured and forwarded (hook still working);
+2. the foreground changes, and Windows stops calling our hook;
+3. the Alt release is **never seen by mouse-rs**, so it is never forwarded;
+4. the peer keeps Alt logically down, and nothing resyncs it.
+
+**Why only sometimes.** The culprits are windows that flash up for a moment, so it only
+bites when one appears inside that gap. By frequency in the log:
+
+| Window in front | Times | What it is |
+|---|---|---|
+| `OmApSvcBroker` | 18 | OEM service broker, elevated |
+| `OSD_FnKey` | 1 | the Fn-key / volume on-screen overlay |
+| `Task Manager`, `Windows Security`, others | 5 | transient system UI |
+
+`OSD_FnKey` is worth singling out: pressing a volume or brightness key pops an elevated
+overlay, which is enough to kill the hook mid-chord.
+
+**Why pressing Ctrl a few times fixes it.** Not fully confirmed, and probably two things
+at once: moving back to Windows triggers `ReleaseAll` on the peer (`client.rs`, on
+`Message::Leave`), which clears whatever it believed held; and fresh Ctrl press/release
+pairs that *do* get through resync the modifier state.
+
+**Fix the owner can apply today:** every one of the 24 warnings recorded
+`our_level="0x2000 (normal)"` — **mouse-rs on the laptop is not running elevated**, even
+though the install prompt asked for it. 23 of the 24 blocking windows were
+`0x3000 (elevated (administrator))`, ordinary admin rather than SYSTEM, so an elevated
+mouse-rs would be at the same level and would keep its hook. The toggle already exists:
+Startup → *Start at login as administrator* (R20). **Not done — Windows is frozen by the
+owner's instruction until they ask.**
+
+**Fix we should build regardless**, because elevation only removes the most common cause
+and a lost release will still happen eventually: the sending side should **resync
+modifier state** rather than assume every release reaches us — on regaining the
+foreground, or on a timer, compare what it believes is held against the real key state
+and send releases for the difference. Today there is no such reconciliation anywhere; the
+only correction is `ReleaseAll` on a crossing, which is why the owner's workaround
+involves crossing.
 
 ### B4 — cut-and-paste across machines behaves as copy in Thunar
 **open**
