@@ -35,8 +35,8 @@ equivalent, or a distinct bug seen while sharing.
 
 ## Built but never proven on hardware
 
-### B2 — login-screen sharing was never switched on, and nothing said so
-**open** · built 2026-10-08 (`61b0d72`, `7b143a6`) · tested by the owner 2026-10-09 · R21
+### B2 — login-screen sharing: installed and enabled, not yet proven at a real prompt
+**on hold at the owner's request 2026-10-09** (they cannot reboot right now) · built 2026-10-08 (`61b0d72`, `7b143a6`) · tested by the owner 2026-10-09 · R21
 
 The owner rebooted to try it, got the SDDM password prompt with no keyboard, and had to
 plug one in again. Checked afterwards: **no unit, no `/etc/mouse-rs`, and not one line
@@ -171,11 +171,26 @@ This is a **safety net, not the cure.** It recovers within five seconds instead 
 requiring a crossing; it cannot know the release was lost any sooner, because only the
 sending machine ever saw it.
 
-**Still open — the actual fix, on the sending side.** Windows should reconcile what it
-believes is held against the real key state (`GetAsyncKeyState`) when it regains the
-foreground, and send the releases it missed. Deliberately not built yet: it is Windows
-code, and Windows is frozen by the owner's instruction. Worth doing in the same pass as
-elevating the laptop.
+**Cured on the sending side 2026-10-09** (`mouse-input/src/windows.rs`), once the owner
+lifted the Windows freeze. Every ~120 ms while control is on the peer, the capture thread
+compares what it has *told* the peer is held against what `GetAsyncKeyState` reports —
+which works regardless of hooks, and so can see the release the hook missed — and sends
+the release itself. Throttled to 120 ms rather than run on the 8 ms pump because that
+thread is `TIME_CRITICAL` and must never be why a hook callback misses its deadline.
+
+The decision is extracted as a pure `stuck_mask(sent_down, physically_down)` so the one
+piece of reasoning is testable: a release is owed exactly when we said *down* and the
+keyboard says *up*. Keys physically down that we never forwarded are not ours to release.
+Two tests — but note they compile only for the Windows target and therefore **do not
+execute on the Linux build host**.
+
+Shipped to the laptop as `22C7FC47…`. **Unverified in use:** the owner has to hit the
+fault again, and the fix logs a line naming the modifier each time it fires, which is
+also how we learn how often it was happening.
+
+**Still worth doing:** elevate mouse-rs on the laptop. All 24 hook-blocked events recorded
+`our_level="0x2000 (normal)"` against blockers at ordinary elevated admin, so elevation
+removes the most common cause outright rather than correcting after the fact.
 
 ### B4 — cut-and-paste across machines behaves as copy in Thunar
 **open**
@@ -246,8 +261,8 @@ machine cannot be the *server*. Kali is X11 today, so nothing is blocked right n
 
 ## Build and release fragility
 
-### B11 — the served Windows exe is a symlink into the build tree
-**open** · found 2026-10-08
+### B11 — the served Windows exe was a symlink into the build tree
+**fixed 2026-10-09** · found 2026-10-08
 
 `~/mouse-serve/mouse-rs.exe` is a symlink to
 `target/x86_64-pc-windows-gnu/release/mouse-rs.exe`, not a copy. Any Windows rebuild
@@ -258,7 +273,11 @@ hash — the laptop fails the checksum step, and it reads as a corrupt download 
 Shared code (`config.rs`, `run.rs`) has already diverged from the served build, so this is
 live, not theoretical.
 
-**Fix:** have `scripts/serve-windows.sh` copy the binary instead of linking it.
+**Fixed:** `scripts/serve-windows.sh` now copies the binary (via a temp file and an
+atomic rename, so a download in flight never sees a half-written exe) instead of linking
+it. Verified: the served file is a real 12,087,808-byte copy, not a link. The prompts stay
+symlinked — the same script regenerates them and rewrites the hash in them, so a link
+there can never disagree with what it states.
 
 ### B12 — a bare `cargo build` fails on this machine
 **open**
