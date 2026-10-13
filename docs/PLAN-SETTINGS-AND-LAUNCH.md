@@ -148,3 +148,35 @@ recorded here before any change, so the target is agreed first.
 - [ ] Evidence from both machines' logs for those cases
 - [ ] Agreed behaviour, written as requirements
 - [ ] Fix, then the owner tests by hand
+
+### The test ladder: one kind of content at a time
+
+Agreed 2026-10-13. Trying to fix every kind of copy at once is what went wrong before, so
+each rung is tested, fixed and **signed off by the owner** before the next one starts. A
+rung is done when it works in the direction tested; the reverse direction is its own rung.
+
+| Rung | What is copied | Direction | Status |
+|---|---|---|---|
+| 1a | **Image pixels**: a screenshot, or "Copy image" in a browser | Linux → Windows | **testing now** |
+| 1b | **Image file**: a `.png`/`.jpg` copied in the file manager | Linux → Windows | waiting |
+| 2 | **Video file** (a large one, hundreds of MB) | Linux → Windows | waiting |
+| 3 | **Folder** with several files and sub-folders | Linux → Windows | waiting |
+| 4 | **Zip file** | Linux → Windows | waiting |
+| 5–8 | Rungs 1–4 again | Windows → Linux | waiting |
+
+Image pixels and image files are different rungs because they take different paths:
+pixels go through the clipboard itself, while a file is fetched over the file lane when
+you paste.
+
+**For every rung the owner notes:**
+1. What was copied, and roughly how big it was.
+2. Where it was pasted (Paint, Word, a folder in Explorer, the desktop…).
+3. The time of the copy and the time of the paste, to the minute.
+4. What happened, and what should have happened.
+
+Claude then reads both machines' logs for that minute and records here, under the rung:
+what happened, the cause, the agreed behaviour, the fix, and the owner's sign-off.
+
+#### Rung 1a — image pixels, Linux → Windows
+
+- Owner's report: _pending_
