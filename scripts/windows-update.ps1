@@ -1,5 +1,5 @@
 # mouse-rs standing installer. Served from the Kali box and run as a file, by one line:
-#   iwr http://192.168.137.2:8000/update.ps1 -UseBasicParsing -OutFile $env:TEMP\mouse-rs-update.ps1; powershell -NoProfile -ExecutionPolicy Bypass -File $env:TEMP\mouse-rs-update.ps1
+#   $f="$env:TEMP\mouse-rs-update.ps1"; iwr http://192.168.137.2:8000/update.ps1 -UseBasicParsing -OutFile $f; Unblock-File $f; powershell -NoProfile -ExecutionPolicy Bypass -Command "Set-ExecutionPolicy -Scope Process Bypass -Force -ErrorAction SilentlyContinue; Invoke-Expression ([IO.File]::ReadAllText('$f'))"
 #
 # The point of this script is that the owner keeps using mouse-rs while it updates. So a
 # running instance is replaced by the new build and started again straight away, with the

@@ -24,11 +24,18 @@ again. Do not continue in a normal shell.
 
 ## Step 2 — run the installer
 
-Run this one line in the elevated shell. It saves the installer to a file and runs the
-file, which avoids PowerShell mis-reading the download as bytes:
+Run this one line in the elevated shell, exactly as written. It saves the installer to a
+file, unblocks it, and runs its text in a fresh PowerShell with the execution policy bypassed.
+
+It deliberately does **not** run the file with `-File`. A machine whose execution policy is
+set by Group Policy blocks every `.ps1` file even with `-ExecutionPolicy Bypass`, and the
+installer then never starts: no download, no report. Running the file's text as a command is
+not subject to the execution policy, so it works on every machine. Do not "simplify" it back
+to `-File`, and do not pipe `iwr` straight into `iex` (PowerShell can read the download as
+bytes and fail).
 
 ```powershell
-iwr http://192.168.137.2:8000/update.ps1 -UseBasicParsing -OutFile $env:TEMP\mouse-rs-update.ps1; powershell -NoProfile -ExecutionPolicy Bypass -File $env:TEMP\mouse-rs-update.ps1
+$f="$env:TEMP\mouse-rs-update.ps1"; iwr http://192.168.137.2:8000/update.ps1 -UseBasicParsing -OutFile $f; Unblock-File $f; powershell -NoProfile -ExecutionPolicy Bypass -Command "Set-ExecutionPolicy -Scope Process Bypass -Force -ErrorAction SilentlyContinue; Invoke-Expression ([IO.File]::ReadAllText('$f'))"
 ```
 
 The installer checks everything itself. It refuses if the download does not match the size
@@ -46,6 +53,10 @@ Say what the installer printed, in particular:
 - the `installed:` line (size and hash of the new exe);
 - the `running after:` line, or the rollback lines if it had to restore the previous build;
 - whether it said `report uploaded as …`.
+
+If PowerShell itself refused to run anything (for example "running scripts is disabled on
+this system"), quote that error exactly. The command above is built to avoid it, so it means
+something else is blocking it.
 
 If it stopped, quote the `STOP:` line exactly and change nothing else. Do not try a second
 time, and do not start or stop mouse-rs by hand.
