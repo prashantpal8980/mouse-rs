@@ -839,6 +839,9 @@ impl ClipboardSync {
         if let Some(j) = self.join.take() {
             join_bounded(j, Duration::from_millis(800));
         }
+        // Stop, quit and exit all come through here. Hand a file list we still serve to
+        // a holder first, so pasting it after mouse-rs is gone still works.
+        files::handoff_on_exit();
     }
 }
 

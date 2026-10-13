@@ -18,6 +18,8 @@ struct Inner {
     peer_w: AtomicI32,
     peer_h: AtomicI32,
     peer: Mutex<String>,
+    /// The peer is the login-screen instance: its machine is at a password prompt.
+    peer_at_login_screen: AtomicBool,
 }
 
 /// A shared, cheaply-cloned handle to the engine's live status.
@@ -32,6 +34,8 @@ pub struct StatusSnapshot {
     pub peer: String,
     pub peer_w: i32,
     pub peer_h: i32,
+    /// The peer is at its login screen. Input reaches it once the pointer crosses over.
+    pub peer_at_login_screen: bool,
 }
 
 impl StatusHandle {
@@ -39,10 +43,11 @@ impl StatusHandle {
         StatusHandle::default()
     }
 
-    pub(crate) fn set_connected(&self, peer: &str, w: i32, h: i32) {
+    pub(crate) fn set_connected(&self, peer: &str, w: i32, h: i32, login_screen: bool) {
         if let Ok(mut p) = self.0.peer.lock() {
             *p = peer.to_owned();
         }
+        self.0.peer_at_login_screen.store(login_screen, Ordering::SeqCst);
         self.0.peer_w.store(w, Ordering::SeqCst);
         self.0.peer_h.store(h, Ordering::SeqCst);
         self.0.engaged.store(false, Ordering::SeqCst);
@@ -67,14 +72,21 @@ impl StatusHandle {
             peer: self.0.peer.lock().map(|p| p.clone()).unwrap_or_default(),
             peer_w: self.0.peer_w.load(Ordering::SeqCst),
             peer_h: self.0.peer_h.load(Ordering::SeqCst),
+            peer_at_login_screen: self.0.peer_at_login_screen.load(Ordering::SeqCst),
         }
     }
 }
 
 /// Mark the peer connected, if a status handle is wired in.
-pub(crate) fn set_status_connected(s: &Option<StatusHandle>, peer: &str, w: i32, h: i32) {
+pub(crate) fn set_status_connected(
+    s: &Option<StatusHandle>,
+    peer: &str,
+    w: i32,
+    h: i32,
+    login_screen: bool,
+) {
     if let Some(s) = s {
-        s.set_connected(peer, w, h);
+        s.set_connected(peer, w, h, login_screen);
     }
 }
 

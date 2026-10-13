@@ -234,7 +234,12 @@ mod imp {
 #[cfg(all(unix, not(target_os = "macos")))]
 mod imp {
     use super::FileList;
+    use std::io::Write as _;
+    use std::os::unix::ffi::OsStrExt as _;
     use std::path::PathBuf;
+    use std::process::{Command, Stdio};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Mutex, OnceLock};
     use std::time::{Duration, Instant};
     use x11rb::connection::Connection;
     use x11rb::protocol::xproto::{
@@ -454,36 +459,174 @@ mod imp {
         publish(list, super::Publish { png, ..Default::default() })
     }
 
-    /// Publish a file list with a paste mode and relink data.
-    pub fn publish(list: &FileList, how: super::Publish) -> bool {
-        let uris: Vec<String> = list
-            .paths
+    /// The file list this process currently serves on the selection, kept so it can be
+    /// handed to a holder process at exit (see [`handoff`]). `id` ties the record to one
+    /// publish, so an owner thread that loses the selection clears only its own record,
+    /// never the one from a newer publish. `window` is the X window that owns the
+    /// selection; `handoff` checks the server still says it does before acting.
+    struct Held {
+        id: u64,
+        window: u32,
+        verb: &'static str,
+        paths: Vec<PathBuf>,
+    }
+
+    static HELD: Mutex<Option<Held>> = Mutex::new(None);
+    static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+    /// The program and arguments that start a holder, set once by the application.
+    static HOLDER: OnceLock<(PathBuf, Vec<String>)> = OnceLock::new();
+
+    /// The two bodies a file list is served as: the `text/uri-list` form and the GNOME
+    /// form, whose first line is the paste verb.
+    fn bodies(paths: &[PathBuf], verb: &str) -> (String, String) {
+        let uris: Vec<String> = paths
             .iter()
             .map(|p| format!("file://{}", percent_encode(&p.to_string_lossy())))
             .collect();
-        if uris.is_empty() {
+        let uri_list = format!("{}\r\n", uris.join("\r\n"));
+        let gnome = format!("{verb}\n{}", uris.join("\n"));
+        (uri_list, gnome)
+    }
+
+    /// Publish a file list with a paste mode and relink data.
+    pub fn publish(list: &FileList, how: super::Publish) -> bool {
+        if list.paths.is_empty() {
             return false;
         }
-        let uri_list = format!("{}\r\n", uris.join("\r\n"));
         // The verb the file manager obeys. "cut" makes it relocate our hard link rather
         // than duplicate the data — the whole point on a large file.
         let verb = if how.move_on_paste { "cut" } else { "copy" };
-        let gnome = format!("{verb}\n{}", uris.join("\n"));
+        let (uri_list, gnome) = bodies(&list.paths, verb);
         let png = how.png;
         let relink = how.relink;
         let on_paste = how.on_paste;
         let wanted_paths = list.paths.clone();
+        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        if let Ok(mut held) = HELD.lock() {
+            *held = Some(Held { id, window: 0, verb, paths: wanted_paths.clone() });
+        }
 
         std::thread::Builder::new()
             .name("clip-files-owner".into())
-            .spawn(move || serve_selection(uri_list, gnome, png, relink, on_paste, wanted_paths))
+            .spawn(move || {
+                serve_selection(id, uri_list, gnome, png, relink, on_paste, wanted_paths);
+                forget_held(id);
+            })
             .is_ok()
+    }
+
+    /// Record which window now owns the selection, for this publish only.
+    fn record_window(id: u64, window: u32) {
+        if let Ok(mut held) = HELD.lock() {
+            if let Some(h) = held.as_mut().filter(|h| h.id == id) {
+                h.window = window;
+            }
+        }
+    }
+
+    /// Drop the record for `id` once its owner thread has given up the selection.
+    fn forget_held(id: u64) {
+        if let Ok(mut held) = HELD.lock() {
+            if held.as_ref().is_some_and(|h| h.id == id) {
+                *held = None;
+            }
+        }
+    }
+
+    /// Set the program and arguments that start a holder. Called once at startup by the
+    /// application; without it [`handoff`] does nothing, so tests never spawn anything.
+    pub fn set_holder(program: PathBuf, args: Vec<String>) {
+        let _ = HOLDER.set((program, args));
+    }
+
+    /// Hand the file list we serve to a detached holder process, so it stays pasteable
+    /// after mouse-rs exits. Does nothing unless a holder is set, we still own the
+    /// selection, and every file is still on disk.
+    pub fn handoff() {
+        let Some((program, args)) = HOLDER.get() else { return };
+        let held = match HELD.lock() {
+            Ok(mut g) => g.take(),
+            Err(_) => return,
+        };
+        let Some(held) = held else { return };
+        if held.paths.is_empty() || !held.paths.iter().all(|p| p.exists()) {
+            tracing::info!("not handing the clipboard files on: some are no longer on disk");
+            return;
+        }
+        let Some(x) = open() else { return };
+        let owner = x
+            .conn
+            .get_selection_owner(x.clipboard)
+            .ok()
+            .and_then(|c| c.reply().ok())
+            .map(|r| r.owner);
+        if owner != Some(held.window) {
+            // Someone else copied after us; their selection is theirs to keep.
+            return;
+        }
+        let spawned = Command::new(program)
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+        match spawned {
+            Ok(mut child) => {
+                if let Some(mut stdin) = child.stdin.take() {
+                    let _ = stdin.write_all(&encode_payload(held.verb, &held.paths));
+                    // Dropping stdin closes it, which is how the holder knows the list is all in.
+                }
+                // Reaped in the background so it does not linger as a zombie while we run.
+                std::thread::spawn(move || {
+                    let _ = child.wait();
+                });
+                tracing::info!(files = held.paths.len(), "handed the file clipboard to a holder, so it survives exit");
+            }
+            Err(e) => tracing::warn!("could not start a clipboard holder: {e}"),
+        }
+    }
+
+    /// The holder's input: the paste verb on the first line, then the paths separated by
+    /// NUL. A NUL cannot occur in a path, so nothing needs escaping.
+    fn encode_payload(verb: &str, paths: &[PathBuf]) -> Vec<u8> {
+        let mut out = verb.as_bytes().to_vec();
+        out.push(b'\n');
+        for (i, p) in paths.iter().enumerate() {
+            if i > 0 {
+                out.push(0);
+            }
+            out.extend_from_slice(p.as_os_str().as_bytes());
+        }
+        out
+    }
+
+    /// The holder process: serve the listed files until another copy takes the selection.
+    /// Returns then, so an abandoned holder never outlives the copy that replaced it.
+    pub fn hold_from_payload(payload: &[u8]) {
+        let (verb_bytes, rest) = match payload.iter().position(|b| *b == b'\n') {
+            Some(i) => (&payload[..i], &payload[i + 1..]),
+            None => return,
+        };
+        // Only the two verbs we ever publish; anything else is served as a copy.
+        let verb = if verb_bytes == b"cut" { "cut" } else { "copy" };
+        let paths: Vec<PathBuf> = rest
+            .split(|b| *b == 0)
+            .filter(|s| !s.is_empty())
+            .map(|s| PathBuf::from(std::ffi::OsStr::from_bytes(s)))
+            .collect();
+        if paths.is_empty() {
+            return;
+        }
+        let (uri_list, gnome) = bodies(&paths, verb);
+        // id 0 is never recorded, so the holder keeps no `HELD` record of its own.
+        serve_selection(0, uri_list, gnome, None, Vec::new(), None, paths);
     }
 
     /// Own the selection until someone else takes it. Returns when we lose ownership,
     /// which is exactly when the user copies something else — including via our own
     /// text/image path.
     fn serve_selection(
+        id: u64,
         uri_list: String,
         gnome: String,
         png: Option<Vec<u8>>,
@@ -520,6 +663,7 @@ mod imp {
             return;
         }
         let _ = x.conn.flush();
+        record_window(id, x.window);
         tracing::info!(
             targets = FILE_TARGETS.len(),
             // The verb the file manager acts on. `cut` should make it relocate our hard
@@ -718,6 +862,30 @@ pub fn publish(list: &FileList, how: Publish) -> bool {
     imp::publish(list, how)
 }
 
+/// Name the program and arguments that start a clipboard holder. The application calls
+/// this once at startup; the holder is the same binary run with a hidden subcommand that
+/// calls [`hold_from_payload`].
+#[allow(unused_variables)]
+pub fn set_holder(program: std::path::PathBuf, args: Vec<String>) {
+    #[cfg(all(unix, not(target_os = "macos")))]
+    imp::set_holder(program, args);
+}
+
+/// Called as the clipboard shuts down. On X11, where a selection dies with its owner,
+/// the file list we are serving is handed to a holder process so it stays pasteable.
+/// Windows keeps the clipboard itself, so there is nothing to do there.
+pub fn handoff_on_exit() {
+    #[cfg(all(unix, not(target_os = "macos")))]
+    imp::handoff();
+}
+
+/// The holder process: serve the file list in `payload` until another copy replaces it.
+#[allow(unused_variables)]
+pub fn hold_from_payload(payload: &[u8]) {
+    #[cfg(all(unix, not(target_os = "macos")))]
+    imp::hold_from_payload(payload);
+}
+
 /// Put an image on the clipboard **and** the same content as a file, so one copy can be
 /// pasted into a browser or a chat window *and* into a file manager.
 ///
@@ -858,6 +1026,40 @@ mod paste_trigger_tests {
             !sig.wanted.load(Ordering::SeqCst),
             "asking for content we already hold must not start a transfer"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(all(test, unix, not(target_os = "macos")))]
+mod handoff_tests {
+    use super::*;
+
+    /// Needs a live X display, so it is ignored by default. Run it with
+    /// `cargo test -p mouse-clipboard handoff -- --ignored`.
+    ///
+    /// Publishes a file, then hands it off to a stand-in holder (`sh`) that writes the
+    /// payload it receives to a file. The payload must name the verb and the file.
+    #[test]
+    #[ignore]
+    fn a_file_list_is_handed_to_the_holder_while_we_still_own_the_selection() {
+        let dir = std::env::temp_dir().join(format!("mouse-handoff-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("held.txt");
+        std::fs::write(&file, b"x").unwrap();
+        let out = dir.join("payload");
+        set_holder(
+            PathBuf::from("/bin/sh"),
+            vec!["-c".into(), format!("cat > '{}'", out.display())],
+        );
+
+        assert!(publish(&FileList { paths: vec![file.clone()] }, Publish::default()));
+        // Give the owner thread time to take the selection and record its window.
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        handoff_on_exit();
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        let got = std::fs::read(&out).expect("the holder should have written the payload");
+        assert_eq!(got, format!("copy\n{}", file.display()).into_bytes());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

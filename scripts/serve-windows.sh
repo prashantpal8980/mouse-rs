@@ -69,6 +69,9 @@ ln -sfn "$REPO_ROOT/docs/windows-test-prompt.md"   "$SERVE_DIR/setup.md"
 ln -sfn "$REPO_ROOT/docs/windows-leak-hunt-prompt.md" "$SERVE_DIR/leak-hunt.md"
 ln -sfn "$REPO_ROOT/docs/windows-paired-test-prompt.md" "$SERVE_DIR/paired.md"
 ln -sfn "$REPO_ROOT/docs/windows-update-prompt.md" "$SERVE_DIR/update.md"
+# The installer the standing prompt runs. It reads the expected size and hash from
+# CHECKSUM.txt, so it never needs rewriting when the build changes.
+ln -sfn "$REPO_ROOT/scripts/windows-update.ps1" "$SERVE_DIR/update.ps1"
 ln -sfn "$REPO_ROOT/docs/windows-clipboard-prompt.md" "$SERVE_DIR/clipboard.md"
 printf 'mouse-rs.exe  %s bytes\nSHA256  %s\n' "$SIZE" "$SHA" > "$SERVE_DIR/CHECKSUM.txt"
 
@@ -92,8 +95,9 @@ if curl -sf -o /dev/null "http://$BIND_ADDR:$PORT/retest.md"; then
 
 ==> serving on http://$BIND_ADDR:$PORT/  (cable only)
 
-    http://$BIND_ADDR:$PORT/clipboard.md   install + check the clipboard build  <-- current
-    http://$BIND_ADDR:$PORT/update.md      install the current build  (standing prompt)
+    http://$BIND_ADDR:$PORT/update.md      install the current build  (standing prompt, <-- current)
+    http://$BIND_ADDR:$PORT/update.ps1     the installer that prompt runs
+    http://$BIND_ADDR:$PORT/clipboard.md   the clipboard test prompt (older)
     http://$BIND_ADDR:$PORT/paired.md      paired foreground/background test
     http://$BIND_ADDR:$PORT/leak-hunt.md   the keyboard-leak hunt
     http://$BIND_ADDR:$PORT/retest.md      focused retest of the six fixes

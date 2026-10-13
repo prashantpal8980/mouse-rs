@@ -58,6 +58,9 @@ fn default_listen_host() -> String {
 fn default_port() -> u16 {
     24800
 }
+fn default_discovery_port() -> u16 {
+    crate::beacon::DEFAULT_DISCOVERY_PORT
+}
 fn default_lock_hotkey() -> String {
     "scroll_lock".into()
 }
@@ -339,6 +342,15 @@ pub struct Config {
     pub server_host: String,
     #[serde(default = "default_port")]
     pub server_port: u16,
+    /// UDP port for the discovery beacons (see `beacon`). The server sends on it and the
+    /// client listens on it, so each finds the other on whatever network they share. 0
+    /// turns discovery off, and the client then uses only `server_host`.
+    #[serde(default = "default_discovery_port")]
+    pub discovery_port: u16,
+    /// Runtime only, never saved: set by the login-screen instance, and sent in the
+    /// handshake so the other machine knows this one is at a password prompt.
+    #[serde(skip)]
+    pub at_login_screen: bool,
     /// Client only: automatically reconnect (with backoff) after a recoverable
     /// disconnect, and keep retrying when the server isn't up yet. Default on.
     #[serde(default = "default_true")]
@@ -412,6 +424,8 @@ impl Default for Config {
             // wrong answer. Empty is honest, and the panel offers Detect.
             server_host: String::new(),
             server_port: default_port(),
+            discovery_port: default_discovery_port(),
+            at_login_screen: false,
             reconnect: true,
             autoconnect: false,
             start_minimized: false,

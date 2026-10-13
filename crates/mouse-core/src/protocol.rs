@@ -95,6 +95,10 @@ pub enum Message {
         /// exactly `Lane::Input`.
         #[serde(default)]
         lane: Lane,
+        /// The sender is the login-screen instance: its machine is at a password prompt.
+        /// Absent from an older peer, which never runs at a login screen.
+        #[serde(default)]
+        login_screen: bool,
     },
     AuthChallenge {
         nonce: String, // hex-encoded
@@ -271,6 +275,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_hello_from_an_older_peer_is_not_at_a_login_screen() {
+        // Built before the field existed, so it never sends it: take a current Hello and
+        // remove the field, exactly as an older peer's would look.
+        let hello = Message::Hello {
+            name: "old".into(),
+            width: 1,
+            height: 1,
+            version: PROTOCOL_VERSION,
+            lane: Lane::Input,
+            login_screen: true,
+        };
+        let mut value = serde_json::to_value(&hello).unwrap();
+        assert!(value.as_object_mut().unwrap().remove("login_screen").is_some());
+        match serde_json::from_value::<Message>(value) {
+            Ok(Message::Hello { login_screen, .. }) => assert!(!login_screen),
+            other => panic!("expected a Hello, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn roundtrip_each_variant() {
         let msgs = vec![
             Message::Hello {
@@ -279,6 +303,7 @@ mod tests {
                 height: 1440,
                 version: PROTOCOL_VERSION,
                 lane: Lane::Bulk,
+                login_screen: true,
             },
             Message::AuthChallenge { nonce: "ab".into() },
             Message::MouseMove { dx: 3, dy: -7 },

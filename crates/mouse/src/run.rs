@@ -202,7 +202,13 @@ pub fn run_blocking_in(
             let cfg_bulk_client = cfg.clone();
             let c1 = cancel.clone();
             let c2 = cancel.clone();
-            let bulk_channels = bulk_wiring.channels.take();
+            // No file lane at the login screen: it only ever carries input, and the lane
+            // reconnecting every second was noise in both machines' logs.
+            let bulk_channels = if session == Session::Greeter {
+                None
+            } else {
+                bulk_wiring.channels.take()
+            };
             let health_link = health.clone();
             runtime.block_on(async move {
                 if install_ctrl_c {

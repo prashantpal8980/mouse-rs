@@ -145,15 +145,28 @@ pub async fn run_server_engine(
                         suppress.set(false);
                         return;
                     }
-                    Some(LinkEvent::Connected { width, height, peer }) => {
+                    Some(LinkEvent::Connected { width, height, peer, login_screen }) => {
                         connected = true;
                         peer_dims = Some((width, height));
                         cross_armed = false;
                         state = State::Local;
                         suppress.set(false);
-                        set_clipboard_connected(&clipboard, true);
-                        set_status_connected(&status, &peer, width, height);
-                        tracing::info!("peer '{peer}' connected: {width}x{height}");
+                        // Nothing from this machine's clipboard goes to a login screen:
+                        // nobody is logged in there to have asked for it.
+                        set_clipboard_connected(&clipboard, !login_screen);
+                        if login_screen {
+                            let label = format!("{peer} (login screen)");
+                            set_status_connected(&status, &label, width, height, true);
+                            tracing::info!(
+                                "peer '{peer}' is at its LOGIN SCREEN ({width}x{height}): move the pointer \
+                                 off the {exit_edge:?} edge of this screen to type the password there. \
+                                 Move it a little inward first if it is resting on that edge. \
+                                 The clipboard is not shared until someone logs in"
+                            );
+                        } else {
+                            set_status_connected(&status, &peer, width, height, false);
+                            tracing::info!("peer '{peer}' connected: {width}x{height}");
+                        }
                     }
                     Some(LinkEvent::Disconnected(reason)) => {
                         // Keep running: the link re-accepts the next client.
@@ -286,7 +299,7 @@ mod tests {
         // (the two are on different channels; select! order isn't guaranteed).
         chans
             .events
-            .send(LinkEvent::Connected { peer: "c".into(), width: 1920, height: 1080 })
+            .send(LinkEvent::Connected { peer: "c".into(), width: 1920, height: 1080, login_screen: false })
             .unwrap();
         tokio::time::sleep(Duration::from_millis(15)).await;
 
@@ -344,7 +357,7 @@ mod tests {
 
         chans
             .events
-            .send(LinkEvent::Connected { peer: "c".into(), width: 1920, height: 1080 })
+            .send(LinkEvent::Connected { peer: "c".into(), width: 1920, height: 1080, login_screen: false })
             .unwrap();
         tokio::time::sleep(Duration::from_millis(15)).await;
         cap_tx.send(CaptureSignal::Cursor { x: 800, y: 540 }).unwrap();
@@ -439,7 +452,7 @@ mod tests {
 
         chans
             .events
-            .send(LinkEvent::Connected { peer: "c".into(), width: 1920, height: 1080 })
+            .send(LinkEvent::Connected { peer: "c".into(), width: 1920, height: 1080, login_screen: false })
             .unwrap();
         tokio::time::sleep(Duration::from_millis(15)).await;
 
@@ -486,7 +499,7 @@ mod tests {
         // First client connects, crosses, then drops.
         chans
             .events
-            .send(LinkEvent::Connected { peer: "a".into(), width: 1920, height: 1080 })
+            .send(LinkEvent::Connected { peer: "a".into(), width: 1920, height: 1080, login_screen: false })
             .unwrap();
         tokio::time::sleep(Duration::from_millis(15)).await;
         cap_tx.send(CaptureSignal::Cursor { x: 800, y: 540 }).unwrap();
@@ -506,7 +519,7 @@ mod tests {
         // Second client connects — engine is still alive and must work.
         chans
             .events
-            .send(LinkEvent::Connected { peer: "b".into(), width: 1280, height: 720 })
+            .send(LinkEvent::Connected { peer: "b".into(), width: 1280, height: 720, login_screen: false })
             .unwrap();
         tokio::time::sleep(Duration::from_millis(15)).await;
         cap_tx.send(CaptureSignal::Cursor { x: 800, y: 360 }).unwrap();

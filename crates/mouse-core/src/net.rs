@@ -22,7 +22,9 @@ use futures::stream::SplitSink;
 use futures::{SinkExt, StreamExt};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
+use futures::stream::FuturesUnordered;
+use crate::{beacon, discover};
 use tokio::time::{interval, timeout, Instant, MissedTickBehavior};
 use tokio_rustls::client::TlsStream as ClientTlsStream;
 use tokio_rustls::server::TlsStream as ServerTlsStream;
@@ -68,7 +70,9 @@ impl Default for LinkParams {
 pub enum LinkEvent {
     Listening(SocketAddr),
     Connecting(String),
-    Connected { peer: String, width: i32, height: i32 },
+    /// `login_screen`: the peer is the login-screen instance, so its machine is at a
+    /// password prompt and should get input only.
+    Connected { peer: String, width: i32, height: i32, login_screen: bool },
     AuthFailed(String),
     Disconnected(DisconnectReason),
     Error(String),
@@ -87,6 +91,11 @@ pub enum DisconnectReason {
     ProtocolError(String),
     /// Underlying socket/TLS I/O error.
     Io(String),
+    /// This machine's network changed (a cable, Wi-Fi, a new address). The session is
+    /// dropped on purpose so the client reconnects over whichever path is now best.
+    NetworkChanged,
+    /// The server accepted a newer connection from the same peer and replaced this one.
+    Superseded,
 }
 
 impl DisconnectReason {
@@ -94,7 +103,10 @@ impl DisconnectReason {
     pub fn is_recoverable(&self) -> bool {
         matches!(
             self,
-            DisconnectReason::PeerClosed | DisconnectReason::TimedOut | DisconnectReason::Io(_)
+            DisconnectReason::PeerClosed
+                | DisconnectReason::TimedOut
+                | DisconnectReason::Io(_)
+                | DisconnectReason::NetworkChanged
         )
     }
 }
@@ -220,6 +232,14 @@ pub async fn run_server(
     if let Ok(addr) = listener.local_addr() {
         let _ = link_events.send(LinkEvent::Listening(addr));
     }
+    // Tell any client on any network we are attached to where to find us. Stops with `cancel`.
+    tokio::spawn(beacon::run_sender(
+        cfg.shared_secret.clone(),
+        cfg.name.clone(),
+        cfg.listen_port,
+        cfg.discovery_port,
+        cancel.child_token(),
+    ));
 
     let acceptor = if cfg.tls_enabled {
         match tls::server_acceptor() {
@@ -243,6 +263,8 @@ pub async fn run_server(
     // "an input session is live".
     let mut ch_slot: Option<LinkChannels> = Some(ch);
     let mut session: Option<tokio::task::JoinHandle<(LinkChannels, DisconnectReason)>> = None;
+    // Cancels the live session on its own, so a newer connection can replace it.
+    let mut session_cancel: Option<CancellationToken> = None;
     let events = link_events.clone();
 
     loop {
@@ -281,6 +303,7 @@ pub async fn run_server(
                         continue;
                     }
                 };
+                let local_addr = tcp.local_addr().ok();
                 enable_keepalive(&tcp);
 
                 // Wrap in TLS if enabled.
@@ -308,7 +331,7 @@ pub async fn run_server(
                     _ = cancel.cancelled() => break,
                     r = timeout(params.handshake_timeout, server_handshake(&mut framed, &cfg)) => r,
                 };
-                let (peer_name, peer_w, peer_h, lane) = match shook {
+                let (peer_name, peer_w, peer_h, lane, peer_login_screen) = match shook {
                     Ok(Ok(v)) => v,
                     Ok(Err(reason)) => {
                         let _ = events.send(LinkEvent::AuthFailed(reason));
@@ -328,6 +351,20 @@ pub async fn run_server(
                         bulk.take_server_connection(framed, &cancel);
                     }
                     Lane::Input => {
+                        // A new input connection that has passed the handshake is from the same
+                        // trusted peer, now on a newer path. It replaces a session still open on
+                        // the old one, rather than being refused until that session times out.
+                        if session.is_some() {
+                            if let Some(old) = session_cancel.take() {
+                                old.cancel();
+                            }
+                            if let Some(h) = session.take() {
+                                if let Ok((returned, _reason)) = h.await {
+                                    let _ = returned.events.send(LinkEvent::Disconnected(DisconnectReason::Superseded));
+                                    ch_slot = Some(returned);
+                                }
+                            }
+                        }
                         let Some(mut owned) = ch_slot.take() else {
                             // One input client at a time. Refusing immediately is kinder
                             // than accepting into a queue the peer will time out on; it
@@ -339,16 +376,23 @@ pub async fn run_server(
                             );
                             continue;
                         };
+                        tracing::info!(
+                            peer = %peer_name,
+                            "input link from {peer_addr} arrived through {}",
+                            local_path(local_addr)
+                        );
                         let _ = owned.events.send(LinkEvent::Connecting(peer_addr.to_string()));
                         let _ = owned.events.send(LinkEvent::Connected {
                             peer: peer_name,
                             width: peer_w,
                             height: peer_h,
+                            login_screen: peer_login_screen,
                         });
-                        let c = cancel.clone();
+                        let c = cancel.child_token();
+                        session_cancel = Some(c.clone());
                         let h = health.clone();
                         session = Some(tokio::spawn(async move {
-                            let reason = pump(framed, params, &c, &mut owned, &h).await;
+                            let reason = pump(framed, params, &c, &mut owned, &h, None).await;
                             (owned, reason)
                         }));
                     }
@@ -385,10 +429,21 @@ enum AttemptOutcome {
     },
 }
 
-/// Run the client side. Connects, handshakes, and pumps; when `cfg.reconnect` is
-/// set it keeps retrying with exponential backoff after any recoverable drop —
-/// including before the server is up — until `cancel` fires. The engine resets its
-/// crossing state on every `Connected`, so reusing this link across reconnects is safe.
+/// Run the client side. Finds the server and connects, then (when enabled) reconnects after
+/// any recoverable drop until `cancel` fires.
+///
+/// Where to connect is not fixed. Each attempt tries every address that might lead to the
+/// server at once, and keeps the first that answers:
+///   1. the address that worked last time (forgotten when the network changes),
+///   2. the configured `server_host`, if set,
+///   3. every address the server has beaconed on any network it is on, heard recently.
+///
+/// So the same setup works over Ethernet, Wi-Fi, a shared router or a phone hotspot, and a
+/// change of network is followed without editing anything.
+///
+/// The client also watches its own network. When that changes it drops a live session at once
+/// and reconnects straight away, rather than retrying a dead path until a timeout. With no
+/// network at all it reports that, instead of reporting that the server was not found.
 pub async fn run_client(
     cfg: Config,
     params: LinkParams,
@@ -396,21 +451,76 @@ pub async fn run_client(
     mut ch: LinkChannels,
     health: Arc<LinkHealth>,
 ) {
+    let found = beacon::Found::new();
+    let (epoch_tx, epoch_rx) = watch::channel(0u64);
+    tokio::spawn(beacon::run_listener(
+        cfg.shared_secret.clone(),
+        cfg.discovery_port,
+        found.clone(),
+        cancel.child_token(),
+    ));
+    tokio::spawn(beacon::watch_network(epoch_tx, cancel.child_token()));
+
     let mut backoff = params.reconnect_initial;
     // Whether we've already told the UI we're down, so repeated failed retries
     // while the server stays offline don't spam Disconnected every backoff tick.
     let mut announced_down = false;
+    let mut last_good: Option<SocketAddr> = None;
 
     loop {
         if cancel.is_cancelled() {
             return;
         }
 
-        match connect_once(&cfg, params, &cancel, &mut ch, &health).await {
+        let no_network = discover::local_ipv4s().is_empty();
+        let mut targets: Vec<SocketAddr> = last_good.into_iter().collect();
+        if !cfg.server_host.trim().is_empty() {
+            let host = format!("{}:{}", cfg.server_host.trim(), cfg.server_port);
+            if let Ok(addrs) = tokio::net::lookup_host(host).await {
+                for a in addrs {
+                    if !targets.contains(&a) {
+                        targets.push(a);
+                    }
+                }
+            }
+        }
+        for a in found.candidates(std::time::Instant::now()) {
+            if !targets.contains(&a) {
+                targets.push(a);
+            }
+        }
+
+        let outcome = connect_once(
+            &targets,
+            &cfg,
+            params,
+            &cancel,
+            &mut ch,
+            &health,
+            Some(epoch_rx.clone()),
+            &mut last_good,
+        )
+        .await;
+
+        match outcome {
             AttemptOutcome::Cancelled | AttemptOutcome::Fatal => return,
             AttemptOutcome::Lost { was_connected, reason } => {
+                // With no network at all, a failed attempt is a fact about this machine, not
+                // about the server, so say so.
+                let reason = if no_network && !was_connected {
+                    DisconnectReason::Io("no network connection".into())
+                } else {
+                    reason
+                };
                 let recoverable = reason.is_recoverable();
-                if was_connected {
+                if matches!(reason, DisconnectReason::NetworkChanged) {
+                    // The path we had is gone or no longer best. Forget it, so the next race
+                    // decides afresh, and reconnect at once.
+                    last_good = None;
+                    backoff = params.reconnect_initial;
+                    let _ = ch.events.send(LinkEvent::Disconnected(reason.clone()));
+                    announced_down = true;
+                } else if was_connected {
                     // A live session ended: always surface it, and treat the next
                     // retry as a fresh start (fast backoff, re-announce if it fails).
                     let _ = ch.events.send(LinkEvent::Disconnected(reason));
@@ -428,48 +538,61 @@ pub async fn run_client(
             }
         }
 
-        // Backoff before the next attempt, but wake instantly on cancel.
+        // Wait before the next attempt. Wake on cancel, or at once if the network changes. With no
+        // network, poll at a steady rate instead of backing off.
+        let wait = if no_network { NO_NETWORK_POLL } else { backoff };
+        let mut epoch = epoch_rx.clone();
         tokio::select! {
             _ = cancel.cancelled() => return,
-            _ = tokio::time::sleep(backoff) => {}
+            _ = epoch.changed() => { backoff = params.reconnect_initial; }
+            _ = tokio::time::sleep(wait) => {}
         }
-        backoff = (backoff * 2).min(params.reconnect_max);
+        if !no_network {
+            backoff = (backoff * 2).min(params.reconnect_max);
+        }
     }
 }
 
 /// One client connection attempt: connect → TLS → handshake → pump. Emits the
 /// progress events (Connecting/Connected, plus AuthFailed/Error for terminal
 /// failures); the caller decides whether to retry and emits the final Disconnected.
+#[allow(clippy::too_many_arguments)] // the attempt needs all of these; a struct would only rename them
 async fn connect_once(
+    targets: &[SocketAddr],
     cfg: &Config,
     params: LinkParams,
     cancel: &CancellationToken,
     ch: &mut LinkChannels,
     health: &Arc<LinkHealth>,
+    net: Option<watch::Receiver<u64>>,
+    last_good: &mut Option<SocketAddr>,
 ) -> AttemptOutcome {
-    let addr = format!("{}:{}", cfg.server_host, cfg.server_port);
-    let _ = ch.events.send(LinkEvent::Connecting(addr.clone()));
+    if targets.is_empty() {
+        return AttemptOutcome::Lost {
+            was_connected: false,
+            reason: DisconnectReason::Io("no server address known yet".into()),
+        };
+    }
+    let listing = targets.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(", ");
+    let _ = ch.events.send(LinkEvent::Connecting(listing.clone()));
 
-    let tcp = tokio::select! {
+    let raced = tokio::select! {
         _ = cancel.cancelled() => return AttemptOutcome::Cancelled,
-        r = timeout(params.handshake_timeout, TcpStream::connect(&addr)) => r,
+        r = race_connect(targets, CONNECT_TRY) => r,
     };
-    let tcp = match tcp {
-        Ok(Ok(s)) => s,
-        // Connection refused/unreachable: recoverable — the server may not be up yet.
-        Ok(Err(e)) => {
-            return AttemptOutcome::Lost {
-                was_connected: false,
-                reason: DisconnectReason::Io(format!("connect {addr}: {e}")),
-            }
-        }
-        Err(_) => {
-            return AttemptOutcome::Lost {
-                was_connected: false,
-                reason: DisconnectReason::TimedOut,
-            }
-        }
+    // Connection refused or unreachable on every candidate: recoverable, the server may not
+    // be up yet, or may be on a network this machine is not on at the moment.
+    let Some((addr, tcp)) = raced else {
+        return AttemptOutcome::Lost {
+            was_connected: false,
+            reason: DisconnectReason::Io(format!("no server answered at {listing}")),
+        };
     };
+    *last_good = Some(addr);
+    tracing::info!(
+        "link to {addr} goes out through {} (candidates tried: {listing})",
+        local_path(tcp.local_addr().ok())
+    );
     enable_keepalive(&tcp);
 
     let stream = if cfg.tls_enabled {
@@ -528,8 +651,9 @@ async fn connect_once(
         peer: server_name,
         width: server_w,
         height: server_h,
+        login_screen: false,
     });
-    let reason = pump(framed, params, cancel, ch, health).await;
+    let reason = pump(framed, params, cancel, ch, health, net).await;
     match reason {
         DisconnectReason::Cancelled => AttemptOutcome::Cancelled,
         reason => AttemptOutcome::Lost {
@@ -601,8 +725,8 @@ pub async fn run_bulk_listener(
             // The same shared secret guards this port as the input one; a connection
             // that authenticates but asks for the input lane is refused here, because
             // input has exactly one home and it is not this listener.
-            Ok(Ok((_, _, _, Lane::Bulk))) => bulk.take_server_connection(framed, &cancel),
-            Ok(Ok((name, _, _, Lane::Input))) => {
+            Ok(Ok((_, _, _, Lane::Bulk, _))) => bulk.take_server_connection(framed, &cancel),
+            Ok(Ok((name, _, _, Lane::Input, _))) => {
                 tracing::warn!(peer = %name, "input connection offered to the bulk port; refused")
             }
             Ok(Err(reason)) => tracing::warn!("bulk handshake rejected: {reason}"),
@@ -666,10 +790,12 @@ pub async fn connect_and_handshake(
 async fn server_handshake(
     framed: &mut Framed<LinkStream, MessageCodec>,
     cfg: &Config,
-) -> Result<(String, i32, i32, Lane), String> {
+) -> Result<(String, i32, i32, Lane, bool), String> {
     let hello = framed.next().await;
-    let (name, width, height, lane) = match hello {
-        Some(Ok(Message::Hello { name, width, height, lane, .. })) => (name, width, height, lane),
+    let (name, width, height, lane, login_screen) = match hello {
+        Some(Ok(Message::Hello { name, width, height, lane, login_screen, .. })) => {
+            (name, width, height, lane, login_screen)
+        }
         Some(Ok(other)) => return Err(format!("expected hello, got {other:?}")),
         Some(Err(e)) => return Err(format!("hello decode: {e}")),
         None => return Err("peer closed before hello".into()),
@@ -713,7 +839,7 @@ async fn server_handshake(
         .await
         .map_err(|e| format!("send auth ok: {e}"))?;
 
-    Ok((name, width, height, lane))
+    Ok((name, width, height, lane, login_screen))
 }
 
 async fn client_handshake(
@@ -728,6 +854,7 @@ async fn client_handshake(
             height: cfg.screen_height,
             version: PROTOCOL_VERSION,
             lane,
+            login_screen: cfg.at_login_screen,
         })
         .await
         .map_err(|e| format!("send hello: {e}"))?;
@@ -765,14 +892,69 @@ async fn client_handshake(
 // The pump: the steady-state loop. Heartbeat + liveness + cancellation.
 // ----------------------------------------------------------------------------
 
+/// Resolves when the network watch reports a change. Pends forever when there is no watch.
+/// Which of this machine's interfaces a connection uses, e.g. `eth0 (192.168.137.2)`, so a
+/// log shows whether the link went over the cable or Wi-Fi after a network change.
+fn local_path(local: Option<SocketAddr>) -> String {
+    let Some(local) = local else {
+        return "an unknown interface".into();
+    };
+    let iface = discover::local_ipv4s()
+        .into_iter()
+        .find(|a| std::net::IpAddr::V4(a.ip) == local.ip())
+        .map(|a| a.iface);
+    match iface {
+        Some(name) => format!("{name} ({})", local.ip()),
+        None => local.ip().to_string(),
+    }
+}
+
+async fn network_moved(net: &mut Option<watch::Receiver<u64>>) {
+    match net {
+        Some(r) => {
+            if r.changed().await.is_err() {
+                std::future::pending::<()>().await;
+            }
+        }
+        None => std::future::pending::<()>().await,
+    }
+}
+
+/// How long one candidate address gets to accept the TCP connection.
+const CONNECT_TRY: Duration = Duration::from_secs(3);
+
+/// How often a client with no network re-checks for one.
+const NO_NETWORK_POLL: Duration = Duration::from_secs(2);
+
+/// Connect to every candidate at once and keep the first that accepts. Racing, rather than
+/// trying in turn, means a dead address costs nothing. It also picks the faster path: when the
+/// server is reachable over both Ethernet and Wi-Fi, the one that answers first has less delay.
+async fn race_connect(targets: &[SocketAddr], per: Duration) -> Option<(SocketAddr, TcpStream)> {
+    let mut attempts: FuturesUnordered<_> = targets
+        .iter()
+        .map(|a| async move { (*a, timeout(per, TcpStream::connect(a)).await) })
+        .collect();
+    while let Some((addr, result)) = attempts.next().await {
+        if let Ok(Ok(stream)) = result {
+            return Some((addr, stream));
+        }
+    }
+    None
+}
+
 async fn pump(
     framed: Framed<LinkStream, MessageCodec>,
     params: LinkParams,
     cancel: &CancellationToken,
     ch: &mut LinkChannels,
     health: &Arc<LinkHealth>,
+    mut net: Option<watch::Receiver<u64>>,
 ) -> DisconnectReason {
     let (mut sink, mut stream) = framed.split();
+    // Only changes from here on count. The network was already settled when we connected.
+    if let Some(r) = net.as_mut() {
+        r.borrow_and_update();
+    }
 
     let mut hb = interval(params.heartbeat_interval);
     hb.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -786,6 +968,10 @@ async fn pump(
         tokio::select! {
             // Local Stop/Reload: return immediately, no blocking.
             _ = cancel.cancelled() => return DisconnectReason::Cancelled,
+
+            // This machine's network moved under the session. Drop it now, so the connect loop
+            // can take the best path, rather than waiting out a dead one for the liveness timeout.
+            _ = network_moved(&mut net) => return DisconnectReason::NetworkChanged,
 
             // Heartbeat tick: check liveness, then send a PING.
             _ = hb.tick() => {
@@ -992,6 +1178,7 @@ mod tests {
                 height: 1080,
                 version: PROTOCOL_VERSION,
                 lane: Lane::Input,
+                login_screen: false,
             })
             .await
             .unwrap();
@@ -1465,6 +1652,192 @@ mod tests {
             wait_for_connect(&mut c_events, Duration::from_secs(3)).await,
             "client connected once the server appeared"
         );
+
+        cancel.cancel();
+        let _ = timeout(Duration::from_secs(2), client).await;
+        let _ = timeout(Duration::from_secs(2), server).await;
+    }
+
+    #[tokio::test]
+    async fn the_race_takes_the_address_that_answers_and_ignores_a_dead_one() {
+        let dead = free_port().await; // nothing listens here, so the connect is refused
+        let live = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let live_addr = live.local_addr().unwrap();
+        let targets = [
+            SocketAddr::from(([127, 0, 0, 1], dead)),
+            live_addr,
+        ];
+        let got = race_connect(&targets, Duration::from_secs(2)).await;
+        assert_eq!(got.map(|(a, _)| a), Some(live_addr));
+    }
+
+    #[tokio::test]
+    async fn a_client_with_no_address_configured_finds_the_server_by_beacon() {
+        // The server is reached only through what it beacons. No address is configured on
+        // the client. Needs a real network interface to broadcast on, so it is skipped
+        // on a machine without one.
+        if crate::discover::local_ipv4s().is_empty() {
+            return;
+        }
+        let port = free_port().await;
+        let disc = free_port().await;
+        let cancel = CancellationToken::new();
+
+        let mut server_cfg = test_cfg(Role::Server, port, false);
+        server_cfg.listen_host = "0.0.0.0".into();
+        server_cfg.discovery_port = disc;
+        let (s_ch, _s_to, _s_from, mut s_events) = channels();
+        let server = tokio::spawn(run_server(
+            server_cfg,
+            fast_params(),
+            cancel.clone(),
+            s_ch,
+            BulkServer::disabled(),
+            LinkHealth::new(),
+        ));
+
+        let mut client_cfg = test_cfg(Role::Client, port, false);
+        client_cfg.server_host = String::new();
+        client_cfg.discovery_port = disc;
+        let (c_ch, _c_to, _c_from, mut c_events) = channels();
+        let client = tokio::spawn(run_client(
+            client_cfg,
+            fast_params(),
+            cancel.clone(),
+            c_ch,
+            LinkHealth::new(),
+        ));
+
+        assert!(
+            wait_for_connect(&mut c_events, Duration::from_secs(10)).await,
+            "the client found the server without being given an address"
+        );
+        assert!(wait_connected(&mut s_events).await, "the server sees the client");
+
+        cancel.cancel();
+        let _ = timeout(Duration::from_secs(2), client).await;
+        let _ = timeout(Duration::from_secs(2), server).await;
+    }
+
+    #[tokio::test]
+    async fn a_newer_connection_from_the_same_peer_replaces_a_stale_session() {
+        let port = free_port().await;
+        let cancel = CancellationToken::new();
+
+        let mut server_cfg = test_cfg(Role::Server, port, false);
+        server_cfg.discovery_port = 0;
+        let (s_ch, _s_to, _s_from, mut s_events) = channels();
+        let server = tokio::spawn(run_server(
+            server_cfg,
+            fast_params(),
+            cancel.clone(),
+            s_ch,
+            BulkServer::disabled(),
+            LinkHealth::new(),
+        ));
+
+        // The first client never reconnects, so it cannot supersede the second in turn.
+        let old_cancel = CancellationToken::new();
+        let mut old_cfg = test_cfg(Role::Client, port, false);
+        old_cfg.reconnect = false;
+        let (o_ch, _o_to, _o_from, mut o_events) = channels();
+        let old_client = tokio::spawn(run_client(
+            old_cfg,
+            fast_params(),
+            old_cancel.clone(),
+            o_ch,
+            LinkHealth::new(),
+        ));
+        assert!(wait_for_connect(&mut o_events, Duration::from_secs(3)).await);
+        assert!(wait_connected(&mut s_events).await, "the server holds the first session");
+
+        // A second client arrives while that session is still live.
+        let (n_ch, _n_to, _n_from, mut n_events) = channels();
+        let new_client = tokio::spawn(run_client(
+            test_cfg(Role::Client, port, false),
+            fast_params(),
+            cancel.clone(),
+            n_ch,
+            LinkHealth::new(),
+        ));
+        assert!(
+            wait_for_connect(&mut n_events, Duration::from_secs(3)).await,
+            "the new connection is accepted instead of refused"
+        );
+
+        // The server reports that the old session was replaced.
+        let mut superseded = false;
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            match timeout(Duration::from_millis(200), s_events.recv()).await {
+                Ok(Some(LinkEvent::Disconnected(DisconnectReason::Superseded))) => {
+                    superseded = true;
+                    break;
+                }
+                Ok(Some(_)) => continue,
+                _ => {}
+            }
+        }
+        assert!(superseded, "the stale session was reported as superseded");
+
+        old_cancel.cancel();
+        cancel.cancel();
+        let _ = timeout(Duration::from_secs(2), old_client).await;
+        let _ = timeout(Duration::from_secs(2), new_client).await;
+        let _ = timeout(Duration::from_secs(2), server).await;
+    }
+
+    #[tokio::test]
+    async fn a_network_change_wakes_a_waiting_session() {
+        let (tx, rx) = watch::channel(0u64);
+        let mut net = Some(rx);
+        let waiter = tokio::spawn(async move { network_moved(&mut net).await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!waiter.is_finished(), "nothing changed, so nothing should wake");
+        tx.send_modify(|e| *e += 1);
+        assert!(
+            timeout(Duration::from_secs(1), waiter).await.is_ok(),
+            "a change on the network watch wakes the session"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_server_is_told_when_the_client_is_at_its_login_screen() {
+        let port = free_port().await;
+        let cancel = CancellationToken::new();
+        let mut server_cfg = test_cfg(Role::Server, port, false);
+        server_cfg.discovery_port = 0;
+        let (s_ch, _s_to, _s_from, mut s_events) = channels();
+        let server = tokio::spawn(run_server(
+            server_cfg,
+            fast_params(),
+            cancel.clone(),
+            s_ch,
+            BulkServer::disabled(),
+            LinkHealth::new(),
+        ));
+
+        let mut client_cfg = test_cfg(Role::Client, port, false);
+        client_cfg.at_login_screen = true;
+        let (c_ch, _c_to, _c_from, _c_events) = channels();
+        let client = tokio::spawn(run_client(
+            client_cfg,
+            fast_params(),
+            cancel.clone(),
+            c_ch,
+            LinkHealth::new(),
+        ));
+
+        let mut flagged = None;
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline && flagged.is_none() {
+            if let Ok(Some(LinkEvent::Connected { login_screen, .. })) =
+                timeout(Duration::from_millis(200), s_events.recv()).await
+            {
+                flagged = Some(login_screen);
+            }
+        }
+        assert_eq!(flagged, Some(true), "the server learns the peer is at its login screen");
 
         cancel.cancel();
         let _ = timeout(Duration::from_secs(2), client).await;

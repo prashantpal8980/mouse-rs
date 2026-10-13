@@ -36,6 +36,17 @@ pub fn file_waiting(count: usize) {
     send("mouse-rs", &body);
 }
 
+/// Tell the user the other machine is waiting at its login screen, and how to reach it.
+///
+/// Once per arrival. Without this, the only sign was a peer name in a closed panel, and
+/// the password got typed on a second keyboard instead.
+pub fn peer_at_login_screen(peer: &str) {
+    send(
+        "mouse-rs",
+        &format!("{peer} is at its login screen. Move the pointer across to it to type the password."),
+    );
+}
+
 #[cfg(all(unix, not(target_os = "macos")))]
 fn send(summary: &str, body: &str) {
     use std::process::{Command, Stdio};

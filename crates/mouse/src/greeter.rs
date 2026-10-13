@@ -125,6 +125,9 @@ pub fn load_config(path: &Path) -> anyhow::Result<Config> {
         cfg.role = Role::Client;
     }
     cfg.clipboard_sync = false;
+    // Told to the other machine in the handshake, so it can say this one is at a password
+    // prompt, and also keeps every key's identity out of the log.
+    cfg.at_login_screen = true;
     // Nothing is watching a log file at the login screen, and the upload is how the
     // owner sees what happened — leave whatever the config says about shipping alone.
     Ok(cfg)
@@ -138,11 +141,18 @@ pub fn run() -> anyhow::Result<()> {
     let path = config_path();
     let cfg = load_config(&path)?;
 
-    // Someone is already logged in — their instance owns the link. Nothing to do, and
-    // starting anyway would double every keystroke.
+    // Someone is already logged in — their instance owns the link, and serving now would
+    // double every keystroke. Wait here, quietly, until the login screen comes back.
+    //
+    // This used to return at once, so systemd restarted it every few seconds for the whole
+    // session: about 28,000 log lines a day, which rotated the one part worth reading — what
+    // happened at the login screen — out of the size-capped log within a day.
     if graphical_user_session_active() {
-        tracing::info!("a graphical session is already active; the login screen is not showing");
-        return Ok(());
+        tracing::info!("a graphical session is active; waiting for the login screen to return");
+        while graphical_user_session_active() {
+            std::thread::sleep(POLL);
+        }
+        tracing::info!("the session has ended; the login screen is back");
     }
 
     tracing::info!(
@@ -199,6 +209,33 @@ const UNIT_PATH: &str = "/etc/systemd/system/mouse-rs-greeter.service";
 /// at nothing, and the failure would show up as a login screen that quietly stopped
 /// working. So the binary is copied somewhere stable and the unit names that.
 const INSTALLED_EXE: &str = "/usr/local/bin/mouse-rs";
+
+/// Whether the service's own copy of the binary is this build. `None` when either file
+/// cannot be read.
+///
+/// The service runs a copy, not the build tree, so rebuilding mouse-rs does not change what
+/// runs at the login screen. A stale copy used to pass as "binary in place" while running
+/// code from before every later fix.
+pub fn installed_copy_is_current() -> Option<bool> {
+    let installed = std::fs::read(INSTALLED_EXE).ok()?;
+    let running = std::fs::read(std::env::current_exe().ok()?).ok()?;
+    Some(installed == running)
+}
+
+/// Log a warning when login-screen sharing is installed but runs an older build than this
+/// one, so the shipped log says so rather than the login screen silently lagging behind.
+pub fn warn_if_stale() {
+    if !Path::new(UNIT_PATH).is_file() {
+        return;
+    }
+    if installed_copy_is_current() == Some(false) {
+        let me = std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_else(|_| "mouse-rs".into());
+        tracing::warn!(
+            "login-screen sharing runs an OLDER build than this one ({INSTALLED_EXE}); \
+             fixes since then do not reach the login screen. Refresh it with: sudo {me} greeter-install"
+        );
+    }
+}
 
 /// Makes the kernel load `uinput` at boot, so the service never races the module.
 const MODULES_LOAD_PATH: &str = "/etc/modules-load.d/mouse-rs-uinput.conf";
@@ -328,10 +365,17 @@ pub fn install(source: Option<PathBuf>) -> anyhow::Result<()> {
     let running = std::env::current_exe()?;
     let exe = PathBuf::from(INSTALLED_EXE);
     if running != exe {
-        std::fs::copy(&running, &exe).map_err(|e| {
+        // Copy beside it and rename over it: writing into the installed file fails with
+        // "Text file busy" whenever the service happens to be running it, and a rename
+        // also means the service never starts a half-written binary.
+        let staged = exe.with_extension("new");
+        std::fs::copy(&running, &staged).map_err(|e| {
+            anyhow::anyhow!("cannot install the binary to {}: {e}", staged.display())
+        })?;
+        std::fs::set_permissions(&staged, std::os::unix::fs::PermissionsExt::from_mode(0o755))?;
+        std::fs::rename(&staged, &exe).map_err(|e| {
             anyhow::anyhow!("cannot install the binary to {}: {e}", exe.display())
         })?;
-        std::fs::set_permissions(&exe, std::os::unix::fs::PermissionsExt::from_mode(0o755))?;
     }
     std::fs::write(UNIT_PATH, unit_text(&exe))?;
 
@@ -556,6 +600,19 @@ pub fn status() -> anyhow::Result<()> {
               "installed but not enabled — run: sudo systemctl enable mouse-rs-greeter");
         check("binary in place", Path::new(INSTALLED_EXE).is_file(), &mut problems,
               &format!("{INSTALLED_EXE} is missing — re-run the install"));
+        // A warning, not a failure: an older copy still works at the login screen, it just
+        // lacks whatever was fixed since, so it must not flip the verdict below.
+        match installed_copy_is_current() {
+            Some(true) => println!("  ok    binary up to date"),
+            Some(false) => {
+                let me = std::env::current_exe()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|_| "mouse-rs".into());
+                println!("  old   binary is an older build than this one (works, without later fixes)");
+                println!("        refresh it with: sudo {me} greeter-install");
+            }
+            None => {}
+        }
         // Only root can see inside the settings directory, so an unprivileged run can
         // confirm the directory and no more. Saying FAIL here would be reporting our own
         // lack of permission as the service's fault.

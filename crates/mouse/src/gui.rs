@@ -240,6 +240,8 @@ struct App {
     /// How many waiting files the user has already been notified about, so a
     /// notification fires once per file rather than on every tick.
     notified_waiting: usize,
+    /// Whether the "peer is at its login screen" notice has gone out for this arrival.
+    notified_login_screen: bool,
     /// Per-entry transfer rate in bytes/sec, and the sample it was derived from.
     clip_rates: std::collections::HashMap<u64, u64>,
     clip_progress: std::collections::HashMap<u64, (std::time::Instant, u64)>,
@@ -396,6 +398,7 @@ impl App {
             // Spawn the tray here — boot runs on the UI thread, which Windows requires.
             tray: crate::tray::spawn("mouse-rs — stopped"),
             notified_waiting: 0,
+            notified_login_screen: false,
             clip_rates: std::collections::HashMap::new(),
             clip_progress: std::collections::HashMap::new(),
             autostart_on: crate::autostart::is_enabled(),
@@ -624,6 +627,20 @@ impl App {
                 } else if waiting < self.notified_waiting {
                     self.notified_waiting = waiting;
                 }
+                // Say so when the other machine is at its login screen. Input works there,
+                // but only once the pointer has been moved across to it.
+                let login_peer = self
+                    .engine
+                    .as_ref()
+                    .map(|e| e.status())
+                    .filter(|s| s.connected && s.peer_at_login_screen)
+                    .map(|s| s.peer);
+                if let Some(peer) = &login_peer {
+                    if !self.notified_login_screen {
+                        crate::notify::peer_at_login_screen(peer.trim_end_matches(" (login screen)"));
+                    }
+                }
+                self.notified_login_screen = login_peer.is_some();
                 // Act on tray menu clicks (the tray can't touch the engine/window itself).
                 let mut want_open = false;
                 let mut want_quit = false;

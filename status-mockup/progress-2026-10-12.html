@@ -1,0 +1,280 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>mouse-rs progress</title>
+<style>
+  :root {
+    color-scheme: light;
+    --bg: #f3f2ee;
+    --surface: #fcfcfb;
+    --line: #e2e0d9;
+    --ink: #0b0b0b;
+    --ink-2: #52514e;
+    --ink-3: #7a7973;
+    --good: #0ca30c;
+    --warning: #fab219;
+    --serious: #ec835a;
+    --critical: #d03b3b;
+    --neutral: #a9a79f;
+    --track: #e9e7e1;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      color-scheme: dark;
+      --bg: #121211;
+      --surface: #1a1a19;
+      --line: #2d2d2b;
+      --ink: #ffffff;
+      --ink-2: #c3c2b7;
+      --ink-3: #8f8e86;
+      --neutral: #6b6a64;
+      --track: #262624;
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --bg: #121211;
+    --surface: #1a1a19;
+    --line: #2d2d2b;
+    --ink: #ffffff;
+    --ink-2: #c3c2b7;
+    --ink-3: #8f8e86;
+    --neutral: #6b6a64;
+    --track: #262624;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  main { max-width: 1040px; margin: 0 auto; padding: 32px 16px 64px; }
+  header { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; flex-wrap: wrap; }
+  h1 { margin: 0; font-size: 28px; letter-spacing: -0.01em; }
+  .sub { color: var(--ink-2); margin: 4px 0 0; }
+  .theme { background: var(--surface); color: var(--ink-2); border: 1px solid var(--line);
+           border-radius: 8px; padding: 6px 12px; font: inherit; cursor: pointer; }
+  h2 { font-size: 18px; margin: 40px 0 12px; }
+  .card { background: var(--surface); border: 1px solid var(--line); border-radius: 12px; padding: 20px; }
+
+  /* headline tiles */
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 16px; margin-top: 24px; }
+  .tile .label { color: var(--ink-2); font-size: 13px; }
+  .tile .big { font-size: 44px; font-weight: 650; line-height: 1.1; margin: 6px 0 2px; font-variant-numeric: tabular-nums; }
+  .tile .how { color: var(--ink-3); font-size: 13px; }
+  .meter { height: 10px; background: var(--track); border-radius: 5px; overflow: hidden; margin-top: 12px; }
+  .meter > span { display: block; height: 100%; border-radius: 5px; }
+
+  /* the one chart: every item, coloured by state */
+  .stack { display: flex; gap: 2px; height: 36px; margin: 8px 0 12px; }
+  .seg { position: relative; display: flex; align-items: center; justify-content: center;
+         color: #0b0b0b; font-size: 13px; font-weight: 600; min-width: 0; cursor: default; }
+  .seg:first-child { border-radius: 4px 0 0 4px; }
+  .seg:last-child { border-radius: 0 4px 4px 0; }
+  .seg:hover, .seg:focus { outline: 2px solid var(--ink); outline-offset: 1px; z-index: 1; }
+  .legend { display: flex; flex-wrap: wrap; gap: 8px 20px; font-size: 13px; color: var(--ink-2); }
+  .legend span { display: inline-flex; align-items: center; gap: 6px; }
+  .dot { width: 10px; height: 10px; border-radius: 3px; display: inline-block; flex: none; }
+  #tip { position: fixed; pointer-events: none; background: var(--ink); color: var(--surface);
+         padding: 6px 10px; border-radius: 6px; font-size: 13px; opacity: 0; transition: opacity .1s; max-width: 260px; }
+
+  /* item groups */
+  .groups { display: grid; gap: 16px; }
+  .group h3 { margin: 0 0 4px; font-size: 16px; display: flex; align-items: center; gap: 8px; }
+  .group .gsub { color: var(--ink-2); font-size: 13px; margin: 0 0 12px; }
+  .item { display: grid; grid-template-columns: 1fr; gap: 2px; padding: 10px 0; border-top: 1px solid var(--line); }
+  .item:first-of-type { border-top: 0; }
+  .item .name { font-weight: 600; }
+  .item .name code { font-weight: 400; color: var(--ink-3); font-size: 12px; margin-left: 6px; }
+  .item .note { color: var(--ink-2); font-size: 14px; }
+  .badge { font-size: 12px; font-weight: 600; padding: 2px 8px; border-radius: 999px; color: #0b0b0b; }
+
+  /* your checklist */
+  ol.todo { margin: 0; padding-left: 20px; }
+  ol.todo li { margin: 8px 0; }
+  ol.todo .why { color: var(--ink-2); font-size: 14px; display: block; }
+
+  footer { margin-top: 40px; color: var(--ink-3); font-size: 13px; }
+  @media (max-width: 560px) { .tile .big { font-size: 36px; } .seg { font-size: 11px; } }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <div>
+      <h1>mouse-rs — where it stands</h1>
+      <p class="sub">Snapshot of 12 October 2026, after the network-following build went onto both machines.</p>
+    </div>
+    <button class="theme" id="themeBtn" type="button">Dark / light</button>
+  </header>
+
+  <section class="tiles" id="tiles" aria-label="Headline numbers"></section>
+
+  <h2>Every item, by state</h2>
+  <div class="card">
+    <div class="stack" id="stack" role="img" aria-label="Items by state"></div>
+    <div class="legend" id="legend"></div>
+  </div>
+
+  <h2>What you need to do next</h2>
+  <div class="card">
+    <ol class="todo">
+      <li><strong>Unplug the Ethernet cable while sharing.</strong>
+        <span class="why">Sharing should come back over Wi-Fi within a few seconds. Then plug it back in and check it moves back to the cable. If Wi-Fi does not work, allow mouse-rs through Windows Firewall on that network.</span></li>
+      <li><strong>Copy a file on Windows and paste it on Kali.</strong>
+        <span class="why">The send side is proven. A file arriving and pasting is not.</span></li>
+      <li><strong>Copy a file, quit mouse-rs on Kali, then paste it in Thunar.</strong>
+        <span class="why">Proves the clipboard holder keeps files pasteable after exit.</span></li>
+      <li><strong>When a file is waiting on Windows, look for a toast.</strong>
+        <span class="why">The notification exists in code and has never been seen on the laptop.</span></li>
+      <li><strong>Login-screen test</strong>, when you can reboot.
+        <span class="why">On hold at your request.</span></li>
+    </ol>
+  </div>
+
+  <h2>The items</h2>
+  <div class="groups" id="groups"></div>
+
+  <footer>
+    Percentages are counted from the items on this page, not estimated. “In scope” leaves out the deferred items.
+    Source of truth: <code>docs/KNOWN-ISSUES.md</code> and <code>docs/UI-REQUIREMENTS.md</code>.
+  </footer>
+</main>
+<div id="tip" role="tooltip"></div>
+
+<script>
+  // The states, in the order they appear. Colours are the fixed status palette; each one
+  // always ships with an icon and a label, so colour never carries the meaning alone.
+  const STATES = {
+    proven:   { label: "Proven on your machines",       icon: "✓", color: "var(--good)" },
+    awaiting: { label: "Built — waiting for your test", icon: "◷", color: "var(--warning)" },
+    open:     { label: "Open — not fixed",              icon: "!", color: "var(--serious)" },
+    parked:   { label: "Parked by you",                 icon: "⏸", color: "var(--critical)" },
+    deferred: { label: "Deferred — out of scope now",   icon: "–", color: "var(--neutral)" },
+  };
+
+  const ITEMS = [
+    // proven
+    { s: "proven", name: "Network link: TLS, heartbeat, instant Stop", note: "Fixes the Python version's hang and stale-connection bugs." },
+    { s: "proven", name: "Linux input and edge crossing", note: "Kali side of keyboard and mouse sharing." },
+    { s: "proven", name: "Windows mouse via Raw Input", note: "1:1 tracking, corners reachable." },
+    { s: "proven", name: "Windows keyboard capture, no leaks", note: "Today's log: leaked=0 on every crossing." },
+    { s: "proven", name: "Auto-reconnect", note: "Reconnected about 6 s after the laptop restarted today." },
+    { s: "proven", name: "Control panel and tray", note: "Open, Start, Stop, Quit verified on Windows." },
+    { s: "proven", name: "Start at login and auto-connect", note: "Registry entry written and removed correctly." },
+    { s: "proven", name: "Log shipping from both machines", note: "Both logs arrive in ~/mouse-reports every 30 s." },
+    { s: "proven", name: "Text clipboard, both directions", note: "In daily use; seen in both logs." },
+    { s: "proven", name: "Windows installer that restarts the app", note: "Two runs today, verified and restarted each time.", code: "update.ps1" },
+    { s: "proven", name: "Discovery beacons", note: "Heard on Kali over cable and Wi-Fi, every signature valid.", code: "R22" },
+    { s: "proven", name: "Plain cargo build", note: "No RUSTFLAGS workaround needed any more.", code: "B12" },
+    // built, awaiting test
+    { s: "awaiting", name: "Network failover: cable ↔ Wi-Fi", note: "Built and unit-tested; the actual unplug has not been tried.", code: "R22" },
+    { s: "awaiting", name: "Copy any file between machines", note: "Send side proven; a file landing and pasting is not.", code: "R18" },
+    { s: "awaiting", name: "Files stay pasteable after quitting", note: "Holder process tested with xclip, not with a Thunar paste.", code: "B5" },
+    { s: "awaiting", name: "Windows toast for a waiting file", note: "In code, never seen on the laptop.", code: "B6" },
+    { s: "awaiting", name: "Stalled-transfer fixes", note: "Built, never confirmed on hardware.", code: "B3" },
+    { s: "awaiting", name: "Share input at the Linux login screen", note: "On hold until you can reboot.", code: "B2 · R21" },
+    // open
+    { s: "open", name: "Cut behaves as copy in Thunar", note: "We publish the cut format correctly; Thunar may be declining it.", code: "B4" },
+    // parked
+    { s: "parked", name: "Alt+Tab sometimes sticks", note: "Mitigated: Kali releases a modifier held through 5 s of silence. Cause unknown.", code: "B13" },
+    // deferred
+    { s: "deferred", name: "Screen-reader support in the panel", note: "Limit of the GUI toolkit; a product decision.", code: "B7" },
+    { s: "deferred", name: "Windows login screen", note: "No supported way for a normal program to type there.", code: "B9" },
+    { s: "deferred", name: "Wayland machine as the server", note: "Needs the compositor portal; Kali is X11.", code: "B10" },
+    { s: "deferred", name: "Console flash when launched from Explorer", note: "Cosmetic.", code: "B8" },
+  ];
+
+  const count = s => ITEMS.filter(i => i.s === s).length;
+  const inScope = ITEMS.length - count("deferred");
+  const built = count("proven") + count("awaiting");
+  const pct = (n, d) => Math.round((n / d) * 100);
+
+  // --- headline tiles ---
+  const tiles = [
+    { label: "Built", value: pct(built, inScope), color: "var(--good)",
+      how: `${built} of ${inScope} in-scope items have working code` },
+    { label: "Proven on your machines", value: pct(count("proven"), inScope), color: "var(--good)",
+      how: `${count("proven")} of ${inScope} tested on the laptop and Kali` },
+    { label: "Waiting for your test", value: count("awaiting"), unit: "", color: "var(--warning)",
+      how: "built, need a hands-on check" },
+    { label: "Still broken or parked", value: count("open") + count("parked"), unit: "", color: "var(--serious)",
+      how: "one open, one parked by you" },
+  ];
+  document.getElementById("tiles").innerHTML = tiles.map(t => {
+    const isPct = t.unit === undefined;
+    return `<div class="card tile">
+      <div class="label">${t.label}</div>
+      <div class="big">${t.value}${isPct ? "%" : ""}</div>
+      <div class="how">${t.how}</div>
+      ${isPct ? `<div class="meter"><span style="width:${t.value}%;background:${t.color}"></span></div>` : ""}
+    </div>`;
+  }).join("");
+
+  // --- the stacked bar: one segment per state, width = share of all items ---
+  const order = Object.keys(STATES);
+  const stack = document.getElementById("stack");
+  const tip = document.getElementById("tip");
+  stack.innerHTML = order.filter(s => count(s) > 0).map(s => {
+    const n = count(s);
+    const names = ITEMS.filter(i => i.s === s).map(i => i.name).join(" · ");
+    return `<div class="seg" tabindex="0" style="flex:${n};background:${STATES[s].color}"
+      data-tip="${STATES[s].icon} ${STATES[s].label}: ${n} of ${ITEMS.length}">
+      ${n >= 2 ? `${STATES[s].icon} ${n}` : STATES[s].icon}</div>`;
+  }).join("");
+  stack.setAttribute("aria-label", order.map(s => `${STATES[s].label}: ${count(s)}`).join(", "));
+  stack.querySelectorAll(".seg").forEach(el => {
+    const show = e => {
+      tip.textContent = el.dataset.tip;
+      const r = el.getBoundingClientRect();
+      const x = e && e.clientX ? e.clientX : r.left + r.width / 2;
+      tip.style.left = Math.min(x + 12, window.innerWidth - 270) + "px";
+      tip.style.top = (r.bottom + 8) + "px";
+      tip.style.opacity = 1;
+    };
+    el.addEventListener("mousemove", show);
+    el.addEventListener("focus", () => show());
+    el.addEventListener("mouseleave", () => tip.style.opacity = 0);
+    el.addEventListener("blur", () => tip.style.opacity = 0);
+  });
+  document.getElementById("legend").innerHTML = order.map(s =>
+    `<span><i class="dot" style="background:${STATES[s].color}"></i>${STATES[s].icon} ${STATES[s].label} (${count(s)})</span>`
+  ).join("");
+
+  // --- grouped item lists ---
+  const blurb = {
+    proven: "Done and confirmed on the laptop and Kali.",
+    awaiting: "Code is finished and tested here. Only a hands-on check is left.",
+    open: "Known fault, not fixed yet.",
+    parked: "You asked to stop work on this until its trigger is known.",
+    deferred: "Known and deliberately left for later.",
+  };
+  document.getElementById("groups").innerHTML = order.map(s => {
+    const items = ITEMS.filter(i => i.s === s);
+    if (!items.length) return "";
+    return `<section class="card group">
+      <h3><span class="badge" style="background:${STATES[s].color}">${STATES[s].icon} ${items.length}</span>${STATES[s].label}</h3>
+      <p class="gsub">${blurb[s]}</p>
+      ${items.map(i => `<div class="item">
+        <div class="name">${i.name}${i.code ? `<code>${i.code}</code>` : ""}</div>
+        <div class="note">${i.note}</div>
+      </div>`).join("")}
+    </section>`;
+  }).join("");
+
+  // --- theme toggle (remembered per browser, harmless if storage is blocked) ---
+  const root = document.documentElement;
+  try { const t = localStorage.getItem("theme"); if (t) root.dataset.theme = t; } catch (e) {}
+  document.getElementById("themeBtn").addEventListener("click", () => {
+    const dark = root.dataset.theme
+      ? root.dataset.theme === "dark"
+      : matchMedia("(prefers-color-scheme: dark)").matches;
+    root.dataset.theme = dark ? "light" : "dark";
+    try { localStorage.setItem("theme", root.dataset.theme); } catch (e) {}
+  });
+</script>
+</body>
+</html>

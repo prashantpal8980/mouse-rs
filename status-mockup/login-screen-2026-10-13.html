@@ -1,0 +1,470 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Login screen explained</title>
+<style>
+  :root {
+    color-scheme: light;
+    --bg: #f3f2ee; --surface: #fcfcfb; --line: #e2e0d9;
+    --ink: #0b0b0b; --ink-2: #52514e; --ink-3: #7a7973;
+    --good: #0ca30c; --warning: #fab219; --serious: #ec835a; --critical: #d03b3b;
+    --neutral: #a9a79f; --track: #e9e7e1; --accent: #2a6fdb; --code-bg: #efede7;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      color-scheme: dark;
+      --bg: #121211; --surface: #1a1a19; --line: #2d2d2b;
+      --ink: #ffffff; --ink-2: #c3c2b7; --ink-3: #8f8e86;
+      --neutral: #6b6a64; --track: #262624; --accent: #7aa7f0; --code-bg: #232321;
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --bg: #121211; --surface: #1a1a19; --line: #2d2d2b;
+    --ink: #ffffff; --ink-2: #c3c2b7; --ink-3: #8f8e86;
+    --neutral: #6b6a64; --track: #262624; --accent: #7aa7f0; --code-bg: #232321;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink);
+         font: 15px/1.55 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  main { max-width: 1040px; margin: 0 auto; padding: 32px 16px 64px; }
+  header { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; flex-wrap: wrap; }
+  h1 { margin: 0; font-size: 28px; letter-spacing: -0.01em; }
+  .sub { color: var(--ink-2); margin: 4px 0 0; }
+  .theme { background: var(--surface); color: var(--ink-2); border: 1px solid var(--line);
+           border-radius: 8px; padding: 6px 12px; font: inherit; cursor: pointer; }
+  h2 { font-size: 20px; margin: 44px 0 6px; }
+  .lede { color: var(--ink-2); margin: 0 0 14px; max-width: 760px; }
+  .card { background: var(--surface); border: 1px solid var(--line); border-radius: 12px; padding: 20px; }
+  code, .mono { font-family: ui-monospace, "Cascadia Code", Consolas, monospace; font-size: 13px; }
+  p code, li code, td code { background: var(--code-bg); padding: 1px 5px; border-radius: 4px; }
+  nav.toc { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 20px; }
+  nav.toc a { color: var(--ink-2); text-decoration: none; border: 1px solid var(--line);
+              background: var(--surface); padding: 4px 10px; border-radius: 999px; font-size: 13px; }
+  nav.toc a:hover { color: var(--ink); border-color: var(--ink-3); }
+
+  /* verdict banner */
+  .verdict { display: flex; gap: 16px; align-items: flex-start; margin-top: 24px; border-left: 4px solid var(--good); }
+  .verdict .icon { font-size: 28px; line-height: 1; color: var(--good); }
+  .verdict h3 { margin: 0 0 4px; font-size: 18px; }
+  .verdict p { margin: 0; color: var(--ink-2); }
+
+  /* how it works diagram */
+  .flow { display: grid; grid-template-columns: 1fr auto 1fr; gap: 12px; align-items: stretch; }
+  .box { border: 1px solid var(--line); border-radius: 10px; padding: 14px; background: var(--bg); }
+  .box h4 { margin: 0 0 6px; font-size: 15px; }
+  .box p { margin: 0; color: var(--ink-2); font-size: 14px; }
+  .box .tag { display: inline-block; font-size: 12px; font-weight: 600; color: var(--ink-3); margin-bottom: 4px; text-transform: uppercase; letter-spacing: .04em; }
+  .arrow { display: flex; flex-direction: column; justify-content: center; align-items: center; color: var(--ink-3); font-size: 12px; text-align: center; min-width: 90px; }
+  .arrow .line { font-size: 22px; color: var(--ink-2); }
+  .kali-stack { display: grid; gap: 10px; }
+  .box.on { border-color: var(--good); }
+  .box.off { opacity: .8; border-style: dashed; }
+  .phase { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-top: 16px; }
+  .phase .step { border-top: 3px solid var(--line); padding-top: 10px; }
+  .phase .step b { display: block; }
+  .phase .step span { color: var(--ink-2); font-size: 14px; }
+  @media (max-width: 720px) {
+    .flow { grid-template-columns: 1fr; }
+    .arrow { flex-direction: row; gap: 8px; min-width: 0; }
+    .arrow .line { transform: rotate(90deg); }
+    .phase { grid-template-columns: 1fr; }
+  }
+
+  /* timeline */
+  .tl { list-style: none; margin: 0; padding: 0; position: relative; }
+  .tl::before { content: ""; position: absolute; left: 76px; top: 6px; bottom: 6px; width: 2px; background: var(--line); }
+  .tl li { display: grid; grid-template-columns: 64px 26px 1fr; gap: 0 12px; padding: 7px 0; align-items: start; }
+  .tl .t { font-variant-numeric: tabular-nums; color: var(--ink-3); font-size: 13px; text-align: right; padding-top: 1px; }
+  .tl .dot { width: 14px; height: 14px; border-radius: 50%; background: var(--surface); border: 2px solid var(--ink-3); margin: 3px 0 0 6px; position: relative; z-index: 1; }
+  .tl .dot.good { border-color: var(--good); background: var(--good); }
+  .tl .dot.warn { border-color: var(--warning); background: var(--warning); }
+  .tl .what b { display: block; }
+  .tl .what span { color: var(--ink-2); font-size: 14px; }
+
+  /* compare */
+  .compare { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  .compare h3 { margin: 0 0 8px; font-size: 16px; }
+  .compare ul { margin: 0; padding-left: 18px; color: var(--ink-2); }
+  .compare li { margin: 4px 0; }
+  .compare .bad { border-left: 4px solid var(--serious); }
+  .compare .ok { border-left: 4px solid var(--good); }
+  @media (max-width: 720px) { .compare { grid-template-columns: 1fr; } }
+
+  /* command anatomy */
+  .cmd { display: flex; flex-wrap: wrap; gap: 6px; font-family: ui-monospace, "Cascadia Code", Consolas, monospace; font-size: 15px; margin-bottom: 18px; }
+  .cmd button { font: inherit; border: 1px solid var(--line); background: var(--bg); color: var(--ink);
+                padding: 8px 10px; border-radius: 8px; cursor: pointer; overflow-wrap: anywhere; text-align: left; }
+  .cmd button[aria-pressed="true"] { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent) inset; }
+  .explain { min-height: 96px; border-left: 4px solid var(--accent); }
+  .explain h4 { margin: 0 0 4px; }
+  .explain p { margin: 0; color: var(--ink-2); }
+  .copyrow { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin: 6px 0 0; }
+  .copyrow pre { flex: 1 1 400px; margin: 0; background: var(--code-bg); padding: 10px 12px; border-radius: 8px; overflow-x: auto; }
+  .copybtn { border: 1px solid var(--line); background: var(--surface); color: var(--ink-2); border-radius: 8px; padding: 8px 12px; font: inherit; cursor: pointer; }
+  table.does { width: 100%; border-collapse: collapse; font-size: 14px; margin-top: 8px; }
+  table.does th, table.does td { text-align: left; padding: 8px 10px; border-top: 1px solid var(--line); vertical-align: top; }
+  table.does th { color: var(--ink-3); font-weight: 600; font-size: 12px; text-transform: uppercase; letter-spacing: .04em; border-top: 0; }
+  .facts { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 12px; margin-top: 16px; }
+  .facts .card { padding: 14px; }
+  .facts b { display: block; margin-bottom: 2px; }
+  .facts span { color: var(--ink-2); font-size: 14px; }
+
+  /* progress */
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 16px; }
+  .tile .label { color: var(--ink-2); font-size: 13px; }
+  .tile .big { font-size: 44px; font-weight: 650; line-height: 1.1; margin: 6px 0 2px; font-variant-numeric: tabular-nums; }
+  .tile .how { color: var(--ink-3); font-size: 13px; }
+  .meter { height: 10px; background: var(--track); border-radius: 5px; overflow: hidden; margin-top: 12px; }
+  .meter > span { display: block; height: 100%; border-radius: 5px; }
+  .stack { display: flex; gap: 2px; height: 36px; margin: 8px 0 12px; }
+  .seg { display: flex; align-items: center; justify-content: center; color: #0b0b0b; font-size: 13px; font-weight: 600; min-width: 0; cursor: default; }
+  .seg:first-child { border-radius: 4px 0 0 4px; }
+  .seg:last-child { border-radius: 0 4px 4px 0; }
+  .seg:hover, .seg:focus { outline: 2px solid var(--ink); outline-offset: 1px; z-index: 1; }
+  .legend { display: flex; flex-wrap: wrap; gap: 8px 20px; font-size: 13px; color: var(--ink-2); }
+  .legend span { display: inline-flex; align-items: center; gap: 6px; }
+  .sq { width: 10px; height: 10px; border-radius: 3px; display: inline-block; flex: none; }
+  #tip { position: fixed; pointer-events: none; background: var(--ink); color: var(--surface);
+         padding: 6px 10px; border-radius: 6px; font-size: 13px; opacity: 0; transition: opacity .1s; max-width: 260px; }
+  .groups { display: grid; gap: 16px; margin-top: 16px; }
+  .group h3 { margin: 0 0 4px; font-size: 16px; display: flex; align-items: center; gap: 8px; }
+  .group .gsub { color: var(--ink-2); font-size: 13px; margin: 0 0 8px; }
+  .item { padding: 10px 0; border-top: 1px solid var(--line); }
+  .item:first-of-type { border-top: 0; }
+  .item .name { font-weight: 600; }
+  .item .name code { font-weight: 400; color: var(--ink-3); font-size: 12px; margin-left: 6px; background: none; }
+  .item .name .new { font-size: 11px; font-weight: 700; color: var(--accent); margin-left: 6px; }
+  .item .note { color: var(--ink-2); font-size: 14px; }
+  .badge { font-size: 12px; font-weight: 600; padding: 2px 8px; border-radius: 999px; color: #0b0b0b; }
+
+  ol.todo { margin: 0; padding-left: 22px; }
+  ol.todo li { margin: 12px 0; }
+  ol.todo .why { color: var(--ink-2); font-size: 14px; display: block; }
+  footer { margin-top: 40px; color: var(--ink-3); font-size: 13px; }
+  @media (max-width: 560px) { .tile .big { font-size: 36px; } .seg { font-size: 11px; } }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <div>
+      <h1>Typing your password from the laptop</h1>
+      <p class="sub">How it worked this morning, the command explained, and what's still pending. 13 October 2026.</p>
+    </div>
+    <button class="theme" id="themeBtn" type="button">Dark / light</button>
+  </header>
+
+  <nav class="toc" aria-label="Sections">
+    <a href="#how">1 · How it works</a>
+    <a href="#today">2 · What happened at 12:34</a>
+    <a href="#why">3 · Why it failed before</a>
+    <a href="#command">4 · The command, explained</a>
+    <a href="#progress">5 · How much is pending</a>
+    <a href="#next">6 · What to do next</a>
+  </nav>
+
+  <div class="card verdict">
+    <div class="icon" aria-hidden="true">✓</div>
+    <div>
+      <h3>Yes, it worked, and both logs prove it.</h3>
+      <p>At 12:34 Kali booted to the login screen. The login-screen service connected to the laptop in under a second.
+      You moved the laptop's pointer onto Kali and typed the password on the laptop's keyboard, and Kali logged you in at 12:35:03.
+      Login-screen sharing now counts as <b>proven on your machines</b>.</p>
+    </div>
+  </div>
+
+  <!-- 1 -->
+  <h2 id="how">1 · How it works</h2>
+  <p class="lede">There are two copies of mouse-rs on Kali, and only one of them runs at a time.
+  At the login screen nobody is logged in, so the normal app can't run yet. A separate background service takes its place until you log in.</p>
+  <div class="card">
+    <div class="flow">
+      <div class="box on">
+        <span class="tag">Windows laptop</span>
+        <h4>mouse-rs (the server)</h4>
+        <p>Owns the real keyboard and mouse. When the pointer leaves the screen edge, it sends every movement and key to Kali.</p>
+      </div>
+      <div class="arrow"><span class="line">⟶</span>encrypted link<br>port 24800</div>
+      <div class="kali-stack">
+        <div class="box on">
+          <span class="tag">Kali · before you log in</span>
+          <h4>Login-screen service</h4>
+          <p>A system service that starts at boot, before any user. It runs as root and types into the login screen through a virtual keyboard (<code>uinput</code>).</p>
+        </div>
+        <div class="box off">
+          <span class="tag">Kali · after you log in</span>
+          <h4>Your normal mouse-rs app</h4>
+          <p>Starts with your desktop. It adds the clipboard, files and the control panel.</p>
+        </div>
+      </div>
+    </div>
+    <div class="phase">
+      <div class="step" style="border-color:var(--accent)"><b>1. Boot</b><span>The service starts and connects to the laptop. Kali's login screen can now be controlled from the laptop.</span></div>
+      <div class="step" style="border-color:var(--good)"><b>2. You type the password</b><span>Move the laptop pointer onto Kali, then type. The keys travel over the link and the service types them into the login screen.</span></div>
+      <div class="step" style="border-color:var(--neutral)"><b>3. Handover</b><span>Once you're logged in, the service sees your session and steps aside. Your normal app connects about 10 seconds later.</span></div>
+    </div>
+  </div>
+
+  <!-- 2 -->
+  <h2 id="today">2 · What happened at 12:34 this morning</h2>
+  <p class="lede">Every line below comes from the two logs: Kali's service log and the laptop log in <code>~/mouse-reports</code>. Times are Indian Standard Time.</p>
+  <div class="card">
+    <ol class="tl">
+      <li><span class="t">12:34:29</span><span class="dot"></span><span class="what"><b>Kali starts booting</b></span></li>
+      <li><span class="t">12:34:45</span><span class="dot"></span><span class="what"><b>The login screen appears</b><span>SDDM, Kali's login manager.</span></span></li>
+      <li><span class="t">12:34:47</span><span class="dot good"></span><span class="what"><b>The login-screen service starts and connects</b><span>The virtual keyboard was created and the link to the laptop came up in about 0.4 s. The laptop logged "peer 'kali-desktop' connected".</span></span></li>
+      <li><span class="t">12:34:52</span><span class="dot warn"></span><span class="what"><b>You push the pointer across, and it bounces back four times</b><span>Each visit lasted under a second (0.4 to 1 s), so the pointer kept slipping back to the laptop. That's normal; nothing was typed on those visits.</span></span></li>
+      <li><span class="t">12:34:57</span><span class="dot good"></span><span class="what"><b>The fifth crossing stays on Kali</b><span>The laptop logged "keyboard grabbed (control moved to the peer)".</span></span></li>
+      <li><span class="t">12:34:58</span><span class="dot good"></span><span class="what"><b>Keys arrive at the login screen</b><span>20 key events arrived (presses and releases), with 0 keys leaking onto the laptop.</span></span></li>
+      <li><span class="t">12:35:03</span><span class="dot good"></span><span class="what"><b>Kali accepts the password and your session opens</b></span></li>
+      <li><span class="t">12:35:05</span><span class="dot"></span><span class="what"><b>The service steps aside</b><span>"a session has taken over; standing down so input is not injected twice".</span></span></li>
+      <li><span class="t">12:35:16</span><span class="dot good"></span><span class="what"><b>Your normal app connects</b><span>Sharing continued on the desktop without you doing anything.</span></span></li>
+    </ol>
+  </div>
+
+  <!-- 3 -->
+  <h2 id="why">3 · Why it didn't work last time</h2>
+  <p class="lede">The software behaved the same both times. The difference was whether the pointer reached Kali before the password was typed.</p>
+  <div class="compare">
+    <div class="card bad">
+      <h3>12 October: you typed on Kali's keyboard</h3>
+      <ul>
+        <li>The service connected at 08:33:17, two seconds after it started.</li>
+        <li>The laptop's pointer never crossed onto Kali. The laptop log has no "crossed to remote" line.</li>
+        <li>The password was typed on Kali's own keyboard at 08:33:26.</li>
+        <li>Nothing told you Kali's login screen was ready, or that you had to move the pointer across first.</li>
+      </ul>
+    </div>
+    <div class="card ok">
+      <h3>13 October: you typed on the laptop</h3>
+      <ul>
+        <li>The service connected the same way, in under a second.</li>
+        <li>You moved the pointer across, and on the fifth try it stayed on Kali.</li>
+        <li>You typed on the laptop, and the keys reached the login screen.</li>
+        <li>No code changed on Kali in between: it still runs the 9 October copy.</li>
+      </ul>
+    </div>
+  </div>
+  <div class="card" style="margin-top:16px">
+    <p style="margin:0 0 8px"><b>Problems the logs showed, all fixed in the newer build that isn't installed yet:</b></p>
+    <ul style="margin:0;padding-left:18px;color:var(--ink-2)">
+      <li><b>You had no cue.</b> The new laptop build shows a toast and labels the peer "kali-desktop (login screen)" when Kali is waiting at its login screen.</li>
+      <li><b>Key names went into the log.</b> The old copy logged the first 8 keys of each crossing by name. This morning those were arrow keys, so no password letters were recorded, but a password could have been. The new copy never logs key names at the login screen.</li>
+      <li><b>The laptop sent your clipboard to the login screen.</b> 216 bytes of copied text went to it this morning. The new laptop build doesn't send the clipboard there.</li>
+      <li><b>It restarted every 3 seconds.</b> While you're logged in, the old copy has restarted 172 times today. The new copy waits quietly instead.</li>
+      <li><b>Its log never reached you.</b> The old copy's log stays inside Kali. The new copy ships it to <code>~/mouse-reports/kali-desktop-login-screen-mouse-rs.log</code>, so I can read it after a reboot.</li>
+    </ul>
+  </div>
+
+  <!-- 4 -->
+  <h2 id="command">4 · The command I asked you to run, explained</h2>
+  <p class="lede">The login-screen service runs its own protected copy of mouse-rs, and that copy is still from 9 October.
+  This command replaces it with today's build. It needs administrator rights (<code>sudo</code>), which I'm not allowed to use, so you have to run it.
+  Click each part to see what it means.</p>
+  <div class="card">
+    <div class="cmd" id="cmd" role="group" aria-label="Parts of the command">
+      <button type="button" data-k="bang">!</button>
+      <button type="button" data-k="sudo">sudo</button>
+      <button type="button" data-k="path">/home/kalip/mouse-rs/target/release/mouse-rs</button>
+      <button type="button" data-k="sub">greeter-install</button>
+    </div>
+    <div class="card explain" id="explain" aria-live="polite"></div>
+
+    <p style="margin:20px 0 4px"><b>Type this into the Claude Code prompt, exactly as shown:</b></p>
+    <div class="copyrow">
+      <pre class="mono" id="cmdText">! sudo /home/kalip/mouse-rs/target/release/mouse-rs greeter-install</pre>
+      <button class="copybtn" id="copyBtn" type="button">Copy</button>
+    </div>
+
+    <p style="margin:20px 0 0"><b>What it changes on Kali</b></p>
+    <table class="does">
+      <thead><tr><th>Step</th><th>File</th><th>Why</th></tr></thead>
+      <tbody>
+        <tr><td>Copies your settings</td><td><code>/etc/mouse-rs/config.json</code></td><td>The laptop's address and the shared secret. The service can't read your home folder, and only root can read this copy.</td></tr>
+        <tr><td>Copies the program</td><td><code>/usr/local/bin/mouse-rs</code></td><td>Replaces the 9 October copy with today's build, which has all the fixes listed above.</td></tr>
+        <tr><td>Writes the service definition</td><td><code>/etc/systemd/system/mouse-rs-greeter.service</code></td><td>Tells Linux to start it at every boot.</td></tr>
+        <tr><td>Loads the virtual keyboard driver</td><td><code>/etc/modules-load.d/mouse-rs-uinput.conf</code></td><td>Makes sure <code>uinput</code> is loaded at boot.</td></tr>
+        <tr><td>Enables the service</td><td><code>systemctl enable</code></td><td>Turns it on for the next boot.</td></tr>
+      </tbody>
+    </table>
+
+    <div class="facts">
+      <div class="card"><b>It won't interrupt sharing</b><span>Your running mouse-rs app isn't touched. The new copy only takes over at the next login screen.</span></div>
+      <div class="card"><b>It asks for your password</b><span>That's <code>sudo</code> confirming it's you. The password isn't stored or logged.</span></div>
+      <div class="card"><b>Success looks like this</b><span>It prints "Installed." and three lines naming the config, service and binary.</span></div>
+      <div class="card"><b>You can run it again</b><span>Run it again whenever I say there's a newer build. <code>greeter-uninstall</code> removes the service completely.</span></div>
+    </div>
+    <p style="margin:14px 0 0;color:var(--ink-2);font-size:14px">To check it worked, run <code>/home/kalip/mouse-rs/target/release/mouse-rs greeter-status</code> (no sudo needed).
+    The line <code>old  binary is an older build than this one</code> should be gone, and every line should read <code>ok</code>.
+    I also changed the install so it can't fail with "Text file busy" while the old copy is restarting.</p>
+  </div>
+
+  <!-- 5 -->
+  <h2 id="progress">5 · How much is pending</h2>
+  <p class="lede">Every item in the project, counted rather than estimated. The login screen moved to proven this morning.</p>
+  <section class="tiles" id="tiles" aria-label="Headline numbers"></section>
+  <div class="card" style="margin-top:16px">
+    <div class="stack" id="stack" role="img"></div>
+    <div class="legend" id="legend"></div>
+  </div>
+  <div class="groups" id="groups"></div>
+
+  <!-- 6 -->
+  <h2 id="next">6 · What to do next</h2>
+  <div class="card">
+    <ol class="todo">
+      <li><strong>Refresh the login-screen copy:</strong> <code>! sudo /home/kalip/mouse-rs/target/release/mouse-rs greeter-install</code>
+        <span class="why">See section 4. It takes a few seconds and doesn't interrupt sharing.</span></li>
+      <li><strong>Update the laptop.</strong> Give the Windows assistant this prompt: <code>read and follow the instructions at http://192.168.137.2:8000/update.md</code>
+        <span class="why">Adds the "Kali is at its login screen" toast, and stops the clipboard being sent to the login screen. The installer restarts mouse-rs for you.</span></li>
+      <li><strong>At your next reboot, do what you did this morning.</strong> Wait for the toast, move the pointer onto Kali, and type the password on the laptop.
+        <span class="why">If the pointer slips back, move it inward a little and push it across again. Then tell me, and I'll read the login-screen log, which will reach <code>~/mouse-reports</code> from then on.</span></li>
+      <li><strong>Other hands-on checks, whenever convenient:</strong>
+        <span class="why">Unplug the Ethernet cable while sharing (it should switch to Wi-Fi). Copy a file on Windows and paste it on Kali. Copy a file, quit mouse-rs on Kali, then paste in Thunar. Look for the toast when a file is waiting on Windows.</span></li>
+    </ol>
+  </div>
+
+  <footer>
+    Sources: Kali's journal for <code>mouse-rs-greeter.service</code> (boot of 13 Oct, 12:34), <code>~/mouse-reports/laptop-mouse-rs.log</code>,
+    <code>docs/KNOWN-ISSUES.md</code> and <code>docs/UI-REQUIREMENTS.md</code>. The previous snapshot is <code>progress-2026-10-12.html</code>.
+  </footer>
+</main>
+<div id="tip" role="tooltip"></div>
+
+<script>
+  // --- command anatomy ---
+  const PARTS = {
+    bang: { h: "!  : run it in this Claude Code session",
+      p: "This is a Claude Code shortcut, not part of Linux. A line starting with ! runs in your terminal, and I see the output, so I can tell whether it worked. Without the !, the text would just be sent to me as a message." },
+    sudo: { h: "sudo : run as administrator (root)",
+      p: "Installing a system service means writing to /etc and /usr/local/bin, which only root can change. sudo asks for your Kali password once. I'm blocked from using sudo, which is why you have to run it." },
+    path: { h: "/home/kalip/mouse-rs/target/release/mouse-rs : today's build",
+      p: "The full path to the mouse-rs program I just built from the latest code. It's the same program your desktop runs. The command copies this file into place for the login-screen service." },
+    sub: { h: "greeter-install : the job to do",
+      p: "The \"greeter\" is Linux's name for the login screen. This sub-command installs (or refreshes) the login-screen service: it copies your settings and the program, writes the service file and enables it. The table below lists each file it touches." },
+  };
+  const cmd = document.getElementById("cmd");
+  const explain = document.getElementById("explain");
+  function pick(k) {
+    cmd.querySelectorAll("button").forEach(b => b.setAttribute("aria-pressed", String(b.dataset.k === k)));
+    explain.innerHTML = `<h4 class="mono">${PARTS[k].h}</h4><p>${PARTS[k].p}</p>`;
+  }
+  cmd.querySelectorAll("button").forEach(b => b.addEventListener("click", () => pick(b.dataset.k)));
+  pick("sub");
+  document.getElementById("copyBtn").addEventListener("click", async e => {
+    try { await navigator.clipboard.writeText(document.getElementById("cmdText").textContent); e.target.textContent = "Copied"; }
+    catch (_) { e.target.textContent = "Select and copy by hand"; }
+    setTimeout(() => e.target.textContent = "Copy", 1800);
+  });
+
+  // --- progress: the same item list as the 12 October page, updated ---
+  const STATES = {
+    proven:   { label: "Proven on your machines",       icon: "✓", color: "var(--good)" },
+    awaiting: { label: "Built, waiting for your test",  icon: "◷", color: "var(--warning)" },
+    open:     { label: "Open, not fixed",               icon: "!", color: "var(--serious)" },
+    parked:   { label: "Parked by you",                 icon: "⏸", color: "var(--critical)" },
+    deferred: { label: "Deferred, out of scope for now", icon: "–", color: "var(--neutral)" },
+  };
+  const ITEMS = [
+    { s: "proven", name: "Type the password at Kali's login screen from the laptop", note: "Proven this morning at 12:34: 20 key events arrived and Kali logged you in.", code: "B2 · R21", isNew: true },
+    { s: "proven", name: "Network link: TLS, heartbeat, instant Stop", note: "Fixes the Python version's hang and stale-connection bugs." },
+    { s: "proven", name: "Linux input and edge crossing", note: "Kali side of keyboard and mouse sharing." },
+    { s: "proven", name: "Windows mouse via Raw Input", note: "1:1 tracking, corners reachable." },
+    { s: "proven", name: "Windows keyboard capture, no leaks", note: "leaked=0 again this morning, at the login screen." },
+    { s: "proven", name: "Auto-reconnect", note: "The desktop app reconnected on its own 11 s after login." },
+    { s: "proven", name: "Control panel and tray", note: "Open, Start, Stop, Quit verified on Windows." },
+    { s: "proven", name: "Start at login and auto-connect", note: "Registry entry written and removed correctly." },
+    { s: "proven", name: "Log shipping from both machines", note: "Both logs arrive in ~/mouse-reports every 30 s." },
+    { s: "proven", name: "Text clipboard, both directions", note: "In daily use; seen in both logs." },
+    { s: "proven", name: "Windows installer that restarts the app", note: "Verified and restarted on each run.", code: "update.ps1" },
+    { s: "proven", name: "Discovery beacons", note: "Heard on Kali over cable and Wi-Fi, every signature valid.", code: "R22" },
+    { s: "proven", name: "Plain cargo build", note: "No RUSTFLAGS workaround needed any more.", code: "B12" },
+    { s: "awaiting", name: "Login-screen improvements", note: "Toast, no key names in the log, no clipboard to the login screen, shipped log, no restart churn. Needs the command in section 4 plus the laptop update.", code: "B2", isNew: true },
+    { s: "awaiting", name: "Network failover: cable ↔ Wi-Fi", note: "Built and unit-tested; nobody has tried an actual unplug yet.", code: "R22" },
+    { s: "awaiting", name: "Copy any file between machines", note: "The sending side is proven; nobody has yet seen a file arrive and paste.", code: "R18" },
+    { s: "awaiting", name: "Files stay pasteable after quitting", note: "Holder process tested with xclip, not with a Thunar paste.", code: "B5" },
+    { s: "awaiting", name: "Windows toast for a waiting file", note: "In code, never seen on the laptop.", code: "B6" },
+    { s: "awaiting", name: "Stalled-transfer fixes", note: "Built, never confirmed on hardware.", code: "B3" },
+    { s: "open", name: "Cut behaves as copy in Thunar", note: "We publish the cut format correctly; Thunar may be declining it.", code: "B4" },
+    { s: "parked", name: "Alt+Tab sometimes sticks", note: "Mitigated: Kali releases a modifier held through 5 s of silence. Cause unknown.", code: "B13" },
+    { s: "deferred", name: "Screen-reader support in the panel", note: "A limit of the GUI toolkit; needs a product decision.", code: "B7" },
+    { s: "deferred", name: "Windows login screen", note: "No supported way for a normal program to type there.", code: "B9" },
+    { s: "deferred", name: "Wayland machine as the server", note: "Needs the compositor portal; Kali is X11.", code: "B10" },
+    { s: "deferred", name: "Console flash when launched from Explorer", note: "Cosmetic.", code: "B8" },
+  ];
+  const count = s => ITEMS.filter(i => i.s === s).length;
+  const inScope = ITEMS.length - count("deferred");
+  const built = count("proven") + count("awaiting");
+  const pct = (n, d) => Math.round((n / d) * 100);
+
+  const tiles = [
+    { label: "Built", value: pct(built, inScope), color: "var(--good)", how: `${built} of ${inScope} in-scope items have working code` },
+    { label: "Proven on your machines", value: pct(count("proven"), inScope), color: "var(--good)", how: `${count("proven")} of ${inScope}, up from 12 yesterday` },
+    { label: "Waiting for your test", value: count("awaiting"), unit: "", how: "built; each needs a hands-on check" },
+    { label: "Still broken or parked", value: count("open") + count("parked"), unit: "", how: "one open, one parked by you" },
+  ];
+  document.getElementById("tiles").innerHTML = tiles.map(t => {
+    const isPct = t.unit === undefined;
+    return `<div class="card tile"><div class="label">${t.label}</div>
+      <div class="big">${t.value}${isPct ? "%" : ""}</div><div class="how">${t.how}</div>
+      ${isPct ? `<div class="meter"><span style="width:${t.value}%;background:${t.color}"></span></div>` : ""}</div>`;
+  }).join("");
+
+  const order = Object.keys(STATES);
+  const stack = document.getElementById("stack");
+  const tip = document.getElementById("tip");
+  stack.innerHTML = order.filter(s => count(s) > 0).map(s => {
+    const n = count(s);
+    return `<div class="seg" tabindex="0" style="flex:${n};background:${STATES[s].color}"
+      data-tip="${STATES[s].icon} ${STATES[s].label}: ${n} of ${ITEMS.length}">${n >= 2 ? `${STATES[s].icon} ${n}` : STATES[s].icon}</div>`;
+  }).join("");
+  stack.setAttribute("aria-label", order.map(s => `${STATES[s].label}: ${count(s)}`).join(", "));
+  stack.querySelectorAll(".seg").forEach(el => {
+    const show = e => {
+      tip.textContent = el.dataset.tip;
+      const r = el.getBoundingClientRect();
+      const x = e && e.clientX ? e.clientX : r.left + r.width / 2;
+      tip.style.left = Math.min(x + 12, window.innerWidth - 270) + "px";
+      tip.style.top = (r.bottom + 8) + "px";
+      tip.style.opacity = 1;
+    };
+    el.addEventListener("mousemove", show);
+    el.addEventListener("focus", () => show());
+    el.addEventListener("mouseleave", () => tip.style.opacity = 0);
+    el.addEventListener("blur", () => tip.style.opacity = 0);
+  });
+  document.getElementById("legend").innerHTML = order.map(s =>
+    `<span><i class="sq" style="background:${STATES[s].color}"></i>${STATES[s].icon} ${STATES[s].label} (${count(s)})</span>`).join("");
+
+  const blurb = {
+    proven: "Done and confirmed on the laptop and Kali.",
+    awaiting: "The code is finished and passes its tests here. Only a hands-on check on your machines is left.",
+    open: "A known fault that isn't fixed yet.",
+    parked: "You asked me to stop work on this until its trigger is known.",
+    deferred: "Known, and deliberately left for later.",
+  };
+  document.getElementById("groups").innerHTML = order.map(s => {
+    const items = ITEMS.filter(i => i.s === s);
+    if (!items.length) return "";
+    return `<section class="card group">
+      <h3><span class="badge" style="background:${STATES[s].color}">${STATES[s].icon} ${items.length}</span>${STATES[s].label}</h3>
+      <p class="gsub">${blurb[s]}</p>
+      ${items.map(i => `<div class="item"><div class="name">${i.name}${i.code ? `<code>${i.code}</code>` : ""}${i.isNew ? `<span class="new">NEW</span>` : ""}</div>
+        <div class="note">${i.note}</div></div>`).join("")}
+    </section>`;
+  }).join("");
+
+  // --- theme toggle (remembered per browser, harmless if storage is blocked) ---
+  const root = document.documentElement;
+  try { const t = localStorage.getItem("theme"); if (t) root.dataset.theme = t; } catch (e) {}
+  document.getElementById("themeBtn").addEventListener("click", () => {
+    const dark = root.dataset.theme ? root.dataset.theme === "dark" : matchMedia("(prefers-color-scheme: dark)").matches;
+    root.dataset.theme = dark ? "light" : "dark";
+    try { localStorage.setItem("theme", root.dataset.theme); } catch (e) {}
+  });
+</script>
+</body>
+</html>

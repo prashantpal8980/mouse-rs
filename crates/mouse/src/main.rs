@@ -34,6 +34,25 @@ mod notify;
 
 fn main() -> anyhow::Result<()> {
     let sub = std::env::args().nth(1);
+
+    // The clipboard holder: a detached child started when mouse-rs exits while it still
+    // owns a file list. It reads the list from stdin and keeps it pasteable until another
+    // copy takes the selection. It runs none of the normal startup, so it writes no log
+    // file, starts no log shipping and loads no config.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    if sub.as_deref() == Some("hold-files") {
+        use std::io::Read as _;
+        let mut payload = Vec::new();
+        let _ = std::io::stdin().read_to_end(&mut payload);
+        mouse_clipboard::files::hold_from_payload(&payload);
+        return Ok(());
+    }
+    // Tell the clipboard how to start a holder, so a file list survives exit (see
+    // `mouse_clipboard::files::handoff_on_exit`).
+    if let Ok(exe) = std::env::current_exe() {
+        mouse_clipboard::files::set_holder(exe, vec!["hold-files".into()]);
+    }
+
     let is_gui = matches!(sub.as_deref(), None | Some("gui"));
     // The login-screen service logs to a file like the GUI does, because the file is
     // what gets shipped — a service that only logged to the journal would be the one
@@ -59,14 +78,35 @@ fn main() -> anyhow::Result<()> {
 
     let cfg = Config::load_or_default();
 
+    // A desktop launch is the moment to notice that the login-screen copy has fallen behind.
+    #[cfg(target_os = "linux")]
+    if matches!(sub.as_deref(), None | Some("gui") | Some("client") | Some("server")) {
+        greeter::warn_if_stale();
+    }
+
     // Held for the life of the process: dropping it sends one final copy, which is the
     // most valuable one because it holds whatever happened last. Started here rather
     // than inside the engine so it also covers a run that never manages to connect —
     // exactly the case where the log is the only evidence there is.
+    //
+    // The login-screen instance has no config under its HOME; its settings are in
+    // /etc/mouse-rs. It ships from those, under a name of its own, so its log is neither
+    // left unshipped nor written over the desktop instance's copy on the collector.
+    #[cfg(target_os = "linux")]
+    let (ship_url, ship_name) = if sub.as_deref() == Some("greeter") {
+        match greeter::load_config(&greeter::config_path()) {
+            Ok(g) => (g.log_upload_url, format!("{}-login-screen", g.name)),
+            Err(_) => (String::new(), String::new()),
+        }
+    } else {
+        (cfg.log_upload_url.clone(), cfg.name.clone())
+    };
+    #[cfg(not(target_os = "linux"))]
+    let (ship_url, ship_name) = (cfg.log_upload_url.clone(), cfg.name.clone());
     let _logship = logship::LogShipper::spawn(
-        &cfg.log_upload_url,
+        &ship_url,
         &logging::log_path(),
-        &cfg.name,
+        &ship_name,
         cfg.log_upload_secs,
     );
 

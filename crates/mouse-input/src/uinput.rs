@@ -502,7 +502,8 @@ impl InputInjector for UinputInjector {
         // An unmappable key is dropped with a note rather than failing the whole
         // injection: one unknown key must not take the link down mid-sentence.
         let Some(code) = Self::code_for(key) else {
-            tracing::debug!(?key, "no Linux keycode for this key; dropped");
+            // The key is not named: at the login screen it would be part of a password.
+            tracing::debug!("no Linux keycode for a received key; dropped");
             return Ok(());
         };
         self.kbd.emit(EV_KEY, code, i32::from(pressed)).map_err(io_err)?;

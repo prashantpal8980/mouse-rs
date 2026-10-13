@@ -36,6 +36,8 @@ pub async fn run_client_engine(
 
     let entry_edge = cfg.entry_edge;
     let threshold = cfg.edge_threshold_px;
+    // At the login screen every key is part of a password, so none is ever named in a log.
+    let at_login_screen = cfg.at_login_screen;
     let (w, h) = local_dims;
     let clamp = |x: i32, y: i32| (x.clamp(0, (w - 1).max(0)), y.clamp(0, (h - 1).max(0)));
 
@@ -123,7 +125,9 @@ pub async fn run_client_engine(
                                 // First few only: enough to prove keys arrive and to see
                                 // which ones, without the per-second spam that got the
                                 // old kbd_diag counters deleted.
-                                if keys <= 8 {
+                                if keys <= 8 && at_login_screen {
+                                    tracing::info!(pressed, n = keys, "key received from peer (not named: login screen)");
+                                } else if keys <= 8 {
                                     tracing::info!(?key, pressed, n = keys, "key received from peer");
                                 }
                             }
@@ -149,7 +153,7 @@ pub async fn run_client_engine(
                         set_status_disconnected(&status);
                         tracing::info!("disconnected from server: {reason:?}");
                     }
-                    Some(LinkEvent::Connected { peer, width, height }) => {
+                    Some(LinkEvent::Connected { peer, width, height, .. }) => {
                         // Clean slate on every (re)connect so no crossing state
                         // survives a reconnect — mirrors the server's reset and keeps
                         // this engine correct once Phase 7 reuses it across reconnects.
@@ -159,7 +163,7 @@ pub async fn run_client_engine(
                         vx = 0;
                         vy = 0;
                         set_clipboard_connected(&clipboard, true);
-                        set_status_connected(&status, &peer, width, height);
+                        set_status_connected(&status, &peer, width, height, false);
                         tracing::info!("connected to server '{peer}': {width}x{height}");
                     }
                     Some(_) => {}
@@ -324,7 +328,7 @@ mod tests {
         // A connect event arrives — must reset to inactive and release.
         chans
             .events
-            .send(LinkEvent::Connected { peer: "s".into(), width: 1920, height: 1080 })
+            .send(LinkEvent::Connected { peer: "s".into(), width: 1920, height: 1080, login_screen: false })
             .unwrap();
         tokio::time::sleep(Duration::from_millis(20)).await;
         assert!(drain(&rx).contains(&InjectCmd::ReleaseAll), "connect releases held input");

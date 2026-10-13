@@ -5,6 +5,7 @@
 //! crates so a stuck input hook can never block the network task and vice-versa.
 
 pub mod auth;
+pub mod beacon;
 pub mod bulk;
 pub mod config;
 pub mod discover;

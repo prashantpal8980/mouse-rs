@@ -36,8 +36,30 @@ equivalent, or a distinct bug seen while sharing.
 
 ## Built but never proven on hardware
 
-### B2 — login-screen sharing: installed and enabled, not yet proven at a real prompt
+### B2 — login-screen sharing: PROVEN 13 Oct 2026 (password typed from the laptop); refresh pending
+
+**13 Oct 2026, proven.** Boot at 12:34. The service connected at 12:34:47; the fifth crossing stuck at 12:34:57; 20 key events were injected; logind opened the session at 12:35:03; the service stood down at 12:35:05. This ran on the 9 Oct copy, so the 12 Oct fixes (toast, no key names logged, no clipboard to the login screen, shipped log, no restart churn) are still waiting for `greeter-install` and the laptop update. `greeter-install` now stages the binary and renames it over the old one, so it cannot fail with ETXTBSY while the old copy churns.
 **on hold at the owner's request 2026-10-09** (they cannot reboot right now) · built 2026-10-08 (`61b0d72`, `7b143a6`) · tested by the owner 2026-10-09 · R21
+
+**2026-10-12 boot — what the logs showed.** The service **did** run. It started at
+08:33:15 with the login screen, created its uinput devices, and the laptop logged
+`peer 'kali-desktop' connected` at 08:33:17. The laptop never crossed to it: no
+`crossed to remote` in the ten seconds before the password was typed at 08:33:26 on a
+local keyboard. Nothing told the owner Kali was ready, or that the pointer had to be moved
+across. Fixed the same day:
+
+* the login-screen instance says so in its handshake; the laptop logs it loudly, shows
+  "(login screen)" next to the peer, raises a toast, and withholds the clipboard;
+* key names are never logged at the login screen (the first 8 keys of a crossing were
+  logged by name, which there means the password);
+* no file lane at the login screen (it reconnected every second, flooding both logs);
+* the service waits quietly through a session instead of restarting every 3 s, which had
+  rotated the boot-time evidence out of the capped log within a day;
+* its log ships as `kali-desktop-login-screen-mouse-rs.log`; before, it shipped nowhere;
+* `greeter-status` and the desktop log now flag a **stale service copy**. The copy at
+  `/usr/local/bin/mouse-rs` was from 9 Oct and only a root `greeter-install` refreshes it.
+
+**Still unproven:** typing the password from the laptop at a real login screen.
 
 The owner rebooted to try it, got the SDDM password prompt with no keyboard, and had to
 plug one in again. Checked afterwards: **no unit, no `/etc/mouse-rs`, and not one line
@@ -295,32 +317,39 @@ our side, so the fix may not be ours to make. Unconfirmed.
 delete it themselves.
 
 ### B5 — files on the clipboard stop working once mouse-rs exits
-**open**
+**fixed 2026-10-12 on X11** · verified with a real X selection owner, not yet on a desktop paste
 
-X11 has no clipboard daemon: the selection owner is asked **live** for every paste
-(`crates/mouse-clipboard/src/files.rs:41`). So when mouse-rs quits, anything it had put
-on the clipboard silently stops being pasteable.
+X11 has no clipboard daemon: the selection owner is asked **live** for every paste. So when
+mouse-rs quit, a file list it had put on the clipboard silently stopped being pasteable.
 
-**Impact:** copy a file, quit mouse-rs, paste — nothing happens, with no error. Standard
-X11 behaviour that every application shares, but surprising all the same.
+**Fixed:** the file list being served is recorded (`files.rs`, `HELD`). When clipboard sync
+shuts down (Stop, Quit or exit), and mouse-rs still owns the selection and every file is still
+on disk, it starts a detached holder: the same binary with the hidden `hold-files`
+subcommand, which takes the list on stdin and keeps serving it until someone else copies.
+The holder exits as soon as another copy takes the selection, so it never outlives its use.
 
-**Possible fix:** hand off to a running clipboard manager before exit, or persist and
-re-own on next start.
+**Verified:** `hold-files` served the list (`text/uri-list` and GNOME forms checked with `xclip`),
+and exited when another copy replaced it. `handoff_tests` (ignored by default, needs a display)
+checks that a live owner hands its list over. **Not yet proven:** a paste into Thunar after
+mouse-rs has exited.
 
 ### B6 — Windows shows a tray tooltip but no toast
-**open** · tracked under R18
+**unverified** · tracked under R18 · built 2026-08-14
 
-A file waiting for a decision updates the tray tooltip; there is no desktop notification.
-A real toast needs an Application User Model ID registered at install time, which the
-current "download the exe and run it" distribution has nowhere to do.
+The toast is implemented in `crates/mouse/src/notify.rs`: it raises a Windows toast through
+PowerShell's built-in application ID, so it needs no installer. It has never been seen on the
+Windows machine. Until it is, treat it as built but unproven.
 
-**Impact:** on Windows, a waiting transfer is easy to miss.
+**Impact (if it does not show):** on Windows, a waiting transfer is easy to miss.
 
 ### B7 — the panel has no accessibility tree
-**open** · tracked as R13
+**deferred** · tracked as R13
 
 iced/wgpu exposes zero UI Automation descendants, so screen readers cannot see the panel
-and UI automation cannot drive it. Worth a decision before selling this.
+and UI automation cannot drive it. **Why deferred:** it is a limit of the GUI toolkit, not a
+bug in mouse-rs code, and fixing it means either a toolkit change or a second, accessible
+front end. That is a product decision (see the sale plan), not a fix to ship in this round.
+Until then the tray menu is the one fully accessible control surface.
 
 ### B8 — console flashes when launching the GUI from Explorer
 **deferred** · tracked as R14
@@ -338,12 +367,19 @@ Nothing equivalent exists on Windows. The Windows login screen (Winlogon) runs o
 separate, more protected desktop, so this is unlikely to be the same shape of fix.
 **May be what B1 is about** — do not assume.
 
+**Why deferred:** there is no supported way for an ordinary program to inject input at the
+Winlogon desktop, and the one route that might work (a SYSTEM service on a secure desktop)
+is a different product with its own signing and review burden. Not attempted in this round.
+
 ### B10 — Wayland can receive input but cannot send it
-**open**
+**deferred** · 2026-10-12
 
 The new uinput backend injects fine under Wayland, so a Wayland machine can be a
 *client*. Capture is still X11-only (`crates/mouse-input/src/linux.rs`), so a Wayland
 machine cannot be the *server*. Kali is X11 today, so nothing is blocked right now.
+
+**Why deferred:** Wayland capture needs the compositor's portal (PipeWire/libei), a separate
+integration per desktop. Build it when a Wayland machine has to be the server.
 
 ---
 
@@ -368,11 +404,40 @@ symlinked — the same script regenerates them and rewrites the hash in them, so
 there can never disagree with what it states.
 
 ### B12 — a bare `cargo build` fails on this machine
-**open**
+**fixed 2026-10-12**
 
 `libxdo-dev` is not installed, so the `libxdo.so` dev symlink is missing and linking fails
-with `unable to find library -lxdo`. The repo carries `.xdo-shim/libxdo.so`;
-`scripts/serve-windows.sh` exports it, but a plain cargo invocation does not.
+with `unable to find library -lxdo`.
+
+**Fixed:** `crates/mouse/build.rs` adds `.xdo-shim/` to the link search path on Linux, so a plain
+`cargo build` links without any `RUSTFLAGS`. Verified with `env -u RUSTFLAGS cargo build -p mouse`.
+Installing `libxdo-dev` still works and is simply not needed.
 
 **Workaround:** `RUSTFLAGS="-L $PWD/.xdo-shim" cargo build --release`
 **Fix:** `sudo apt install libxdo-dev`
+
+---
+
+## Network following (R22)
+
+### B15 — discovery cannot cross a network that isolates its devices
+**unverified** · built 2026-10-12
+
+Discovery sends a beacon to each network's broadcast address on UDP 24801. Some networks stop
+one device from reaching another: guest Wi-Fi, some office and hotel networks, and some
+hotspot settings ("AP isolation" or "client isolation"). On those, beacons never arrive, and
+the client falls back to `server_host` and to the addresses it already knows. A server on an
+isolated network is only found if its address is typed in.
+
+**Impact:** no automatic discovery on that network. Connecting still works if the address is set.
+
+**Also check on Windows:** the first time the server listens for beacons, Windows Firewall may
+ask about mouse-rs on private networks. Allow it, or beacons do not reach the server.
+
+### B16 — the two machines must share a network before they can connect
+**by design, not a defect**
+
+A client only reaches a server on a network it is attached to. If the two machines are on
+different networks with no route between them (for example Kali on Ethernet to one router, and
+the laptop on Wi-Fi to another), no software can join them. The moment they share a network,
+the beacon finds the server and the link comes up within a few seconds.
