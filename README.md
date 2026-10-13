@@ -169,6 +169,9 @@ Known issues, with their status, are listed in [docs/KNOWN-ISSUES.md](docs/KNOWN
 
 ## 🗺️ Making it one-click
 
+> The full plan for launch on **1 November 2026**, and the settings reorganisation, is in
+> [docs/PLAN-SETTINGS-AND-LAUNCH.md](docs/PLAN-SETTINGS-AND-LAUNCH.md).
+
 The goal: **download, run, done**, on both computers, with updates that take care of
 themselves. This is where each step stands today.
 

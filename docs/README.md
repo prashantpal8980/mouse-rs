@@ -8,6 +8,7 @@
 | [KNOWN-ISSUES.md](KNOWN-ISSUES.md) | The standing bug list (B1…), with evidence and state |
 | [UI-REQUIREMENTS.md](UI-REQUIREMENTS.md) | Agreed behaviour of the control panel (R1…) |
 | [STATUS.md](STATUS.md) | Longer project history and phase status |
+| [PLAN-SETTINGS-AND-LAUNCH.md](PLAN-SETTINGS-AND-LAUNCH.md) | Settings reorganisation, launch-readiness list for 1 Nov, copy/paste work |
 
 ## How it works
 
