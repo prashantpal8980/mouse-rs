@@ -1,0 +1,318 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Copy-paste test ladder</title>
+<style>
+  :root {
+    color-scheme: light;
+    --bg: #f3f2ee; --surface: #fcfcfb; --line: #e2e0d9;
+    --ink: #0b0b0b; --ink-2: #52514e; --ink-3: #7a7973;
+    --good: #0ca30c; --warning: #fab219; --serious: #ec835a; --neutral: #a9a79f;
+    --accent: #2a6fdb; --code-bg: #efede7; --field: #ffffff;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      color-scheme: dark;
+      --bg: #121211; --surface: #1a1a19; --line: #2d2d2b;
+      --ink: #ffffff; --ink-2: #c3c2b7; --ink-3: #8f8e86; --neutral: #6b6a64;
+      --accent: #7aa7f0; --code-bg: #232321; --field: #121211;
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --bg: #121211; --surface: #1a1a19; --line: #2d2d2b;
+    --ink: #ffffff; --ink-2: #c3c2b7; --ink-3: #8f8e86; --neutral: #6b6a64;
+    --accent: #7aa7f0; --code-bg: #232321; --field: #121211;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink);
+         font: 15px/1.55 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  .layout { display: grid; grid-template-columns: 260px 1fr; min-height: 100vh; }
+  @media (max-width: 760px) { .layout { grid-template-columns: 1fr; } aside { position: static !important; height: auto !important; } }
+
+  aside { position: sticky; top: 0; height: 100vh; overflow-y: auto; border-right: 1px solid var(--line);
+          background: var(--surface); padding: 20px 14px; }
+  aside h1 { font-size: 17px; margin: 0 0 2px; }
+  aside .sub { color: var(--ink-3); font-size: 12px; margin: 0 0 14px; }
+  .dirhead { font-size: 11px; font-weight: 700; color: var(--ink-3); text-transform: uppercase; letter-spacing: .05em; margin: 14px 6px 6px; }
+  .rung-btn { display: flex; align-items: center; gap: 10px; width: 100%; text-align: left; border: 1px solid transparent;
+              background: none; color: var(--ink); font: inherit; padding: 8px; border-radius: 8px; cursor: pointer; }
+  .rung-btn:hover { background: var(--bg); }
+  .rung-btn[aria-current="true"] { border-color: var(--accent); background: var(--bg); }
+  .rung-btn .id { font-weight: 700; width: 26px; flex: none; font-variant-numeric: tabular-nums; }
+  .rung-btn .lbl { flex: 1; font-size: 14px; line-height: 1.3; }
+  .pill { font-size: 11px; font-weight: 700; padding: 2px 8px; border-radius: 999px; color: #0b0b0b; white-space: nowrap; flex: none; }
+  .s-waiting { background: var(--neutral); }
+  .s-testing { background: var(--warning); }
+  .s-fixing  { background: var(--serious); }
+  .s-done    { background: var(--good); }
+  .side-foot { margin-top: 18px; display: grid; gap: 8px; }
+  .side-foot button { font: inherit; font-size: 13px; padding: 7px 10px; border-radius: 8px; border: 1px solid var(--line);
+                      background: var(--bg); color: var(--ink-2); cursor: pointer; }
+
+  main { padding: 28px 24px 64px; max-width: 860px; }
+  .eyebrow { color: var(--ink-3); font-size: 13px; font-weight: 600; }
+  h2 { font-size: 26px; margin: 2px 0 6px; letter-spacing: -0.01em; }
+  .why { color: var(--ink-2); margin: 0 0 18px; }
+  .card { background: var(--surface); border: 1px solid var(--line); border-radius: 12px; padding: 18px 20px; margin-bottom: 16px; }
+  .card h3 { margin: 0 0 10px; font-size: 16px; display: flex; align-items: center; gap: 8px; }
+  .card h3 .n { width: 24px; height: 24px; border-radius: 50%; background: var(--accent); color: #fff; font-size: 13px;
+                display: inline-flex; align-items: center; justify-content: center; flex: none; }
+  ol.steps { margin: 0; padding-left: 20px; }
+  ol.steps li { margin: 6px 0; }
+  ul.expect { margin: 0; padding-left: 0; list-style: none; }
+  ul.expect li { padding: 5px 0 5px 26px; position: relative; }
+  ul.expect li::before { content: "✓"; position: absolute; left: 4px; color: var(--good); font-weight: 700; }
+  kbd { font-family: ui-monospace, Consolas, monospace; font-size: 12px; background: var(--code-bg); border: 1px solid var(--line);
+        border-bottom-width: 2px; border-radius: 4px; padding: 0 5px; }
+  code { font-family: ui-monospace, Consolas, monospace; font-size: 13px; background: var(--code-bg); padding: 1px 5px; border-radius: 4px; }
+
+  form { display: grid; gap: 12px; }
+  .row2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  @media (max-width: 560px) { .row2 { grid-template-columns: 1fr; } }
+  label { display: grid; gap: 4px; font-size: 13px; font-weight: 600; color: var(--ink-2); }
+  input, textarea, select { font: inherit; font-weight: 400; color: var(--ink); background: var(--field); border: 1px solid var(--line);
+                            border-radius: 8px; padding: 8px 10px; width: 100%; }
+  textarea { min-height: 76px; resize: vertical; }
+  .timefield { display: flex; gap: 6px; }
+  .timefield button { flex: none; }
+  .btn { font: inherit; font-size: 13px; font-weight: 600; padding: 8px 14px; border-radius: 8px; border: 1px solid var(--line);
+         background: var(--surface); color: var(--ink); cursor: pointer; }
+  .btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .outcomes { display: flex; flex-wrap: wrap; gap: 8px; }
+  .outcomes label { display: inline-flex; align-items: center; gap: 6px; font-weight: 400; color: var(--ink);
+                    border: 1px solid var(--line); border-radius: 999px; padding: 5px 12px; cursor: pointer; }
+  .outcomes input { width: auto; margin: 0; }
+  .actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  .saved { color: var(--ink-3); font-size: 12px; }
+  .claude { border-left: 4px solid var(--accent); }
+  .claude .empty { color: var(--ink-3); font-style: italic; margin: 0; }
+  .navrow { display: flex; justify-content: space-between; gap: 8px; margin-top: 8px; }
+  .toast { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%); background: var(--ink); color: var(--surface);
+           padding: 8px 14px; border-radius: 8px; font-size: 13px; opacity: 0; transition: opacity .15s; pointer-events: none; }
+</style>
+</head>
+<body>
+<div class="layout">
+  <aside>
+    <h1>Copy & paste ladder</h1>
+    <p class="sub">One kind of content at a time. Each step is signed off before the next.</p>
+    <nav id="nav" aria-label="Test steps"></nav>
+    <div class="side-foot">
+      <button type="button" id="themeBtn">Dark / light</button>
+      <button type="button" id="resetBtn">Clear my notes</button>
+    </div>
+  </aside>
+
+  <main id="main" aria-live="polite"></main>
+</div>
+<div class="toast" id="toast" role="status"></div>
+
+<script>
+  // ---- The ladder. Status and Claude's findings are edited by Claude as we go. ----
+  const RUNGS = [
+    { id: "1a", dir: "L2W", title: "Image itself", short: "Image (picture)", status: "testing",
+      why: "The picture goes onto the clipboard directly, with no file involved. Small ones travel inside the clipboard message; big ones are fetched over the file lane when you paste.",
+      copy: [
+        "On <b>Kali</b>, either take a screenshot straight to the clipboard (Screenshot tool → <b>Copy to clipboard</b>), or right-click an image in a browser → <b>Copy image</b>.",
+        "Note roughly how big it is: a small icon, part of the screen, or the whole screen.",
+      ],
+      paste: [
+        "Move the pointer across to <b>Windows</b>.",
+        "Open <b>Paint</b> (or Word, or a chat box) and press <kbd>Ctrl</kbd>+<kbd>V</kbd>.",
+      ],
+      expect: [
+        "The picture appears in Paint the first time you paste, within about a second.",
+        "It is the same picture, the same size, with no distortion or wrong colours.",
+        "Pasting again gives the same picture again.",
+        "It appears in the clipboard history on both computers.",
+      ] },
+    { id: "1b", dir: "L2W", title: "Image file", short: "Image file", status: "waiting",
+      why: "Copying a .png or .jpg in the file manager copies the FILE, not the picture. It is fetched from Kali when you paste.",
+      copy: ["On <b>Kali</b>, open the file manager (Thunar), click a <code>.png</code> or <code>.jpg</code>, press <kbd>Ctrl</kbd>+<kbd>C</kbd>.", "Note its size (right-click → Properties)."],
+      paste: ["On <b>Windows</b>, open a folder in Explorer (or the desktop) and press <kbd>Ctrl</kbd>+<kbd>V</kbd>."],
+      expect: ["A file with the same name and size appears in that folder.", "It opens and looks the same as on Kali.", "The panel shows the transfer while it runs."] },
+    { id: "2", dir: "L2W", title: "Video file", short: "Video", status: "waiting",
+      why: "A large file: tests speed, progress and whether a long transfer finishes.",
+      copy: ["On <b>Kali</b>, copy a video file (ideally hundreds of MB) in the file manager with <kbd>Ctrl</kbd>+<kbd>C</kbd>.", "Note its size."],
+      paste: ["On <b>Windows</b>, paste into a folder with <kbd>Ctrl</kbd>+<kbd>V</kbd>.", "Watch how long it takes, and whether progress is shown."],
+      expect: ["Progress is shown, and the transfer finishes.", "The file has the same size and plays to the end.", "You can keep using the mouse and keyboard while it copies."] },
+    { id: "3", dir: "L2W", title: "Folder", short: "Folder", status: "waiting",
+      why: "Several files and sub-folders at once: tests that the whole structure arrives.",
+      copy: ["On <b>Kali</b>, copy a folder that has some files and at least one sub-folder.", "Note how many files it has and its total size."],
+      paste: ["On <b>Windows</b>, paste into a folder with <kbd>Ctrl</kbd>+<kbd>V</kbd>."],
+      expect: ["The folder arrives with the same name.", "Every file and sub-folder is inside, with the same sizes.", "Nothing extra (no temporary files) is left behind."] },
+    { id: "4", dir: "L2W", title: "Zip file", short: "Zip", status: "waiting",
+      why: "A single compressed file: it must arrive byte-for-byte identical or it won't open.",
+      copy: ["On <b>Kali</b>, copy a <code>.zip</code> file in the file manager.", "Note its size."],
+      paste: ["On <b>Windows</b>, paste into a folder, then open the zip."],
+      expect: ["The zip arrives with the same name and size.", "It opens, and its contents extract without errors."] },
+    { id: "5", dir: "W2L", title: "Image itself", short: "Image (picture)", status: "waiting",
+      why: "The reverse of 1a.",
+      copy: ["On <b>Windows</b>, press <kbd>Win</kbd>+<kbd>Shift</kbd>+<kbd>S</kbd> and snip part of the screen, or right-click an image in a browser → <b>Copy image</b>."],
+      paste: ["On <b>Kali</b>, paste into an app that takes pictures (GIMP, LibreOffice, a chat box) with <kbd>Ctrl</kbd>+<kbd>V</kbd>."],
+      expect: ["The picture appears the first time, unchanged.", "It appears in the clipboard history on both computers."] },
+    { id: "6", dir: "W2L", title: "Image file", short: "Image file", status: "waiting",
+      why: "The reverse of 1b.",
+      copy: ["On <b>Windows</b>, copy a <code>.png</code>/<code>.jpg</code> in Explorer."],
+      paste: ["On <b>Kali</b>, paste into a Thunar folder."],
+      expect: ["Same name and size; it opens."] },
+    { id: "7", dir: "W2L", title: "Video file", short: "Video", status: "waiting",
+      why: "The reverse of 2.",
+      copy: ["On <b>Windows</b>, copy a large video in Explorer."],
+      paste: ["On <b>Kali</b>, paste into a Thunar folder."],
+      expect: ["Progress shown; it finishes; same size; it plays."] },
+    { id: "8", dir: "W2L", title: "Folder and zip", short: "Folder, zip", status: "waiting",
+      why: "The reverse of 3 and 4.",
+      copy: ["On <b>Windows</b>, copy a folder, then separately a zip."],
+      paste: ["On <b>Kali</b>, paste each into a Thunar folder."],
+      expect: ["Folder structure complete; zip opens."] },
+  ];
+
+  // Claude's findings per step: filled in by Claude after reading the logs.
+  const FINDINGS = {
+    // "1a": { happened: "...", cause: "...", agreed: "...", fix: "...", signoff: "" },
+  };
+
+  const STATUS_LABEL = { waiting: "waiting", testing: "testing now", fixing: "fixing", done: "signed off" };
+  const DIRS = { L2W: "Linux → Windows", W2L: "Windows → Linux" };
+  const KEY = "mouse-rs-ladder-notes-v1";
+  let notes = {};
+  try { notes = JSON.parse(localStorage.getItem(KEY) || "{}"); } catch (e) { notes = {}; }
+  const save = () => { try { localStorage.setItem(KEY, JSON.stringify(notes)); } catch (e) {} };
+
+  let current = (RUNGS.find(r => r.status === "testing") || RUNGS[0]).id;
+  try { const h = location.hash.slice(1); if (RUNGS.some(r => r.id === h)) current = h; } catch (e) {}
+
+  function nav() {
+    let html = "", lastDir = "";
+    for (const r of RUNGS) {
+      if (r.dir !== lastDir) { html += `<div class="dirhead">${DIRS[r.dir]}</div>`; lastDir = r.dir; }
+      html += `<button class="rung-btn" type="button" data-id="${r.id}" aria-current="${r.id === current}">
+        <span class="id">${r.id}</span><span class="lbl">${r.short}</span>
+        <span class="pill s-${r.status}">${STATUS_LABEL[r.status]}</span></button>`;
+    }
+    const el = document.getElementById("nav");
+    el.innerHTML = html;
+    el.querySelectorAll(".rung-btn").forEach(b => b.addEventListener("click", () => show(b.dataset.id)));
+  }
+
+  const esc = s => String(s || "").replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+  const nowHM = () => { const d = new Date(); return d.toTimeString().slice(0, 5); };
+
+  function show(id) {
+    current = id;
+    try { history.replaceState(null, "", "#" + id); } catch (e) {}
+    const r = RUNGS.find(x => x.id === id);
+    const n = notes[id] || {};
+    const f = FINDINGS[id];
+    const idx = RUNGS.indexOf(r);
+    const outcome = n.outcome || "";
+    document.getElementById("main").innerHTML = `
+      <div class="eyebrow">Step ${r.id} · ${DIRS[r.dir]} · <span class="pill s-${r.status}">${STATUS_LABEL[r.status]}</span></div>
+      <h2>${r.title}</h2>
+      <p class="why">${r.why}</p>
+
+      <div class="card"><h3><span class="n">1</span>Copy</h3><ol class="steps">${r.copy.map(s => `<li>${s}</li>`).join("")}</ol></div>
+      <div class="card"><h3><span class="n">2</span>Paste</h3><ol class="steps">${r.paste.map(s => `<li>${s}</li>`).join("")}</ol></div>
+      <div class="card"><h3><span class="n">3</span>What should happen</h3><ul class="expect">${r.expect.map(s => `<li>${s}</li>`).join("")}</ul></div>
+
+      <div class="card">
+        <h3><span class="n">4</span>Your notes</h3>
+        <form id="f" autocomplete="off">
+          <label>What you copied, and roughly how big
+            <input name="what" value="${esc(n.what)}" placeholder="e.g. full-screen screenshot / 450 MB .mp4"></label>
+          <label>Where you pasted it
+            <input name="where" value="${esc(n.where)}" placeholder="e.g. Paint / Desktop folder in Explorer"></label>
+          <div class="row2">
+            <label>Time you copied
+              <span class="timefield"><input name="tcopy" value="${esc(n.tcopy)}" placeholder="HH:MM"><button class="btn" type="button" data-now="tcopy">Now</button></span></label>
+            <label>Time you pasted
+              <span class="timefield"><input name="tpaste" value="${esc(n.tpaste)}" placeholder="HH:MM"><button class="btn" type="button" data-now="tpaste">Now</button></span></label>
+          </div>
+          <div>
+            <div style="font-size:13px;font-weight:600;color:var(--ink-2);margin-bottom:6px">Result</div>
+            <div class="outcomes">
+              ${["Worked perfectly", "Worked, but…", "Nothing pasted", "Wrong / broken content", "Very slow", "Error shown"].map(o =>
+                `<label><input type="radio" name="outcome" value="${o}" ${outcome === o ? "checked" : ""}>${o}</label>`).join("")}
+            </div>
+          </div>
+          <label>What happened
+            <textarea name="happened" placeholder="Exactly what you saw, step by step">${esc(n.happened)}</textarea></label>
+          <label>What you want it to do instead
+            <textarea name="want" placeholder="The behaviour you expect">${esc(n.want)}</textarea></label>
+          <div class="actions">
+            <button class="btn primary" type="button" id="copyReport">Copy my report for Claude</button>
+            <span class="saved" id="saved">Saved automatically in this browser.</span>
+          </div>
+        </form>
+      </div>
+
+      <div class="card claude">
+        <h3>Claude's findings</h3>
+        ${f ? `
+          <p><b>What the logs show:</b> ${f.happened || "—"}</p>
+          <p><b>Cause:</b> ${f.cause || "—"}</p>
+          <p><b>Agreed behaviour:</b> ${f.agreed || "—"}</p>
+          <p><b>Fix:</b> ${f.fix || "—"}</p>
+          <p style="margin:0"><b>Signed off:</b> ${f.signoff || "not yet"}</p>`
+          : `<p class="empty">Nothing yet. After you send your report, Claude reads both computers' logs for that minute and writes the result here.</p>`}
+      </div>
+
+      <div class="navrow">
+        ${idx > 0 ? `<button class="btn" type="button" data-go="${RUNGS[idx - 1].id}">← ${RUNGS[idx - 1].id} ${RUNGS[idx - 1].short}</button>` : "<span></span>"}
+        ${idx < RUNGS.length - 1 ? `<button class="btn" type="button" data-go="${RUNGS[idx + 1].id}">${RUNGS[idx + 1].id} ${RUNGS[idx + 1].short} →</button>` : ""}
+      </div>`;
+
+    const form = document.getElementById("f");
+    const store = () => {
+      const d = Object.fromEntries(new FormData(form).entries());
+      notes[id] = d; save();
+      const s = document.getElementById("saved"); s.textContent = "Saved " + nowHM();
+    };
+    form.addEventListener("input", store);
+    form.addEventListener("change", store);
+    form.querySelectorAll("[data-now]").forEach(b => b.addEventListener("click", () => {
+      form.elements[b.dataset.now].value = nowHM(); store();
+    }));
+    document.getElementById("copyReport").addEventListener("click", async () => {
+      store();
+      const d = notes[id] || {};
+      const text = [
+        `Step ${r.id} — ${r.title}, ${DIRS[r.dir]}`,
+        `Copied: ${d.what || "-"}`,
+        `Pasted into: ${d.where || "-"}`,
+        `Time copied: ${d.tcopy || "-"}   Time pasted: ${d.tpaste || "-"}`,
+        `Result: ${d.outcome || "-"}`,
+        `What happened: ${d.happened || "-"}`,
+        `What I want: ${d.want || "-"}`,
+      ].join("\n");
+      try { await navigator.clipboard.writeText(text); toast("Report copied. Paste it to Claude."); }
+      catch (e) { toast("Couldn't copy automatically. Select the fields and copy them by hand."); }
+    });
+    document.querySelectorAll("[data-go]").forEach(b => b.addEventListener("click", () => { show(b.dataset.go); window.scrollTo(0, 0); }));
+    nav();
+  }
+
+  function toast(msg) {
+    const t = document.getElementById("toast"); t.textContent = msg; t.style.opacity = 1;
+    clearTimeout(toast._t); toast._t = setTimeout(() => t.style.opacity = 0, 2200);
+  }
+
+  document.getElementById("resetBtn").addEventListener("click", () => {
+    delete notes[current]; save(); show(current); toast("Notes for step " + current + " cleared.");
+  });
+  const root = document.documentElement;
+  try { const t = localStorage.getItem("theme"); if (t) root.dataset.theme = t; } catch (e) {}
+  document.getElementById("themeBtn").addEventListener("click", () => {
+    const dark = root.dataset.theme ? root.dataset.theme === "dark" : matchMedia("(prefers-color-scheme: dark)").matches;
+    root.dataset.theme = dark ? "light" : "dark";
+    try { localStorage.setItem("theme", root.dataset.theme); } catch (e) {}
+  });
+
+  show(current);
+</script>
+</body>
+</html>
