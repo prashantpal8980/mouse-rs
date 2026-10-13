@@ -157,8 +157,8 @@ rung is done when it works in the direction tested; the reverse direction is its
 
 | Rung | What is copied | Direction | Status |
 |---|---|---|---|
-| 1a | **Image pixels**: a screenshot, or "Copy image" in a browser; pasted into an Explorer folder **and** into apps | Linux → Windows | **testing now** (needs the laptop update) |
-| 1b | **Image file**: a `.png`/`.jpg` copied in the file manager | Linux → Windows | waiting |
+| 1a | **Image pixels**: a screenshot, or "Copy image" in a browser; pasted into an Explorer folder **and** into apps | Linux → Windows | **signed off 13 Oct** |
+| 1b | **Image file**: a `.png`/`.jpg` copied in the file manager | Linux → Windows | **next** |
 | 2 | **Video file** (a large one, hundreds of MB) | Linux → Windows | waiting |
 | 3 | **Folder** with several files and sub-folders | Linux → Windows | waiting |
 | 4 | **Zip file** | Linux → Windows | waiting |
@@ -196,4 +196,4 @@ what happened, the cause, the agreed behaviour, the fix, and the owner's sign-of
 
 #### Rung 1a — image pixels, Linux → Windows
 
-- Owner's report: _pending_
+- Same cause and fix as rung 5. Signed off by the owner on 13 Oct, after the laptop update.
