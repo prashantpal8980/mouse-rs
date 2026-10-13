@@ -14,6 +14,7 @@
 
 pub mod cache;
 pub mod files;
+pub mod pipe;
 pub mod transfer;
 #[cfg(target_os = "linux")]
 pub mod stream_fs;
@@ -1231,6 +1232,8 @@ fn run(
                     break;
                 }
             }
+            // Streams feeding a paste directly: start, resume or pause them as it reads.
+            t.drive_pipes(&to_peer);
             // A paste is waiting on content: start fetching it now. This is the only
             // thing that begins a large transfer, which is what keeps copying cheap.
             paste_signals.retain(|id, sig| {
@@ -1802,7 +1805,13 @@ use stream_fs::StreamFs as Streaming;
 struct Streaming;
 #[cfg(not(target_os = "linux"))]
 impl Streaming {
-    fn add_set(&self, _entry: u64, _set: &FileSet, _sig: Arc<files::PasteSignal>) -> Option<files::FileList> {
+    fn add_set(
+        &self,
+        _entry: u64,
+        _set: &FileSet,
+        _sig: Arc<files::PasteSignal>,
+        _pipes: &std::collections::HashMap<String, Arc<pipe::StreamPipe>>,
+    ) -> Option<files::FileList> {
         None
     }
 }
@@ -1816,7 +1825,7 @@ impl Streaming {
 /// Thunar): a 3.1 GB video failed that way with "nothing on the clipboard".
 #[allow(clippy::too_many_arguments)] // every one is per-application state
 fn publish_pending_set(
-    t: &transfer::Transfers,
+    t: &mut transfer::Transfers,
     streaming: Option<&Streaming>,
     streamed: &mut std::collections::HashMap<u64, u64>,
     id: u64,
@@ -1826,7 +1835,18 @@ fn publish_pending_set(
     last: &mut Option<String>,
     last_files: &mut Option<u64>,
 ) -> bool {
-    if let Some(list) = streaming.and_then(|s| s.add_set(id, set, sig.clone())) {
+    // Large files (identified by length rather than content hash) stream straight from the
+    // network to the paste through memory, so they never take disk space twice. Small,
+    // content-hashed ones keep going through the cache, where the hash is checked.
+    let mut pipes = std::collections::HashMap::new();
+    if streaming.is_some() {
+        for f in &set.files {
+            if !f.content_hashed && !t.cache().contains(&f.hash) {
+                pipes.insert(f.hash.clone(), t.pipe_for(&f.hash, f.size, id));
+            }
+        }
+    }
+    if let Some(list) = streaming.and_then(|s| s.add_set(id, set, sig.clone(), &pipes)) {
         // A copy, never a move: the folder is read-only, and the file manager would
         // otherwise report a failure deleting the source after a successful paste.
         let how = files::Publish { move_on_paste: false, relink: Vec::new(), png: None, on_paste: None };

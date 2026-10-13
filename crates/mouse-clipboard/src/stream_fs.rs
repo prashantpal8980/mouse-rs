@@ -31,6 +31,7 @@ use fuser::{
 
 use crate::cache::{self, BlobCache};
 use crate::files::{FileList, PasteSignal};
+use crate::pipe::StreamPipe;
 use crate::FileSet;
 
 /// How long attributes may be cached by the kernel. Nothing here changes once created.
@@ -52,6 +53,8 @@ struct RemoteFile {
     hash: String,
     size: u64,
     signal: Arc<PasteSignal>,
+    /// Large files stream through memory instead of the cache; see [`crate::pipe`].
+    pipe: Option<Arc<StreamPipe>>,
 }
 
 enum Kind {
@@ -107,7 +110,14 @@ impl Tree {
     }
 
     /// Build `<root>/<entry>/…` for a copied set; returns its top-level paths.
-    fn add_set(&mut self, root: &Path, entry: u64, set: &FileSet, signal: Arc<PasteSignal>) -> Option<FileList> {
+    fn add_set(
+        &mut self,
+        root: &Path,
+        entry: u64,
+        set: &FileSet,
+        signal: Arc<PasteSignal>,
+        pipes: &HashMap<String, Arc<StreamPipe>>,
+    ) -> Option<FileList> {
         if let Some(paths) = self.by_entry.get(&entry) {
             return Some(FileList { paths: paths.clone() });
         }
@@ -144,7 +154,12 @@ impl Tree {
                 self.add(
                     at,
                     leaf,
-                    Kind::File(RemoteFile { hash: f.hash.clone(), size: f.size, signal: signal.clone() }),
+                    Kind::File(RemoteFile {
+                        hash: f.hash.clone(),
+                        size: f.size,
+                        signal: signal.clone(),
+                        pipe: pipes.get(&f.hash).cloned(),
+                    }),
                 );
             }
             note_top(&parts[0], &mut tops);
@@ -171,6 +186,7 @@ impl Tree {
 struct Open {
     hash: String,
     tail_served: Arc<std::sync::atomic::AtomicBool>,
+    pipe: Option<Arc<StreamPipe>>,
 }
 
 struct Inner {
@@ -279,9 +295,16 @@ impl StreamFs {
 
     /// Present a copied set under `<mount>/<entry>/…` and return its top-level items, which
     /// is what goes on the clipboard. Presenting the same entry again returns the same paths.
-    pub fn add_set(&self, entry: u64, set: &FileSet, signal: Arc<PasteSignal>) -> Option<FileList> {
+    /// `pipes` are the files in the set that stream through memory rather than the cache.
+    pub fn add_set(
+        &self,
+        entry: u64,
+        set: &FileSet,
+        signal: Arc<PasteSignal>,
+        pipes: &HashMap<String, Arc<StreamPipe>>,
+    ) -> Option<FileList> {
         let mut tree = self.inner.tree.lock().ok()?;
-        tree.add_set(&self.root, entry, set, signal)
+        tree.add_set(&self.root, entry, set, signal, pipes)
     }
 
     /// Whether a path lives in this folder.
@@ -344,14 +367,18 @@ impl Filesystem for Fs {
             Err(_) => return reply.error(Errno::EIO),
         };
         // Opening is the paste: start the transfer now, unless we already hold the file.
-        if !self.0.cache.contains(&file.hash) {
+        // A piped file is fetched by its first read instead, from the offset it asks for.
+        if file.pipe.is_none() && !self.0.cache.contains(&file.hash) {
             file.signal.failed.store(false, Ordering::SeqCst);
             file.signal.wanted.store(true, Ordering::SeqCst);
             tracing::info!(bytes = file.size, "streaming folder: a paste opened a file still on the peer; fetching");
         }
         let fh = self.0.next_fh.fetch_add(1, Ordering::SeqCst);
         if let Ok(mut opens) = self.0.opens.lock() {
-            opens.insert(fh, Open { hash: file.hash.clone(), tail_served: Default::default() });
+            opens.insert(
+                fh,
+                Open { hash: file.hash.clone(), tail_served: Default::default(), pipe: file.pipe.clone() },
+            );
         }
         // Direct I/O: every read comes to us, so nothing stale is served from the page cache
         // for a file that is still filling in.
@@ -395,7 +422,7 @@ impl Filesystem for Fs {
         let tail_flag = self.0.opens.lock().ok().and_then(|o| o.get(&fh.0).map(|o| o.tail_served.clone()));
         // Answered from a thread of its own: a read waiting on the network must not hold
         // up every other request to this folder.
-        std::thread::spawn(move || match read_when_ready(&cache, &file, offset, size as u64) {
+        std::thread::spawn(move || match read_file(&cache, &file, offset, size as u64) {
             Ok(bytes) => {
                 if offset + bytes.len() as u64 >= file.size {
                     if let Some(flag) = tail_flag {
@@ -415,10 +442,18 @@ impl Fs {
     fn closed(&self, fh: u64) {
         let Ok(mut opens) = self.0.opens.lock() else { return };
         let Some(open) = opens.remove(&fh) else { return };
+        let others = opens.values().any(|o| o.hash == open.hash);
+        if let Some(pipe) = &open.pipe {
+            if !others {
+                pipe.release();
+                tracing::info!(hash = %open.hash, "paste closed the streamed file; stream stopped and its memory freed");
+            }
+            return;
+        }
         if !open.tail_served.load(Ordering::SeqCst) {
             return; // cancelled part-way: keep what arrived, so a retry resumes
         }
-        if opens.values().any(|o| o.hash == open.hash) {
+        if others {
             return;
         }
         drop(opens);
@@ -430,6 +465,17 @@ impl Fs {
 /// `O_ACCMODE`: any write access asked for at open.
 fn libc_o_accmode() -> i32 {
     0o3
+}
+
+/// A read, from the pipe for a streamed file, otherwise from the cache.
+fn read_file(cache: &BlobCache, file: &RemoteFile, offset: u64, len: u64) -> Result<Vec<u8>, Errno> {
+    match &file.pipe {
+        Some(pipe) => pipe.read(offset, len, STALL).ok_or_else(|| {
+            tracing::warn!(offset, size = file.size, "streaming folder: no data for {STALL:?}; failing the copy");
+            Errno::EIO
+        }),
+        None => read_when_ready(cache, file, offset, len),
+    }
 }
 
 /// The bytes `offset..offset+len` of `file`, waiting for them to arrive if need be.
@@ -506,7 +552,7 @@ mod tests {
         let cache = Arc::new(BlobCache::new(dir.clone()).unwrap());
         let body = b"0123456789".to_vec();
         let hash = cache::hash_bytes(&body);
-        let file = RemoteFile { hash: hash.clone(), size: 10, signal: Arc::new(PasteSignal::default()) };
+        let file = RemoteFile { hash: hash.clone(), size: 10, signal: Arc::new(PasteSignal::default()), pipe: None };
 
         // Half the file has arrived: the first half reads, and opening raised nothing yet.
         {
@@ -536,6 +582,7 @@ mod tests {
             hash: cache::hash_bytes(b"never"),
             size: 5,
             signal: Arc::new(PasteSignal::default()),
+            pipe: None,
         };
         missing.signal.failed.store(true, Ordering::SeqCst);
         assert!(read_when_ready(&cache, &missing, 0, 5).is_err());
@@ -555,7 +602,7 @@ mod tests {
             origin: "laptop".into(),
         };
         let root = Path::new("/mnt");
-        let list = tree.add_set(root, 7, &set, Arc::new(PasteSignal::default())).unwrap();
+        let list = tree.add_set(root, 7, &set, Arc::new(PasteSignal::default()), &HashMap::new()).unwrap();
         assert_eq!(list.paths, vec![PathBuf::from("/mnt/7/Album"), PathBuf::from("/mnt/7/a.mkv")]);
         let set_ino = tree.child(1, "7").unwrap();
         let album = tree.child(set_ino, "Album").unwrap();
@@ -567,7 +614,7 @@ mod tests {
         }
         // Presenting the same entry again gives the same paths and builds nothing new.
         let n = tree.nodes.len();
-        assert_eq!(tree.add_set(root, 7, &set, Arc::new(PasteSignal::default())).unwrap(), list);
+        assert_eq!(tree.add_set(root, 7, &set, Arc::new(PasteSignal::default()), &HashMap::new()).unwrap(), list);
         assert_eq!(tree.nodes.len(), n);
     }
 
@@ -587,7 +634,7 @@ mod tests {
         f.hash = hash.clone();
         let set = FileSet { files: vec![f], dirs: vec![], origin: "peer".into() };
         let sig = Arc::new(PasteSignal::default());
-        let list = sfs.add_set(1, &set, sig.clone()).unwrap();
+        let list = sfs.add_set(1, &set, sig.clone(), &HashMap::new()).unwrap();
 
         // The "transfer": starts only once the copy has opened the file, then trickles in.
         let (c2, h2, b2, s2) = (cache.clone(), hash.clone(), body.clone(), sig.clone());
@@ -618,6 +665,62 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         assert!(gone, "mouse-rs's own copy should be removed once the paste has it");
+        drop(sfs);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Mounts for real: `cargo test -p mouse-clipboard -- --ignored mounted`.
+    #[test]
+    #[ignore]
+    fn mounted_piped_copy_survives_a_drop_and_writes_nothing_to_the_cache() {
+        use crate::pipe::PipeCmd;
+        let base = std::env::temp_dir().join(format!("mouse-rs-sfs-pipe-{}", std::process::id()));
+        let cache = Arc::new(BlobCache::new(base.join("cache")).unwrap());
+        let at = base.join("mnt");
+        let sfs = StreamFs::mount(cache.clone(), &at).expect("FUSE mount");
+
+        let body: Vec<u8> = (0..24 * 1024 * 1024u32).map(|i| (i % 253) as u8).collect();
+        let mut f = fref("big.iso", "", body.len() as u64);
+        f.content_hashed = false;
+        let hash = f.hash.clone();
+        let pipe = Arc::new(StreamPipe::new(body.len() as u64));
+        let mut pipes = HashMap::new();
+        pipes.insert(hash.clone(), pipe.clone());
+        let set = FileSet { files: vec![f], dirs: vec![], origin: "peer".into() };
+        let list = sfs.add_set(1, &set, Arc::new(PasteSignal::default()), &pipes).unwrap();
+
+        // The peer, reduced to its essentials: answer each start from the asked offset.
+        // The first stream "drops" after 9 MB, as a pulled cable would.
+        let (p2, b2) = (pipe.clone(), body.clone());
+        let peer = std::thread::spawn(move || {
+            let mut starts = Vec::new();
+            let deadline = Instant::now() + Duration::from_secs(60);
+            while Instant::now() < deadline && !p2.complete() {
+                if let PipeCmd::Start(off) = p2.take_command() {
+                    starts.push(off);
+                    assert!(p2.begin(off));
+                    let stop_at = if starts.len() == 1 { 9 * 1024 * 1024 } else { b2.len() };
+                    let mut pos = off as usize;
+                    while pos < stop_at {
+                        let end = (pos + 256 * 1024).min(stop_at);
+                        p2.push(&b2[pos..end]);
+                        pos = end;
+                    }
+                    p2.interrupted();
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            starts
+        });
+        let dest = base.join("pasted.iso");
+        std::fs::copy(&list.paths[0], &dest).unwrap();
+        let starts = peer.join().unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), body, "byte-identical");
+        assert_eq!(starts[0], 0);
+        assert!(starts.len() >= 2, "the drop was resumed");
+        assert!(starts[1] > 0, "resumed from where the paste got to, not from zero");
+        assert_eq!(cache.partial_len(&hash), 0, "nothing spooled to disk");
+        assert!(!cache.contains(&hash));
         drop(sfs);
         let _ = std::fs::remove_dir_all(&base);
     }

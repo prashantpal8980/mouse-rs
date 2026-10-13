@@ -77,7 +77,9 @@ pub struct BlobMeta {
 /// Receiving side of one in-flight blob.
 struct Incoming {
     hash: String,
-    file: std::fs::File,
+    /// Where the bytes go: the cache's partial file, or straight to a paste's pipe.
+    file: Option<std::fs::File>,
+    pipe: Option<Arc<crate::pipe::StreamPipe>>,
     got: u64,
     total: u64,
     entry: Option<u64>,
@@ -152,6 +154,9 @@ pub struct Transfers {
     /// The hash of the most recently completed transfer, so an image can be applied
     /// without the caller having to track transfer ids.
     last_completed: Option<String>,
+    /// Large files a paste reads straight from the network, by hash, with their entry.
+    /// These never touch the cache: see [`crate::pipe`].
+    pipes: HashMap<String, (Arc<crate::pipe::StreamPipe>, u64)>,
 }
 
 impl Transfers {
@@ -165,6 +170,49 @@ impl Transfers {
             entry_progress: HashMap::new(),
             pending_images: HashMap::new(),
             last_completed: None,
+            pipes: HashMap::new(),
+        }
+    }
+
+    /// The pipe a paste reads `hash` through, created on first use.
+    pub fn pipe_for(&mut self, hash: &str, size: u64, entry: u64) -> Arc<crate::pipe::StreamPipe> {
+        self.pipes
+            .entry(hash.to_string())
+            .or_insert_with(|| (Arc::new(crate::pipe::StreamPipe::new(size)), entry))
+            .0
+            .clone()
+    }
+
+    /// Act on what the pipes' readers asked for: start, resume or pause a stream.
+    pub fn drive_pipes(&mut self, to_peer: &UnboundedSender<Message>) {
+        use crate::pipe::PipeCmd;
+        let cmds: Vec<(String, u64, u64, PipeCmd)> = self
+            .pipes
+            .iter()
+            .map(|(hash, (pipe, entry))| (hash.clone(), *entry, pipe.size(), pipe.take_command()))
+            .collect();
+        for (hash, entry, size, cmd) in cmds {
+            if cmd == PipeCmd::Nothing {
+                continue;
+            }
+            // Whatever comes next, a stream already running for this file ends first.
+            // Cancelling *after* asking again would cancel the new stream too, since the
+            // sender stops by hash. Frames still in flight for the old one carry a transfer
+            // id forgotten here, so they are dropped.
+            if self.requested.remove(&hash).is_some() {
+                let _ = to_peer.send(Message::BlobCancel { hash: hash.clone() });
+                self.incoming.retain(|_, inc| inc.hash != hash);
+            }
+            if let PipeCmd::Start(offset) = cmd {
+                let _ = to_peer.send(Message::BlobRequest { hash: hash.clone(), offset });
+                self.requested.insert(hash.clone(), entry);
+                tracing::info!(
+                    hash = %hash,
+                    offset,
+                    size,
+                    "streaming to the paste: asked the peer for the file from this byte (no copy kept on disk)"
+                );
+            }
         }
     }
 
@@ -433,6 +481,11 @@ impl Transfers {
             if self.cache.contains(&f.hash) {
                 continue;
             }
+            // Fetched by the paste reading it, straight through memory.
+            if self.pipes.contains_key(&f.hash) {
+                in_flight = true;
+                continue;
+            }
             if self.requested.contains_key(&f.hash) {
                 in_flight = true;
                 continue;
@@ -664,6 +717,20 @@ impl Transfers {
         match frame {
             BulkFrame::Begin { transfer, total, meta } => {
                 let meta: BlobMeta = serde_json::from_slice(&meta).ok()?;
+                // Headed straight to a paste: nothing is written to disk.
+                if let Some((pipe, _)) = self.pipes.get(&meta.hash) {
+                    if !pipe.begin(meta.offset) {
+                        tracing::debug!(hash = %meta.hash, offset = meta.offset, "ignored a stream for an offset the paste no longer wants");
+                        return None;
+                    }
+                    let pipe = pipe.clone();
+                    let entry = history.find_by_hash(&meta.hash);
+                    self.incoming.insert(
+                        transfer,
+                        Incoming { hash: meta.hash, file: None, pipe: Some(pipe), got: meta.offset, total, entry },
+                    );
+                    return None;
+                }
                 let file = self.cache.open_partial(&meta.hash).ok()?;
                 let got = self.cache.partial_len(&meta.hash);
                 // The sender starts where we asked it to; if those disagree the stream
@@ -680,7 +747,7 @@ impl Transfers {
                     let entry = history.find_by_hash(&meta.hash);
                     self.incoming.insert(
                         transfer,
-                        Incoming { hash: meta.hash, file, got: 0, total, entry },
+                        Incoming { hash: meta.hash, file: Some(file), pipe: None, got: 0, total, entry },
                     );
                     return None;
                 }
@@ -693,14 +760,19 @@ impl Transfers {
                         agg.done = agg.done.saturating_add(got).min(agg.total);
                     }
                 }
-                self.incoming
-                    .insert(transfer, Incoming { hash: meta.hash, file, got, total, entry });
+                self.incoming.insert(
+                    transfer,
+                    Incoming { hash: meta.hash, file: Some(file), pipe: None, got, total, entry },
+                );
                 self.next_id = self.next_id.wrapping_add(1);
                 None
             }
             BulkFrame::Chunk { transfer, data, .. } => {
                 let inc = self.incoming.get_mut(&transfer)?;
-                if let Err(e) = inc.file.write_all(&data) {
+                if let Some(pipe) = &inc.pipe {
+                    // A full window is handled by `drive_pipes`, which pauses the stream.
+                    pipe.push(&data);
+                } else if let Some(Err(e)) = inc.file.as_mut().map(|f| f.write_all(&data)) {
                     tracing::warn!(hash = %inc.hash, "could not write a chunk: {e}");
                     let hash = inc.hash.clone();
                     let entry = inc.entry;
@@ -735,8 +807,18 @@ impl Transfers {
             }
             BulkFrame::End { transfer } => {
                 let inc = self.incoming.remove(&transfer)?;
-                drop(inc.file);
                 self.requested.remove(&inc.hash);
+                if let Some(pipe) = inc.pipe {
+                    pipe.interrupted();
+                    if pipe.complete() {
+                        tracing::info!(hash = %inc.hash, bytes = pipe.size(), "streamed to the paste in full; length verified");
+                        if let Some(id) = inc.entry {
+                            history.set_status(id, ClipStatus::Ready);
+                        }
+                    }
+                    return inc.entry;
+                }
+                drop(inc.file);
                 self.last_completed = Some(inc.hash.clone());
                 // Verified by content when the sender hashed it, by length when it did
                 // not — see `BlobCache::identify` for why a large file is not hashed.
@@ -764,6 +846,10 @@ impl Transfers {
             BulkFrame::Abort { transfer } => {
                 let inc = self.incoming.remove(&transfer)?;
                 self.requested.remove(&inc.hash);
+                if let Some(pipe) = &inc.pipe {
+                    pipe.interrupted(); // the waiting paste asks again from where it got to
+                    return None;
+                }
                 // The partial is kept: the sender gave up, but what arrived is still a
                 // valid prefix and a retry can resume from it.
                 if let Some(id) = inc.entry {
