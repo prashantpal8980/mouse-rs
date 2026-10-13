@@ -157,12 +157,12 @@ rung is done when it works in the direction tested; the reverse direction is its
 
 | Rung | What is copied | Direction | Status |
 |---|---|---|---|
-| 1a | **Image pixels**: a screenshot, or "Copy image" in a browser | Linux → Windows | waiting |
+| 1a | **Image pixels**: a screenshot, or "Copy image" in a browser; pasted into an Explorer folder **and** into apps | Linux → Windows | **testing now** (needs the laptop update) |
 | 1b | **Image file**: a `.png`/`.jpg` copied in the file manager | Linux → Windows | waiting |
 | 2 | **Video file** (a large one, hundreds of MB) | Linux → Windows | waiting |
 | 3 | **Folder** with several files and sub-folders | Linux → Windows | waiting |
 | 4 | **Zip file** | Linux → Windows | waiting |
-| 5 | Image pixels, pasted into an app **and into a Thunar folder** | Windows → Linux | **fixed, waiting for retest** |
+| 5 | Image pixels, pasted into an app **and into a Thunar folder** | Windows → Linux | **signed off 13 Oct** |
 | 6–8 | Rungs 1b–4 again | Windows → Linux | waiting |
 
 Image pixels and image files are different rungs because they take different paths:
@@ -192,7 +192,7 @@ what happened, the cause, the agreed behaviour, the fix, and the owner's sign-of
   A received image pastes as a picture into apps and as a `.png` into a folder.
 - **Fix:** `write_received_image` in `mouse-clipboard` now does this for every received image,
   and logs which forms it offered and why. It applies on both OSes.
-- **Sign-off:** _waiting for the owner's retest_
+- **Sign-off:** owner, 13 Oct — a Windows screenshot pasted straight into a Thunar folder with Ctrl+V.
 
 #### Rung 1a — image pixels, Linux → Windows
 

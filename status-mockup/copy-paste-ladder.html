@@ -113,7 +113,7 @@
 <script>
   // ---- The ladder. Status and Claude's findings are edited by Claude as we go. ----
   const RUNGS = [
-    { id: "1a", dir: "L2W", title: "Image itself", short: "Image (picture)", status: "waiting",
+    { id: "1a", dir: "L2W", title: "Image itself", short: "Image (picture)", status: "testing",
       why: "The picture goes onto the clipboard directly, with no file involved. Small ones travel inside the clipboard message; big ones are fetched over the file lane when you paste.",
       copy: [
         "On <b>Kali</b>, either take a screenshot straight to the clipboard (Screenshot tool → <b>Copy to clipboard</b>), or right-click an image in a browser → <b>Copy image</b>.",
@@ -121,10 +121,12 @@
       ],
       paste: [
         "Move the pointer across to <b>Windows</b>.",
-        "Open <b>Paint</b> (or Word, or a chat box) and press <kbd>Ctrl</kbd>+<kbd>V</kbd>.",
+        "Press <kbd>Ctrl</kbd>+<kbd>V</kbd> in a <b>File Explorer folder</b> (or the desktop). Then also in an app: Paint, Word, or a browser chat such as Gemini.",
+        "Don't open the panel in between. The point is that no click there is needed.",
       ],
       expect: [
-        "The picture appears in Paint the first time you paste, within about a second.",
+        "In a File Explorer folder, a <code>clipboard-image-….png</code> file appears straight away.",
+        "In Paint, Word or Gemini, the picture appears the first time you paste, within about a second.",
         "It is the same picture, the same size, with no distortion or wrong colours.",
         "Pasting again gives the same picture again.",
         "It appears in the clipboard history on both computers.",
@@ -149,7 +151,7 @@
       copy: ["On <b>Kali</b>, copy a <code>.zip</code> file in the file manager.", "Note its size."],
       paste: ["On <b>Windows</b>, paste into a folder, then open the zip."],
       expect: ["The zip arrives with the same name and size.", "It opens, and its contents extract without errors."] },
-    { id: "5", dir: "W2L", title: "Image itself", short: "Image (picture)", status: "testing",
+    { id: "5", dir: "W2L", title: "Image itself", short: "Image (picture)", status: "done",
       why: "The reverse of 1a.",
       copy: ["On <b>Windows</b>, press <kbd>Win</kbd>+<kbd>Shift</kbd>+<kbd>S</kbd> and snip part of the screen, or right-click an image in a browser → <b>Copy image</b>."],
       paste: ["On <b>Kali</b>, paste with <kbd>Ctrl</kbd>+<kbd>V</kbd> or right-click → Paste: into a <b>Thunar folder</b>, and also into an app that takes pictures (GIMP, LibreOffice, a chat box)."],
@@ -178,7 +180,7 @@
       cause: "Two receive paths, both incomplete. Small images (sent inside the clipboard message) never made a file at all. Large images (fetched over the file lane, like this screenshot) were meant to, but the code that runs when the download finishes was handed no file cache, so it silently fell back to picture-only. Only the history click did it right.",
       agreed: "Copy on one computer, paste on the other, anywhere, with nothing to click in between: a received image pastes as a picture into apps, and as a .png file into a folder (Thunar or Explorer).",
       fix: "Every received image, small or large, now goes through one function that offers both forms. The log says which forms it offered, and why if it could only offer the picture (\"received image offered as pixels and as a file\" / \"…pixels only (reason)\"). This also applies on Windows, for pasting into an Explorer folder. Built and running on Kali; the laptop needs the update prompt.",
-      signoff: "",
+      signoff: "Signed off by the owner, 13 Oct: a Windows screenshot pasted straight into a Thunar folder with Ctrl+V.",
     },
   };
 
