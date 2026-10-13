@@ -3,7 +3,8 @@ name = "mouse"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-license.workspace = true
+license-file.workspace = true
+publish.workspace = true
 description = "mouse-rs: a fast, Barrier-like KVM software switch"
 
 [[bin]]

@@ -3,7 +3,8 @@ name = "mouse-input"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-license.workspace = true
+license-file.workspace = true
+publish.workspace = true
 description = "OS input capture/injection for mouse-rs, behind an OS-neutral trait"
 
 [dependencies]

@@ -3,7 +3,8 @@ name = "mouse-core"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-license.workspace = true
+license-file.workspace = true
+publish.workspace = true
 description = "Core protocol, config, auth, and networking for mouse-rs (a Barrier-like KVM switch)"
 
 [dependencies]

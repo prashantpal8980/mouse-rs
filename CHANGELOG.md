@@ -21,6 +21,7 @@ Dates are when the work was committed. Item codes refer to
   with its previous arguments, and rolls back on failure.
 - **Plain `cargo build` (B12)** links on Linux without `RUSTFLAGS`.
 - Documentation: new README, [docs/NETWORKING.md](docs/NETWORKING.md), docs index.
+- Licence changed to proprietary (all rights reserved); crates marked `publish = false`.
 
 ## 2026-10-08 to 2026-10-09
 

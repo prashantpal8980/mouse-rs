@@ -3,7 +3,8 @@ name = "mouse-engine"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-license.workspace = true
+license-file.workspace = true
+publish.workspace = true
 description = "Edge-crossing engine: binds the async network link to OS input capture/injection"
 
 [dependencies]
