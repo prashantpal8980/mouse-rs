@@ -1005,7 +1005,13 @@ fn run(
                         "the peer copied files"
                     );
                     if let Some(id) = h.record_files(set.clone(), true, status.clone()) {
-                        if status == ClipStatus::Remote {
+                        if status == ClipStatus::Ready {
+                            // Already here, from an earlier copy of the same files. This
+                            // case used to put nothing on the clipboard at all: the panel
+                            // said "ready" while Thunar said "nothing on the clipboard to
+                            // paste" for a 3.1 GB video that was sitting in the cache.
+                            publish_ready_set(t, &set, &settings, &mut last, &mut last_files);
+                        } else if status == ClipStatus::Remote {
                             t.request_missing(&set, id, &to_peer, settings.cache_budget);
                             // On its way already, but a paste should not have to wait for it
                             // to land: offer it now from the streaming folder.
@@ -1891,6 +1897,41 @@ fn publish_pending_set(
         count = set.files.len(),
         bytes = set.total_bytes(),
         "described on the clipboard — a paste waits for the transfer"
+    );
+    true
+}
+
+/// Put a set whose files are all in the cache on the clipboard, as the real files.
+///
+/// Delivered into the owner's folder when they named one; otherwise the cache's own
+/// hard links, published as a move when asked for, so the paste is a rename however big
+/// the files are.
+fn publish_ready_set(
+    t: &transfer::Transfers,
+    set: &FileSet,
+    settings: &ClipboardSettings,
+    last: &mut Option<String>,
+    last_files: &mut Option<u64>,
+) -> bool {
+    let delivered = settings.deliver_dir.as_deref().and_then(|dir| t.deliver(set, dir));
+    let Some(list) = delivered.or_else(|| t.materialize(set)) else {
+        tracing::warn!(count = set.files.len(), "files are in the cache but could not be laid out for pasting");
+        return false;
+    };
+    let how = files::Publish {
+        move_on_paste: settings.move_on_paste,
+        relink: t.relink_pairs(&list, set),
+        png: None,
+        on_paste: None,
+    };
+    if !publish_files(&list, how, last, last_files) {
+        tracing::warn!(count = set.files.len(), "could not put files already held here on the clipboard");
+        return false;
+    }
+    tracing::info!(
+        count = set.files.len(),
+        bytes = set.total_bytes(),
+        "already held here; put on the clipboard straight away — pasting is instant"
     );
     true
 }

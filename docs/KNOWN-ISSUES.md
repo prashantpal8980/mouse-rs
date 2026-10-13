@@ -441,3 +441,13 @@ A client only reaches a server on a network it is attached to. If the two machin
 different networks with no route between them (for example Kali on Ethernet to one router, and
 the laptop on Wi-Fi to another), no software can join them. The moment they share a network,
 the beacon finds the server and the link comes up within a few seconds.
+
+### B17 — files already held here were never put on the clipboard — **fixed 2026-10-13**
+
+A copy on the peer of files Kali already held (here, a 3.1 GB video left in the cache by an
+earlier test) was classed `Ready` and recorded in the history, but only the `Remote` and
+`NeedsConsent` branches published anything. The panel said "3.1 GB · ready" while Thunar said
+"There is nothing on the clipboard to paste". Log: `13:20:25 DECISION: ready immediately …
+status=Ready`, with no PUBLISHED line after it. Fixed by `publish_ready_set`, which publishes
+the cached files as a move, so the paste is a rename. It logs "already held here; put on the
+clipboard straight away".
