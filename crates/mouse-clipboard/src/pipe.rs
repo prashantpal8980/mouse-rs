@@ -36,8 +36,11 @@ pub enum PipeCmd {
     Nothing,
     /// (Re)start the stream from this offset, cancelling any stream already running.
     Start(u64),
-    /// Cancel the running stream: the window is full, or the paste has gone.
+    /// Cancel the running stream: the window is full.
     Stop,
+    /// The paste closed the file. `finished` says whether it had read it all; if not, the
+    /// user cancelled, and whatever shows the transfer must stop saying it is running.
+    Released { finished: bool },
 }
 
 #[derive(Debug)]
@@ -52,6 +55,8 @@ struct State {
     overfull: bool,
     /// The peer said it cannot send this file: fail the paste now, not after the wait.
     failed: bool,
+    /// Every byte has been handed to a paste at least once.
+    finished: bool,
     grew_at: Instant,
     asked_at: Instant,
     /// Running content hash, for a file the sender hashed. `None` for length-only files,
@@ -100,6 +105,7 @@ impl StreamPipe {
                 stop: false,
                 overfull: false,
                 failed: false,
+                finished: false,
                 grew_at: Instant::now(),
                 asked_at: Instant::now(),
                 hasher,
@@ -122,11 +128,8 @@ impl StreamPipe {
         if st.stop {
             st.stop = false;
             st.want = None;
-            if st.running {
-                st.running = false;
-                return PipeCmd::Stop;
-            }
-            return PipeCmd::Nothing;
+            st.running = false;
+            return PipeCmd::Released { finished: st.finished };
         }
         if let Some(offset) = st.want.take() {
             st.running = true;
@@ -275,6 +278,9 @@ impl StreamPipe {
                     let from = (offset - st.start) as usize;
                     let to = (end - st.start) as usize;
                     let out: Vec<u8> = st.buf.range(from..to).copied().collect();
+                    if end == self.size {
+                        st.finished = true;
+                    }
                     // Drop what the paste has finished with, keeping a little behind it.
                     let keep_from = end.saturating_sub(KEEP_BEHIND).max(st.start);
                     let drop = (keep_from - st.start) as usize;
@@ -410,7 +416,7 @@ mod tests {
         assert_eq!(p.take_command(), PipeCmd::Start(0));
         p.push(&[1u8; 50]);
         p.release();
-        assert_eq!(p.take_command(), PipeCmd::Stop);
+        assert_eq!(p.take_command(), PipeCmd::Released { finished: false }, "a cancel, reported as one");
         assert!(p.st.lock().unwrap().buf.is_empty());
     }
 
@@ -450,5 +456,24 @@ mod tests {
         p.release(); // the previous paste closed the file
         let _ = p.read_slice(0, 5, Duration::from_secs(30), Duration::from_millis(20));
         assert_eq!(p.take_command(), PipeCmd::Start(0), "not swallowed by the earlier stop");
+    }
+
+    #[test]
+    fn a_completed_paste_is_not_reported_as_cancelled() {
+        let p = StreamPipe::new(4, None);
+        p.st.lock().unwrap().want = Some(0);
+        let _ = p.take_command();
+        p.push(b"abcd");
+        assert_eq!(p.read(0, 4, Duration::from_secs(1)).unwrap(), b"abcd");
+        p.release();
+        assert_eq!(p.take_command(), PipeCmd::Released { finished: true });
+
+        let q = StreamPipe::new(4, None);
+        q.st.lock().unwrap().want = Some(0);
+        let _ = q.take_command();
+        q.push(b"ab");
+        assert_eq!(q.read(0, 2, Duration::from_secs(1)).unwrap(), b"ab");
+        q.release(); // cancelled in Thunar half-way
+        assert_eq!(q.take_command(), PipeCmd::Released { finished: false });
     }
 }

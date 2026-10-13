@@ -194,6 +194,7 @@ fn owner_thread(rx: Receiver<Cmd>, ready: Sender<bool>, cache: Arc<BlobCache>, s
                 // SAFETY: called on the OLE-initialised thread that will keep pumping.
                 let ok = unsafe { OleSetClipboard(&obj) }.is_ok();
                 if ok {
+                    crate::files::mark_own_write();
                     tracing::info!(files = count, "PUBLISHED virtual files to the Windows clipboard — Explorer's Paste pulls them as they arrive");
                     current = Some(obj);
                 } else {

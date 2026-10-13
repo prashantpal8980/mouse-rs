@@ -91,21 +91,41 @@ pub fn list_key(list: &FileList) -> u64 {
 
 #[cfg(windows)]
 mod imp {
-    /// The clipboard's change counter, unless this process made the latest change.
+    /// The clipboard's change counter after this process's own most recent write.
+    static OWN_SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+    /// Note that this process just wrote the clipboard, so that write is never mistaken
+    /// for the user copying something.
+    pub fn mark_own_write() {
+        // SAFETY: a read-only query.
+        let seq = unsafe { windows::Win32::System::DataExchange::GetClipboardSequenceNumber() };
+        OWN_SEQ.store(seq, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// The clipboard's change counter, if another program made the latest change.
+    ///
+    /// Two guards against counting our own writes. A write by this process opens the
+    /// clipboard without a window, so Windows records *no* owner; treating "no owner" as
+    /// someone else made every image received from the peer look like the user copying
+    /// its .png again, and it was sent straight back, replacing the peer's clipboard with a
+    /// file link. So a missing owner is "can't tell", and our own last counter is skipped.
     pub fn foreign_copy_stamp() -> Option<u64> {
         use windows::Win32::System::DataExchange::{GetClipboardOwner, GetClipboardSequenceNumber};
         use windows::Win32::System::Threading::GetCurrentProcessId;
         use windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId;
         // SAFETY: read-only queries about the clipboard and a window handle.
         unsafe {
-            if let Ok(owner) = GetClipboardOwner() {
-                let mut pid = 0u32;
-                GetWindowThreadProcessId(owner, Some(&mut pid));
-                if pid == GetCurrentProcessId() {
-                    return None;
-                }
+            let seq = GetClipboardSequenceNumber();
+            if seq == OWN_SEQ.load(std::sync::atomic::Ordering::SeqCst) {
+                return None;
             }
-            Some(u64::from(GetClipboardSequenceNumber()))
+            let owner = GetClipboardOwner().ok().filter(|h| !h.is_invalid())?;
+            let mut pid = 0u32;
+            GetWindowThreadProcessId(owner, Some(&mut pid));
+            if pid == 0 || pid == GetCurrentProcessId() {
+                return None;
+            }
+            Some(u64::from(seq))
         }
     }
 
@@ -146,6 +166,8 @@ mod imp {
         };
         match raw::set_file_list_with(strings.as_slice(), options::NoClear) {
             Ok(()) => {
+                drop(_clip);
+                mark_own_write();
                 tracing::info!(
                     count = strings.len(),
                     paths = %strings.join(" | "),
@@ -198,6 +220,8 @@ mod imp {
                 None => tracing::warn!("could not register the drop-effect format"),
             }
         }
+        drop(_clip);
+        mark_own_write();
         tracing::info!(
             count = strings.len(),
             mode = if how.move_on_paste { "move" } else { "copy" },
@@ -230,6 +254,8 @@ mod imp {
         // that never happened, and both look like silence from here.
         match formats::FileList.write_clipboard(strings.as_slice()) {
             Ok(()) => {
+                drop(_clip);
+                mark_own_write();
                 tracing::info!(
                     count = strings.len(),
                     paths = %strings.join(" | "),
@@ -888,6 +914,12 @@ pub fn read_files() -> Option<FileList> {
 /// on the same file be noticed, which comparing the file list never could.
 pub fn foreign_copy_stamp() -> Option<u64> {
     imp::foreign_copy_stamp()
+}
+
+/// Record that this process just wrote the clipboard (Windows; elsewhere the owner tells).
+pub fn mark_own_write() {
+    #[cfg(windows)]
+    imp::mark_own_write();
 }
 
 /// Put a file list on the system clipboard.

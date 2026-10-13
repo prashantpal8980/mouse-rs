@@ -711,7 +711,9 @@ impl SystemClipboard for arboard::Clipboard {
         self.get_text().ok()
     }
     fn write_text(&mut self, text: &str) -> bool {
-        self.set_text(text.to_owned()).is_ok()
+        let ok = self.set_text(text.to_owned()).is_ok();
+        files::mark_own_write();
+        ok
     }
     fn read_image(&mut self) -> Option<RgbaImage> {
         let img = self.get_image().ok()?;
@@ -722,12 +724,14 @@ impl SystemClipboard for arboard::Clipboard {
         })
     }
     fn write_image(&mut self, img: &RgbaImage) -> bool {
-        self.set_image(arboard::ImageData {
+        let ok = self.set_image(arboard::ImageData {
             width: img.w,
             height: img.h,
             bytes: std::borrow::Cow::Borrowed(&img.bytes),
         })
-        .is_ok()
+        .is_ok();
+        files::mark_own_write();
+        ok
     }
 }
 
@@ -1314,7 +1318,13 @@ fn run(
                 }
             }
             // Streams feeding a paste directly: start, resume or pause them as it reads.
-            t.drive_pipes(&to_peer);
+            for id in t.drive_pipes(&to_peer) {
+                // Cancelled in the file manager: the transfer stopped, so stop showing it as
+                // running. Left as "fetching", its time-left estimate grew by the second —
+                // hours, then days — for a transfer that no longer existed.
+                h.set_status(id, ClipStatus::Remote);
+                tracing::info!(id, "the paste was cancelled; transfer stopped, the file is still offered");
+            }
             // A paste is waiting on content: start fetching it now. This is the only
             // thing that begins a large transfer, which is what keeps copying cheap.
             paste_signals.retain(|id, sig| {

@@ -495,3 +495,18 @@ the Linux streaming folder.
   `BlobUnavailable`, which never reached the waiting paste. The pipe (and the cache-path
   signal) now fail at once. A pending stop from the previous paste could also swallow a new
   paste's first request, costing 10 s; a reader's request now clears it.
+
+### B22 — a screenshot pasted as a file link; a cancelled paste counted up for days — **fixed 2026-10-13**
+
+- **Echo.** A Kali screenshot went to the laptop as an image (correct). The laptop then mistook
+  its own clipboard write for the user copying the `.png` again ("the same files were copied
+  again", from the B19 re-copy detection) and sent it back as a file. Kali's clipboard then held
+  `file:///run/user/1000/mouse-rs/incoming/9/clipboard-image-540x587-….png` instead of the
+  picture. Cause: mouse-rs opens the Windows clipboard without a window, so the recorded owner
+  is *nobody*, which was treated as another program. Fixed twice over: no owner means "can't
+  tell", and every write by mouse-rs records the clipboard sequence number, which is then never
+  treated as a copy.
+- **Cancel.** Cancelling a streamed paste in Thunar stopped the transfer but left the history
+  entry "fetching", so its time-left estimate grew without end. The pipe now reports
+  `Released { finished }`; a paste cancelled part-way returns the entry to "on the other
+  computer · paste any time" and logs it.

@@ -204,7 +204,10 @@ impl Transfers {
     }
 
     /// Act on what the pipes' readers asked for: start, resume or pause a stream.
-    pub fn drive_pipes(&mut self, to_peer: &UnboundedSender<Message>) {
+    /// Returns the entries whose paste was cancelled part-way, so their status can stop
+    /// claiming a transfer is running.
+    pub fn drive_pipes(&mut self, to_peer: &UnboundedSender<Message>) -> Vec<u64> {
+        let mut cancelled = Vec::new();
         use crate::pipe::PipeCmd;
         let cmds: Vec<(String, u64, u64, PipeCmd)> = self
             .pipes
@@ -223,6 +226,13 @@ impl Transfers {
                 let _ = to_peer.send(Message::BlobCancel { hash: hash.clone() });
                 self.incoming.retain(|_, inc| inc.hash != hash);
             }
+            if let PipeCmd::Released { finished } = cmd {
+                if !finished {
+                    self.entry_progress.remove(&entry);
+                    cancelled.push(entry);
+                }
+                continue;
+            }
             if let PipeCmd::Start(offset) = cmd {
                 let _ = to_peer.send(Message::BlobRequest { hash: hash.clone(), offset });
                 self.requested.insert(hash.clone(), entry);
@@ -234,6 +244,7 @@ impl Transfers {
                 );
             }
         }
+        cancelled
     }
 
     /// Take the hash of the transfer that just finished, if any.
