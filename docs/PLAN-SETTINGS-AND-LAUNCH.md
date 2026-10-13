@@ -157,12 +157,13 @@ rung is done when it works in the direction tested; the reverse direction is its
 
 | Rung | What is copied | Direction | Status |
 |---|---|---|---|
-| 1a | **Image pixels**: a screenshot, or "Copy image" in a browser | Linux → Windows | **testing now** |
+| 1a | **Image pixels**: a screenshot, or "Copy image" in a browser | Linux → Windows | waiting |
 | 1b | **Image file**: a `.png`/`.jpg` copied in the file manager | Linux → Windows | waiting |
 | 2 | **Video file** (a large one, hundreds of MB) | Linux → Windows | waiting |
 | 3 | **Folder** with several files and sub-folders | Linux → Windows | waiting |
 | 4 | **Zip file** | Linux → Windows | waiting |
-| 5–8 | Rungs 1–4 again | Windows → Linux | waiting |
+| 5 | Image pixels, pasted into an app **and into a Thunar folder** | Windows → Linux | **fixed, waiting for retest** |
+| 6–8 | Rungs 1b–4 again | Windows → Linux | waiting |
 
 Image pixels and image files are different rungs because they take different paths:
 pixels go through the clipboard itself, while a file is fetched over the file lane when
@@ -176,6 +177,22 @@ you paste.
 
 Claude then reads both machines' logs for that minute and records here, under the rung:
 what happened, the cause, the agreed behaviour, the fix, and the owner's sign-off.
+
+#### Rung 5 — image pixels, Windows → Linux (tested first, by the owner's choice)
+
+- **Owner's report (13 Oct):** a Windows screenshot showed up in the panel, but Ctrl+V in
+  Thunar did nothing. It only pasted after clicking the image in the panel's history.
+- **Logs:** 14:44:57, a 1920×1080 image (1.3 MB) arrived over the file lane, was verified and
+  applied, as pixels only. 14:45:15, the history click published "pixels and a file"; Thunar's
+  Paste then worked.
+- **Cause:** two receive paths, both pixel-only. The inline path (small images) never
+  staged a file. The bulk path's completion handler was passed `None` for the cache, so it
+  silently fell back to pixels. Only the history click did both.
+- **Agreed behaviour:** copy on one machine, paste on the other, anywhere, with nothing to click.
+  A received image pastes as a picture into apps and as a `.png` into a folder.
+- **Fix:** `write_received_image` in `mouse-clipboard` now does this for every received image,
+  and logs which forms it offered and why. It applies on both OSes.
+- **Sign-off:** _waiting for the owner's retest_
 
 #### Rung 1a — image pixels, Linux → Windows
 

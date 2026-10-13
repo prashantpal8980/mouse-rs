@@ -922,7 +922,17 @@ fn run(
             }
             Ok(Message::ClipboardImage { data, w, h }) if settings.sync_images => {
                 if let Some(got) =
-                    apply_remote_image(&mut clipboard, &mut last_img, &data, w, h, &settings)
+                    apply_remote_image(
+                        &mut clipboard,
+                        &mut last_img,
+                        &mut last,
+                        &mut last_files,
+                        &data,
+                        w,
+                        h,
+                        &settings,
+                        transfers.as_ref(),
+                    )
                 {
                     tracing::info!(
                         w = got.w,
@@ -1120,7 +1130,7 @@ fn run(
                             &png,
                             Some(h),
                             &settings,
-                            None,
+                            Some(&*t),
                         );
                     }
                 }
@@ -1507,13 +1517,17 @@ struct SyncedImage {
 ///
 /// `w`/`h` come off the wire alongside the PNG; they are treated as a claim to be
 /// checked against what the PNG actually decodes to, not as trusted dimensions.
+#[allow(clippy::too_many_arguments)] // every one is per-application state
 fn apply_remote_image<C: SystemClipboard>(
     clipboard: &mut C,
     last_img: &mut Option<u64>,
+    last: &mut Option<String>,
+    last_files: &mut Option<u64>,
     data: &str,
     w: i32,
     h: i32,
     settings: &ClipboardSettings,
+    transfers: Option<&transfer::Transfers>,
 ) -> Option<SyncedImage> {
     use base64::Engine as _;
     let raw = base64::engine::general_purpose::STANDARD.decode(data).ok()?;
@@ -1541,8 +1555,8 @@ fn apply_remote_image<C: SystemClipboard>(
     if *last_img == Some(key) {
         return None; // originated here and came back
     }
-    if !clipboard.write_image(&img) {
-        tracing::debug!("clipboard image set failed");
+    if !write_received_image(clipboard, &img, &raw, settings, transfers, last, last_files) {
+        tracing::warn!("could not put a received image on the clipboard");
         return None;
     }
     *last_img = Some(key);
@@ -1646,25 +1660,7 @@ fn apply_encoded_image<C: SystemClipboard>(
     // user should never have to know about: Ctrl+C on one machine, Ctrl+V on the other,
     // wherever they are pasting. Writing the .png out as well costs one small file and
     // removes the whole detour.
-    let as_file = if settings.images_also_as_file {
-        transfers.and_then(|t| stage_image_file(t, png, img.w, img.h))
-    } else {
-        None
-    };
-    let published = match as_file {
-        Some(path) => {
-            let list = files::FileList { paths: vec![path] };
-            publish_image_and_file(
-                &list,
-                png.to_vec(),
-                || clipboard.write_image(&img),
-                last,
-                last_files,
-            )
-        }
-        None => clipboard.write_image(&img),
-    };
-    if !published {
+    if !write_received_image(clipboard, &img, png, settings, transfers, last, last_files) {
         tracing::warn!("could not put a received image on the clipboard");
         return false;
     }
@@ -1698,6 +1694,69 @@ fn publish_files(
     *last_files = Some(files::list_key(list));
     *last = Some(files::uri_text(list));
     true
+}
+
+/// Put an image that arrived from the peer on the clipboard, as pixels **and** as a `.png`
+/// file whenever that is possible.
+///
+/// Every received image goes through here, whichever way it travelled. The inline path
+/// (small images) and the bulk path (large ones) each used to publish on their own, and
+/// both ended up publishing pixels only: the inline path never staged a file, and the
+/// bulk path was handed no cache to stage one in. The result was that a screenshot from
+/// the other machine pasted into Paint or a chat box but not into a folder, until the
+/// user found the history entry and clicked it. One function means one behaviour.
+///
+/// It logs which forms were offered, so a paste that fails in a file manager can be
+/// traced to "pixels only" and its reason without guessing.
+fn write_received_image<C: SystemClipboard>(
+    clipboard: &mut C,
+    img: &RgbaImage,
+    png: &[u8],
+    settings: &ClipboardSettings,
+    transfers: Option<&transfer::Transfers>,
+    last: &mut Option<String>,
+    last_files: &mut Option<u64>,
+) -> bool {
+    let as_file = if !settings.images_also_as_file {
+        Err("the 'images as a file' setting is off")
+    } else {
+        match transfers {
+            None => Err("no file cache is available"),
+            Some(t) => stage_image_file(t, png, img.w, img.h).ok_or("the .png could not be written"),
+        }
+    };
+    match as_file {
+        Ok(path) => {
+            let list = files::FileList { paths: vec![path.clone()] };
+            let ok = publish_image_and_file(
+                &list,
+                png.to_vec(),
+                || clipboard.write_image(img),
+                last,
+                last_files,
+            );
+            if ok {
+                tracing::info!(
+                    w = img.w,
+                    h = img.h,
+                    path = %path.display(),
+                    "received image offered as pixels and as a file — pastes into apps and folders"
+                );
+            }
+            ok
+        }
+        Err(why) => {
+            let ok = clipboard.write_image(img);
+            if ok {
+                tracing::warn!(
+                    w = img.w,
+                    h = img.h,
+                    "received image offered as pixels only ({why}) — it will not paste into a folder"
+                );
+            }
+            ok
+        }
+    }
 }
 
 /// As [`publish_files`], for the image-plus-file case.
@@ -1825,7 +1884,7 @@ mod tests {
         let source = img(16, 16, 9);
         let png = encode_png(&source, TEST_PX).unwrap();
 
-        assert!(apply_remote_image(&mut cb, &mut last_img, &b64(&png), 16, 16, &set()).is_some());
+        assert!(apply_remote_image(&mut cb, &mut last_img, &mut None, &mut None, &b64(&png), 16, 16, &set(), None).is_some());
         assert_eq!(cb.image.as_ref(), Some(&source));
         // The poll now reads back exactly what we just applied.
         assert!(poll_local_image(&mut cb, &mut last_img, &tx, &set(), None).is_none());
@@ -1869,18 +1928,18 @@ mod tests {
         let mut cb = Fake::default();
         let mut last_img = None;
 
-        assert!(apply_remote_image(&mut cb, &mut last_img, "not base64!!", 4, 4, &set()).is_none());
-        assert!(apply_remote_image(&mut cb, &mut last_img, &b64(b"not a png"), 4, 4, &set()).is_none());
-        assert!(apply_remote_image(&mut cb, &mut last_img, "", 0, 0, &set()).is_none());
+        assert!(apply_remote_image(&mut cb, &mut last_img, &mut None, &mut None, "not base64!!", 4, 4, &set(), None).is_none());
+        assert!(apply_remote_image(&mut cb, &mut last_img, &mut None, &mut None, &b64(b"not a png"), 4, 4, &set(), None).is_none());
+        assert!(apply_remote_image(&mut cb, &mut last_img, &mut None, &mut None, "", 0, 0, &set(), None).is_none());
 
         // A valid PNG whose real dimensions contradict the declared ones is refused:
         // trusting the header over the payload is how buffer-size bugs start.
         let png = encode_png(&img(8, 8, 3), TEST_PX).unwrap();
-        assert!(apply_remote_image(&mut cb, &mut last_img, &b64(&png), 4096, 4096, &set()).is_none());
+        assert!(apply_remote_image(&mut cb, &mut last_img, &mut None, &mut None, &b64(&png), 4096, 4096, &set(), None).is_none());
 
         // And an image beyond the user's own edge limit is refused before decoding.
         let small = ClipboardSettings { max_image_px: 4, ..set() };
-        assert!(apply_remote_image(&mut cb, &mut last_img, &b64(&png), 8, 8, &small).is_none());
+        assert!(apply_remote_image(&mut cb, &mut last_img, &mut None, &mut None, &b64(&png), 8, 8, &small, None).is_none());
 
         assert!(cb.image.is_none(), "nothing should have reached the clipboard");
         assert_eq!(last_img, None);
