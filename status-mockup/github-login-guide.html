@@ -1,0 +1,303 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GitHub login guide</title>
+<style>
+  :root {
+    color-scheme: light;
+    --bg: #f3f2ee; --surface: #fcfcfb; --line: #e2e0d9;
+    --ink: #0b0b0b; --ink-2: #52514e; --ink-3: #7a7973;
+    --good: #0ca30c; --warning: #fab219; --serious: #ec835a;
+    --accent: #2a6fdb; --code-bg: #efede7; --term-bg: #16161a; --term-ink: #e8e6df; --term-dim: #8f8e86;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      color-scheme: dark;
+      --bg: #121211; --surface: #1a1a19; --line: #2d2d2b;
+      --ink: #ffffff; --ink-2: #c3c2b7; --ink-3: #8f8e86;
+      --accent: #7aa7f0; --code-bg: #232321; --term-bg: #0b0b0c;
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --bg: #121211; --surface: #1a1a19; --line: #2d2d2b;
+    --ink: #ffffff; --ink-2: #c3c2b7; --ink-3: #8f8e86;
+    --accent: #7aa7f0; --code-bg: #232321; --term-bg: #0b0b0c;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink);
+         font: 15px/1.6 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  main { max-width: 900px; margin: 0 auto; padding: 32px 16px 64px; }
+  header { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; flex-wrap: wrap; }
+  h1 { margin: 0; font-size: 28px; letter-spacing: -0.01em; }
+  .sub { color: var(--ink-2); margin: 4px 0 0; }
+  .theme { background: var(--surface); color: var(--ink-2); border: 1px solid var(--line);
+           border-radius: 8px; padding: 6px 12px; font: inherit; cursor: pointer; }
+  h2 { font-size: 20px; margin: 40px 0 8px; }
+  .card { background: var(--surface); border: 1px solid var(--line); border-radius: 12px; padding: 20px; }
+  code, .mono { font-family: ui-monospace, "Cascadia Code", Consolas, monospace; font-size: 13px; }
+  p code, li code, td code { background: var(--code-bg); padding: 1px 5px; border-radius: 4px; }
+  p { margin: 0 0 10px; }
+  .muted { color: var(--ink-2); }
+
+  /* progress strip */
+  .strip { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin-top: 24px; }
+  .strip div { border-top: 4px solid var(--line); padding-top: 8px; font-size: 13px; color: var(--ink-2); }
+  .strip div b { display: block; color: var(--ink); font-size: 14px; }
+  .strip .done { border-color: var(--good); }
+  .strip .you { border-color: var(--accent); }
+  @media (max-width: 640px) { .strip { grid-template-columns: 1fr 1fr; } }
+
+  /* steps */
+  .step { display: grid; grid-template-columns: 40px 1fr; gap: 14px; margin-top: 16px; }
+  .num { width: 36px; height: 36px; border-radius: 50%; display: flex; align-items: center; justify-content: center;
+         font-weight: 700; background: var(--accent); color: #fff; }
+  .num.done { background: var(--good); }
+  .step h3 { margin: 4px 0 8px; font-size: 17px; }
+  .step .body { min-width: 0; }
+
+  .cmdrow { display: flex; gap: 8px; align-items: stretch; margin: 8px 0 12px; }
+  .cmdrow pre { flex: 1; margin: 0; background: var(--code-bg); padding: 10px 12px; border-radius: 8px; overflow-x: auto; }
+  .copybtn { border: 1px solid var(--line); background: var(--surface); color: var(--ink-2); border-radius: 8px;
+             padding: 0 14px; font: inherit; font-size: 13px; cursor: pointer; white-space: nowrap; }
+
+  /* fake terminal */
+  .term { background: var(--term-bg); color: var(--term-ink); border-radius: 10px; padding: 14px 16px; margin: 8px 0 12px;
+          font-family: ui-monospace, "Cascadia Code", Consolas, monospace; font-size: 13px; line-height: 1.7; overflow-x: auto; white-space: pre; }
+  .term .p { color: #7ee787; }
+  .term .q { color: #79c0ff; }
+  .term .dim { color: var(--term-dim); }
+  .term .ans { color: #ffa657; font-weight: 600; }
+  .term .ok { color: #7ee787; }
+
+  /* browser mock */
+  .browser { border: 1px solid var(--line); border-radius: 10px; overflow: hidden; margin: 8px 0 12px; background: var(--bg); }
+  .browser .bar { background: var(--code-bg); padding: 8px 12px; font-size: 12px; color: var(--ink-3); font-family: ui-monospace, Consolas, monospace; }
+  .browser .page { padding: 16px; text-align: center; }
+  .browser .codebox { display: inline-flex; gap: 6px; margin: 8px 0; }
+  .browser .codebox span { width: 26px; height: 34px; border: 1px solid var(--line); border-radius: 6px; display: inline-flex;
+                           align-items: center; justify-content: center; font-family: ui-monospace, monospace; background: var(--surface); }
+  .browser .codebox .dash { border: 0; background: none; width: 10px; }
+  .browser .btn { display: inline-block; background: #1f883d; color: #fff; padding: 6px 16px; border-radius: 6px; font-size: 14px; font-weight: 600; margin-top: 6px; }
+
+  .note { border-left: 4px solid var(--accent); padding: 10px 14px; background: var(--surface); border-radius: 0 8px 8px 0; margin: 10px 0; color: var(--ink-2); font-size: 14px; }
+  .note.warn { border-color: var(--warning); }
+  .note b { color: var(--ink); }
+
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  th, td { text-align: left; padding: 9px 10px; border-top: 1px solid var(--line); vertical-align: top; }
+  th { color: var(--ink-3); font-weight: 600; font-size: 12px; text-transform: uppercase; letter-spacing: .04em; border-top: 0; }
+
+  details { border-top: 1px solid var(--line); padding: 10px 0; }
+  details:first-of-type { border-top: 0; }
+  summary { cursor: pointer; font-weight: 600; }
+  details p { margin: 8px 0 0; color: var(--ink-2); }
+
+  .two { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  .two ul { margin: 0; padding-left: 18px; color: var(--ink-2); }
+  .two li { margin: 4px 0; }
+  .two h3 { margin: 0 0 8px; font-size: 16px; }
+  @media (max-width: 640px) { .two { grid-template-columns: 1fr; } }
+  footer { margin-top: 40px; color: var(--ink-3); font-size: 13px; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <div>
+      <h1>Connect GitHub so Claude can push mouse-rs</h1>
+      <p class="sub">About 3 minutes. You run four commands on Kali and click one button in the browser.</p>
+    </div>
+    <button class="theme" id="themeBtn" type="button">Dark / light</button>
+  </header>
+
+  <div class="strip" aria-label="Progress">
+    <div class="done"><b>✓ gh installed</b>Done by Claude, version 2.102.0</div>
+    <div class="done"><b>✓ Repo ready</b>Work committed, secret scrubbed</div>
+    <div class="you"><b>→ You log in</b>Steps 1–5 below</div>
+    <div><b>Claude pushes</b>Creates public repo mouse-rs</div>
+  </div>
+
+  <h2>Why you have to do this part</h2>
+  <div class="card">
+    <p>Logging in proves to GitHub that you own the account <code>prashantpal8980</code>. That needs your GitHub password (and 2FA code, if you use one), which only you should type. Claude can't do it, and shouldn't.</p>
+    <p class="muted" style="margin:0">Once you're logged in, <code>gh</code> keeps a login token on Kali. Claude uses that token through the <code>gh</code> and <code>git</code> commands, without ever seeing or printing it.</p>
+  </div>
+
+  <h2>The steps</h2>
+  <div class="card">
+
+    <div class="step">
+      <div class="num">1</div>
+      <div class="body">
+        <h3>Open a normal terminal on Kali</h3>
+        <p>Use the regular Kali terminal app, <b>not</b> the Claude window. The login asks you questions and waits for Enter, and Claude's <code>!</code> shortcut can't answer questions. You saw this happen with <code>sudo</code> earlier.</p>
+        <p class="muted">First check that <code>gh</code> is found:</p>
+        <div class="cmdrow"><pre class="mono">gh --version</pre><button class="copybtn" type="button">Copy</button></div>
+        <div class="term"><span class="p">kalip@kalip:~$</span> gh --version
+gh version 2.102.0 (2026-09-30)</div>
+        <p class="muted" style="margin:0">If it says <code>command not found</code>, run <code>~/.local/bin/gh</code> wherever these steps say <code>gh</code>, or open a new terminal window.</p>
+      </div>
+    </div>
+
+    <div class="step">
+      <div class="num">2</div>
+      <div class="body">
+        <h3>Start the login</h3>
+        <div class="cmdrow"><pre class="mono">gh auth login --hostname github.com --git-protocol https --web</pre><button class="copybtn" type="button">Copy</button></div>
+        <p>What you'll see, and what to answer:</p>
+        <div class="term"><span class="p">kalip@kalip:~$</span> gh auth login --hostname github.com --git-protocol https --web
+<span class="q">?</span> Authenticate Git with your GitHub credentials? <span class="ans">Yes</span>   <span class="dim">← press Enter (Yes is the default)</span>
+
+<span class="dim">!</span> First copy your one-time code: <span class="ans">ABCD-1234</span>   <span class="dim">← yours will differ; note it down</span>
+Press Enter to open https://github.com/login/device in your browser...   <span class="dim">← press Enter</span></div>
+        <div class="note"><b>Leave this terminal open.</b> It waits until you finish in the browser, then continues by itself.</div>
+      </div>
+    </div>
+
+    <div class="step">
+      <div class="num">3</div>
+      <div class="body">
+        <h3>Approve in the browser</h3>
+        <p>A browser tab opens at <code>github.com/login/device</code>. If none opens, go to that address yourself.</p>
+        <div class="browser" aria-hidden="true">
+          <div class="bar">https://github.com/login/device</div>
+          <div class="page">
+            <div style="font-weight:600">Device Activation</div>
+            <div class="muted" style="font-size:13px">Enter the code displayed on your device</div>
+            <div class="codebox"><span>A</span><span>B</span><span>C</span><span>D</span><span class="dash">–</span><span>1</span><span>2</span><span>3</span><span>4</span></div><br>
+            <span class="btn">Continue</span>
+          </div>
+        </div>
+        <ol class="muted" style="padding-left:20px;margin:0">
+          <li>If GitHub asks you to sign in, sign in as <b>prashantpal8980</b>. Check the account picture in the top right; if it's a different account, sign out first.</li>
+          <li>Type the 8-character code from the terminal and click <b>Continue</b>.</li>
+          <li>On the next page, "GitHub CLI wants to access your account", click <b>Authorize github</b>. You may be asked for your password or 2FA code again.</li>
+          <li>You'll see "Congratulations, you're all set!" You can close the tab.</li>
+        </ol>
+        <p style="margin-top:10px">Back in the terminal, it finishes like this:</p>
+        <div class="term"><span class="ok">✓</span> Authentication complete.
+<span class="dim">-</span> gh config set -h github.com git_protocol https
+<span class="ok">✓</span> Configured git protocol
+<span class="ok">✓</span> Logged in as <span class="ans">prashantpal8980</span></div>
+      </div>
+    </div>
+
+    <div class="step">
+      <div class="num">4</div>
+      <div class="body">
+        <h3>Let git use this login</h3>
+        <p>This lets plain <code>git push</code> use the same login. It prints nothing when it works.</p>
+        <div class="cmdrow"><pre class="mono">gh auth setup-git</pre><button class="copybtn" type="button">Copy</button></div>
+      </div>
+    </div>
+
+    <div class="step">
+      <div class="num">5</div>
+      <div class="body">
+        <h3>Check it, then tell Claude</h3>
+        <div class="cmdrow"><pre class="mono">gh auth status</pre><button class="copybtn" type="button">Copy</button></div>
+        <div class="term">github.com
+  <span class="ok">✓</span> Logged in to github.com account <span class="ans">prashantpal8980</span> (keyring)
+  - Active account: true
+  - Git operations protocol: https
+  - Token: gho_************************************
+  - Token scopes: 'gist', 'read:org', 'repo'</div>
+        <p>If you see <b>Logged in</b> and <code>'repo'</code> in the scopes, you're done. Come back to Claude and type <b>"gh login done"</b>.</p>
+        <div class="note warn"><b>Don't paste the token into the chat.</b> <code>gh auth status</code> hides it with stars; keep it that way. Claude doesn't need it.</div>
+      </div>
+    </div>
+  </div>
+
+  <h2>What Claude will do next</h2>
+  <div class="card">
+    <table>
+      <thead><tr><th>#</th><th>Action</th><th>Command Claude runs</th></tr></thead>
+      <tbody>
+        <tr><td>1</td><td>Confirm the login works</td><td><code>gh auth status</code></td></tr>
+        <tr><td>2</td><td>Move <code>master</code> up to the latest work. It only moves forward; nothing is lost.</td><td><code>git branch -f master wip/iced-ui-input-fixes</code></td></tr>
+        <tr><td>3</td><td>Create the <b>public</b> repo and connect it</td><td><code>gh repo create mouse-rs --public --source . --remote origin</code></td></tr>
+        <tr><td>4</td><td>Push both branches</td><td><code>git push -u origin master wip/iced-ui-input-fixes</code></td></tr>
+        <tr><td>5</td><td>Check on GitHub that the shared secret isn't there</td><td><code>gh search code</code> and a fresh clone scan</td></tr>
+      </tbody>
+    </table>
+    <p class="muted" style="margin:12px 0 0">The repo will be at <code>https://github.com/prashantpal8980/mouse-rs</code>.</p>
+  </div>
+
+  <h2>What Claude can and can't do once you're logged in</h2>
+  <div class="two">
+    <div class="card">
+      <h3>Will do, when you ask</h3>
+      <ul>
+        <li>Commit work and push it to GitHub</li>
+        <li>Create branches, pull requests and releases</li>
+        <li>Open and read issues</li>
+        <li>Check whether the copy on GitHub matches Kali</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h3>Won't do</h3>
+      <ul>
+        <li>Push without you asking. Commits and pushes happen only on your request.</li>
+        <li>Force-push over GitHub history or delete the repo, unless you say so explicitly</li>
+        <li>Show, copy or log your GitHub token</li>
+        <li>Push anything containing the mouse-rs shared secret. Every push gets checked first.</li>
+      </ul>
+    </div>
+  </div>
+
+  <h2>If something goes wrong</h2>
+  <div class="card">
+    <details>
+      <summary>The browser didn't open</summary>
+      <p>Open <code>https://github.com/login/device</code> yourself in any browser, even on the laptop, and enter the code. The terminal is still waiting and continues on its own.</p>
+    </details>
+    <details>
+      <summary>"The code has expired" or the terminal gave up</summary>
+      <p>The code lasts 15 minutes. Press Ctrl+C in the terminal and run step 2 again to get a new code.</p>
+    </details>
+    <details>
+      <summary>I logged in with the wrong GitHub account</summary>
+      <p>Run <code>gh auth logout --hostname github.com</code>, sign out on github.com in the browser, then start again at step 2.</p>
+    </details>
+    <details>
+      <summary>It asks about a keyring or password store</summary>
+      <p>If Kali's keyring isn't available, <code>gh</code> saves the token in <code>~/.config/gh/hosts.yml</code>, readable only by you. Both are fine.</p>
+    </details>
+    <details>
+      <summary>How do I undo all of this later?</summary>
+      <p>On Kali, run <code>gh auth logout</code>. On GitHub, go to Settings → Applications → Authorized OAuth Apps → <b>GitHub CLI</b> → Revoke. Either one stops Claude from pushing.</p>
+    </details>
+    <details>
+      <summary>Why HTTPS and not my SSH key?</summary>
+      <p>Your SSH key (<code>~/.ssh/id_ed25519</code>) isn't registered with your GitHub account; GitHub rejected it when Claude tested it. HTTPS through <code>gh</code> needs no extra setup. You can add the key later at github.com → Settings → SSH keys if you like.</p>
+    </details>
+  </div>
+
+  <h2>A note about "public"</h2>
+  <div class="card">
+    <p>You chose a <b>public</b> repo, so anyone can read the code. There's no LICENSE file, which by default means people may look but have no right to copy or reuse it. That still protects you as the seller.</p>
+    <p class="muted" style="margin:0">To switch it to private later, run <code>gh repo edit prashantpal8980/mouse-rs --visibility private --accept-visibility-change-consequences</code>, or ask Claude.</p>
+  </div>
+
+  <footer>Made 13 October 2026. Before anything is pushed, the repo is backed up in <code>~/mouse-rs-backup-2026-10-13.bundle</code>.</footer>
+</main>
+<script>
+  document.querySelectorAll(".copybtn").forEach(b => b.addEventListener("click", async () => {
+    const text = b.previousElementSibling.textContent;
+    try { await navigator.clipboard.writeText(text); b.textContent = "Copied"; }
+    catch (_) { b.textContent = "Select by hand"; }
+    setTimeout(() => b.textContent = "Copy", 1600);
+  }));
+  const root = document.documentElement;
+  try { const t = localStorage.getItem("theme"); if (t) root.dataset.theme = t; } catch (e) {}
+  document.getElementById("themeBtn").addEventListener("click", () => {
+    const dark = root.dataset.theme ? root.dataset.theme === "dark" : matchMedia("(prefers-color-scheme: dark)").matches;
+    root.dataset.theme = dark ? "light" : "dark";
+    try { localStorage.setItem("theme", root.dataset.theme); } catch (e) {}
+  });
+</script>
+</body>
+</html>

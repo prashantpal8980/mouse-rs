@@ -1,7 +1,7 @@
 // Makes a bare `cargo build` link on a machine without `libxdo-dev`.
 //
 // The Linux GUI links `-lxdo`, which needs a `libxdo.so` dev symlink that a stock Kali
-// install does not have. The repo carries one at `.xdo-shim/libxdo.so`, pointing at the
+// install does not have. The repo carries one at `.buildlibs/libxdo.so`, pointing at the
 // runtime library. Without this script the only way to build was to remember to export
 // `RUSTFLAGS=-L .xdo-shim` first, and a plain `cargo build` failed with
 // "unable to find library -lxdo". Adding the directory here means the link finds the
@@ -16,9 +16,14 @@ fn main() {
     }
 
     let manifest = std::path::PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
-    // crates/mouse/ -> repo root
-    let shim = manifest.join("..").join("..").join(".xdo-shim");
-    if shim.join("libxdo.so").exists() {
-        println!("cargo:rustc-link-search=native={}", shim.display());
+    // crates/mouse/ -> repo root. `.buildlibs` is the tracked copy, so a fresh clone builds;
+    // `.xdo-shim` is the older, untracked one some checkouts still have.
+    let root = manifest.join("..").join("..");
+    for dir in [".buildlibs", ".xdo-shim"] {
+        let shim = root.join(dir);
+        if shim.join("libxdo.so").exists() {
+            println!("cargo:rustc-link-search=native={}", shim.display());
+            return;
+        }
     }
 }
