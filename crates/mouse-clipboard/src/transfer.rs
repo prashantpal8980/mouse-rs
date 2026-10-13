@@ -187,6 +187,22 @@ impl Transfers {
             .clone()
     }
 
+    /// Every file of `set` not yet held here streams into a paste, and none is running:
+    /// nothing moves until the user pastes.
+    pub fn waits_for_paste(&self, set: &FileSet) -> bool {
+        let mut any = false;
+        for f in &set.files {
+            if self.cache.contains(&f.hash) {
+                continue;
+            }
+            if !self.pipes.contains_key(&f.hash) || self.requested.contains_key(&f.hash) {
+                return false;
+            }
+            any = true;
+        }
+        any
+    }
+
     /// Act on what the pipes' readers asked for: start, resume or pause a stream.
     pub fn drive_pipes(&mut self, to_peer: &UnboundedSender<Message>) {
         use crate::pipe::PipeCmd;

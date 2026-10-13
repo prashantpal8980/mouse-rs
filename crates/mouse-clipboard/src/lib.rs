@@ -520,6 +520,9 @@ enum ClipCommand {
     /// Applying it only on restart would make "always allow this size" look broken the
     /// very next time a file that size arrived.
     SetAutoMax(u64),
+    /// Files may have been deleted under the clipboard (the panel's Clear): if what it
+    /// offers is gone, offer the newest file entry again in a form that still works.
+    Refresh,
 }
 
 /// The panel's handle for asking that a history entry be put back on the clipboard.
@@ -549,6 +552,11 @@ impl ClipboardCommander {
     /// Change the "bring it over without asking" limit on the running thread.
     pub fn set_auto_max(&self, bytes: u64) {
         let _ = self.tx.send(ClipCommand::SetAutoMax(bytes));
+    }
+
+    /// Re-check the clipboard after files were deleted from the cache.
+    pub fn refresh(&self) {
+        let _ = self.tx.send(ClipCommand::Refresh);
     }
 }
 
@@ -1012,9 +1020,11 @@ fn run(
                             // paste" for a 3.1 GB video that was sitting in the cache.
                             publish_ready_set(t, &set, &settings, &mut last, &mut last_files);
                         } else if status == ClipStatus::Remote {
-                            t.request_missing(&set, id, &to_peer, settings.cache_budget);
-                            // On its way already, but a paste should not have to wait for it
-                            // to land: offer it now from the streaming folder.
+                            // Offered from the streaming folder first, so its large files get
+                            // pipes and are fetched by the paste, straight to where it goes.
+                            // Fetching them now would put them on this disk before the paste
+                            // copies them again: twice the space for a file nobody pasted yet.
+                            // Small files are still prefetched below, so their paste is instant.
                             if streaming.is_some() {
                                 let sig = Arc::new(files::PasteSignal::default());
                                 paste_signals.insert(id, sig.clone());
@@ -1030,6 +1040,7 @@ fn run(
                                     &mut last_files,
                                 );
                             }
+                            t.request_missing(&set, id, &to_peer, settings.cache_budget);
                         } else if status == ClipStatus::NeedsConsent {
                             // Nothing is fetched yet — only the description crossed. The
                             // files are still published to the clipboard so Ctrl+V works
@@ -1114,6 +1125,46 @@ fn run(
                     ClipCommand::SetAutoMax(bytes) => {
                         settings.auto_transfer_max = bytes;
                         tracing::info!(bytes, "ask-first limit raised from the panel");
+                        continue;
+                    }
+                    ClipCommand::Refresh => {
+                        // Clearing the cache used to leave the clipboard naming files it had
+                        // just deleted, so the next paste failed with "No such file or
+                        // directory". Only acts when what is offered is really gone.
+                        let gone = files::read_files()
+                            .is_some_and(|l| l.paths.iter().any(|p| !p.exists()));
+                        if !gone {
+                            continue;
+                        }
+                        if let (Some(t), Some(h)) = (transfers.as_mut(), history.as_ref()) {
+                            let newest = h.meta().iter().map(|m| m.id).find_map(|id| match h.payload(id) {
+                                Some(ClipPayload::Files(set)) => Some((id, set)),
+                                _ => None,
+                            });
+                            if let Some((id, set)) = newest {
+                                let ok = if t.is_complete(&set) {
+                                    publish_ready_set(t, &set, &settings, &mut last, &mut last_files)
+                                } else {
+                                    let sig = paste_signals
+                                        .entry(id)
+                                        .or_insert_with(|| Arc::new(files::PasteSignal::default()))
+                                        .clone();
+                                    streamed.remove(&id);
+                                    publish_pending_set(
+                                        t,
+                                        streaming.as_ref(),
+                                        &mut streamed,
+                                        id,
+                                        &set,
+                                        sig,
+                                        &settings,
+                                        &mut last,
+                                        &mut last_files,
+                                    )
+                                };
+                                tracing::info!(id, ok, "the clipboard named files the cache clear removed; offered again");
+                            }
+                        }
                         continue;
                     }
                 };
@@ -1494,6 +1545,12 @@ fn reuse_entry<C: SystemClipboard>(
                     == transfer::FetchStart::AlreadyInFlight
                 {
                     tracing::debug!(id, "a transfer for this entry is already running");
+                }
+                // Files that stream straight into a paste are fetched by the paste, so until
+                // one happens there is nothing "fetching": say it is ready to paste instead
+                // of showing 0% forever.
+                if t.waits_for_paste(&set) {
+                    history.set_status(id, ClipStatus::Remote);
                 }
                 return true; // the click did something; publishing happens on arrival
             } else {

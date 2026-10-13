@@ -188,6 +188,7 @@
       agreed: "Ctrl+C on one computer, Ctrl+V on the other, for files of any size, exactly like images. Keyboard and mouse never stall. The size limit is a heads-up, never a blocker.",
       fix: "Kali now offers incoming files from a small virtual folder (/run/user/1000/mouse-rs/incoming). Paste is answered at once and Thunar copies with its own progress dialog while the bytes stream in. The last bytes are only handed over once the whole file has been verified, so a damaged transfer fails the copy instead of leaving a bad file. The panel's prompt now says paste works, and the size is a heads-up. Files over 64 MB now stream straight from the network through memory (64 MB window) into the paste: they take their own size on disk once, never twice. A dropped connection resumes from the byte the paste had reached. Smaller files still go through the verified cache, and mouse-rs deletes its copy once the paste has it. The 16 MB/s limit now applies only while the pointer is actually lagging, so the cable or Wi-Fi sets the speed. Tested with a real mount: a copy started before any bytes existed, finished byte-identical, and left no copy behind. Running on Kali; the laptop needs the update for the speed change.",
       signoff: "",
+      retest: "13 Oct, 19:16–19:21: the 3.1 GB video streamed into Desktop/test with Thunar's progress, was length-verified, and left nothing on Kali's disk. 11.6 MB/s on average: the laptop still had the old 16 MB/s cap. Found and fixed on the way: Clear left the clipboard naming deleted files (B18); files already held were never offered (B17); the 'Fetching…' banner stayed after Allow; ask-first limit set to 10 GB.",
     },
     "5": {
       happened: "13 Oct, 14:44: a 1920×1080 Windows screenshot (1.3 MB) arrived on Kali and was verified, but was put on the clipboard as a <b>picture only</b>. Thunar can only paste files, so Paste did nothing. At 14:45 you clicked the entry in the panel's history; that path puts it on the clipboard as a picture <b>and</b> a .png file, so Thunar's Paste then worked.",
@@ -279,6 +280,7 @@
           <p><b>Cause:</b> ${f.cause || "—"}</p>
           <p><b>Agreed behaviour:</b> ${f.agreed || "—"}</p>
           <p><b>Fix:</b> ${f.fix || "—"}</p>
+          ${f.retest ? `<p><b>Latest retest:</b> ${f.retest}</p>` : ""}
           <p style="margin:0"><b>Signed off:</b> ${f.signoff || "not yet"}</p>`
           : `<p class="empty">Nothing yet. After you send your report, Claude reads both computers' logs for that minute and writes the result here.</p>`}
       </div>

@@ -451,3 +451,14 @@ earlier test) was classed `Ready` and recorded in the history, but only the `Rem
 status=Ready`, with no PUBLISHED line after it. Fixed by `publish_ready_set`, which publishes
 the cached files as a move, so the paste is a rename. It logs "already held here; put on the
 clipboard straight away".
+
+### B18 — Clear left the clipboard naming deleted files — **fixed 2026-10-13**
+
+After the 3.1 GB video was pasted from the cache, Clear in the Clipboard tab removed
+`cache/trees/`, which the clipboard still pointed at. The next Ctrl+V failed in Thunar with
+"Error when getting information for file …/.mouse_share/cache/trees/…: No such file or
+directory". Clear now sends `ClipCommand::Refresh`. If what the clipboard offers no longer
+exists, the newest file entry is offered again: from the cache if it is still held, otherwise
+from the streaming folder. Same day: the consent banner now shows only while an entry is
+*waiting*, not after Allow. Files under the ask-first limit no longer prefetch big files to
+disk before a paste, and "Remote" reads "on the other computer · paste any time".

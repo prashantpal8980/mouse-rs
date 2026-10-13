@@ -388,7 +388,10 @@ impl EngineHandle {
         };
         // Same protection eviction uses: pinned entries and in-flight transfers are not
         // the program's to throw away, whoever pressed the button.
-        cache.clear_except(&self.clip_history.referenced_hashes())
+        let freed = cache.clear_except(&self.clip_history.referenced_hashes());
+        // The clipboard may name files that were just removed; have it offer them again.
+        self.clip_commands.refresh();
+        freed
     }
 
     /// Stop an in-flight transfer. What has arrived stays on disk, so clicking the

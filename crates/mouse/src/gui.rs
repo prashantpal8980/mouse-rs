@@ -1883,10 +1883,10 @@ impl App {
             .as_ref()?
             .clipboard_meta()
             .into_iter()
-            .filter(|m| {
-                m.status == mouse_clipboard::ClipStatus::NeedsConsent
-                    || matches!(m.status, mouse_clipboard::ClipStatus::Fetching { .. })
-            })
+            // Only while it is *waiting*. Once fetching — "Allow" pressed, or a paste
+            // started it — its job is done; the history row carries the progress. Keeping
+            // it up showed a stale "Fetching…" prompt over a transfer already running below.
+            .filter(|m| m.status == mouse_clipboard::ClipStatus::NeedsConsent)
             .collect();
         let first = waiting.first()?;
         let fetching = matches!(first.status, mouse_clipboard::ClipStatus::Fetching { .. });
@@ -1981,8 +1981,10 @@ impl App {
                             (format!("{} · ready", human_bytes(m.disk_bytes as usize)), p.good)
                         }
                         mouse_clipboard::ClipStatus::Ready => (human_bytes(m.bytes), p.txt3),
+                        // True of both kinds: a small file being prefetched, and a large one
+                        // that streams in when pasted. Either way, pasting works now.
                         mouse_clipboard::ClipStatus::Remote => (
-                            format!("{} · fetching…", human_bytes(m.disk_bytes as usize)),
+                            format!("{} · on the other computer · paste any time", human_bytes(m.disk_bytes as usize)),
                             p.accent,
                         ),
                         // No longer an instruction. The paths are already on the
