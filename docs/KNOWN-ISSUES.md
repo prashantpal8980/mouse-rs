@@ -462,3 +462,22 @@ exists, the newest file entry is offered again: from the cache if it is still he
 from the streaming folder. Same day: the consent banner now shows only while an entry is
 *waiting*, not after Allow. Files under the ask-first limit no longer prefetch big files to
 disk before a paste, and "Remote" reads "on the other computer · paste any time".
+
+### B19 — copying the same files again was ignored — **fixed 2026-10-13**
+
+After clearing the history and the cache, a second Ctrl+C on the same video in Explorer sent
+nothing, because a local copy was detected by comparing the file list with the last one seen.
+The fix also watches the clipboard's own change marker (`GetClipboardSequenceNumber` on
+Windows; the owner window plus its TIMESTAMP on X11), ignoring changes mouse-rs made itself.
+Same files with a new marker counts as a new copy and is announced again; the log says "the
+same files were copied again". Text and images still dedupe by content.
+
+### B20 — a file from Linux could not be pasted in Explorer until it had fully arrived
+
+Windows put cache paths on the clipboard as `CF_HDROP` before the files existed, so Explorer
+failed at once. Built 2026-10-13, **not yet tested on hardware**: `win_virtual.rs` offers files
+still on the peer as OLE virtual files (`FileGroupDescriptorW` + `FileContents` `IStream`,
+with `IDataObjectAsyncCapability`) from an STA thread that pumps messages, including while a
+read waits. Explorer writes the bytes straight to the paste target with its own progress.
+Large files use the same memory pipe as Linux. Reads go through `remote_read.rs`, shared with
+the Linux streaming folder.

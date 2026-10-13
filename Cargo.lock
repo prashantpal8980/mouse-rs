@@ -2237,6 +2237,8 @@ dependencies = [
  "sha2",
  "tokio",
  "tracing",
+ "windows 0.62.2",
+ "windows-core 0.62.2",
  "x11rb",
 ]
 

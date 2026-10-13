@@ -15,9 +15,12 @@
 pub mod cache;
 pub mod files;
 pub mod pipe;
+pub mod remote_read;
 pub mod transfer;
 #[cfg(target_os = "linux")]
 pub mod stream_fs;
+#[cfg(windows)]
+pub mod win_virtual;
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -911,6 +914,9 @@ fn run(
     } else {
         None
     };
+    // The clipboard's "copied again" marker, so an unchanged file list copied a second time
+    // is still noticed. Seeded like the anchors above, so nothing is sent at startup.
+    let mut last_copy_stamp = if settings.sync_files { files::foreign_copy_stamp() } else { None };
     let (mut transfers, to_bulk, from_bulk, health, bulk_queue) = match bulk {
         Some(b) => (
             Some(transfer::Transfers::new(b.cache)),
@@ -926,7 +932,11 @@ fn run(
     let streaming: Option<Streaming> = transfers
         .as_ref()
         .and_then(|t| Streaming::mount(t.cache().clone(), &Streaming::default_mountpoint(), settings.stream_wait));
-    #[cfg(not(target_os = "linux"))]
+    // Windows: the same, as virtual files on the clipboard that Explorer pulls from.
+    #[cfg(windows)]
+    let streaming: Option<Streaming> =
+        transfers.as_ref().and_then(|t| Streaming::start(t.cache().clone(), settings.stream_wait));
+    #[cfg(not(any(target_os = "linux", windows)))]
     let streaming: Option<Streaming> = None;
     // Entries currently on the clipboard from the streaming folder, with that list's key.
     let mut streamed: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
@@ -1364,7 +1374,19 @@ fn run(
                 if let (Some(t), Some(h)) = (transfers.as_ref(), history.as_ref()) {
                     if let Some(list) = files::read_files() {
                         let key = files::list_key(&list);
-                        if last_files != Some(key) {
+                        // The same files copied again: the list is identical, but the
+                        // clipboard was claimed afresh by another program. Without this a
+                        // second Ctrl+C on the same video did nothing at all — not even
+                        // after the history and cache had been cleared.
+                        let stamp = files::foreign_copy_stamp();
+                        let again = last_files == Some(key) && stamp.is_some() && stamp != last_copy_stamp;
+                        if stamp.is_some() {
+                            last_copy_stamp = stamp;
+                        }
+                        if last_files != Some(key) || again {
+                            if again {
+                                tracing::info!(count = list.paths.len(), "the same files were copied again; telling the peer again");
+                            }
                             last_files = Some(key);
                             if let Some(set) = t.describe_local(&list, settings.machine, settings.max_files_per_copy, settings.follow_symlinks, settings.cache_budget, settings.hash_limit) {
                                 tracing::info!(
@@ -1872,18 +1894,42 @@ fn write_received_image<C: SystemClipboard>(
 #[cfg(target_os = "linux")]
 use stream_fs::StreamFs as Streaming;
 
-/// Stand-in where there is no streaming folder: nothing is ever offered from it.
-#[cfg(not(target_os = "linux"))]
+#[cfg(windows)]
+use win_virtual::VirtualClipboard as Streaming;
+
+/// Stand-in where there is no streaming support: nothing is ever offered from it.
+#[cfg(not(any(target_os = "linux", windows)))]
 struct Streaming;
-#[cfg(not(target_os = "linux"))]
-impl Streaming {
-    fn add_set(
-        &self,
-        _entry: u64,
-        _set: &FileSet,
-        _sig: Arc<files::PasteSignal>,
-        _pipes: &std::collections::HashMap<String, Arc<pipe::StreamPipe>>,
-    ) -> Option<files::FileList> {
+
+/// Offer a set that is not here yet so a paste can pull it as it arrives. Returns the key
+/// that now identifies the clipboard's contents, or `None` if it could not be offered.
+#[allow(unused_variables)]
+fn offer_streaming(
+    streaming: Option<&Streaming>,
+    id: u64,
+    set: &FileSet,
+    sig: &Arc<files::PasteSignal>,
+    pipes: &std::collections::HashMap<String, Arc<pipe::StreamPipe>>,
+    last: &mut Option<String>,
+) -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let list = streaming?.add_set(id, set, sig.clone(), pipes)?;
+        // A copy, never a move: the folder is read-only, and the file manager would
+        // otherwise report a failure deleting the source after a successful paste.
+        let how = files::Publish { move_on_paste: false, relink: Vec::new(), png: None, on_paste: None };
+        if !files::publish(&list, how) {
+            return None;
+        }
+        *last = Some(files::uri_text(&list));
+        Some(files::list_key(&list))
+    }
+    #[cfg(windows)]
+    {
+        streaming?.offer(id, set, sig.clone(), pipes)
+    }
+    #[cfg(not(any(target_os = "linux", windows)))]
+    {
         None
     }
 }
@@ -1921,16 +1967,8 @@ fn publish_pending_set(
             }
         }
     }
-    if let Some(list) = streaming.and_then(|s| s.add_set(id, set, sig.clone(), &pipes)) {
-        // A copy, never a move: the folder is read-only, and the file manager would
-        // otherwise report a failure deleting the source after a successful paste.
-        let how = files::Publish { move_on_paste: false, relink: Vec::new(), png: None, on_paste: None };
-        if !files::publish(&list, how) {
-            return false;
-        }
-        let key = files::list_key(&list);
+    if let Some(key) = offer_streaming(streaming, id, set, &sig, &pipes, last) {
         *last_files = Some(key);
-        *last = Some(files::uri_text(&list));
         streamed.insert(id, key);
         tracing::info!(
             id,

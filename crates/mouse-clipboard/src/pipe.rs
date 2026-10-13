@@ -213,52 +213,70 @@ impl StreamPipe {
     /// without any progress, which ends the paste with an I/O error rather than a frozen
     /// progress dialog.
     pub fn read(&self, offset: u64, len: u64, stall: Duration) -> Option<Vec<u8>> {
-        if offset >= self.size || len == 0 {
-            return Some(Vec::new());
+        loop {
+            match self.read_slice(offset, len, stall, stall) {
+                crate::remote_read::Got::Data(b) => return Some(b),
+                crate::remote_read::Got::Fail => return None,
+                crate::remote_read::Got::Wait => continue,
+            }
         }
+    }
+
+    /// As [`StreamPipe::read`], but waits at most `slice` before answering `Wait`, so a
+    /// caller that must keep doing other things (a Windows thread pumping messages) can.
+    pub fn read_slice(&self, offset: u64, len: u64, stall: Duration, slice: Duration) -> crate::remote_read::Got {
+        use crate::remote_read::Got;
+        if offset >= self.size || len == 0 {
+            return Got::Data(Vec::new());
+        }
+        let started = Instant::now();
         let end = (offset + len).min(self.size);
-        let Ok(mut st) = self.st.lock() else { return None };
+        let Ok(mut st) = self.st.lock() else { return Got::Fail };
         loop {
             // A step back past what is kept, or a jump far ahead: start over from there.
             if offset < st.start || offset > st.have_end() + WINDOW as u64 / 2 {
                 st.restart_at(offset);
             }
+            let mut tail_pending = false;
             if st.have_end() >= end {
                 // The last bytes of a hashed file are only handed over once it verified.
                 if end == self.size && self.expect.is_some() && st.verified != Some(true) {
                     if st.verified == Some(false) {
-                        return None;
+                        return Got::Fail;
                     }
-                    st = match self.cv.wait_timeout(st, Duration::from_millis(100)) {
-                        Ok((g, _)) => g,
-                        Err(_) => return None,
-                    };
-                    continue;
+                    tail_pending = true;
+                } else {
+                    let from = (offset - st.start) as usize;
+                    let to = (end - st.start) as usize;
+                    let out: Vec<u8> = st.buf.range(from..to).copied().collect();
+                    // Drop what the paste has finished with, keeping a little behind it.
+                    let keep_from = end.saturating_sub(KEEP_BEHIND).max(st.start);
+                    let drop = (keep_from - st.start) as usize;
+                    st.buf.drain(..drop);
+                    st.start = keep_from;
+                    return Got::Data(out);
                 }
-                let from = (offset - st.start) as usize;
-                let to = (end - st.start) as usize;
-                let out: Vec<u8> = st.buf.range(from..to).copied().collect();
-                // Drop what the paste has finished with, keeping a little behind it.
-                let keep_from = end.saturating_sub(KEEP_BEHIND).max(st.start);
-                let drop = (keep_from - st.start) as usize;
-                st.buf.drain(..drop);
-                st.start = keep_from;
-                return Some(out);
             }
-            // Missing bytes and nothing on its way, or no progress for a while (a dropped
-            // connection, a stream stopped for flow control): ask from where we are.
-            let quiet = st.grew_at.elapsed() > NUDGE && st.asked_at.elapsed() > NUDGE;
-            if st.want.is_none() && (!st.running || quiet) {
-                let at = st.have_end();
-                st.want = Some(at);
-                st.asked_at = Instant::now();
+            if !tail_pending {
+                // Missing bytes and nothing on its way, or no progress for a while (a
+                // dropped connection, a stream stopped for flow control): ask from here.
+                let quiet = st.grew_at.elapsed() > NUDGE && st.asked_at.elapsed() > NUDGE;
+                if st.want.is_none() && (!st.running || quiet) {
+                    let at = st.have_end();
+                    st.want = Some(at);
+                    st.asked_at = Instant::now();
+                }
             }
             if st.grew_at.elapsed() > stall {
-                return None;
+                return Got::Fail;
             }
-            st = match self.cv.wait_timeout(st, Duration::from_millis(100)) {
+            let left = slice.saturating_sub(started.elapsed());
+            if left.is_zero() {
+                return Got::Wait;
+            }
+            st = match self.cv.wait_timeout(st, left.min(Duration::from_millis(100))) {
                 Ok((g, _)) => g,
-                Err(_) => return None,
+                Err(_) => return Got::Fail,
             };
         }
     }

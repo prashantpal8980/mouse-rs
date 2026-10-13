@@ -18,11 +18,11 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::ffi::OsStr;
-use std::os::unix::fs::{FileExt, MetadataExt};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, SystemTime};
 
 use fuser::{
     Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, INodeNo, LockOwner, MountOption,
@@ -32,30 +32,19 @@ use fuser::{
 use crate::cache::{self, BlobCache};
 use crate::files::{FileList, PasteSignal};
 use crate::pipe::StreamPipe;
+use crate::remote_read::{Got, Reader, RemoteSource};
 use crate::FileSet;
 
 /// How long attributes may be cached by the kernel. Nothing here changes once created.
 const TTL: Duration = Duration::from_secs(60);
 /// How often a waiting read looks for new bytes.
-const POLL: Duration = Duration::from_millis(50);
-/// While waiting, re-ask for the file this often, so a transfer that dropped (a reconnect,
-/// a cancelled fetch) is resumed rather than waited on.
-const NUDGE: Duration = Duration::from_secs(10);
 /// Copies kept visible. Older ones leave the folder; their inodes stay valid.
 const KEEP_SETS: usize = 32;
 
-#[derive(Clone)]
-struct RemoteFile {
-    hash: String,
-    size: u64,
-    signal: Arc<PasteSignal>,
-    /// Large files stream through memory instead of the cache; see [`crate::pipe`].
-    pipe: Option<Arc<StreamPipe>>,
-}
 
 enum Kind {
     Dir(Vec<(String, u64)>),
-    File(RemoteFile),
+    File(RemoteSource),
 }
 
 struct Node {
@@ -150,7 +139,7 @@ impl Tree {
                 self.add(
                     at,
                     leaf,
-                    Kind::File(RemoteFile {
+                    Kind::File(RemoteSource {
                         hash: f.hash.clone(),
                         size: f.size,
                         signal: signal.clone(),
@@ -421,19 +410,23 @@ impl Filesystem for Fs {
         };
         let cache = self.0.cache.clone();
         let stall = self.0.stall;
+        let file_size = file.size;
         let tail_flag = self.0.opens.lock().ok().and_then(|o| o.get(&fh.0).map(|o| o.tail_served.clone()));
         // Answered from a thread of its own: a read waiting on the network must not hold
         // up every other request to this folder.
-        std::thread::spawn(move || match read_file(&cache, &file, offset, size as u64, stall) {
-            Ok(bytes) => {
-                if offset + bytes.len() as u64 >= file.size {
+        std::thread::spawn(move || match Reader::new(file).read(&cache, offset, size as u64, stall, stall) {
+            Got::Data(bytes) => {
+                if offset + bytes.len() as u64 >= file_size {
                     if let Some(flag) = tail_flag {
                         flag.store(true, Ordering::SeqCst);
                     }
                 }
                 reply.data(&bytes)
             }
-            Err(e) => reply.error(e),
+            Got::Wait | Got::Fail => {
+                tracing::warn!(offset, size = file_size, "streaming folder: no data, or the file failed verification; failing the copy");
+                reply.error(Errno::EIO)
+            }
         });
     }
 }
@@ -469,69 +462,6 @@ fn libc_o_accmode() -> i32 {
     0o3
 }
 
-/// A read, from the pipe for a streamed file, otherwise from the cache.
-fn read_file(cache: &BlobCache, file: &RemoteFile, offset: u64, len: u64, stall: Duration) -> Result<Vec<u8>, Errno> {
-    match &file.pipe {
-        Some(pipe) => pipe.read(offset, len, stall).ok_or_else(|| {
-            tracing::warn!(offset, size = file.size, "streaming folder: no data for {stall:?}, or the file failed verification; failing the copy");
-            Errno::EIO
-        }),
-        None => read_when_ready(cache, file, offset, len, stall),
-    }
-}
-
-/// The bytes `offset..offset+len` of `file`, waiting for them to arrive if need be.
-fn read_when_ready(cache: &BlobCache, file: &RemoteFile, offset: u64, len: u64, stall: Duration) -> Result<Vec<u8>, Errno> {
-    if offset >= file.size || len == 0 {
-        return Ok(Vec::new());
-    }
-    let end = (offset + len).min(file.size);
-    // The tail is only served once the whole file is verified, so a corrupt transfer
-    // fails the copy instead of completing it.
-    let tail = end == file.size;
-    let mut grew_at = Instant::now();
-    let mut nudged_at = Instant::now();
-    let mut seen = 0u64;
-    loop {
-        if cache.contains(&file.hash) {
-            return read_range(&cache.blob_path(&file.hash), offset, end);
-        }
-        let have = cache.partial_len(&file.hash);
-        if !tail && have >= end {
-            // The partial can be renamed into place between the check and the read; then
-            // the next pass reads the finished blob instead.
-            if let Ok(bytes) = read_range(&cache.part_path(&file.hash), offset, end) {
-                return Ok(bytes);
-            }
-            continue;
-        }
-        if file.signal.failed.load(Ordering::SeqCst) {
-            tracing::warn!(bytes = file.size, "streaming folder: the transfer gave up; failing the copy");
-            return Err(Errno::EIO);
-        }
-        if have != seen {
-            seen = have;
-            grew_at = Instant::now();
-        }
-        if grew_at.elapsed() > stall {
-            tracing::warn!(have, size = file.size, "streaming folder: no progress for {stall:?}; failing the copy");
-            return Err(Errno::EIO);
-        }
-        if nudged_at.elapsed() > NUDGE && grew_at.elapsed() > NUDGE {
-            file.signal.wanted.store(true, Ordering::SeqCst);
-            nudged_at = Instant::now();
-        }
-        std::thread::sleep(POLL);
-    }
-}
-
-fn read_range(path: &Path, offset: u64, end: u64) -> Result<Vec<u8>, Errno> {
-    let f = std::fs::File::open(path).map_err(|_| Errno::EIO)?;
-    let mut buf = vec![0u8; (end - offset) as usize];
-    f.read_exact_at(&mut buf, offset).map_err(|_| Errno::EIO)?;
-    Ok(buf)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -546,49 +476,6 @@ mod tests {
             source_path: None,
             rel: rel.into(),
         }
-    }
-
-    #[test]
-    fn a_read_waits_for_bytes_and_withholds_the_tail_until_verified() {
-        let dir = std::env::temp_dir().join(format!("mouse-rs-sfs-{}", std::process::id()));
-        let cache = Arc::new(BlobCache::new(dir.clone()).unwrap());
-        let body = b"0123456789".to_vec();
-        let hash = cache::hash_bytes(&body);
-        let file = RemoteFile { hash: hash.clone(), size: 10, signal: Arc::new(PasteSignal::default()), pipe: None };
-
-        // Half the file has arrived: the first half reads, and opening raised nothing yet.
-        {
-            use std::io::Write as _;
-            let mut p = cache.open_partial(&hash).unwrap();
-            p.write_all(&body[..6]).unwrap();
-        }
-        assert_eq!(read_when_ready(&cache, &file, 0, 4, Duration::from_secs(30)).unwrap(), b"0123");
-
-        // The tail waits: finish the file from another thread and the read completes.
-        let c2 = cache.clone();
-        let h2 = hash.clone();
-        let rest = body[6..].to_vec();
-        let t = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(200));
-            use std::io::Write as _;
-            let mut p = c2.open_partial(&h2).unwrap();
-            p.write_all(&rest).unwrap();
-            drop(p);
-            c2.finish(&h2).unwrap();
-        });
-        assert_eq!(read_when_ready(&cache, &file, 6, 100, Duration::from_secs(30)).unwrap(), b"6789");
-        t.join().unwrap();
-
-        // A transfer marked failed ends a waiting read with an error.
-        let missing = RemoteFile {
-            hash: cache::hash_bytes(b"never"),
-            size: 5,
-            signal: Arc::new(PasteSignal::default()),
-            pipe: None,
-        };
-        missing.signal.failed.store(true, Ordering::SeqCst);
-        assert!(read_when_ready(&cache, &missing, 0, 5, Duration::from_secs(30)).is_err());
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -696,8 +583,8 @@ mod tests {
         let (p2, b2) = (pipe.clone(), body.clone());
         let peer = std::thread::spawn(move || {
             let mut starts = Vec::new();
-            let deadline = Instant::now() + Duration::from_secs(60);
-            while Instant::now() < deadline && !p2.complete() {
+            let deadline = std::time::Instant::now() + Duration::from_secs(60);
+            while std::time::Instant::now() < deadline && !p2.complete() {
                 if let PipeCmd::Start(off) = p2.take_command() {
                     starts.push(off);
                     assert!(p2.begin(off));

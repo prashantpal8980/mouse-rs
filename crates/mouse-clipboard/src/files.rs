@@ -91,6 +91,24 @@ pub fn list_key(list: &FileList) -> u64 {
 
 #[cfg(windows)]
 mod imp {
+    /// The clipboard's change counter, unless this process made the latest change.
+    pub fn foreign_copy_stamp() -> Option<u64> {
+        use windows::Win32::System::DataExchange::{GetClipboardOwner, GetClipboardSequenceNumber};
+        use windows::Win32::System::Threading::GetCurrentProcessId;
+        use windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId;
+        // SAFETY: read-only queries about the clipboard and a window handle.
+        unsafe {
+            if let Ok(owner) = GetClipboardOwner() {
+                let mut pid = 0u32;
+                GetWindowThreadProcessId(owner, Some(&mut pid));
+                if pid == GetCurrentProcessId() {
+                    return None;
+                }
+            }
+            Some(u64::from(GetClipboardSequenceNumber()))
+        }
+    }
+
     use super::FileList;
     use std::path::PathBuf;
 
@@ -343,6 +361,48 @@ mod imp {
             }
         }
         None
+    }
+
+    /// Who owns the clipboard and when they took it, unless the owner is us.
+    ///
+    /// Every copy re-claims the selection with a fresh timestamp, even of exactly the same
+    /// files, so this changes on each Ctrl+C where the file list alone does not.
+    pub fn foreign_copy_stamp() -> Option<u64> {
+        let x = open()?;
+        let owner = x.conn.get_selection_owner(x.clipboard).ok()?.reply().ok()?.owner;
+        if owner == 0 {
+            return None;
+        }
+        // Our own file publications: not a copy the user made.
+        if HELD.lock().ok().and_then(|h| h.as_ref().map(|h| h.window)) == Some(owner) {
+            return None;
+        }
+        let stamp = intern(&x.conn, "TIMESTAMP").and_then(|target| {
+            x.conn.convert_selection(x.window, x.clipboard, target, x.prop, x11rb::CURRENT_TIME).ok()?;
+            x.conn.flush().ok()?;
+            let deadline = Instant::now() + REPLY_TIMEOUT;
+            while Instant::now() < deadline {
+                match x.conn.poll_for_event() {
+                    Ok(Some(Event::SelectionNotify(ev))) if ev.requestor == x.window => {
+                        if ev.property == 0 {
+                            return None;
+                        }
+                        let r = x
+                            .conn
+                            .get_property(true, x.window, x.prop, AtomEnum::ANY, 0, 1)
+                            .ok()?
+                            .reply()
+                            .ok()?;
+                        return r.value.get(..4).map(|b| u32::from_ne_bytes([b[0], b[1], b[2], b[3]]));
+                    }
+                    Ok(Some(_)) => {}
+                    Ok(None) => std::thread::sleep(Duration::from_millis(5)),
+                    Err(_) => return None,
+                }
+            }
+            None
+        });
+        Some((u64::from(owner) << 32) | u64::from(stamp.unwrap_or(0)))
     }
 
     /// Ask for the content and wait for it to land, so a paste of something not yet
@@ -796,6 +856,10 @@ mod imp {
 
 #[cfg(not(any(windows, all(unix, not(target_os = "macos")))))]
 mod imp {
+    pub fn foreign_copy_stamp() -> Option<u64> {
+        None
+    }
+
     use super::FileList;
     pub fn read_files() -> Option<FileList> {
         None
@@ -817,6 +881,13 @@ mod imp {
 /// Read a file list from the system clipboard, if it holds one.
 pub fn read_files() -> Option<FileList> {
     imp::read_files()
+}
+
+/// Changes every time another program copies something, even the very same files; `None`
+/// when this process made the latest change (or it cannot be told). Lets a second Ctrl+C
+/// on the same file be noticed, which comparing the file list never could.
+pub fn foreign_copy_stamp() -> Option<u64> {
+    imp::foreign_copy_stamp()
 }
 
 /// Put a file list on the system clipboard.
@@ -1061,5 +1132,31 @@ mod handoff_tests {
         let got = std::fs::read(&out).expect("the holder should have written the payload");
         assert_eq!(got, format!("copy\n{}", file.display()).into_bytes());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Needs a live X display and xclip: `cargo test -p mouse-clipboard -- --ignored recopy`.
+    #[test]
+    #[ignore]
+    fn recopy_the_same_content_changes_the_stamp() {
+        let copy = || {
+            let mut c = std::process::Command::new("xclip")
+                .args(["-selection", "clipboard", "-t", "text/uri-list"])
+                .stdin(std::process::Stdio::piped())
+                .spawn()
+                .expect("xclip");
+            use std::io::Write as _;
+            c.stdin.take().unwrap().write_all(b"file:///tmp/same.mkv\r\n").unwrap();
+            c.wait().unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(300));
+        };
+        copy();
+        let first = super::foreign_copy_stamp();
+        let list_a = super::read_files();
+        copy();
+        let second = super::foreign_copy_stamp();
+        let list_b = super::read_files();
+        assert!(first.is_some() && second.is_some());
+        assert_eq!(list_a, list_b, "the same files");
+        assert_ne!(first, second, "but a new copy");
     }
 }
