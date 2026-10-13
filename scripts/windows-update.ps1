@@ -1,4 +1,7 @@
-# mouse-rs standing installer. Served from the Kali box and run as a file, by one line:
+# mouse-rs standing installer. Quickest, in an elevated PowerShell:
+#   irm http://192.168.137.2:8000/u.txt | iex
+# Keep this file ASCII and iex-safe (no param(), exit, $PSScriptRoot or $MyInvocation): the
+# one-liner above runs it as text. Or, as the assistant prompt does it:
 #   $f="$env:TEMP\mouse-rs-update.ps1"; iwr http://192.168.137.2:8000/update.ps1 -UseBasicParsing -OutFile $f; Unblock-File $f; powershell -NoProfile -ExecutionPolicy Bypass -Command "Set-ExecutionPolicy -Scope Process Bypass -Force -ErrorAction SilentlyContinue; Invoke-Expression ([IO.File]::ReadAllText('$f'))"
 #
 # The point of this script is that the owner keeps using mouse-rs while it updates. So a

@@ -72,6 +72,10 @@ ln -sfn "$REPO_ROOT/docs/windows-update-prompt.md" "$SERVE_DIR/update.md"
 # The installer the standing prompt runs. It reads the expected size and hash from
 # CHECKSUM.txt, so it never needs rewriting when the build changes.
 ln -sfn "$REPO_ROOT/scripts/windows-update.ps1" "$SERVE_DIR/update.ps1"
+# The same installer as text, for the short one-liner `irm <url>/u.txt | iex`. Served as
+# .txt so PowerShell receives a string (a .ps1 arrives as bytes and iex fails), and run as
+# text so no execution policy applies. The script is kept ASCII and iex-safe for this.
+ln -sfn "$REPO_ROOT/scripts/windows-update.ps1" "$SERVE_DIR/u.txt"
 ln -sfn "$REPO_ROOT/docs/windows-clipboard-prompt.md" "$SERVE_DIR/clipboard.md"
 printf 'mouse-rs.exe  %s bytes\nSHA256  %s\n' "$SIZE" "$SHA" > "$SERVE_DIR/CHECKSUM.txt"
 
@@ -97,6 +101,7 @@ if curl -sf -o /dev/null "http://$BIND_ADDR:$PORT/retest.md"; then
 
     http://$BIND_ADDR:$PORT/update.md      install the current build  (standing prompt, <-- current)
     http://$BIND_ADDR:$PORT/update.ps1     the installer that prompt runs
+    One-liner for an elevated PowerShell:  irm http://$BIND_ADDR:$PORT/u.txt | iex
     http://$BIND_ADDR:$PORT/clipboard.md   the clipboard test prompt (older)
     http://$BIND_ADDR:$PORT/paired.md      paired foreground/background test
     http://$BIND_ADDR:$PORT/leak-hunt.md   the keyboard-leak hunt

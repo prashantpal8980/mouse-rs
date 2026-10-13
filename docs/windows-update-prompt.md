@@ -11,6 +11,18 @@ any AutoHotkey-style helper. When control is on the other machine, mouse-rs forw
 input to it, so any synthetic input lands on the wrong computer. Every step here is a
 PowerShell command.
 
+## Quickest way (the owner, by hand)
+
+In an **elevated** PowerShell (Terminal (Admin)), paste:
+
+```powershell
+irm http://192.168.137.2:8000/u.txt | iex
+```
+
+It runs the same installer as Step 2 below, with the same checks and restart. It is served
+as text and run as text, so no execution policy can block it. The rest of this page is for an
+assistant session, which also reports what happened.
+
 ## Step 1 — check you are in an elevated shell
 
 Run this and report the output:
