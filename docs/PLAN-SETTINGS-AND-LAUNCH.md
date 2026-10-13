@@ -199,3 +199,30 @@ what happened, the cause, the agreed behaviour, the fix, and the owner's sign-of
 #### Rung 1a — image pixels, Linux → Windows
 
 - Same cause and fix as rung 5. Signed off by the owner on 13 Oct, after the laptop update.
+
+#### Rung 7 — video file, Windows → Linux (in progress, 13 Oct)
+
+- **Owner's report:** a 3.1 GB `.mkv`. Ctrl+V in Thunar said there was nothing to paste; the panel
+  showed "over your 16 MB limit, Bring it over". After fetching, the file had to be clicked in
+  the history before it pasted.
+- **Logs (Kali):** 15:58:11 described on the clipboard (Paste enabled). 15:58:12 Thunar's paste
+  started the fetch and was made to *wait*. 16:01:43 all 3.1 GB arrived and was verified, but
+  Thunar had given up after its ~30 s selection timeout. At 15:58:40 a screenshot replaced the
+  clipboard, which is why the history click was needed afterwards.
+- **Cause:** "paste waits for the bytes" only works for transfers under ~30 s. Speed: the file lane
+  is capped at 16 MB/s while the pointer is on the receiving machine (`bulk_pause_while_crossed`),
+  so 3.1 GB took about 3 min 17 s.
+- **Agreed behaviour (owner):** Ctrl+C / Ctrl+V for files of any size (10, 20, 30 GB) exactly like
+  images. Keyboard and mouse never stall. The size limit only *warns*, it never blocks the paste,
+  and is configurable in Settings. Clicking "yes" must never require a second copy.
+- **Planned fix (not built yet):** a read-only FUSE folder at `$XDG_RUNTIME_DIR/mouse-rs/incoming`
+  (crate `fuser` 0.18, MIT, no libfuse, mounts via setuid `fusermount3`, verified present). Remote
+  files are published from there as a *copy*, so Thunar's paste starts at once and shows its own
+  progress. Reads are answered from `blobs/<hash>.part` as it grows (replies sent from a waiter
+  thread, so nothing blocks the filesystem). The final bytes are withheld until the cache has
+  verified the file, so a corrupt transfer fails the copy. Opening a file raises the existing
+  `PasteSignal` to start the fetch. Hook points in `mouse-clipboard/src/lib.rs`: the `NeedsConsent`
+  and `Remote` branches of `ClipboardFiles`, `reuse_entry`'s incomplete-files branch, and the
+  completion handler (skip re-publishing while a FUSE paste is live). Fallback when FUSE is
+  unavailable: today's behaviour. Then revisit the 16 MB/s crossed cap, and make the consent
+  prompt a warning.
