@@ -481,3 +481,17 @@ with `IDataObjectAsyncCapability`) from an STA thread that pumps messages, inclu
 read waits. Explorer writes the bytes straight to the paste target with its own progress.
 Large files use the same memory pipe as Linux. Reads go through `remote_read.rs`, shared with
 the Linux streaming folder.
+
+### B21 — big pastes held to 17 MB/s; a paste of something the peer forgot waited 3 minutes — **fixed 2026-10-13**
+
+- **Speed.** The same 3.1 GB video streamed at 68 MB/s at 19:40 and at 17 MB/s at 23:06, with the
+  pointer on Kali both times. The hard 16 MiB/s ceiling while crossed was tied to
+  `is_congested` (8 ms over baseline), which is far below anything felt, and stayed on for the
+  whole second run. It now needs `pointer_at_risk`: 3× baseline and at least 30 ms extra. The
+  adaptive pace still uses the gentle signal. The sender logs "transfer slowed to protect the
+  pointer" / "back to full speed" on every change.
+- **Forgotten file.** After the laptop's history was cleared, a second paste of the streamed
+  video asked every 10 s for 180 s and then failed. The laptop had answered each request with
+  `BlobUnavailable`, which never reached the waiting paste. The pipe (and the cache-path
+  signal) now fail at once. A pending stop from the previous paste could also swallow a new
+  paste's first request, costing 10 s; a reader's request now clears it.

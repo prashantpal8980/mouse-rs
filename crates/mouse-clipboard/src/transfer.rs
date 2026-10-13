@@ -884,6 +884,9 @@ impl Transfers {
     /// The peer says it cannot produce a hash. Mark every entry waiting on it.
     pub fn on_unavailable(&mut self, hash: &str, reason: &str, history: &ClipboardHistory) -> Option<u64> {
         self.requested.remove(hash);
+        if let Some((pipe, _)) = self.pipes.get(hash) {
+            pipe.fail();
+        }
         let id = history.find_by_hash(hash)?;
         history.set_status(id, ClipStatus::Unavailable(reason.to_string()));
         Some(id)

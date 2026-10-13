@@ -356,6 +356,9 @@ impl Filesystem for Fs {
             },
             Err(_) => return reply.error(Errno::EIO),
         };
+        if let Some(pipe) = &file.pipe {
+            pipe.reopen();
+        }
         // Opening is the paste: start the transfer now, unless we already hold the file.
         // A piped file is fetched by its first read instead, from the offset it asks for.
         if file.pipe.is_none() && !self.0.cache.contains(&file.hash) {

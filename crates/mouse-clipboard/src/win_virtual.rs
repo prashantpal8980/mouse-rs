@@ -347,6 +347,9 @@ impl IDataObject_Impl for DataObj_Impl {
                 .filter(|i| !i.dir)
                 .ok_or_else(|| windows::core::Error::from(DV_E_LINDEX))?;
             let src = item.src.clone().ok_or_else(|| windows::core::Error::from(DV_E_LINDEX))?;
+            if let Some(pipe) = &src.pipe {
+                pipe.reopen();
+            }
             // Asking for the contents is the paste: start the fetch now, unless it streams
             // through a pipe (its first read asks) or is already here.
             if src.pipe.is_none() && !self.cache.contains(&src.hash) {

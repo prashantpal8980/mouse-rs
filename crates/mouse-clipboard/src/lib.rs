@@ -1096,7 +1096,12 @@ fn run(
             Ok(Message::BlobUnavailable { hash, reason }) => {
                 if let (Some(t), Some(h)) = (transfers.as_mut(), history.as_ref()) {
                     tracing::warn!(hash, "the peer cannot send a file: {reason}");
-                    t.on_unavailable(&hash, &reason, h);
+                    // A paste waiting on it fails now, instead of after the whole wait.
+                    if let Some(id) = t.on_unavailable(&hash, &reason, h) {
+                        if let Some(sig) = paste_signals.get(&id) {
+                            sig.failed.store(true, Ordering::SeqCst);
+                        }
+                    }
                 }
             }
             // A stray message for this thread, or a kind the user has switched off.

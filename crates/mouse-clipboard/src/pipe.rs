@@ -50,6 +50,8 @@ struct State {
     want: Option<u64>,
     stop: bool,
     overfull: bool,
+    /// The peer said it cannot send this file: fail the paste now, not after the wait.
+    failed: bool,
     grew_at: Instant,
     asked_at: Instant,
     /// Running content hash, for a file the sender hashed. `None` for length-only files,
@@ -97,6 +99,7 @@ impl StreamPipe {
                 want: None,
                 stop: false,
                 overfull: false,
+                failed: false,
                 grew_at: Instant::now(),
                 asked_at: Instant::now(),
                 hasher,
@@ -194,6 +197,26 @@ impl StreamPipe {
         }
     }
 
+    /// The peer cannot send this file. A waiting paste fails at once, with the reason in
+    /// the log, rather than waiting out the whole "dropped connection" limit.
+    pub fn fail(&self) {
+        if let Ok(mut st) = self.st.lock() {
+            st.failed = true;
+            st.running = false;
+            st.want = None;
+        }
+        self.cv.notify_all();
+    }
+
+    /// A new paste opened the file: forget an earlier failure or release, so it tries
+    /// again from scratch.
+    pub fn reopen(&self) {
+        if let Ok(mut st) = self.st.lock() {
+            st.failed = false;
+            st.stop = false;
+        }
+    }
+
     /// The stream ended or broke. A reader still waiting asks for it again.
     pub fn interrupted(&self) {
         if let Ok(mut st) = self.st.lock() {
@@ -233,6 +256,9 @@ impl StreamPipe {
         let end = (offset + len).min(self.size);
         let Ok(mut st) = self.st.lock() else { return Got::Fail };
         loop {
+            if st.failed {
+                return Got::Fail;
+            }
             // A step back past what is kept, or a jump far ahead: start over from there.
             if offset < st.start || offset > st.have_end() + WINDOW as u64 / 2 {
                 st.restart_at(offset);
@@ -264,6 +290,10 @@ impl StreamPipe {
                 if st.want.is_none() && (!st.running || quiet) {
                     let at = st.have_end();
                     st.want = Some(at);
+                    // A reader asking supersedes an earlier release: without this, a
+                    // pending stop swallowed the request and the paste sat idle until the
+                    // next nudge, ten seconds later.
+                    st.stop = false;
                     st.asked_at = Instant::now();
                 }
             }
@@ -400,5 +430,25 @@ mod tests {
         bad.push(b"0123456780"); // one byte wrong
         assert!(bad.read(0, 4, Duration::from_secs(1)).is_some(), "early bytes still flow");
         assert!(bad.read(4, 6, Duration::from_secs(1)).is_none(), "the end is refused");
+    }
+
+    #[test]
+    fn a_peer_that_cannot_send_fails_the_paste_at_once_and_a_new_paste_retries() {
+        let p = StreamPipe::new(10, None);
+        p.fail();
+        let t = Instant::now();
+        assert!(p.read(0, 5, Duration::from_secs(30)).is_none());
+        assert!(t.elapsed() < Duration::from_secs(1), "no waiting out the limit");
+        p.reopen();
+        assert_eq!(p.read_slice(0, 5, Duration::from_secs(30), Duration::from_millis(20)), crate::remote_read::Got::Wait);
+        assert_eq!(p.take_command(), PipeCmd::Start(0), "the new paste asks again");
+    }
+
+    #[test]
+    fn a_new_paste_after_a_release_asks_at_once() {
+        let p = StreamPipe::new(10, None);
+        p.release(); // the previous paste closed the file
+        let _ = p.read_slice(0, 5, Duration::from_secs(30), Duration::from_millis(20));
+        assert_eq!(p.take_command(), PipeCmd::Start(0), "not swallowed by the earlier stop");
     }
 }

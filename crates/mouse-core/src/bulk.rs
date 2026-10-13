@@ -310,7 +310,26 @@ impl LinkHealth {
         }
         latest > base.saturating_mul(3) / 2 && latest > base + CONGESTION_FLOOR_US
     }
+
+    /// Is the input link slow enough that the pointer would *feel* it?
+    ///
+    /// Stricter than [`LinkHealth::is_congested`], which only steers the adaptive pace.
+    /// This one decides the hard ceiling while the user is on the other machine, and at
+    /// the gentle threshold that ceiling held a 3.1 GB paste to 17 MB/s for three minutes
+    /// on a cable that had just moved the same file at 68 MB/s, with nothing felt.
+    pub fn pointer_at_risk(&self) -> bool {
+        let base = self.baseline_us();
+        let latest = self.latest_us();
+        if base == 0 || latest == 0 {
+            return false;
+        }
+        latest > base.saturating_mul(3) && latest > base + POINTER_LAG_US
+    }
 }
+
+/// Extra round-trip at which pointer lag starts to be noticeable, so the hard ceiling while
+/// crossed is justified.
+const POINTER_LAG_US: u64 = 30_000;
 
 /// How much worse than baseline the round-trip must get before we call it congestion.
 /// 8 ms is comfortably below the threshold where pointer lag becomes perceptible, and
@@ -389,6 +408,10 @@ impl Pacer {
         }
     }
 
+    pub fn health(&self) -> &LinkHealth {
+        &self.health
+    }
+
     pub fn rate(&self) -> u64 {
         self.rate
     }
@@ -445,7 +468,7 @@ impl Pacer {
     /// same latency signal; this adds a hard ceiling on top only while it says the
     /// pointer is at risk, so the network's own speed is the limit the rest of the time.
     pub fn crossed_cap(&self, slow_while_crossed: bool) -> Option<u64> {
-        (slow_while_crossed && self.health.crossed() && self.health.is_congested())
+        (slow_while_crossed && self.health.crossed() && self.health.pointer_at_risk())
             .then_some(CROSSED_RATE_BYTES_PER_SEC)
     }
 }
@@ -633,6 +656,8 @@ async fn bulk_pump(
     // throughput measurement rather than an assumption.
     let mut sent_bytes: u64 = 0;
     let mut started: Option<tokio::time::Instant> = None;
+    // Whether the pointer-protection ceiling is currently applied, for logging changes.
+    let mut capped = false;
 
     loop {
         tokio::select! {
@@ -671,10 +696,22 @@ async fn bulk_pump(
                     let bytes = frame.payload_len();
                     if bytes > 0 {
                         pacer.step();
-                        let delay = pacer.delay_for_capped(
-                            bytes,
-                            pacer.crossed_cap(settings.pause_while_crossed),
-                        );
+                        let cap = pacer.crossed_cap(settings.pause_while_crossed);
+                        // Said once per change, so a slow transfer always has its reason in
+                        // the log instead of looking like a regression.
+                        if cap.is_some() != capped {
+                            capped = cap.is_some();
+                            if capped {
+                                tracing::info!(
+                                    latency_us = pacer.health().latest_us(),
+                                    baseline_us = pacer.health().baseline_us(),
+                                    "transfer slowed to protect the pointer: input latency is up while you are on the other machine"
+                                );
+                            } else {
+                                tracing::info!("transfer back to full speed");
+                            }
+                        }
+                        let delay = pacer.delay_for_capped(bytes, cap);
                         if !delay.is_zero() {
                             tokio::select! {
                                 _ = cancel.cancelled() => return,
@@ -984,11 +1021,18 @@ mod tests {
             h.record_rtt(Duration::from_millis(1));
         }
         assert!(p.crossed_cap(true).is_none(), "a healthy link is not capped just for being crossed");
-        // Input latency suffers: now the ceiling applies.
+        // A little slower (12 ms): enough for the adaptive pace to notice, not enough to
+        // feel, so no hard ceiling.
         for _ in 0..8 {
-            h.record_rtt(Duration::from_millis(40));
+            h.record_rtt(Duration::from_millis(12));
         }
         assert!(h.is_congested());
+        assert!(p.crossed_cap(true).is_none(), "an unfelt slowdown must not cap the transfer");
+        // Input latency suffers for real: now the ceiling applies.
+        for _ in 0..8 {
+            h.record_rtt(Duration::from_millis(60));
+        }
+        assert!(h.pointer_at_risk());
         assert_eq!(p.crossed_cap(true), Some(CROSSED_RATE_BYTES_PER_SEC));
         assert!(p.crossed_cap(false).is_none(), "the setting must actually be honoured");
         // The point of the change: crossing slows the transfer, it does not stop it.
