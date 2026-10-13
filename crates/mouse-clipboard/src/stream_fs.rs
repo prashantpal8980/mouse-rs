@@ -167,9 +167,17 @@ impl Tree {
     }
 }
 
+/// One open file: which blob, and whether its last bytes have been handed over.
+struct Open {
+    hash: String,
+    tail_served: Arc<std::sync::atomic::AtomicBool>,
+}
+
 struct Inner {
     cache: Arc<BlobCache>,
     tree: Mutex<Tree>,
+    opens: Mutex<HashMap<u64, Open>>,
+    next_fh: std::sync::atomic::AtomicU64,
     uid: u32,
     gid: u32,
     made: SystemTime,
@@ -238,6 +246,8 @@ impl StreamFs {
         let inner = Arc::new(Inner {
             cache,
             tree: Mutex::new(Tree::new()),
+            opens: Mutex::new(HashMap::new()),
+            next_fh: std::sync::atomic::AtomicU64::new(1),
             uid: meta.uid(),
             gid: meta.gid(),
             made: SystemTime::now(),
@@ -339,9 +349,27 @@ impl Filesystem for Fs {
             file.signal.wanted.store(true, Ordering::SeqCst);
             tracing::info!(bytes = file.size, "streaming folder: a paste opened a file still on the peer; fetching");
         }
+        let fh = self.0.next_fh.fetch_add(1, Ordering::SeqCst);
+        if let Ok(mut opens) = self.0.opens.lock() {
+            opens.insert(fh, Open { hash: file.hash.clone(), tail_served: Default::default() });
+        }
         // Direct I/O: every read comes to us, so nothing stale is served from the page cache
         // for a file that is still filling in.
-        reply.opened(FileHandle(0), FopenFlags::FOPEN_DIRECT_IO);
+        reply.opened(FileHandle(fh), FopenFlags::FOPEN_DIRECT_IO);
+    }
+
+    fn release(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        fh: FileHandle,
+        _flags: OpenFlags,
+        _lock_owner: Option<LockOwner>,
+        _flush: bool,
+        reply: fuser::ReplyEmpty,
+    ) {
+        self.closed(fh.0);
+        reply.ok();
     }
 
     #[allow(clippy::too_many_arguments)] // the trait's signature
@@ -349,7 +377,7 @@ impl Filesystem for Fs {
         &self,
         _req: &Request,
         ino: INodeNo,
-        _fh: FileHandle,
+        fh: FileHandle,
         offset: u64,
         size: u32,
         _flags: OpenFlags,
@@ -364,12 +392,38 @@ impl Filesystem for Fs {
             Err(_) => return reply.error(Errno::EIO),
         };
         let cache = self.0.cache.clone();
+        let tail_flag = self.0.opens.lock().ok().and_then(|o| o.get(&fh.0).map(|o| o.tail_served.clone()));
         // Answered from a thread of its own: a read waiting on the network must not hold
         // up every other request to this folder.
         std::thread::spawn(move || match read_when_ready(&cache, &file, offset, size as u64) {
-            Ok(bytes) => reply.data(&bytes),
+            Ok(bytes) => {
+                if offset + bytes.len() as u64 >= file.size {
+                    if let Some(flag) = tail_flag {
+                        flag.store(true, Ordering::SeqCst);
+                    }
+                }
+                reply.data(&bytes)
+            }
             Err(e) => reply.error(e),
         });
+    }
+}
+
+impl Fs {
+    /// Called when a file is closed. After a complete copy-out the file lives where it was
+    /// pasted, so our copy goes, unless something else still has the same file open.
+    fn closed(&self, fh: u64) {
+        let Ok(mut opens) = self.0.opens.lock() else { return };
+        let Some(open) = opens.remove(&fh) else { return };
+        if !open.tail_served.load(Ordering::SeqCst) {
+            return; // cancelled part-way: keep what arrived, so a retry resumes
+        }
+        if opens.values().any(|o| o.hash == open.hash) {
+            return;
+        }
+        drop(opens);
+        self.0.cache.discard(&open.hash);
+        tracing::info!(hash = %open.hash, "pasted copy complete; mouse-rs's own copy removed");
     }
 }
 
@@ -554,6 +608,16 @@ mod tests {
         std::fs::copy(&list.paths[0], &dest).unwrap();
         writer.join().unwrap();
         assert_eq!(std::fs::read(&dest).unwrap(), body);
+        // The paste is the only copy left: no middle cache to clean up.
+        let mut gone = false;
+        for _ in 0..50 {
+            if !cache.contains(&hash) && cache.partial_len(&hash) == 0 {
+                gone = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(gone, "mouse-rs's own copy should be removed once the paste has it");
         drop(sfs);
         let _ = std::fs::remove_dir_all(&base);
     }

@@ -17,7 +17,7 @@ Get-FileHash $HOME\mouse-rs\mouse-rs.exe -Algorithm SHA256
 ```
 
 Must match exactly — size `12183040` bytes, SHA256
-`979F426D8F6CAA8B7F75C7D8697BB3D72F22715B4A86A5179C3D2DE22A80CB54`.
+`74DCBBA0E0149D2890BDD3B793D8E7C02805EF6B6F12EC4192DDE971FAEF2ED6`.
 If it doesn't match, stop and tell me.
 
 Note your current state, carried over from last time: **`Start at login` is ON**,

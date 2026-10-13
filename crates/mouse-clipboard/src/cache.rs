@@ -265,6 +265,20 @@ impl BlobCache {
         self.root.join("trees").join(key)
     }
 
+    /// Remove a blob outright: the finished file, any partial, and its named link.
+    ///
+    /// Used once a paste has copied the whole file out of the streaming folder. The file
+    /// then exists where the user pasted it, and a second copy here would be exactly the
+    /// "middle cache" nobody asked for. A later paste fetches it again.
+    pub fn discard(&self, hash: &str) {
+        if !is_safe_hash(hash) {
+            return;
+        }
+        let _ = fs::remove_file(self.blob_path(hash));
+        let _ = fs::remove_file(self.part_path(hash));
+        let _ = fs::remove_dir_all(self.root.join("names").join(hash));
+    }
+
     /// Discard a partial transfer.
     pub fn abandon(&self, hash: &str) {
         if is_safe_hash(hash) {

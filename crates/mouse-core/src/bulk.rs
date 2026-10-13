@@ -436,8 +436,17 @@ impl Pacer {
     /// `None` means no extra ceiling. The floor is deliberately generous enough that a
     /// large transfer still visibly progresses — the point is that the pointer stays
     /// smooth, not that the transfer stops existing.
+    ///
+    /// It applies only while input latency is actually suffering. A fixed ceiling whenever
+    /// the user was on the other machine held a 3.1 GB paste on Kali to 16 MB/s over a
+    /// gigabit cable — 3½ minutes — with the pointer perfectly smooth the whole time.
+    /// Pasting on the receiving machine *is* being crossed, so the cap hit exactly the
+    /// transfers the user was waiting for. The adaptive pacer already backs off on the
+    /// same latency signal; this adds a hard ceiling on top only while it says the
+    /// pointer is at risk, so the network's own speed is the limit the rest of the time.
     pub fn crossed_cap(&self, slow_while_crossed: bool) -> Option<u64> {
-        (slow_while_crossed && self.health.crossed()).then_some(CROSSED_RATE_BYTES_PER_SEC)
+        (slow_while_crossed && self.health.crossed() && self.health.is_congested())
+            .then_some(CROSSED_RATE_BYTES_PER_SEC)
     }
 }
 
@@ -970,6 +979,16 @@ mod tests {
         let p = Pacer::new(h.clone(), None);
         assert!(p.crossed_cap(true).is_none(), "not crossed: no extra ceiling");
         h.set_crossed(true);
+        // Crossed on a healthy link: full speed. The pointer is fine, so nothing to protect.
+        for _ in 0..8 {
+            h.record_rtt(Duration::from_millis(1));
+        }
+        assert!(p.crossed_cap(true).is_none(), "a healthy link is not capped just for being crossed");
+        // Input latency suffers: now the ceiling applies.
+        for _ in 0..8 {
+            h.record_rtt(Duration::from_millis(40));
+        }
+        assert!(h.is_congested());
         assert_eq!(p.crossed_cap(true), Some(CROSSED_RATE_BYTES_PER_SEC));
         assert!(p.crossed_cap(false).is_none(), "the setting must actually be honoured");
         // The point of the change: crossing slows the transfer, it does not stop it.

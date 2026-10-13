@@ -1158,16 +1158,21 @@ fn run(
                     if let Some(ClipPayload::Files(set)) = h.payload(entry) {
                         if t.is_complete(&set) {
                             h.set_status(entry, ClipStatus::Ready);
+                            // Offered from the streaming folder: it stays offered from there.
+                            // A paste copies straight out of it and mouse-rs then drops its
+                            // own copy, so publishing cache paths now would point the
+                            // clipboard at files about to be removed — and would replace
+                            // whatever the user copied meanwhile.
+                            if streamed.contains_key(&entry) {
+                                tracing::info!(
+                                    count = set.files.len(),
+                                    "files are here; still offered from the streaming folder"
+                                );
+                                continue;
+                            }
                             // Whether a paste is sitting in the selection owner right
                             // now waiting for exactly these files to appear.
-                            // A streamed entry has no paste blocked in the selection owner,
-                            // so it is not "waiting" in that sense; see below.
-                            let streamed_key = streamed.remove(&entry);
-                            let paste_waiting =
-                                streamed_key.is_none() && paste_signals.contains_key(&entry);
-                            if streamed_key.is_some() {
-                                paste_signals.remove(&entry);
-                            }
+                            let paste_waiting = paste_signals.contains_key(&entry);
                             // Delivered into the user's folder when they named one, so
                             // the file is simply *there* and needs no paste at all —
                             // and, being a hard link, costs its own size once rather
@@ -1193,22 +1198,6 @@ fn run(
                                     );
                                     paste_signals.remove(&entry);
                                     continue;
-                                }
-                                // Offered from the streaming folder until now. Swap in the real
-                                // files (which paste as a cheap move) only if the clipboard
-                                // still holds that offer: the user may have copied something
-                                // else meanwhile, and a finished download must not replace it.
-                                // A paste already copying from the folder is unaffected.
-                                if let Some(key) = streamed_key {
-                                    let still_ours = last_files == Some(key)
-                                        && files::read_files().map(|l| files::list_key(&l)) == Some(key);
-                                    if !still_ours {
-                                        tracing::info!(
-                                            count = set.files.len(),
-                                            "files are here; the clipboard has moved on, so it is left as it is"
-                                        );
-                                        continue;
-                                    }
                                 }
                                 // Published as a *move* when asked for: the file manager
                                 // then relocates our hard link to wherever the paste
