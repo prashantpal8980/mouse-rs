@@ -7,15 +7,18 @@
 //!
 //! * **Resuming.** The paste reads in order, so the next byte it needs is always known. A
 //!   dropped connection is resumed by asking the peer for the file from exactly that byte.
-//! * **Verification.** Large files are identified by length, not by content hash (see
-//!   `BlobCache::identify`), so the check is that the stream delivers exactly `size`
-//!   bytes, which this tracks directly.
+//! * **Verification.** A file the sender identified by length is checked by length,
+//!   which this tracks directly. A file the sender hashed is hashed again here as the
+//!   bytes pass through, and the paste's final read waits for that hash to match, so a
+//!   damaged transfer fails the paste instead of completing it.
 //!
 //! So a pipe holds at most [`WINDOW`] bytes. If the paste falls behind and the window
 //! fills, the stream is stopped and restarted from where the paste has got to once it
 //! catches up: flow control by re-request, using the protocol's resume offset.
 
 use std::collections::VecDeque;
+
+use sha2::{Digest as _, Sha256};
 use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -49,6 +52,13 @@ struct State {
     overfull: bool,
     grew_at: Instant,
     asked_at: Instant,
+    /// Running content hash, for a file the sender hashed. `None` for length-only files,
+    /// or once the stream skipped bytes and can no longer be hashed in order.
+    hasher: Option<Sha256>,
+    /// Bytes fed to `hasher` so far, always a prefix of the file.
+    hashed_to: u64,
+    /// For a hashed file: whether the finished hash matched. `None` until it finishes.
+    verified: Option<bool>,
 }
 
 impl State {
@@ -67,14 +77,19 @@ impl State {
 
 pub struct StreamPipe {
     size: u64,
+    /// The content hash to check, for a file the sender hashed.
+    expect: Option<String>,
     st: Mutex<State>,
     cv: Condvar,
 }
 
 impl StreamPipe {
-    pub fn new(size: u64) -> StreamPipe {
+    /// `expect` is the content hash to verify, or `None` for a file identified by length.
+    pub fn new(size: u64, expect: Option<String>) -> StreamPipe {
+        let hasher = expect.as_ref().map(|_| Sha256::new());
         StreamPipe {
             size,
+            expect,
             st: Mutex::new(State {
                 start: 0,
                 buf: VecDeque::new(),
@@ -84,6 +99,9 @@ impl StreamPipe {
                 overfull: false,
                 grew_at: Instant::now(),
                 asked_at: Instant::now(),
+                hasher,
+                hashed_to: 0,
+                verified: None,
             }),
             cv: Condvar::new(),
         }
@@ -132,7 +150,10 @@ impl StreamPipe {
     pub fn push(&self, data: &[u8]) -> bool {
         let Ok(mut st) = self.st.lock() else { return false };
         let room = (self.size - st.have_end().min(self.size)) as usize;
-        st.buf.extend(&data[..data.len().min(room)]);
+        let at = st.have_end();
+        let data = &data[..data.len().min(room)];
+        st.buf.extend(data);
+        self.hash_through(&mut st, at, data);
         st.grew_at = Instant::now();
         let ok = st.buf.len() < WINDOW;
         if !ok {
@@ -140,6 +161,37 @@ impl StreamPipe {
         }
         self.cv.notify_all();
         ok
+    }
+
+    /// Feed the in-order part of `data` (which starts at file offset `at`) to the hash.
+    fn hash_through(&self, st: &mut State, at: u64, data: &[u8]) {
+        let Some(expect) = &self.expect else { return };
+        let end = at + data.len() as u64;
+        if st.hasher.is_some() && end > st.hashed_to {
+            if at > st.hashed_to {
+                // Bytes were skipped (a jump ahead), so the hash can no longer be computed.
+                st.hasher = None;
+                st.verified = Some(false);
+                tracing::warn!(at, hashed_to = st.hashed_to, "streamed file skipped ahead; it cannot be verified, so the paste will fail");
+                return;
+            }
+            let from = (st.hashed_to - at) as usize;
+            if let Some(h) = st.hasher.as_mut() {
+                h.update(&data[from..]);
+            }
+            st.hashed_to = end;
+        }
+        if st.hashed_to >= self.size && st.verified.is_none() {
+            if let Some(h) = st.hasher.take() {
+                let ok = crate::cache::hex(&h.finalize()) == *expect;
+                st.verified = Some(ok);
+                if ok {
+                    tracing::info!(bytes = self.size, "streamed file verified by content hash");
+                } else {
+                    tracing::warn!(bytes = self.size, "streamed file does NOT match its hash; failing the paste");
+                }
+            }
+        }
     }
 
     /// The stream ended or broke. A reader still waiting asks for it again.
@@ -172,6 +224,17 @@ impl StreamPipe {
                 st.restart_at(offset);
             }
             if st.have_end() >= end {
+                // The last bytes of a hashed file are only handed over once it verified.
+                if end == self.size && self.expect.is_some() && st.verified != Some(true) {
+                    if st.verified == Some(false) {
+                        return None;
+                    }
+                    st = match self.cv.wait_timeout(st, Duration::from_millis(100)) {
+                        Ok((g, _)) => g,
+                        Err(_) => return None,
+                    };
+                    continue;
+                }
                 let from = (offset - st.start) as usize;
                 let to = (end - st.start) as usize;
                 let out: Vec<u8> = st.buf.range(from..to).copied().collect();
@@ -220,7 +283,7 @@ mod tests {
 
     #[test]
     fn a_read_asks_for_the_stream_then_gets_the_bytes() {
-        let p = Arc::new(StreamPipe::new(10));
+        let p = Arc::new(StreamPipe::new(10, None));
         let p2 = p.clone();
         let feeder = std::thread::spawn(move || {
             // The clipboard thread's loop, reduced: wait to be asked, then deliver.
@@ -245,7 +308,7 @@ mod tests {
 
     #[test]
     fn a_broken_stream_resumes_from_the_byte_the_paste_reached() {
-        let p = StreamPipe::new(8);
+        let p = StreamPipe::new(8, None);
         assert_eq!(p.take_command(), PipeCmd::Nothing, "nothing is fetched until read");
         {
             let mut st = p.st.lock().unwrap();
@@ -276,7 +339,7 @@ mod tests {
 
     #[test]
     fn a_full_window_stops_the_stream_and_memory_stays_bounded() {
-        let p = StreamPipe::new((WINDOW * 2) as u64);
+        let p = StreamPipe::new((WINDOW * 2) as u64, None);
         p.st.lock().unwrap().want = Some(0);
         assert_eq!(p.take_command(), PipeCmd::Start(0));
         let chunk = vec![7u8; 1024 * 1024];
@@ -294,12 +357,30 @@ mod tests {
 
     #[test]
     fn closing_the_paste_frees_the_memory_and_stops_the_stream() {
-        let p = StreamPipe::new(100);
+        let p = StreamPipe::new(100, None);
         p.st.lock().unwrap().want = Some(0);
         assert_eq!(p.take_command(), PipeCmd::Start(0));
         p.push(&[1u8; 50]);
         p.release();
         assert_eq!(p.take_command(), PipeCmd::Stop);
         assert!(p.st.lock().unwrap().buf.is_empty());
+    }
+
+    #[test]
+    fn a_hashed_file_is_verified_and_a_damaged_one_fails_the_paste() {
+        let body = b"0123456789".to_vec();
+        let good = StreamPipe::new(10, Some(crate::cache::hash_bytes(&body)));
+        good.st.lock().unwrap().want = Some(0);
+        let _ = good.take_command();
+        good.push(&body[..4]);
+        good.push(&body[4..]);
+        assert_eq!(good.read(0, 10, Duration::from_secs(1)).unwrap(), body);
+
+        let bad = StreamPipe::new(10, Some(crate::cache::hash_bytes(&body)));
+        bad.st.lock().unwrap().want = Some(0);
+        let _ = bad.take_command();
+        bad.push(b"0123456780"); // one byte wrong
+        assert!(bad.read(0, 4, Duration::from_secs(1)).is_some(), "early bytes still flow");
+        assert!(bad.read(4, 6, Duration::from_secs(1)).is_none(), "the end is refused");
     }
 }

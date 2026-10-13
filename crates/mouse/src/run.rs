@@ -691,6 +691,9 @@ fn clipboard_settings(cfg: &Config) -> ClipboardSettings {
             (!d.is_empty()).then(|| std::path::PathBuf::from(d))
         },
         quick_send_secs: cfg.clipboard_quick_send_secs as f64,
+        stream_min_bytes: u64::from(cfg.clipboard_stream_min_mb) * 1024 * 1024,
+        stream_wait: std::time::Duration::from_secs(u64::from(cfg.clipboard_stream_wait_secs.max(5))),
+        keep_resumable_copy: cfg.clipboard_keep_resumable_copy,
         persist_history: cfg.clipboard_persist_history,
     }
 }

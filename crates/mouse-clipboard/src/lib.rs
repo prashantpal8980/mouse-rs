@@ -617,6 +617,12 @@ pub struct ClipboardSettings {
     pub quick_send_secs: f64,
     /// Keep history across restarts.
     pub persist_history: bool,
+    /// Files at least this big stream through memory into a paste instead of the cache.
+    pub stream_min_bytes: u64,
+    /// How long a stalled paste waits for its transfer to come back.
+    pub stream_wait: Duration,
+    /// Spool streamed pastes to the cache too, so they resume even after a restart.
+    pub keep_resumable_copy: bool,
 }
 
 impl Default for ClipboardSettings {
@@ -639,6 +645,9 @@ impl Default for ClipboardSettings {
             move_on_paste: true,
             quick_send_secs: 3.0,
             persist_history: false,
+            stream_min_bytes: 64 * 1024 * 1024,
+            stream_wait: Duration::from_secs(180),
+            keep_resumable_copy: false,
         }
     }
 }
@@ -908,7 +917,7 @@ fn run(
     #[cfg(target_os = "linux")]
     let streaming: Option<Streaming> = transfers
         .as_ref()
-        .and_then(|t| Streaming::mount(t.cache().clone(), &Streaming::default_mountpoint()));
+        .and_then(|t| Streaming::mount(t.cache().clone(), &Streaming::default_mountpoint(), settings.stream_wait));
     #[cfg(not(target_os = "linux"))]
     let streaming: Option<Streaming> = None;
     // Entries currently on the clipboard from the streaming folder, with that list's key.
@@ -1010,7 +1019,7 @@ fn run(
                                     id,
                                     &set,
                                     sig,
-                                    settings.move_on_paste,
+                                    &settings,
                                     &mut last,
                                     &mut last_files,
                                 );
@@ -1030,7 +1039,7 @@ fn run(
                                 id,
                                 &set,
                                 sig,
-                                settings.move_on_paste,
+                                &settings,
                                 &mut last,
                                 &mut last_files,
                             );
@@ -1470,7 +1479,7 @@ fn reuse_entry<C: SystemClipboard>(
                         id,
                         &set,
                         sig,
-                        settings.move_on_paste,
+                        settings,
                         last,
                         last_files,
                     );
@@ -1831,18 +1840,21 @@ fn publish_pending_set(
     id: u64,
     set: &FileSet,
     sig: Arc<files::PasteSignal>,
-    move_on_paste: bool,
+    settings: &ClipboardSettings,
     last: &mut Option<String>,
     last_files: &mut Option<u64>,
 ) -> bool {
-    // Large files (identified by length rather than content hash) stream straight from the
-    // network to the paste through memory, so they never take disk space twice. Small,
-    // content-hashed ones keep going through the cache, where the hash is checked.
+    let (move_on_paste, stream_min_bytes, keep_resumable_copy) =
+        (settings.move_on_paste, settings.stream_min_bytes, settings.keep_resumable_copy);
+    // Files over the owner's threshold stream straight from the network into the paste
+    // through memory, so they never take disk space twice. Smaller ones go through the
+    // cache. With "keep a resumable copy" on, everything goes through the cache, which is
+    // what lets a paste cut short by a restart continue later — at the cost of the space.
     let mut pipes = std::collections::HashMap::new();
-    if streaming.is_some() {
+    if streaming.is_some() && !keep_resumable_copy {
         for f in &set.files {
-            if !f.content_hashed && !t.cache().contains(&f.hash) {
-                pipes.insert(f.hash.clone(), t.pipe_for(&f.hash, f.size, id));
+            if f.size >= stream_min_bytes && !t.cache().contains(&f.hash) && t.cache().partial_len(&f.hash) == 0 {
+                pipes.insert(f.hash.clone(), t.pipe_for(&f.hash, f.size, f.content_hashed, id));
             }
         }
     }

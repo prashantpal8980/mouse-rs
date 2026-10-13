@@ -38,10 +38,6 @@ use crate::FileSet;
 const TTL: Duration = Duration::from_secs(60);
 /// How often a waiting read looks for new bytes.
 const POLL: Duration = Duration::from_millis(50);
-/// A read gives up when the file has not grown for this long. Long enough to ride out a
-/// reconnect; short enough that a dead transfer ends the copy with an error rather than a
-/// progress dialog frozen forever.
-const STALL: Duration = Duration::from_secs(180);
 /// While waiting, re-ask for the file this often, so a transfer that dropped (a reconnect,
 /// a cancelled fetch) is resumed rather than waited on.
 const NUDGE: Duration = Duration::from_secs(10);
@@ -197,6 +193,10 @@ struct Inner {
     uid: u32,
     gid: u32,
     made: SystemTime,
+    /// A read gives up when its file has not grown for this long: the owner's "wait for a
+    /// dropped connection" setting. Long enough to ride out a reconnect; finite, so a dead
+    /// transfer ends the copy with an error rather than a progress dialog frozen forever.
+    stall: Duration,
 }
 
 impl Inner {
@@ -244,7 +244,7 @@ impl StreamFs {
 
     /// Mount it. `None` (logged) when FUSE is unavailable; the caller then falls back to
     /// making the paste wait for the transfer, as before.
-    pub fn mount(cache: Arc<BlobCache>, at: &Path) -> Option<StreamFs> {
+    pub fn mount(cache: Arc<BlobCache>, at: &Path, stall: Duration) -> Option<StreamFs> {
         // A previous run that died leaves a dead mount behind ("Transport endpoint is not
         // connected"); every later mount on the same path then fails. Clearing it is
         // harmless when nothing is mounted.
@@ -267,6 +267,7 @@ impl StreamFs {
             uid: meta.uid(),
             gid: meta.gid(),
             made: SystemTime::now(),
+            stall,
         });
         let mut config = fuser::Config::default();
         config.mount_options = vec![
@@ -419,10 +420,11 @@ impl Filesystem for Fs {
             Err(_) => return reply.error(Errno::EIO),
         };
         let cache = self.0.cache.clone();
+        let stall = self.0.stall;
         let tail_flag = self.0.opens.lock().ok().and_then(|o| o.get(&fh.0).map(|o| o.tail_served.clone()));
         // Answered from a thread of its own: a read waiting on the network must not hold
         // up every other request to this folder.
-        std::thread::spawn(move || match read_file(&cache, &file, offset, size as u64) {
+        std::thread::spawn(move || match read_file(&cache, &file, offset, size as u64, stall) {
             Ok(bytes) => {
                 if offset + bytes.len() as u64 >= file.size {
                     if let Some(flag) = tail_flag {
@@ -468,18 +470,18 @@ fn libc_o_accmode() -> i32 {
 }
 
 /// A read, from the pipe for a streamed file, otherwise from the cache.
-fn read_file(cache: &BlobCache, file: &RemoteFile, offset: u64, len: u64) -> Result<Vec<u8>, Errno> {
+fn read_file(cache: &BlobCache, file: &RemoteFile, offset: u64, len: u64, stall: Duration) -> Result<Vec<u8>, Errno> {
     match &file.pipe {
-        Some(pipe) => pipe.read(offset, len, STALL).ok_or_else(|| {
-            tracing::warn!(offset, size = file.size, "streaming folder: no data for {STALL:?}; failing the copy");
+        Some(pipe) => pipe.read(offset, len, stall).ok_or_else(|| {
+            tracing::warn!(offset, size = file.size, "streaming folder: no data for {stall:?}, or the file failed verification; failing the copy");
             Errno::EIO
         }),
-        None => read_when_ready(cache, file, offset, len),
+        None => read_when_ready(cache, file, offset, len, stall),
     }
 }
 
 /// The bytes `offset..offset+len` of `file`, waiting for them to arrive if need be.
-fn read_when_ready(cache: &BlobCache, file: &RemoteFile, offset: u64, len: u64) -> Result<Vec<u8>, Errno> {
+fn read_when_ready(cache: &BlobCache, file: &RemoteFile, offset: u64, len: u64, stall: Duration) -> Result<Vec<u8>, Errno> {
     if offset >= file.size || len == 0 {
         return Ok(Vec::new());
     }
@@ -511,8 +513,8 @@ fn read_when_ready(cache: &BlobCache, file: &RemoteFile, offset: u64, len: u64) 
             seen = have;
             grew_at = Instant::now();
         }
-        if grew_at.elapsed() > STALL {
-            tracing::warn!(have, size = file.size, "streaming folder: no progress for {STALL:?}; failing the copy");
+        if grew_at.elapsed() > stall {
+            tracing::warn!(have, size = file.size, "streaming folder: no progress for {stall:?}; failing the copy");
             return Err(Errno::EIO);
         }
         if nudged_at.elapsed() > NUDGE && grew_at.elapsed() > NUDGE {
@@ -560,7 +562,7 @@ mod tests {
             let mut p = cache.open_partial(&hash).unwrap();
             p.write_all(&body[..6]).unwrap();
         }
-        assert_eq!(read_when_ready(&cache, &file, 0, 4).unwrap(), b"0123");
+        assert_eq!(read_when_ready(&cache, &file, 0, 4, Duration::from_secs(30)).unwrap(), b"0123");
 
         // The tail waits: finish the file from another thread and the read completes.
         let c2 = cache.clone();
@@ -574,7 +576,7 @@ mod tests {
             drop(p);
             c2.finish(&h2).unwrap();
         });
-        assert_eq!(read_when_ready(&cache, &file, 6, 100).unwrap(), b"6789");
+        assert_eq!(read_when_ready(&cache, &file, 6, 100, Duration::from_secs(30)).unwrap(), b"6789");
         t.join().unwrap();
 
         // A transfer marked failed ends a waiting read with an error.
@@ -585,7 +587,7 @@ mod tests {
             pipe: None,
         };
         missing.signal.failed.store(true, Ordering::SeqCst);
-        assert!(read_when_ready(&cache, &missing, 0, 5).is_err());
+        assert!(read_when_ready(&cache, &missing, 0, 5, Duration::from_secs(30)).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -626,7 +628,7 @@ mod tests {
         let base = std::env::temp_dir().join(format!("mouse-rs-sfs-mount-{}", std::process::id()));
         let cache = Arc::new(BlobCache::new(base.join("cache")).unwrap());
         let at = base.join("mnt");
-        let sfs = StreamFs::mount(cache.clone(), &at).expect("FUSE mount");
+        let sfs = StreamFs::mount(cache.clone(), &at, Duration::from_secs(30)).expect("FUSE mount");
 
         let body: Vec<u8> = (0..8 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
         let hash = cache::hash_bytes(&body);
@@ -677,13 +679,13 @@ mod tests {
         let base = std::env::temp_dir().join(format!("mouse-rs-sfs-pipe-{}", std::process::id()));
         let cache = Arc::new(BlobCache::new(base.join("cache")).unwrap());
         let at = base.join("mnt");
-        let sfs = StreamFs::mount(cache.clone(), &at).expect("FUSE mount");
+        let sfs = StreamFs::mount(cache.clone(), &at, Duration::from_secs(30)).expect("FUSE mount");
 
         let body: Vec<u8> = (0..24 * 1024 * 1024u32).map(|i| (i % 253) as u8).collect();
         let mut f = fref("big.iso", "", body.len() as u64);
         f.content_hashed = false;
         let hash = f.hash.clone();
-        let pipe = Arc::new(StreamPipe::new(body.len() as u64));
+        let pipe = Arc::new(StreamPipe::new(body.len() as u64, None));
         let mut pipes = HashMap::new();
         pipes.insert(hash.clone(), pipe.clone());
         let set = FileSet { files: vec![f], dirs: vec![], origin: "peer".into() };

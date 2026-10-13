@@ -130,6 +130,14 @@ fn default_quick_send() -> u32 {
     3
 }
 
+fn default_stream_min_mb() -> u32 {
+    64
+}
+
+fn default_stream_wait_secs() -> u32 {
+    180
+}
+
 /// On-disk configuration. Field names match the Python version exactly.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -317,6 +325,20 @@ pub struct Config {
     /// start slow ones.
     #[serde(default = "default_quick_send")]
     pub clipboard_quick_send_secs: u32,
+    /// Files at least this many MB, pasted from the other machine, stream straight from
+    /// the network into the paste through memory, taking no extra disk. Smaller ones go
+    /// through the cache first.
+    #[serde(default = "default_stream_min_mb")]
+    pub clipboard_stream_min_mb: u32,
+    /// How long a paste whose transfer stopped (cable pulled, Wi-Fi dropped) waits for the
+    /// connection to come back before it gives up with an error.
+    #[serde(default = "default_stream_wait_secs")]
+    pub clipboard_stream_wait_secs: u32,
+    /// Keep a copy of what has arrived while a paste runs, so a paste cut short even by a
+    /// restart continues where it stopped the next time the same file is copied. Costs
+    /// the file's size again in disk while it runs; off by default.
+    #[serde(default)]
+    pub clipboard_keep_resumable_copy: bool,
     /// Keep clipboard history across restarts.
     ///
     /// Off by default, matching Windows. On means clipboard contents — possibly
@@ -414,6 +436,9 @@ impl Default for Config {
             bulk_rate_limit_mbps: 0,
             bulk_send_buffer_mb: default_send_buffer_mb(),
             clipboard_quick_send_secs: default_quick_send(),
+            clipboard_stream_min_mb: default_stream_min_mb(),
+            clipboard_stream_wait_secs: default_stream_wait_secs(),
+            clipboard_keep_resumable_copy: false,
             clipboard_persist_history: false,
             lock_hotkey: default_lock_hotkey(),
             return_hotkey: String::new(),

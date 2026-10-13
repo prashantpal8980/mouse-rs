@@ -128,6 +128,7 @@ re-author them.
 | R24 | Settings **grouped by function with sub-sections**, like Android's Settings (Connection, Screens & edges, Keyboard, Clipboard, Startup, Security, Appearance, Diagnostics, About) | **open** | Owner, 2026-10-13. Categories proposed in the plan, for the owner to confirm |
 | R25 | Every setting marked **Basic or Advanced**; normal users see Basic only | **open** | Owner, 2026-10-13. Extends R19 from the clipboard to every setting |
 | R26 | **Restore settings that went missing**: edge sensitivity and the Python app's return distance, plus the 6 config fields that never had a control | **open** | Owner noticed settings had gone, 2026-10-13. Audit in the plan: 8 of 51 fields have no control; `warp_threshold_px` is stored but unused |
+| R27 | Large-paste settings, all user-configurable: **stream-to-paste size threshold** (default 64 MB), **wait for a dropped connection** (default 180 s), **keep a resumable copy** (default **off**; doubles disk during a paste but survives restarts) | **done** (2026‑10‑13) | Owner, 2026-10-13: "the cost in double memory becomes the feature… by default it would be turned off". In the Clipboard tab's advanced transfer settings; moves to Settings → Clipboard → Transfers with R23 |
 
 ---
 

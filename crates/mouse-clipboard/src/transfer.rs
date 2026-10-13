@@ -175,10 +175,14 @@ impl Transfers {
     }
 
     /// The pipe a paste reads `hash` through, created on first use.
-    pub fn pipe_for(&mut self, hash: &str, size: u64, entry: u64) -> Arc<crate::pipe::StreamPipe> {
+    /// `content_hashed` says whether `hash` is a real content hash to verify on the way.
+    pub fn pipe_for(&mut self, hash: &str, size: u64, content_hashed: bool, entry: u64) -> Arc<crate::pipe::StreamPipe> {
         self.pipes
             .entry(hash.to_string())
-            .or_insert_with(|| (Arc::new(crate::pipe::StreamPipe::new(size)), entry))
+            .or_insert_with(|| {
+                let expect = content_hashed.then(|| hash.to_string());
+                (Arc::new(crate::pipe::StreamPipe::new(size, expect)), entry)
+            })
             .0
             .clone()
     }

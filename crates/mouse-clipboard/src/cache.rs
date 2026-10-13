@@ -611,7 +611,7 @@ pub fn hash_bytes(data: &[u8]) -> String {
     hex(&hasher.finalize())
 }
 
-fn hex(bytes: &[u8]) -> String {
+pub(crate) fn hex(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
     for b in bytes {
         use std::fmt::Write as _;

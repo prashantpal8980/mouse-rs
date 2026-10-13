@@ -103,6 +103,9 @@ enum Message {
     ClipMaxFilesChanged(String),
     ClipPersistToggled(bool),
     ClipQuickSecsChanged(String),
+    ClipStreamMbChanged(String),
+    ClipStreamWaitChanged(String),
+    ClipKeepResumableToggled(bool),
     BulkPauseToggled(bool),
     BulkRateChanged(String),
     ReconnectToggled(bool),
@@ -198,6 +201,9 @@ fn pending_restart_changes(live: &Config, now: &Config) -> Vec<&'static str> {
     chk(live.clipboard_move_on_paste != now.clipboard_move_on_paste, "move on paste");
     chk(live.clipboard_hash_limit != now.clipboard_hash_limit, "hash limit");
     chk(live.clipboard_quick_send_secs != now.clipboard_quick_send_secs, "don't-ask-if-quick");
+    chk(live.clipboard_stream_min_mb != now.clipboard_stream_min_mb, "stream size");
+    chk(live.clipboard_stream_wait_secs != now.clipboard_stream_wait_secs, "wait for a dropped connection");
+    chk(live.clipboard_keep_resumable_copy != now.clipboard_keep_resumable_copy, "resumable copy");
     chk(live.clipboard_persist_history != now.clipboard_persist_history, "keep history after restart");
     chk(live.bulk_enabled != now.bulk_enabled, "separate transfer lane");
     chk(live.bulk_port != now.bulk_port, "transfer lane port");
@@ -310,6 +316,8 @@ struct App {
     clip_inline_kb_s: String,
     clip_max_files_s: String,
     clip_quick_s: String,
+    clip_stream_mb_s: String,
+    clip_stream_wait_s: String,
     bulk_rate_s: String,
     bulk_buf_s: String,
 }
@@ -433,6 +441,8 @@ impl App {
             clip_inline_kb_s: String::new(),
             clip_max_files_s: String::new(),
             clip_quick_s: String::new(),
+            clip_stream_mb_s: String::new(),
+            clip_stream_wait_s: String::new(),
             bulk_rate_s: String::new(),
             bulk_buf_s: String::new(),
             saved_cfg: cfg.clone(),
@@ -456,6 +466,8 @@ impl App {
         self.clip_inline_kb_s = (self.cfg.clipboard_inline_image_max / 1024).max(1).to_string();
         self.clip_max_files_s = self.cfg.clipboard_max_files_per_copy.to_string();
         self.clip_quick_s = self.cfg.clipboard_quick_send_secs.to_string();
+        self.clip_stream_mb_s = self.cfg.clipboard_stream_min_mb.to_string();
+        self.clip_stream_wait_s = self.cfg.clipboard_stream_wait_secs.to_string();
         self.bulk_rate_s = self.cfg.bulk_rate_limit_mbps.to_string();
         self.bulk_buf_s = self.cfg.bulk_send_buffer_mb.to_string();
         self.clip_cache_gb_s =
@@ -857,6 +869,20 @@ impl App {
                 }
                 self.clip_quick_s = s;
             }
+            Message::ClipStreamMbChanged(s) => {
+                // 0 streams everything, however small.
+                if let Ok(v) = s.trim().parse::<u32>() {
+                    self.cfg.clipboard_stream_min_mb = v;
+                }
+                self.clip_stream_mb_s = s;
+            }
+            Message::ClipStreamWaitChanged(s) => {
+                if let Ok(v) = s.trim().parse::<u32>() {
+                    self.cfg.clipboard_stream_wait_secs = v.max(5);
+                }
+                self.clip_stream_wait_s = s;
+            }
+            Message::ClipKeepResumableToggled(v) => self.cfg.clipboard_keep_resumable_copy = v,
             Message::BulkPauseToggled(v) => self.cfg.bulk_pause_while_crossed = v,
             Message::BulkRateChanged(s) => {
                 // 0 means adapt automatically, which is the default.
@@ -872,6 +898,8 @@ impl App {
                 self.clip_inline_kb_s = (self.cfg.clipboard_inline_image_max / 1024).max(1).to_string();
         self.clip_max_files_s = self.cfg.clipboard_max_files_per_copy.to_string();
         self.clip_quick_s = self.cfg.clipboard_quick_send_secs.to_string();
+        self.clip_stream_mb_s = self.cfg.clipboard_stream_min_mb.to_string();
+        self.clip_stream_wait_s = self.cfg.clipboard_stream_wait_secs.to_string();
         self.bulk_rate_s = self.cfg.bulk_rate_limit_mbps.to_string();
         self.bulk_buf_s = self.cfg.bulk_send_buffer_mb.to_string();
         self.clip_cache_gb_s = s;
@@ -2315,10 +2343,40 @@ impl App {
                     })
                     .size(11.0)
                     .color(p.txt3),
+                    labeled(
+                        p,
+                        "Paste files bigger than (MB) straight from the network",
+                        input(p, "64", &self.clip_stream_mb_s, Message::ClipStreamMbChanged)
+                    ),
+                    text(if self.cfg.clipboard_keep_resumable_copy {
+                        "Off while \"keep a resumable copy\" is on: every paste goes through the cache.".to_string()
+                    } else {
+                        format!(
+                            "Files from {} MB up go network → memory → your folder: they use their own size on disk, once. Smaller ones pass through mouse-rs's cache first.",
+                            self.cfg.clipboard_stream_min_mb
+                        )
+                    })
+                    .size(11.0)
+                    .color(p.txt3),
+                    labeled(
+                        p,
+                        "Wait for a dropped connection (seconds)",
+                        input(p, "180", &self.clip_stream_wait_s, Message::ClipStreamWaitChanged)
+                    ),
+                    text("A paste whose transfer stops (cable pulled, Wi-Fi drop) pauses and continues from the same byte if the connection is back within this time; after that it fails.")
+                        .size(11.0)
+                        .color(p.txt3),
+                    toggle_row(
+                        p,
+                        "Keep a resumable copy while pasting",
+                        "uses the file's size again in disk while a paste runs, but a paste cut short — even by a restart — continues where it stopped when you copy and paste the same file again",
+                        self.cfg.clipboard_keep_resumable_copy,
+                        Message::ClipKeepResumableToggled
+                    ),
                     toggle_row(
                         p,
                         "Slow transfers while I'm on the other machine",
-                        "keeps the pointer smooth by capping transfers at 2 MB/s — they keep moving, they do not stop",
+                        "only if the pointer starts to lag; otherwise transfers run at the network's full speed",
                         self.cfg.bulk_pause_while_crossed,
                         Message::BulkPauseToggled
                     ),
