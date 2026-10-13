@@ -253,6 +253,11 @@ struct App {
     /// is a system service and could have been changed with `systemctl` outside the app.
     #[cfg(target_os = "linux")]
     login_screen: crate::greeter::State,
+    /// The service runs its own copy of the binary, so an update of this one leaves the
+    /// login screen on the old version until it is reinstalled. Read at launch and after
+    /// the toggle, not on redraw: it compares two whole binaries.
+    #[cfg(target_os = "linux")]
+    login_screen_stale: bool,
     /// Set while the one-time explanation is on screen, waiting for an answer. The
     /// toggle does not move until it is answered, so the panel never shows a state the
     /// system is not actually in.
@@ -405,6 +410,8 @@ impl App {
             autostart_elevated_on: crate::autostart::elevated_is_enabled(),
             #[cfg(target_os = "linux")]
             login_screen: crate::greeter::state(),
+            #[cfg(target_os = "linux")]
+            login_screen_stale: crate::greeter::installed_copy_is_current() == Some(false),
             #[cfg(target_os = "linux")]
             login_screen_asking: false,
             launch_done: false,
@@ -1568,6 +1575,13 @@ impl App {
                         .size(11.0)
                         .color(p.warn),
                 );
+            } else if self.login_screen.on() && self.login_screen_stale {
+                startup = startup.push(
+                    text("the login screen runs an older version than this one — turn it off \
+                          and on to update it")
+                        .size(11.0)
+                        .color(p.warn),
+                );
             }
         }
 
@@ -1599,6 +1613,7 @@ impl App {
     fn apply_login_screen(&mut self, on: bool) {
         let res = crate::greeter::set_enabled(on);
         self.login_screen = crate::greeter::state();
+        self.login_screen_stale = crate::greeter::installed_copy_is_current() == Some(false);
         self.feedback = match res {
             Ok(()) if self.login_screen.on() == on => {
                 tracing::info!(enabled = on, "login-screen service changed from the panel");

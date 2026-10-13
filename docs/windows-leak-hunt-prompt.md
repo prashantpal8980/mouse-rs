@@ -67,7 +67,7 @@ Get-FileHash $HOME\mouse-rs\mouse-rs.exe -Algorithm SHA256
 ```
 
 Must match exactly — size `12183040` bytes, SHA256
-`068587D1B51B3F74D53F5CE29159887E752AC341DCBED46B86F7E11A84BE4CAA`.
+`73B2A6590CD8E5EA6FED59482BE8A760785953C37BE3B173CBE540C9DFC2A04A`.
 If it doesn't match, stop and tell me.
 
 **Start the log clean** so the trial numbering below lines up with the file — move the old

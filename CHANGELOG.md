@@ -22,6 +22,7 @@ Dates are when the work was committed. Item codes refer to
 - **Plain `cargo build` (B12)** links on Linux without `RUSTFLAGS`.
 - Documentation: new README, [docs/NETWORKING.md](docs/NETWORKING.md), docs index.
 - Licence changed to proprietary (all rights reserved); crates marked `publish = false`.
+- README rewritten for users: install, connect, update and bug-report sections, plus the one-click roadmap. The panel now warns when the login-screen copy is older than the app.
 
 ## 2026-10-08 to 2026-10-09
 
