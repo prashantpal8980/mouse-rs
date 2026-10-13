@@ -158,12 +158,14 @@ rung is done when it works in the direction tested; the reverse direction is its
 | Rung | What is copied | Direction | Status |
 |---|---|---|---|
 | 1a | **Image pixels**: a screenshot, or "Copy image" in a browser; pasted into an Explorer folder **and** into apps | Linux → Windows | **signed off 13 Oct** |
-| 1b | **Image file**: a `.png`/`.jpg` copied in the file manager | Linux → Windows | **next** |
+| 1b | **Image file**: a `.png`/`.jpg` copied in the file manager | Linux → Windows | closed 13 Oct (owner: image copy/paste resolved) |
 | 2 | **Video file** (a large one, hundreds of MB) | Linux → Windows | waiting |
 | 3 | **Folder** with several files and sub-folders | Linux → Windows | waiting |
 | 4 | **Zip file** | Linux → Windows | waiting |
 | 5 | Image pixels, pasted into an app **and into a Thunar folder** | Windows → Linux | **signed off 13 Oct** |
-| 6–8 | Rungs 1b–4 again | Windows → Linux | waiting |
+| 6 | Image file | Windows → Linux | closed 13 Oct (owner: image copy/paste resolved) |
+| 7 | **Video file** | Windows → Linux | **testing now**, owner chose this direction first |
+| 8 | Folder, zip | Windows → Linux | waiting |
 
 Image pixels and image files are different rungs because they take different paths:
 pixels go through the clipboard itself, while a file is fetched over the file lane when
