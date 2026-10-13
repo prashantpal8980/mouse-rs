@@ -15,6 +15,8 @@
 pub mod cache;
 pub mod files;
 pub mod transfer;
+#[cfg(target_os = "linux")]
+pub mod stream_fs;
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -901,6 +903,15 @@ fn run(
         ),
         None => (None, None, None, None, None),
     };
+    // Files still on the peer are offered from here, so a paste of any size starts at once.
+    #[cfg(target_os = "linux")]
+    let streaming: Option<Streaming> = transfers
+        .as_ref()
+        .and_then(|t| Streaming::mount(t.cache().clone(), &Streaming::default_mountpoint()));
+    #[cfg(not(target_os = "linux"))]
+    let streaming: Option<Streaming> = None;
+    // Entries currently on the clipboard from the streaming folder, with that list's key.
+    let mut streamed: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
     // Paste signals, per history entry. A paste raises one; this loop answers it by
     // starting the transfer the entry has been describing but not fetching.
     let mut paste_signals: std::collections::HashMap<u64, Arc<files::PasteSignal>> =
@@ -986,6 +997,23 @@ fn run(
                     if let Some(id) = h.record_files(set.clone(), true, status.clone()) {
                         if status == ClipStatus::Remote {
                             t.request_missing(&set, id, &to_peer, settings.cache_budget);
+                            // On its way already, but a paste should not have to wait for it
+                            // to land: offer it now from the streaming folder.
+                            if streaming.is_some() {
+                                let sig = Arc::new(files::PasteSignal::default());
+                                paste_signals.insert(id, sig.clone());
+                                publish_pending_set(
+                                    t,
+                                    streaming.as_ref(),
+                                    &mut streamed,
+                                    id,
+                                    &set,
+                                    sig,
+                                    settings.move_on_paste,
+                                    &mut last,
+                                    &mut last_files,
+                                );
+                            }
                         } else if status == ClipStatus::NeedsConsent {
                             // Nothing is fetched yet — only the description crossed. The
                             // files are still published to the clipboard so Ctrl+V works
@@ -994,27 +1022,17 @@ fn run(
                             // machine therefore costs nothing here until it is wanted.
                             let sig = Arc::new(files::PasteSignal::default());
                             paste_signals.insert(id, sig.clone());
-                            if let Some(list) = t.placeholder_paths(&set) {
-                                let how = files::Publish {
-                                    move_on_paste: settings.move_on_paste,
-                                    relink: Vec::new(),
-                                    png: None,
-                                    on_paste: Some(sig),
-                                };
-                                if files::publish(&list, how) {
-                                    last_files = Some(files::list_key(&list));
-                                    // Our own selection answers UTF8_STRING with these
-                                    // paths, so without this the next text poll reads
-                                    // them straight back and records a `file:///…cache/
-                                    // trees/…` entry as if the user had copied it.
-                                    last = Some(files::uri_text(&list));
-                                    tracing::info!(
-                                        count = set.files.len(),
-                                        bytes = set.total_bytes(),
-                                        "described on the clipboard — paste it and the transfer starts then"
-                                    );
-                                }
-                            }
+                            publish_pending_set(
+                                t,
+                                streaming.as_ref(),
+                                &mut streamed,
+                                id,
+                                &set,
+                                sig,
+                                settings.move_on_paste,
+                                &mut last,
+                                &mut last_files,
+                            );
                         }
                     }
                 }
@@ -1102,6 +1120,8 @@ fn run(
                         transfers.as_mut(),
                         &mut last_files,
                         Some(sig),
+                        streaming.as_ref(),
+                        &mut streamed,
                     );
                 }
             }
@@ -1140,7 +1160,14 @@ fn run(
                             h.set_status(entry, ClipStatus::Ready);
                             // Whether a paste is sitting in the selection owner right
                             // now waiting for exactly these files to appear.
-                            let paste_waiting = paste_signals.contains_key(&entry);
+                            // A streamed entry has no paste blocked in the selection owner,
+                            // so it is not "waiting" in that sense; see below.
+                            let streamed_key = streamed.remove(&entry);
+                            let paste_waiting =
+                                streamed_key.is_none() && paste_signals.contains_key(&entry);
+                            if streamed_key.is_some() {
+                                paste_signals.remove(&entry);
+                            }
                             // Delivered into the user's folder when they named one, so
                             // the file is simply *there* and needs no paste at all —
                             // and, being a hard link, costs its own size once rather
@@ -1166,6 +1193,22 @@ fn run(
                                     );
                                     paste_signals.remove(&entry);
                                     continue;
+                                }
+                                // Offered from the streaming folder until now. Swap in the real
+                                // files (which paste as a cheap move) only if the clipboard
+                                // still holds that offer: the user may have copied something
+                                // else meanwhile, and a finished download must not replace it.
+                                // A paste already copying from the folder is unaffected.
+                                if let Some(key) = streamed_key {
+                                    let still_ours = last_files == Some(key)
+                                        && files::read_files().map(|l| files::list_key(&l)) == Some(key);
+                                    if !still_ours {
+                                        tracing::info!(
+                                            count = set.files.len(),
+                                            "files are here; the clipboard has moved on, so it is left as it is"
+                                        );
+                                        continue;
+                                    }
                                 }
                                 // Published as a *move* when asked for: the file manager
                                 // then relocates our hard link to wherever the paste
@@ -1327,6 +1370,8 @@ fn reuse_entry<C: SystemClipboard>(
     transfers: Option<&mut transfer::Transfers>,
     last_files: &mut Option<u64>,
     paste_signal: Option<Arc<files::PasteSignal>>,
+    streaming: Option<&Streaming>,
+    streamed: &mut std::collections::HashMap<u64, u64>,
 ) -> bool {
     let Some(payload) = history.payload(id) else {
         tracing::debug!(id, "re-use asked for a clipboard entry that no longer exists");
@@ -1425,17 +1470,18 @@ fn reuse_entry<C: SystemClipboard>(
                 // coming. Without this the click reported "copied" and left the clipboard
                 // untouched, so pasting did nothing — the entry was fetching and there
                 // was no way to tell. The paste blocks until the bytes land.
-                if let Some(list) = t.placeholder_paths(&set) {
-                    let how = files::Publish {
-                        move_on_paste: settings.move_on_paste,
-                        relink: Vec::new(),
-                        png: None,
-                        on_paste: paste_signal,
-                    };
-                    if files::publish(&list, how) {
-                        *last_files = Some(files::list_key(&list));
-                        *last = Some(files::uri_text(&list));
-                    }
+                if let Some(sig) = paste_signal {
+                    publish_pending_set(
+                        t,
+                        streaming,
+                        streamed,
+                        id,
+                        &set,
+                        sig,
+                        settings.move_on_paste,
+                        last,
+                        last_files,
+                    );
                 }
                 if t.request_missing(&set, id, to_peer, settings.cache_budget)
                     == transfer::FetchStart::AlreadyInFlight
@@ -1757,6 +1803,75 @@ fn write_received_image<C: SystemClipboard>(
             ok
         }
     }
+}
+
+#[cfg(target_os = "linux")]
+use stream_fs::StreamFs as Streaming;
+
+/// Stand-in where there is no streaming folder: nothing is ever offered from it.
+#[cfg(not(target_os = "linux"))]
+struct Streaming;
+#[cfg(not(target_os = "linux"))]
+impl Streaming {
+    fn add_set(&self, _entry: u64, _set: &FileSet, _sig: Arc<files::PasteSignal>) -> Option<files::FileList> {
+        None
+    }
+}
+
+/// Put a set we do not hold yet on the clipboard, so pasting it works straight away.
+///
+/// With the streaming folder (Linux) the paste is answered at once and the file manager
+/// copies while the bytes arrive, showing its own progress — whatever the size. Without
+/// it, the paste waits inside the clipboard request for the whole transfer, which only
+/// works when the transfer is shorter than the file manager's patience (about 30 s for
+/// Thunar): a 3.1 GB video failed that way with "nothing on the clipboard".
+#[allow(clippy::too_many_arguments)] // every one is per-application state
+fn publish_pending_set(
+    t: &transfer::Transfers,
+    streaming: Option<&Streaming>,
+    streamed: &mut std::collections::HashMap<u64, u64>,
+    id: u64,
+    set: &FileSet,
+    sig: Arc<files::PasteSignal>,
+    move_on_paste: bool,
+    last: &mut Option<String>,
+    last_files: &mut Option<u64>,
+) -> bool {
+    if let Some(list) = streaming.and_then(|s| s.add_set(id, set, sig.clone())) {
+        // A copy, never a move: the folder is read-only, and the file manager would
+        // otherwise report a failure deleting the source after a successful paste.
+        let how = files::Publish { move_on_paste: false, relink: Vec::new(), png: None, on_paste: None };
+        if !files::publish(&list, how) {
+            return false;
+        }
+        let key = files::list_key(&list);
+        *last_files = Some(key);
+        *last = Some(files::uri_text(&list));
+        streamed.insert(id, key);
+        tracing::info!(
+            id,
+            count = set.files.len(),
+            bytes = set.total_bytes(),
+            "on the clipboard from the streaming folder — a paste starts at once and copies as the bytes arrive"
+        );
+        return true;
+    }
+    let Some(list) = t.placeholder_paths(set) else { return false };
+    let how = files::Publish { move_on_paste, relink: Vec::new(), png: None, on_paste: Some(sig) };
+    if !files::publish(&list, how) {
+        return false;
+    }
+    *last_files = Some(files::list_key(&list));
+    // Our own selection answers UTF8_STRING with these paths, so without this the next
+    // text poll reads them straight back and records a `file:///…cache/trees/…` entry.
+    *last = Some(files::uri_text(&list));
+    tracing::info!(
+        id,
+        count = set.files.len(),
+        bytes = set.total_bytes(),
+        "described on the clipboard — a paste waits for the transfer"
+    );
+    true
 }
 
 /// As [`publish_files`], for the image-plus-file case.
@@ -2141,7 +2256,7 @@ mod tests {
         let old = h.record_text(txt("older"), false).unwrap();
         h.record_text(txt("newer"), false);
 
-        assert!(reuse_entry(&mut cb, &mut last, &mut last_img, &h, &tx, true, old, &set(), None, &mut None, None));
+        assert!(reuse_entry(&mut cb, &mut last, &mut last_img, &h, &tx, true, old, &set(), None, &mut None, None, None, &mut Default::default()));
         assert_eq!(cb.content.as_deref(), Some("older"), "clipboard was set");
         assert_eq!(
             rx.try_recv().unwrap(),
@@ -2164,7 +2279,7 @@ mod tests {
         let h = ClipboardHistory::new();
         let id = h.record_text(txt("offline"), false).unwrap();
 
-        assert!(reuse_entry(&mut cb, &mut None, &mut None, &h, &tx, false, id, &set(), None, &mut None, None));
+        assert!(reuse_entry(&mut cb, &mut None, &mut None, &h, &tx, false, id, &set(), None, &mut None, None, None, &mut Default::default()));
         assert_eq!(cb.content.as_deref(), Some("offline"));
         assert!(rx.try_recv().is_err(), "nothing goes to a peer that isn't connected");
     }
@@ -2372,7 +2487,7 @@ mod tests {
         let (tx, _rx) = unbounded_channel();
         let mut cb = Fake::default();
         let h = ClipboardHistory::new();
-        assert!(!reuse_entry(&mut cb, &mut None, &mut None, &h, &tx, true, 999, &set(), None, &mut None, None));
+        assert!(!reuse_entry(&mut cb, &mut None, &mut None, &h, &tx, true, 999, &set(), None, &mut None, None, None, &mut Default::default()));
         assert!(cb.content.is_none());
     }
 

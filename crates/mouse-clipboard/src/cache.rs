@@ -82,7 +82,7 @@ impl BlobCache {
         self.root.join("blobs").join(hash)
     }
 
-    fn part_path(&self, hash: &str) -> PathBuf {
+    pub fn part_path(&self, hash: &str) -> PathBuf {
         self.root.join("blobs").join(format!("{hash}.part"))
     }
 

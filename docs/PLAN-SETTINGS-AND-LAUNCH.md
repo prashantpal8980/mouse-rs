@@ -164,7 +164,7 @@ rung is done when it works in the direction tested; the reverse direction is its
 | 4 | **Zip file** | Linux → Windows | waiting |
 | 5 | Image pixels, pasted into an app **and into a Thunar folder** | Windows → Linux | **signed off 13 Oct** |
 | 6 | Image file | Windows → Linux | closed 13 Oct (owner: image copy/paste resolved) |
-| 7 | **Video file** | Windows → Linux | **testing now**, owner chose this direction first |
+| 7 | **Video file** | Windows → Linux | **fixed (streaming folder), waiting for retest** |
 | 8 | Folder, zip | Windows → Linux | waiting |
 
 Image pixels and image files are different rungs because they take different paths:
@@ -215,7 +215,12 @@ what happened, the cause, the agreed behaviour, the fix, and the owner's sign-of
 - **Agreed behaviour (owner):** Ctrl+C / Ctrl+V for files of any size (10, 20, 30 GB) exactly like
   images. Keyboard and mouse never stall. The size limit only *warns*, it never blocks the paste,
   and is configurable in Settings. Clicking "yes" must never require a second copy.
-- **Planned fix (not built yet):** a read-only FUSE folder at `$XDG_RUNTIME_DIR/mouse-rs/incoming`
+- **Fix (built 13 Oct, running on Kali):** `mouse-clipboard/src/stream_fs.rs`, as planned below.
+  Tests: tree building, waiting reads with verified tail, and an `#[ignore]` real-mount test
+  (`cargo test -p mouse-clipboard -- --ignored mounted`) that copies a file out while it is still
+  arriving. The panel prompt is now a heads-up on Linux. Not yet done: the 16 MB/s crossed cap,
+  and Windows as the receiver (rung 2: its paste still waits for the whole file).
+- **Design:** a read-only FUSE folder at `$XDG_RUNTIME_DIR/mouse-rs/incoming`
   (crate `fuser` 0.18, MIT, no libfuse, mounts via setuid `fusermount3`, verified present). Remote
   files are published from there as a *copy*, so Thunar's paste starts at once and shows its own
   progress. Reads are answered from `blobs/<hash>.part` as it grows (replies sent from a waiter

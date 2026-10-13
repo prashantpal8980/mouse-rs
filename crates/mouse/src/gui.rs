@@ -1866,8 +1866,8 @@ impl App {
         let title = match (fetching, more) {
             (true, 0) => format!("{} is coming over", first.preview),
             (true, n) => format!("{} (and {n} more) is coming over", first.preview),
-            (false, 0) => format!("{} is waiting", first.preview),
-            (false, n) => format!("{} (and {n} more) is waiting", first.preview),
+            (false, 0) => format!("{} is ready to paste", first.preview),
+            (false, n) => format!("{} (and {n} more) are ready to paste", first.preview),
         };
         Some(
             container(
@@ -1875,9 +1875,16 @@ impl App {
                     column![
                         text(title).size(13.5).color(p.txt),
                         text(format!(
-                            "{} — over your {} limit. Set a bigger limit and files this size come over without being asked.",
+                            "{} — over your {} limit, so it is not fetched until you paste it. {}",
                             human_bytes(first.disk_bytes as usize),
-                            human_bytes(self.cfg.clipboard_auto_transfer_max as usize)
+                            human_bytes(self.cfg.clipboard_auto_transfer_max as usize),
+                            // Linux offers it from the streaming folder, so a paste of any size
+                            // starts at once. Elsewhere the paste waits for the whole transfer.
+                            if cfg!(target_os = "linux") {
+                                "Paste works now; this is only a heads-up."
+                            } else {
+                                "Press Bring it over first if it is large: a paste waits for the whole file."
+                            }
                         ))
                         .size(11.0)
                         .color(p.txt3),

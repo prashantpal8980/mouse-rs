@@ -33,3 +33,9 @@ clipboard-win = "5"
 [target.'cfg(unix)'.dependencies]
 # Owning the X11 CLIPBOARD selection to serve file targets. Already a workspace dep.
 x11rb.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Presents files still arriving from the peer as an ordinary folder, so a paste starts at
+# once and the file manager shows its own progress while the bytes stream in. MIT. Built
+# without libfuse: it mounts through the system's setuid `fusermount3`.
+fuser = { version = "0.18", default-features = false }

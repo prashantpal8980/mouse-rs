@@ -165,7 +165,7 @@
       why: "The reverse of 2.",
       copy: ["On <b>Windows</b>, click a video file in File Explorer and press <kbd>Ctrl</kbd>+<kbd>C</kbd>.", "Note its size (right-click → Properties) and the time."],
       paste: ["Move to <b>Kali</b>, open a folder in Thunar, press <kbd>Ctrl</kbd>+<kbd>V</kbd> (or right-click → Paste).", "Watch: does Paste work at once? Is progress shown, in the panel or in Thunar? How long does it take?"],
-      expect: ["Paste works straight away. There is no need to open the panel first.", "Progress is visible while it copies, and the mouse and keyboard keep working.", "The file arrives with the same name and size, and plays to the end.", "No leftover temporary file in the folder."] },
+      expect: ["Ctrl+V works straight away, even though the file is still on Windows. No panel visit, no 'nothing to paste'.", "Thunar opens its own copy dialog with progress and speed; the mouse and keyboard keep working.", "The file arrives with the same name and size, and plays to the end.", "Expect roughly 16 MB/s while you work on Kali (about 3½ min for 3 GB): that is the pointer-smoothness cap, a separate setting."] },
     { id: "8", dir: "W2L", title: "Folder and zip", short: "Folder, zip", status: "waiting",
       why: "The reverse of 3 and 4.",
       copy: ["On <b>Windows</b>, copy a folder, then separately a zip."],
@@ -181,6 +181,13 @@
       agreed: "Ctrl+V anywhere on Windows: a .png in an Explorer folder, the picture in Paint, Word or Gemini.",
       fix: "The step 5 fix (one receive function offering both forms), installed on the laptop with the new installer one-liner.",
       signoff: "Signed off by the owner, 13 Oct: \"new software is working correctly for windows as well\".",
+    },
+    "7": {
+      happened: "13 Oct, 15:58: a 3.1 GB .mkv. Kali put it on the clipboard and Thunar's paste started the fetch, but mouse-rs made Thunar wait inside the paste for the whole file. Thunar gives up after about 30 s and said there was nothing to paste. The file arrived complete and verified at 16:01:43, after Thunar had given up.",
+      cause: "A paste that waits for the whole transfer only works for transfers under ~30 s. It took 3½ min because the file lane is capped at 16 MB/s while you work on the receiving computer, to keep the pointer smooth.",
+      agreed: "Ctrl+C on one computer, Ctrl+V on the other, for files of any size, exactly like images. Keyboard and mouse never stall. The size limit is a heads-up, never a blocker.",
+      fix: "Kali now offers incoming files from a small virtual folder (/run/user/1000/mouse-rs/incoming). Paste is answered at once and Thunar copies with its own progress dialog while the bytes stream in. The last bytes are only handed over once the whole file has been verified, so a damaged transfer fails the copy instead of leaving a bad file. The panel's prompt now says paste works, and the size is a heads-up. Tested with a real mount: a copy started before any bytes existed and finished byte-identical. Running on Kali now.",
+      signoff: "",
     },
     "5": {
       happened: "13 Oct, 14:44: a 1920×1080 Windows screenshot (1.3 MB) arrived on Kali and was verified, but was put on the clipboard as a <b>picture only</b>. Thunar can only paste files, so Paste did nothing. At 14:45 you clicked the entry in the panel's history; that path puts it on the clipboard as a picture <b>and</b> a .png file, so Thunar's Paste then worked.",

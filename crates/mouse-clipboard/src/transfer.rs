@@ -363,9 +363,9 @@ impl Transfers {
             auto_limit,
             files = set.files.len(),
             measured_bps = quick.map(|q| q.bps).unwrap_or(0),
-            "DECISION: WAITING FOR YOU — {} is over the {} ask-first limit, so nothing has been transferred. \
-             Nothing will arrive until 'Bring it over' is pressed in the panel's Clipboard tab, or the \
-             ask-first limit is raised above this size.",
+            "DECISION: NOT FETCHED YET — {} is over the {} limit, so nothing is transferred until it is \
+             wanted. Pasting it starts the transfer (the paste itself works at once), as does \
+             'Bring it over' in the panel.",
             human(total),
             human(auto_limit),
         );
