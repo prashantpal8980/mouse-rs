@@ -9,7 +9,7 @@ rust-version = "1.80"
 license-file = "LICENSE"
 publish = false
 repository = "https://github.com/prashantpal8980/mouse-rs"
-authors = ["prashantpal8980"]
+authors = ["Prashant Pal"]
 
 [workspace.dependencies]
 # async runtime

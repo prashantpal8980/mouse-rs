@@ -136,7 +136,7 @@ Changes are summarised in [CHANGELOG.md](CHANGELOG.md).
 
 ## Licence
 
-Proprietary. Copyright (c) 2026 prashantpal8980, all rights reserved. See [LICENSE](LICENSE).
+Proprietary. Copyright (c) 2026 Prashant Pal, all rights reserved. See [LICENSE](LICENSE).
 No use, copying or distribution is permitted without a written agreement.
 
 mouse-rs depends on open-source crates under permissive licences (MIT, Apache-2.0 and
