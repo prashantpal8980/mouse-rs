@@ -510,3 +510,7 @@ the Linux streaming folder.
   entry "fetching", so its time-left estimate grew without end. The pipe now reports
   `Released { finished }`; a paste cancelled part-way returns the entry to "on the other
   computer · paste any time" and logs it.
+- **Hardware check, 2026-10-14.** The echo came back once at 12:09 because the laptop still ran
+  the 23:35 build. The fix (`59085CC8…`) was built at 23:53, after that update. Once the laptop
+  was updated (12:12), three screenshots pasted as images, and the log shows no "copied again"
+  line. The echo is **confirmed fixed**. The cancel fix is still awaiting its retest.
