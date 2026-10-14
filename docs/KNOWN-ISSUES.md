@@ -565,3 +565,9 @@ Three defects, all on Kali's side of a streamed (≥ 64 MB) Windows → Linux pa
 Tests: superseded-stream bytes are dropped; a re-copy gets a clean pipe that asks again and
 re-verifies; the real-mount test checks the pasted copy is writable. 239 tests pass, plus both
 mount tests; clippy is clean on Linux and Windows.
+
+### B26 — stopping mouse-rs with SIGTERM leaves the streaming folder's mount stale — open, low
+
+- Seen 2026-10-14 13:02: after `kill`, `/run/user/1000/mouse-rs/incoming` gave "Transport
+  endpoint is not connected" until `fusermount3 -u`. Not yet checked whether a fresh start
+  recovers from that by itself. A logout or crash could leave it the same way.
