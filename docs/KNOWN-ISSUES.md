@@ -646,3 +646,17 @@ owner, but the entry would show done early on a re-paste, and the log drowned.
 Fix: a file leaves `arrived` when a new stream of it begins. The "every file … pasted" line
 and status change happen only on the transition to Ready. Test: the B28 test now pastes the
 set again and requires "not arrived" with half the video in. It fails without the fix.
+
+### B31 — a streamed paste that closed before the end-of-stream frame was never recorded as done — **fixed 2026-10-14**
+
+Windows → Kali, 699 MB zip, 16:36:30. Thunar read the last byte and closed the file **before**
+the end-of-stream frame arrived. The close freed the pipe's buffer, so the frame's
+`pipe.complete()` was false: no "streamed to the paste in full" line, the file was never
+recorded as arrived, and the entry could stay "fetching" after a finished paste. The owner's
+copy was fine (the zip extracted).
+
+Fix: `drive_pipes` treats `Released { finished: true }` (the paste read every byte) as the
+arrival, records it, and hands the entry to the clipboard loop (`take_pasted`), which marks
+it pasted through the same `mark_pasted` as B28/B30. Whichever comes first, the close or the
+end frame, the paste is recorded. Test:
+`a_paste_that_closes_before_the_end_frame_still_counts_as_arrived` (fails without the fix).

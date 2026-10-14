@@ -166,7 +166,7 @@
       copy: ["On <b>Windows</b>, click a video file in File Explorer and press <kbd>Ctrl</kbd>+<kbd>C</kbd>.", "Note its size (right-click → Properties) and the time."],
       paste: ["Move to <b>Kali</b>, open a folder in Thunar, press <kbd>Ctrl</kbd>+<kbd>V</kbd> (or right-click → Paste).", "Watch: does Paste work at once? Is progress shown, in the panel or in Thunar? How long does it take?"],
       expect: ["Ctrl+V works straight away, even though the file is still on Windows. No panel visit, no 'nothing to paste'.", "Thunar opens its own copy dialog with progress and speed; the mouse and keyboard keep working.", "The file arrives with the same name and size, and plays to the end.", "Speed is limited by the cable or Wi-Fi, not by mouse-rs: it only slows down if the pointer starts to lag. (Needs the new laptop build: the sender sets the speed.)", "Big files take their own size on disk, once: the data goes network → memory (64 MB at most) → your folder. Nothing is spooled, nothing left to clean up.", "Pull the cable mid-copy: Thunar's progress pauses, then continues from the same byte when the connection is back (within 3 minutes)."] },
-    { id: "8", dir: "W2L", title: "Folder and zip", short: "Folder, zip", status: "testing",
+    { id: "8", dir: "W2L", title: "Folder and zip", short: "Folder, zip", status: "done",
       why: "The reverse of 3 and 4.",
       copy: ["On <b>Windows</b>, copy a folder, then separately a zip."],
       paste: ["On <b>Kali</b>, paste each into a Thunar folder."],

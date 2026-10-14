@@ -162,6 +162,8 @@ pub struct Transfers {
     /// and a pasted cache file is dropped from it, so the cache alone cannot say whether a
     /// set that mixes the two has been delivered.
     arrived: std::collections::HashSet<String>,
+    /// Entries whose paste just read a streamed file to the end and closed it.
+    pasted: Vec<u64>,
 }
 
 impl Transfers {
@@ -177,6 +179,7 @@ impl Transfers {
             last_completed: None,
             pipes: HashMap::new(),
             arrived: Default::default(),
+            pasted: Vec::new(),
         }
     }
 
@@ -235,7 +238,13 @@ impl Transfers {
                 self.incoming.retain(|_, inc| inc.hash != hash);
             }
             if let PipeCmd::Released { finished } = cmd {
-                if !finished {
+                if finished {
+                    // The paste read every byte. The end-of-stream frame can arrive after
+                    // the paste has closed the file and freed the buffer, and then cannot
+                    // tell that it completed, so this is where a streamed file arrives.
+                    self.arrived.insert(hash.clone());
+                    self.pasted.push(entry);
+                } else {
                     self.entry_progress.remove(&entry);
                     cancelled.push(entry);
                 }
@@ -253,6 +262,11 @@ impl Transfers {
             }
         }
         cancelled
+    }
+
+    /// Entries whose paste has read a streamed file to the end since the last call.
+    pub fn take_pasted(&mut self) -> Vec<u64> {
+        std::mem::take(&mut self.pasted)
     }
 
     /// Take the hash of the transfer that just finished, if any.
@@ -1197,6 +1211,7 @@ mod tests {
         assert_eq!(p.read(0, 10, Duration::from_secs(1)).unwrap(), b"0123456789");
         p.release();
         assert!(t.drive_pipes(&to_peer).is_empty(), "a finished paste is not a cancel");
+        assert_eq!(t.take_pasted(), vec![15], "it is a completed paste, even with no end frame yet");
 
         // Copied again, entry 16: the same pipe, reopened by the new paste.
         let p2 = t.pipe_for(&hash, 10, false, 16);
@@ -1504,6 +1519,34 @@ mod tests {
             matches!(peer_rx.try_recv().unwrap(), Message::BlobUnavailable { .. }),
             "changed content must not be sent as if it were the original"
         );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// 2026-10-14 16:36:30: Thunar read the last byte of a 699 MB zip and closed it before
+    /// the end-of-stream frame arrived. The close freed the buffer, so the frame could not
+    /// see a complete file and the paste was never recorded as done.
+    #[test]
+    fn a_paste_that_closes_before_the_end_frame_still_counts_as_arrived() {
+        use std::time::Duration;
+        let (root, mut t, hist) = setup("close-before-end");
+        let hash = "z".repeat(64);
+        let set = FileSet {
+            files: vec![FileRef { name: "big.zip".into(), size: 10, hash: hash.clone(), content_hashed: false, source_path: None, rel: String::new() }],
+            dirs: Vec::new(),
+            origin: "laptop".into(),
+        };
+        let entry = hist.record_files(Arc::new(set.clone()), true, ClipStatus::Remote).unwrap();
+        let (to_peer, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let pipe = t.pipe_for(&hash, 10, false, entry);
+        let meta = serde_json::to_vec(&BlobMeta { hash: hash.clone(), name: "big.zip".into(), offset: 0 }).unwrap();
+        t.on_bulk_frame(BulkFrame::Begin { transfer: 1, total: 10, meta }, &hist);
+        t.on_bulk_frame(BulkFrame::Chunk { transfer: 1, seq: 0, data: b"0123456789".to_vec() }, &hist);
+        assert_eq!(pipe.read(0, 10, Duration::from_secs(1)).unwrap(), b"0123456789");
+        pipe.release(); // Thunar closes the file
+        assert!(t.drive_pipes(&to_peer).is_empty(), "not a cancel");
+        assert_eq!(t.take_pasted(), vec![entry]);
+        t.on_bulk_frame(BulkFrame::End { transfer: 1 }, &hist); // only now
+        assert!(t.has_arrived(&set), "recorded as pasted although the end frame came late");
         let _ = fs::remove_dir_all(&root);
     }
 

@@ -1245,11 +1245,7 @@ fn run(
                         // Every file went straight into a paste (or was dropped after one),
                         // so there is nothing here to publish: the paste has it.
                         if !t.is_complete(&set) && t.has_arrived(&set) {
-                            // Once, not for every frame that follows.
-                            if h.status(entry) != Some(ClipStatus::Ready) {
-                                h.set_status(entry, ClipStatus::Ready);
-                                tracing::info!(entry, count = set.files.len(), "every file of this copy has been pasted");
-                            }
+                            mark_pasted(h, entry, &set);
                             continue;
                         }
                         if t.is_complete(&set) {
@@ -1334,6 +1330,13 @@ fn run(
                 // hours, then days — for a transfer that no longer existed.
                 h.set_status(id, ClipStatus::Remote);
                 tracing::info!(id, "the paste was cancelled; transfer stopped, the file is still offered");
+            }
+            for id in t.take_pasted() {
+                if let Some(ClipPayload::Files(set)) = h.payload(id) {
+                    if !t.is_complete(&set) && t.has_arrived(&set) {
+                        mark_pasted(h, id, &set);
+                    }
+                }
             }
             // A paste is waiting on content: start fetching it now. This is the only
             // thing that begins a large transfer, which is what keeps copying cheap.
@@ -1965,6 +1968,15 @@ fn offer_streaming(
     #[cfg(not(any(target_os = "linux", windows)))]
     {
         None
+    }
+}
+
+/// Every file of entry `id` has arrived, though not all are held here: streamed files went
+/// straight into the paste. Marked once, not for every frame that follows (B30).
+fn mark_pasted(h: &ClipboardHistory, id: u64, set: &FileSet) {
+    if h.status(id) != Some(ClipStatus::Ready) {
+        h.set_status(id, ClipStatus::Ready);
+        tracing::info!(entry = id, count = set.files.len(), "every file of this copy has been pasted");
     }
 }
 

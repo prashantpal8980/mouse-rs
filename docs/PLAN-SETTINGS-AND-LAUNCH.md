@@ -165,7 +165,7 @@ rung is done when it works in the direction tested; the reverse direction is its
 | 5 | Image pixels, pasted into an app **and into a Thunar folder** | Windows → Linux | **signed off 13 Oct** |
 | 6 | Image file | Windows → Linux | closed 13 Oct (owner: image copy/paste resolved) |
 | 7 | **Video file** | Windows → Linux | **signed off 13 Oct** (retests of B19–B22, B25 passed 14 Oct) |
-| 8 | Folder, zip | Windows → Linux | folder **passed 14 Oct**; zip still to test |
+| 8 | Folder, zip | Windows → Linux | **signed off 14 Oct** (folder; 699 MB zip with a cancel and re-paste; small zip inside the folder) |
 
 Image pixels and image files are different rungs because they take different paths:
 pixels go through the clipboard itself, while a file is fetched over the file lane when
