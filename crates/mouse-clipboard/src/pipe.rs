@@ -42,6 +42,12 @@ const KEEP_BEHIND: u64 = 4 * 1024 * 1024;
 const KEEP_AHEAD: u64 = 8 * 1024 * 1024;
 /// A read this far past a region's end still belongs to it: the stream fills the gap.
 const JOIN_AHEAD: u64 = (WINDOW / 2) as u64;
+/// A reader waiting elsewhere takes the stream from a region someone is also waiting on
+/// only after the stream has stayed there this long, so two readers take turns rather than
+/// moving it back and forth faster than its bytes can arrive.
+const MIN_SLICE: Duration = Duration::from_millis(500);
+/// A region counts as waited on if a reader was waiting on it this recently.
+const WAITING: Duration = Duration::from_millis(250);
 /// A waiting read re-asks for the stream after this long without progress. That is what
 /// resumes a transfer after the connection drops and comes back.
 const NUDGE: Duration = Duration::from_secs(10);
@@ -69,11 +75,13 @@ struct Region {
     used: Instant,
     /// The furthest any read has reached in it.
     read_to: u64,
+    /// Last time a reader was waiting for bytes in it.
+    waited_at: Option<Instant>,
 }
 
 impl Region {
     fn new(start: u64) -> Region {
-        Region { start, buf: VecDeque::new(), used: Instant::now(), read_to: start }
+        Region { start, buf: VecDeque::new(), used: Instant::now(), read_to: start, waited_at: None }
     }
     fn end(&self) -> u64 {
         self.start + self.buf.len() as u64
@@ -99,6 +107,8 @@ struct State {
     released: bool,
     grew_at: Instant,
     asked_at: Instant,
+    /// When the stream was last moved to another region.
+    switched_at: Instant,
     /// Running content hash, for a file the sender hashed. `None` for length-only files.
     hasher: Option<Sha256>,
     /// Every byte from 0 up to here has arrived, in order (and been hashed, if hashing).
@@ -126,6 +136,7 @@ impl State {
     /// Feed the stream to region `i`, from where it ends.
     fn activate(&mut self, i: usize) {
         self.active = i;
+        self.switched_at = Instant::now();
         self.want = Some(self.regions[i].end());
         self.stop = false;
         self.asked_at = Instant::now();
@@ -225,6 +236,7 @@ impl StreamPipe {
                 released: false,
                 grew_at: Instant::now(),
                 asked_at: Instant::now(),
+                switched_at: Instant::now(),
                 hasher,
                 inorder_to: 0,
                 verified: None,
@@ -434,9 +446,15 @@ impl StreamPipe {
                 }
             }
             if !tail_pending {
+                st.regions[r].waited_at = Some(Instant::now());
                 if r != st.active {
-                    // Another region is wanted: move the one stream there, from where it ends.
-                    st.activate(r);
+                    // Another region is wanted: move the one stream there, from where it
+                    // ends. If a reader is waiting on the active region too, take turns.
+                    let a = st.active;
+                    let contested = st.regions[a].waited_at.is_some_and(|t| t.elapsed() < WAITING);
+                    if !contested || st.switched_at.elapsed() >= MIN_SLICE {
+                        st.activate(r);
+                    }
                 } else {
                     // Missing bytes and nothing on its way, or no progress for a while (a
                     // dropped connection, a stream stopped for flow control): ask from here.
@@ -769,5 +787,78 @@ mod tests {
         assert_eq!(q.read(90, 10, Duration::from_secs(1)).unwrap(), &body[90..]);
         q.release();
         assert_eq!(q.take_command(), PipeCmd::Released { finished: false }, "only the tail was read");
+    }
+
+    /// The peer with a network in between: a Start reaches it, and its first bytes
+    /// arrive back, a few milliseconds later. Bytes for a region the pipe no longer feeds
+    /// are dropped, as the real receiver does.
+    fn slow_peer(p: Arc<StreamPipe>, done: Arc<std::sync::atomic::AtomicBool>) -> std::thread::JoinHandle<Vec<u64>> {
+        std::thread::spawn(move || {
+            let mut starts = Vec::new();
+            let mut pos: Option<u64> = None;
+            while !done.load(std::sync::atomic::Ordering::SeqCst) {
+                match p.take_command() {
+                    PipeCmd::Start(off) => {
+                        starts.push(off);
+                        std::thread::sleep(Duration::from_millis(3)); // the round trip
+                        pos = p.begin(off).then_some(off);
+                    }
+                    PipeCmd::Stop | PipeCmd::Released { .. } => pos = None,
+                    PipeCmd::Nothing => {}
+                }
+                match pos {
+                    Some(at) if at < p.size() => {
+                        let n = (256 * 1024).min(p.size() - at);
+                        let chunk: Vec<u8> = (at..at + n).map(byte_at).collect();
+                        pos = if p.push(at, &chunk) { Some(at + n) } else { None };
+                        std::thread::sleep(Duration::from_micros(500));
+                    }
+                    Some(_) => {
+                        p.interrupted();
+                        pos = None;
+                    }
+                    None => std::thread::sleep(Duration::from_millis(1)),
+                }
+            }
+            starts
+        })
+    }
+
+    /// 2026-10-14 18:43: VLC read the video from the start while Thunar's thumbnailer read
+    /// its end. Each moved the one stream to its own region, and the stream answering one
+    /// arrived after the other had moved it back, so every byte was dropped and neither
+    /// read finished. Both readers must make progress.
+    #[test]
+    fn two_readers_in_different_places_both_make_progress() {
+        const MB: u64 = 1024 * 1024;
+        let size = 200 * MB;
+        let p = Arc::new(StreamPipe::new(size, None));
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let peer = slow_peer(p.clone(), done.clone());
+        let stall = Duration::from_secs(5);
+        let (p1, p2) = (p.clone(), p.clone());
+        let player = std::thread::spawn(move || {
+            let mut at = 0;
+            while at < 16 * MB {
+                let got = p1.read(at, 128 * 1024, stall).expect("the player stalled");
+                expect_bytes(&got, at);
+                at += got.len() as u64;
+            }
+        });
+        let thumbnailer = std::thread::spawn(move || {
+            for i in 0..40u64 {
+                let at = size - 64 * 1024 - (i % 4) * 4096;
+                let got = p2.read(at, 4096, stall).expect("the thumbnailer stalled");
+                expect_bytes(&got, at);
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        });
+        let started = Instant::now();
+        player.join().expect("player");
+        thumbnailer.join().expect("thumbnailer");
+        done.store(true, std::sync::atomic::Ordering::SeqCst);
+        let starts = peer.join().unwrap();
+        assert!(started.elapsed() < Duration::from_secs(10), "took {:?}", started.elapsed());
+        assert!(starts.len() < 10, "the stream was moved {} times: {starts:?}", starts.len());
     }
 }
