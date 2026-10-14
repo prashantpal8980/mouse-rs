@@ -1401,7 +1401,7 @@ fn run(
                         // second Ctrl+C on the same video did nothing at all — not even
                         // after the history and cache had been cleared.
                         let stamp = files::foreign_copy_stamp();
-                        let again = last_files == Some(key) && stamp.is_some() && stamp != last_copy_stamp;
+                        let again = last_files == Some(key) && files::is_new_copy(last_copy_stamp, stamp);
                         let before = last_copy_stamp;
                         if stamp.is_some() {
                             last_copy_stamp = stamp;

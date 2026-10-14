@@ -613,7 +613,7 @@ last byte or verified into the cache. `has_arrived(set)` ends "fetching" once ev
 arrived, even if mouse-rs no longer holds them. Test:
 `a_set_mixing_streamed_and_cached_files_arrives_once_every_file_has`.
 
-### B29 — Kali sometimes reports a single Ctrl+C in Thunar as two copies — open, low, logging added
+### B29 — Kali sometimes reports a single Ctrl+C in Thunar as two copies — **fixed 2026-10-14**
 
 - 2026-10-14, 13:30:46 and 15:40:11: "the same files were copied again" came about 2 s after the
   real copy, after control had already gone back to the laptop, so the owner was not pressing
@@ -626,3 +626,11 @@ arrived, even if mouse-rs no longer holds them. Test:
   change looks like a new copy. Not proven. The "copied again" line now logs `before` and `now`
   stamps (high half the owner window, low half its time). If `before` ends in `00000000` when it
   next happens, the fix is to ignore a change where only the time went from unknown to known.
+- **Logged, 16:26:04.** `before=160001600464fab now=1600016004652bb`. Same Thunar window, both
+  times known, 784 ms apart. So the timeout guess was **wrong**: Thunar really took the
+  clipboard twice for one copy (a double Ctrl+C, or a held C repeating, since the laptop forwards
+  key repeats).
+- **Fix.** `files::is_new_copy`: on Linux, a repeat by the same window within 2 s of the
+  previous copy is the same copy. Another window, an unknown time, or a re-copy after 2 s still
+  counts. Windows stamps carry no time, so there any change still counts. Test:
+  `one_copy_seen_twice_by_thunar_is_one_copy`, using the logged stamps.

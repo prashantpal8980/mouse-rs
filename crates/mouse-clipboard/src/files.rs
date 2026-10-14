@@ -916,6 +916,33 @@ pub fn foreign_copy_stamp() -> Option<u64> {
     imp::foreign_copy_stamp()
 }
 
+/// A second copy of the same files closer than this to the first is the same copy: a
+/// double Ctrl+C, or a held C key repeating.
+pub const RECOPY_DEBOUNCE_MS: u32 = 2000;
+
+/// Whether stamp `now` is a fresh copy of files already copied under stamp `before`.
+///
+/// On Linux a stamp is the owner's window (high half) and the X time it took the clipboard
+/// (low half, 0 if it did not say). Thunar took it twice 784 ms apart for one copy
+/// (B29), and the peer was told twice. So when the same window copies again within
+/// [`RECOPY_DEBOUNCE_MS`], it is not a new copy. On Windows a stamp is a sequence number
+/// with no time in it, and any change counts.
+pub fn is_new_copy(before: Option<u64>, now: Option<u64>) -> bool {
+    let Some(now) = now else { return false };
+    let Some(before) = before else { return true };
+    if now == before {
+        return false;
+    }
+    if cfg!(target_os = "linux") {
+        let (owner_b, time_b) = ((before >> 32) as u32, before as u32);
+        let (owner_n, time_n) = ((now >> 32) as u32, now as u32);
+        if owner_b == owner_n && time_b != 0 && time_n != 0 && time_n.wrapping_sub(time_b) < RECOPY_DEBOUNCE_MS {
+            return false;
+        }
+    }
+    true
+}
+
 /// Record that this process just wrote the clipboard (Windows; elsewhere the owner tells).
 pub fn mark_own_write() {
     #[cfg(windows)]
@@ -1022,6 +1049,23 @@ pub fn write_image_and_file(list: &FileList, png: Vec<u8>, write_image_first: im
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn one_copy_seen_twice_by_thunar_is_one_copy() {
+        // The stamps from the log of 2026-10-14 16:26:04: one Thunar window, 784 ms apart.
+        let first = 0x0160_0016_0046_4fab;
+        let echo = 0x0160_0016_0046_52bb;
+        assert!(!is_new_copy(Some(first), Some(echo)), "a double Ctrl+C is one copy");
+        let later = 0x0160_0016_0046_4fab + 5_000;
+        assert!(is_new_copy(Some(first), Some(later)), "a real re-copy seconds later still counts");
+        let other_window = 0x0170_0001_0046_52bb;
+        assert!(is_new_copy(Some(first), Some(other_window)), "another program copying counts at once");
+        assert!(is_new_copy(Some(0x0160_0016_0000_0000), Some(echo)), "an unknown time is not debounced");
+        assert!(!is_new_copy(Some(first), Some(first)));
+        assert!(!is_new_copy(Some(first), None));
+        assert!(is_new_copy(None, Some(first)));
+    }
 
     #[test]
     fn the_key_distinguishes_different_lists() {
