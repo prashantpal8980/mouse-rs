@@ -302,7 +302,9 @@ Guarded by `injector::tests::a_chord_held_while_the_user_keeps_typing_is_never_b
 which runs on the Linux host (unlike the Windows-only tests that shipped the regression)
 and was confirmed to fail against the faulty behaviour before being kept.
 
-### B4 — cut-and-paste across machines behaves as copy in Thunar
+### B4 — cut-and-paste across machines behaves as copy in Thunar — **won't fix (owner, 2026-10-14)**
+
+- The owner's decision: whoever cuts can delete the original themselves, so a cross-machine cut working as a copy is acceptable. Do not work on this.
 **open**
 
 mouse-rs publishes the GNOME `x-special/gnome-copied-files` format with the verb `cut`
