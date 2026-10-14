@@ -528,6 +528,9 @@ the Linux streaming folder.
 
 ### B24 — reading a streamed file out of order restarts the stream on every seek — open, low
 
+- **Update, 13:05.** B25 below was caused by these seeks. The restarts are still open; the
+  corruption they caused is fixed.
+
 - At 2026-10-14 12:34:19 something on Kali read the streamed 3.3 GB video from the FUSE folder at
   scattered offsets: 0, the last 200 KB, 124, 509 MB and so on. It was probably a thumbnailer or a
   player, since a Thunar paste reads in order. Each jump cancelled the request to the laptop and
@@ -536,3 +539,29 @@ the Linux streaming folder.
   throws away data already in flight, so playing a video straight from the streaming folder would
   be slow. Possible fix: serve small reads far from the current position, like the header and
   index at the end, as one-off range requests, without dropping the main stream. Not investigated.
+
+### B25 — a re-copied video failed with "Error splicing file"; the earlier paste came out corrupt — **fixed 2026-10-14**
+
+Three defects, all on Kali's side of a streamed (≥ 64 MB) Windows → Linux paste:
+
+- **"Error splicing file. Input/output error."** A file's in-memory pipe lives as long as the
+  file is offered, so copying the same video again reuses it. After a paste finished, the pipe
+  kept its old "last grew" time. When the same video was pasted again 3½ minutes later, the
+  first read already looked stalled past the 180 s limit and failed at once. The logs show
+  this: "no data, or the file failed verification; failing the copy offset=0" at 12:40:34 and
+  12:41:11, without a single request to the laptop. Now `reopen` after a release resets the
+  pipe completely, including the hash state, so a hashed file is verified again rather than
+  waved through on the last paste's result.
+- **Corrupt earlier paste.** When a read jumps (B24), the pipe clears its buffer and restarts at
+  the new offset at once. But the old stream keeps delivering until the clipboard thread
+  cancels it, and `push` appended those bytes at the new offset. The 12:34 paste ran during
+  ~155 such jumps and "finished" with the right length but the wrong bytes. A 3.3 GB video
+  is checked by length only, so nothing caught it. `push` now takes the chunk's file offset
+  and drops anything that does not start exactly where the buffer ends.
+- **Lock icon / read-only paste.** The streaming folder reported files as 0444 and folders as
+  0555. Thunar copies the mode, so every pasted file was read-only and a pasted folder would
+  refuse new files. Now it reports 0644 and 0755. `open` still refuses any write.
+
+Tests: superseded-stream bytes are dropped; a re-copy gets a clean pipe that asks again and
+re-verifies; the real-mount test checks the pasted copy is writable. 239 tests pass, plus both
+mount tests; clippy is clean on Linux and Windows.

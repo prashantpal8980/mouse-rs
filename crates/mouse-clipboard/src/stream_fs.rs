@@ -190,9 +190,12 @@ struct Inner {
 
 impl Inner {
     fn attr(&self, ino: u64, node: &Node) -> FileAttr {
+        // Ordinary modes, though nothing here can be written: `open` refuses write access.
+        // A file manager copies the mode along with the bytes, so 0444 made every pasted
+        // file read-only (a lock on its icon) and a pasted folder refuse new files.
         let (kind, size, perm) = match &node.kind {
-            Kind::Dir(_) => (FileType::Directory, 0, 0o555),
-            Kind::File(f) => (FileType::RegularFile, f.size, 0o444),
+            Kind::Dir(_) => (FileType::Directory, 0, 0o755),
+            Kind::File(f) => (FileType::RegularFile, f.size, 0o644),
         };
         FileAttr {
             ino: INodeNo(ino),
@@ -595,7 +598,7 @@ mod tests {
                     let mut pos = off as usize;
                     while pos < stop_at {
                         let end = (pos + 256 * 1024).min(stop_at);
-                        p2.push(&b2[pos..end]);
+                        p2.push(pos as u64, &b2[pos..end]);
                         pos = end;
                     }
                     p2.interrupted();
@@ -608,6 +611,7 @@ mod tests {
         std::fs::copy(&list.paths[0], &dest).unwrap();
         let starts = peer.join().unwrap();
         assert_eq!(std::fs::read(&dest).unwrap(), body, "byte-identical");
+        assert!(!std::fs::metadata(&dest).unwrap().permissions().readonly(), "the pasted copy is writable");
         assert_eq!(starts[0], 0);
         assert!(starts.len() >= 2, "the drop was resumed");
         assert!(starts[1] > 0, "resumed from where the paste got to, not from zero");

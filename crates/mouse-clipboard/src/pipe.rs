@@ -57,6 +57,8 @@ struct State {
     failed: bool,
     /// Every byte has been handed to a paste at least once.
     finished: bool,
+    /// The last paste closed the file. The next open starts from a clean pipe.
+    released: bool,
     grew_at: Instant,
     asked_at: Instant,
     /// Running content hash, for a file the sender hashed. `None` for length-only files,
@@ -106,6 +108,7 @@ impl StreamPipe {
                 overfull: false,
                 failed: false,
                 finished: false,
+                released: false,
                 grew_at: Instant::now(),
                 asked_at: Instant::now(),
                 hasher,
@@ -151,10 +154,19 @@ impl StreamPipe {
         offset == st.have_end()
     }
 
-    /// Bytes arrived. Returns false when the window is full: the caller stops the stream,
-    /// and it is restarted from here once the paste has read some of it.
-    pub fn push(&self, data: &[u8]) -> bool {
+    /// Bytes arrived, starting at file offset `at`. Returns false when the window is
+    /// full: the caller stops the stream, and it is restarted from here once the paste has
+    /// read some of it.
+    ///
+    /// Bytes are kept only when `at` is exactly where the buffer ends. A read that jumps
+    /// (a thumbnailer or player seeking) restarts the buffer at once, but the old stream
+    /// goes on delivering until the clipboard thread cancels it. Appending those bytes
+    /// would put them at the wrong offset, and the paste would then copy a corrupt file.
+    pub fn push(&self, at: u64, data: &[u8]) -> bool {
         let Ok(mut st) = self.st.lock() else { return false };
+        if at != st.have_end() {
+            return true; // a superseded stream: dropped, and cancelled on the next drive
+        }
         let room = (self.size - st.have_end().min(self.size)) as usize;
         let at = st.have_end();
         let data = &data[..data.len().min(room)];
@@ -213,10 +225,29 @@ impl StreamPipe {
 
     /// A new paste opened the file: forget an earlier failure or release, so it tries
     /// again from scratch.
+    ///
+    /// A pipe lives as long as its file is offered, so copying the same file again reuses
+    /// it. After a release, everything from the last paste is reset: its "last grew" time
+    /// would fail the first read as stalled, and its finished hash would let the new
+    /// bytes through unchecked.
     pub fn reopen(&self) {
         if let Ok(mut st) = self.st.lock() {
             st.failed = false;
             st.stop = false;
+            if st.released {
+                st.released = false;
+                st.buf.clear();
+                st.start = 0;
+                st.want = None;
+                st.running = false;
+                st.overfull = false;
+                st.finished = false;
+                st.hasher = self.expect.as_ref().map(|_| Sha256::new());
+                st.hashed_to = 0;
+                st.verified = None;
+            }
+            st.grew_at = Instant::now();
+            st.asked_at = Instant::now();
         }
     }
 
@@ -325,6 +356,7 @@ impl StreamPipe {
             st.start = 0;
             st.want = None;
             st.stop = true;
+            st.released = true;
         }
         self.cv.notify_all();
     }
@@ -345,9 +377,9 @@ mod tests {
                 if let PipeCmd::Start(off) = p2.take_command() {
                     assert_eq!(off, 0);
                     assert!(p2.begin(0));
-                    p2.push(b"01234");
+                    p2.push(0, b"01234");
                     std::thread::sleep(Duration::from_millis(50));
-                    p2.push(b"56789");
+                    p2.push(5, b"56789");
                     p2.interrupted();
                     return;
                 }
@@ -369,7 +401,7 @@ mod tests {
             st.want = Some(0);
         }
         assert_eq!(p.take_command(), PipeCmd::Start(0));
-        p.push(b"abc");
+        p.push(0, b"abc");
         p.interrupted(); // the connection dropped
         // The paste reads what arrived; the next read asks again from byte 3.
         assert_eq!(p.read(0, 3, Duration::from_secs(1)).unwrap(), b"abc");
@@ -387,7 +419,7 @@ mod tests {
         assert_eq!(asked, Some(3), "resumed exactly where the paste got to");
         assert!(p.begin(3));
         assert!(!p.begin(0), "a stream from the wrong offset is refused");
-        p.push(b"defgh");
+        p.push(3, b"defgh");
         assert_eq!(t.join().unwrap().unwrap(), b"defgh");
     }
 
@@ -398,7 +430,7 @@ mod tests {
         assert_eq!(p.take_command(), PipeCmd::Start(0));
         let chunk = vec![7u8; 1024 * 1024];
         let mut accepted = 0;
-        while p.push(&chunk) {
+        while p.push((accepted * chunk.len()) as u64, &chunk) {
             accepted += 1;
         }
         assert!(accepted < WINDOW / chunk.len());
@@ -414,7 +446,7 @@ mod tests {
         let p = StreamPipe::new(100, None);
         p.st.lock().unwrap().want = Some(0);
         assert_eq!(p.take_command(), PipeCmd::Start(0));
-        p.push(&[1u8; 50]);
+        p.push(0, &[1u8; 50]);
         p.release();
         assert_eq!(p.take_command(), PipeCmd::Released { finished: false }, "a cancel, reported as one");
         assert!(p.st.lock().unwrap().buf.is_empty());
@@ -426,14 +458,14 @@ mod tests {
         let good = StreamPipe::new(10, Some(crate::cache::hash_bytes(&body)));
         good.st.lock().unwrap().want = Some(0);
         let _ = good.take_command();
-        good.push(&body[..4]);
-        good.push(&body[4..]);
+        good.push(0, &body[..4]);
+        good.push(4, &body[4..]);
         assert_eq!(good.read(0, 10, Duration::from_secs(1)).unwrap(), body);
 
         let bad = StreamPipe::new(10, Some(crate::cache::hash_bytes(&body)));
         bad.st.lock().unwrap().want = Some(0);
         let _ = bad.take_command();
-        bad.push(b"0123456780"); // one byte wrong
+        bad.push(0, b"0123456780"); // one byte wrong
         assert!(bad.read(0, 4, Duration::from_secs(1)).is_some(), "early bytes still flow");
         assert!(bad.read(4, 6, Duration::from_secs(1)).is_none(), "the end is refused");
     }
@@ -463,7 +495,7 @@ mod tests {
         let p = StreamPipe::new(4, None);
         p.st.lock().unwrap().want = Some(0);
         let _ = p.take_command();
-        p.push(b"abcd");
+        p.push(0, b"abcd");
         assert_eq!(p.read(0, 4, Duration::from_secs(1)).unwrap(), b"abcd");
         p.release();
         assert_eq!(p.take_command(), PipeCmd::Released { finished: true });
@@ -471,9 +503,51 @@ mod tests {
         let q = StreamPipe::new(4, None);
         q.st.lock().unwrap().want = Some(0);
         let _ = q.take_command();
-        q.push(b"ab");
+        q.push(0, b"ab");
         assert_eq!(q.read(0, 2, Duration::from_secs(1)).unwrap(), b"ab");
         q.release(); // cancelled in Thunar half-way
         assert_eq!(q.take_command(), PipeCmd::Released { finished: false });
+    }
+
+    #[test]
+    fn bytes_from_a_superseded_stream_never_land_at_the_new_offset() {
+        // A paste reads from 0 while a stream is running; then a seek far ahead restarts
+        // the buffer before the clipboard thread has cancelled the old stream.
+        let body: Vec<u8> = (0..200u32).map(|i| i as u8).collect();
+        let p = StreamPipe::new(body.len() as u64, None);
+        p.st.lock().unwrap().want = Some(0);
+        assert_eq!(p.take_command(), PipeCmd::Start(0));
+        assert!(p.begin(0));
+        p.push(0, &body[..10]);
+        p.st.lock().unwrap().restart_at(150); // the seek
+        p.push(10, &body[10..20]); // still in flight from the old stream
+        assert_eq!(p.st.lock().unwrap().buf.len(), 0, "the stale bytes were dropped");
+        assert!(p.begin(150));
+        p.push(150, &body[150..160]);
+        assert_eq!(p.read(150, 10, Duration::from_secs(1)).unwrap(), &body[150..160]);
+    }
+
+    #[test]
+    fn copying_the_same_file_again_gets_a_clean_pipe() {
+        let body = b"0123456789".to_vec();
+        let p = StreamPipe::new(10, Some(crate::cache::hash_bytes(&body)));
+        p.st.lock().unwrap().want = Some(0);
+        let _ = p.take_command();
+        p.push(0, &body);
+        assert_eq!(p.read(0, 10, Duration::from_secs(1)).unwrap(), body);
+        p.release();
+        let _ = p.take_command();
+        // Minutes pass before the same file is copied and pasted again.
+        p.st.lock().unwrap().grew_at = Instant::now() - Duration::from_secs(600);
+        p.reopen();
+        assert_eq!(
+            p.read_slice(0, 5, Duration::from_secs(180), Duration::from_millis(20)),
+            crate::remote_read::Got::Wait,
+            "not failed as stalled before anything was asked"
+        );
+        assert_eq!(p.take_command(), PipeCmd::Start(0), "the new paste asks from the start");
+        assert!(p.begin(0));
+        p.push(0, b"0123456780"); // damaged this time
+        assert!(p.read(4, 6, Duration::from_secs(1)).is_none(), "checked again, not waved through");
     }
 }

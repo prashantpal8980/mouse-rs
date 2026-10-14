@@ -802,7 +802,7 @@ impl Transfers {
                 let inc = self.incoming.get_mut(&transfer)?;
                 if let Some(pipe) = &inc.pipe {
                     // A full window is handled by `drive_pipes`, which pauses the stream.
-                    pipe.push(&data);
+                    pipe.push(inc.got, &data);
                 } else if let Some(Err(e)) = inc.file.as_mut().map(|f| f.write_all(&data)) {
                     tracing::warn!(hash = %inc.hash, "could not write a chunk: {e}");
                     let hash = inc.hash.clone();
