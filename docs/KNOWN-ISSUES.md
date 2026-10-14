@@ -496,7 +496,7 @@ the Linux streaming folder.
   signal) now fail at once. A pending stop from the previous paste could also swallow a new
   paste's first request, costing 10 s; a reader's request now clears it.
 
-### B22 — a screenshot pasted as a file link; a cancelled paste counted up for days — **fixed 2026-10-13**
+### B22 — a screenshot pasted as a file link; a cancelled paste counted up for days — **fixed 2026-10-13, confirmed on hardware 2026-10-14**
 
 - **Echo.** A Kali screenshot went to the laptop as an image (correct). The laptop then mistook
   its own clipboard write for the user copying the `.png` again ("the same files were copied
@@ -513,4 +513,15 @@ the Linux streaming folder.
 - **Hardware check, 2026-10-14.** The echo came back once at 12:09 because the laptop still ran
   the 23:35 build. The fix (`59085CC8…`) was built at 23:53, after that update. Once the laptop
   was updated (12:12), three screenshots pasted as images, and the log shows no "copied again"
-  line. The echo is **confirmed fixed**. The cancel fix is still awaiting its retest.
+  line. The echo is **confirmed fixed**.
+- **Cancel retest, 2026-10-14 12:31.** A 3.3 GB video pasted into Thunar was cancelled after 485 MB.
+  Kali logged "the paste was cancelled; transfer stopped, the file is still offered"; the laptop
+  logged "the peer cancelled; stopped sending". **Confirmed fixed.** The same run confirms B21:
+  485 MB in 6.7 s (about 72 MB/s), with one 2-second slowdown while pointer latency was high.
+
+### B23 — Kali's panel logs "Timeout when presenting surface" every few seconds — open, low
+
+- `iced_winit` logs `ERROR … Error Timeout when presenting surface`, often every 4–15 s.
+  The Kali log holds 1,809 of these lines, from 2026-09-17 to 2026-10-14. Nobody has seen
+  a visible effect, but the noise buries real errors in the shipped logs. It probably happens
+  while the panel window is hidden or unmapped and iced keeps redrawing. Not investigated.
