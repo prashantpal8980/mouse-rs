@@ -696,3 +696,14 @@ arrival, records it, and hands the entry to the clipboard loop (`take_pasted`), 
 it pasted through the same `mark_pasted` as B28/B30. Whichever comes first, the close or the
 end frame, the paste is recorded. Test:
 `a_paste_that_closes_before_the_end_frame_still_counts_as_arrived` (fails without the fix).
+
+### B32 — Thunar does not show a new copy in the streaming folder until it is reloaded — open, low
+
+- 2026-10-14 18:40 IST. The owner opened `/run/user/1000/mouse-rs/incoming` 12 s before the next
+  Windows copy arrived, and the view stayed empty. Folder `10` existed. F5 (View → Reload) shows
+  it. File managers watch folders through inotify, and a FUSE filesystem gets no inotify events
+  for changes it makes itself. Kernel cache invalidation (`fuser` notifier `inval_entry`) does
+  not reach a GIO file monitor.
+- Impact: only when someone browses the folder by hand (the B24 test). A Ctrl+V paste names
+  the file directly and is unaffected. Possible later fix: offer "Show in folder" from the
+  panel, which opens the folder after the entry exists.
