@@ -472,7 +472,9 @@ Windows; the owner window plus its TIMESTAMP on X11), ignoring changes mouse-rs 
 Same files with a new marker counts as a new copy and is announced again; the log says "the
 same files were copied again". Text and images still dedupe by content.
 
-### B20 — a file from Linux could not be pasted in Explorer until it had fully arrived
+### B20 — a file from Linux could not be pasted in Explorer until it had fully arrived — **fixed, confirmed on hardware 2026-10-14**
+
+- Confirmed by ladder steps 2, 3 and 4 (video, folder, zip Linux → Windows): 834 MB at ~76 MB/s, 4.9 GB of videos in 67 s, a 699 MB zip with a cancel and re-paste.
 
 Windows put cache paths on the clipboard as `CF_HDROP` before the files existed, so Explorer
 failed at once. Built 2026-10-13, **not yet tested on hardware**: `win_virtual.rs` offers files
