@@ -541,7 +541,25 @@ the Linux streaming folder.
   a visible effect, but the noise buries real errors in the shipped logs. It probably happens
   while the panel window is hidden or unmapped and iced keeps redrawing. Not investigated.
 
-### B24 — reading a streamed file out of order restarts the stream on every seek — open, low
+### B24 — reading a streamed file out of order restarts the stream on every seek — **closed, won't fix (owner, 2026-10-14)**
+
+- **Decision.** mouse-rs is copy and paste: Ctrl+C on one machine, Ctrl+V on the other, for any
+  file or folder. It is not a way to stream or play media from the other machine. Opening a file
+  straight from the streaming folder (`/run/user/1000/mouse-rs/incoming`) instead of pasting it
+  is not a supported use, so how well a player or thumbnailer reads from there does not matter.
+  Do not work on this again.
+- **What was tried and reverted.** Up to four buffered regions per file (`4412e56`) and turn-taking
+  between two readers (`475de52`), both reverted (`09c8d01`, `7a43032`). The hardware test still
+  failed. VLC and the thumbnailer reading at once exposed a race: a cancelled stream's late
+  Begin/Abort can clear the record of the new request at the same offset, so the next request
+  went without a cancel and the sender ignored it as a repeat. That race needs a request id in
+  `BlobRequest`/`BlobMeta`. It only appears with several readers or rapid re-requests, which a
+  paste does not do. If a paste ever shows "already streaming this file; ignoring the repeat
+  request" on the sender, start from there.
+- **Why the folder is harmless.** It holds nothing on disk. A file there is a view onto the
+  laptop's file, with at most a 64 MB in-memory buffer while something reads it, freed when the
+  reader closes it. Opening a file there leaves nothing behind, and the folder disappears when
+  mouse-rs stops (B26).
 
 - **Update, 13:05.** B25 below was caused by these seeks. The restarts are still open; the
   corruption they caused is fixed.
@@ -676,7 +694,9 @@ it pasted through the same `mark_pasted` as B28/B30. Whichever comes first, the 
 end frame, the paste is recorded. Test:
 `a_paste_that_closes_before_the_end_frame_still_counts_as_arrived` (fails without the fix).
 
-### B32 — Thunar does not show a new copy in the streaming folder until it is reloaded — open, low
+### B32 — Thunar does not show a new copy in the streaming folder until it is reloaded — **closed with B24 (owner, 2026-10-14)**
+
+- Only matters when browsing the streaming folder by hand, which is not a supported use (see B24).
 
 - 2026-10-14 18:40 IST. The owner opened `/run/user/1000/mouse-rs/incoming` 12 s before the next
   Windows copy arrived, and the view stayed empty. Folder `10` existed. F5 (View → Reload) shows
