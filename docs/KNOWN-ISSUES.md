@@ -560,17 +560,6 @@ the Linux streaming folder.
   from 0 again. With one region (the old behaviour) it fails with starts `[0, tail, 0]`.
   `a_tail_read_neither_finishes_the_paste_nor_spoils_its_check` covers the rest. Passed 20 runs
   of 20.
-- **First hardware run, 18:43 IST: the video did not play.** VLC read from the start while
-  tumblerd (Thunar's thumbnailer) read the end. Each moved the one stream to its own region,
-  and each stream's first bytes arrived after the other reader had moved it back. The receiver
-  drops a stream that does not start where the active region ends, so the laptop sent ~750 MB
-  per attempt and all of it was dropped. Kali re-asked every 10 s, at 0, 262144, 524288 and the
-  tail. **Fix:** a reader takes the stream from a region another reader is waiting on only after
-  the stream has stayed there 500 ms, so they take turns. A reader served from memory never
-  waits, so this only applies when both are stuck. Test:
-  `two_readers_in_different_places_both_make_progress` (fake peer with a round trip). Fewer
-  than 10 moves in 10 runs of 10; without the rule, 110 moves with the same offset pattern as
-  the real log.
 - **To confirm on hardware.** Copy a big video on Windows, open Kali's streaming folder in
   Thunar (thumbnails), or play the video straight from there. The log should show a handful of
   "asked the peer … from this byte" lines, not about 155.
