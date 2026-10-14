@@ -612,3 +612,17 @@ Fix: `Transfers` records every file that arrived in full this session, whether s
 last byte or verified into the cache. `has_arrived(set)` ends "fetching" once every file has
 arrived, even if mouse-rs no longer holds them. Test:
 `a_set_mixing_streamed_and_cached_files_arrives_once_every_file_has`.
+
+### B29 — Kali sometimes reports a single Ctrl+C in Thunar as two copies — open, low, logging added
+
+- 2026-10-14, 13:30:46 and 15:40:11: "the same files were copied again" came about 2 s after the
+  real copy, after control had already gone back to the laptop, so the owner was not pressing
+  anything on Kali. The laptop got the same offer twice and could notify twice ("A file is
+  waiting"). Nothing else went wrong.
+- Ruled out: a clipboard manager. None runs, and Thunar still owned the clipboard afterwards. At
+  rest, Thunar answers the `TIMESTAMP` query in 3 ms with a stable value.
+- Suspected: the first poll after a copy catches Thunar busy, so `TIMESTAMP` misses the 400 ms
+  limit and the stamp is recorded with a zero time. The next poll gets the real time, and the
+  change looks like a new copy. Not proven. The "copied again" line now logs `before` and `now`
+  stamps (high half the owner window, low half its time). If `before` ends in `00000000` when it
+  next happens, the fix is to ignore a change where only the time went from unknown to known.

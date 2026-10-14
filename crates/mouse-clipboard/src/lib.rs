@@ -1402,12 +1402,21 @@ fn run(
                         // after the history and cache had been cleared.
                         let stamp = files::foreign_copy_stamp();
                         let again = last_files == Some(key) && stamp.is_some() && stamp != last_copy_stamp;
+                        let before = last_copy_stamp;
                         if stamp.is_some() {
                             last_copy_stamp = stamp;
                         }
                         if last_files != Some(key) || again {
                             if again {
-                                tracing::info!(count = list.paths.len(), "the same files were copied again; telling the peer again");
+                                // The stamps say why (B29): on Linux the high half is the
+                                // owner's window and the low half its copy time, 0 when the
+                                // owner did not answer in time.
+                                tracing::info!(
+                                    count = list.paths.len(),
+                                    before = format!("{:x}", before.unwrap_or(0)),
+                                    now = format!("{:x}", stamp.unwrap_or(0)),
+                                    "the same files were copied again; telling the peer again"
+                                );
                             }
                             last_files = Some(key);
                             if let Some(set) = t.describe_local(&list, settings.machine, settings.max_files_per_copy, settings.follow_symlinks, settings.cache_budget, settings.hash_limit) {
