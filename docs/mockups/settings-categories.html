@@ -1,0 +1,319 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>mouse-rs settings layout</title>
+<style>
+:root{--bg:#070b14;--panel:#0d1424;--card:#111a2e;--line:#22304d;--txt:#e6ecf7;--txt2:#a9b6cf;--txt3:#6f7d98;--acc:#22d3ee;--acc2:#8b5cf6;--good:#34d399;--warn:#fbbf24;--adv:#f472b6}
+*{box-sizing:border-box}
+body{margin:0;background:#04070d;color:var(--txt);font:14px/1.45 system-ui,-apple-system,"Segoe UI",sans-serif;display:flex;flex-wrap:wrap;gap:28px;justify-content:center;padding:24px 16px}
+.note{max-width:560px;width:100%;color:var(--txt2)}
+.note h1{font-size:20px;margin:0 0 6px;color:var(--txt)}
+.note li{margin:3px 0}
+.win{width:420px;max-width:100%;background:var(--bg);border:1px solid var(--line);border-radius:14px;overflow:hidden;box-shadow:0 10px 40px #0008;position:relative;min-height:640px}
+.bar{display:flex;align-items:center;gap:10px;padding:14px 16px 8px}
+.bar h2{font-size:20px;margin:0;flex:1}
+.pill{font-size:11px;padding:4px 10px;border-radius:99px;background:#063b33;color:var(--good);border:1px solid #0d6b5c}
+.dots,.back{background:var(--card);border:1px solid var(--line);color:var(--txt);border-radius:9px;padding:5px 11px;cursor:pointer;font-size:15px}
+.hero{margin:6px 16px 12px;padding:12px;border:1px solid #1d4b5c;border-radius:12px;background:linear-gradient(180deg,#0c1a2c,#0b1424)}
+.chips{display:flex;gap:8px;align-items:center}
+.chip{flex:1;padding:9px 10px;border-radius:9px;border:1px solid var(--line);background:var(--panel);font-size:13px}
+.chip.lit{border-color:var(--acc);box-shadow:0 0 0 1px var(--acc) inset}
+.chip small{color:var(--txt3);float:right}
+.hero .line{color:var(--acc);font-size:12px;margin-top:8px}
+.tabs{display:flex;gap:6px;margin:0 16px 12px;padding:5px;border:1px solid var(--line);border-radius:12px}
+.tab{flex:1;text-align:center;padding:8px;border-radius:8px;cursor:pointer;color:var(--txt2)}
+.tab.on{background:linear-gradient(90deg,var(--acc),var(--acc2));color:#021018;font-weight:600}
+.body{padding:0 16px 90px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:12px;margin-bottom:10px}
+.lbl{font-size:11.5px;color:var(--txt3);margin:8px 0 5px}
+.lbl:first-child{margin-top:0}
+.in{display:flex;gap:6px}
+.in span{flex:1;background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:8px 10px;color:var(--txt2);font-size:13px}
+.btn{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:8px 12px;font-size:12.5px;color:var(--txt);white-space:nowrap}
+.seg{display:flex;gap:6px}.seg span{flex:1;text-align:center;padding:8px;border-radius:8px;border:1px solid var(--line);font-size:12.5px;color:var(--txt2)}
+.seg span.on{border-color:var(--acc);color:var(--acc)}
+.tg{display:flex;align-items:flex-start;gap:10px;padding:7px 0}
+.tg .t{flex:1}.tg .t div{font-size:13.5px}.tg .t small{color:var(--txt3);font-size:11.5px}
+.sw{width:34px;height:19px;border-radius:99px;background:var(--acc);position:relative;flex:none;margin-top:2px}
+.sw:after{content:"";position:absolute;right:2px;top:2px;width:15px;height:15px;border-radius:50%;background:#021018}
+.sw.off{background:#2a3655}.sw.off:after{left:2px;right:auto;background:#7d8aa6}
+.hist{display:flex;gap:8px;align-items:center;padding:10px;border:1px solid var(--line);border-radius:10px;margin-bottom:8px;background:var(--panel);font-size:12.5px}
+.hist .m{flex:1}.hist small{display:block;color:var(--txt3)}
+.in-tag{color:var(--acc);font-size:11px}.out-tag{color:var(--good);font-size:11px}
+.foot{position:absolute;left:0;right:0;bottom:0;display:flex;gap:8px;padding:12px 16px;border-top:1px solid var(--line);background:var(--bg)}
+.foot .msg{flex:1;color:var(--txt3);font-size:11.5px;align-self:center}
+.stop{background:#f87171;color:#1a0505;border:none;border-radius:9px;padding:10px 16px;font-weight:600}
+.menu{position:absolute;right:14px;top:50px;background:var(--card);border:1px solid var(--line);border-radius:10px;padding:5px;width:190px;display:none;z-index:5;box-shadow:0 8px 24px #000a}
+.menu div{padding:8px 10px;border-radius:7px;cursor:pointer}.menu div:hover{background:var(--panel)}
+.menu .sep{height:1px;background:var(--line);padding:0;margin:4px 0}
+.cat{display:flex;gap:12px;align-items:center;padding:12px;border-radius:10px;cursor:pointer;border:1px solid transparent}
+.cat:hover{background:var(--card);border-color:var(--line)}
+.cat .ic{width:34px;height:34px;border-radius:9px;display:grid;place-items:center;background:var(--card);border:1px solid var(--line);font-size:16px;flex:none}
+.cat .t{flex:1}.cat small{display:block;color:var(--txt3);font-size:11.5px}
+.cat .chev{color:var(--txt3)}
+.grp{font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--txt3);margin:14px 4px 6px}
+.sec{font-size:12px;font-weight:600;color:var(--acc);margin:4px 0 6px}
+.adv{border:1px dashed #5b3a6e;border-radius:12px;margin-top:6px}
+.adv summary{cursor:pointer;padding:11px 12px;color:var(--adv);font-weight:600;list-style:none}
+.adv summary::-webkit-details-marker{display:none}
+.adv summary:before{content:"▸ "}.adv[open] summary:before{content:"▾ "}
+.adv .card{margin:0 10px 10px}
+.new{font-size:10px;color:#021018;background:var(--warn);border-radius:4px;padding:1px 5px;margin-left:6px;vertical-align:1px}
+.os{font-size:10px;color:var(--txt3);border:1px solid var(--line);border-radius:4px;padding:0 5px;margin-left:6px}
+.hint{color:var(--txt3);font-size:11.5px;margin-top:4px}
+.screen{display:none}.screen.on{display:block}
+.legend span{display:inline-block;margin-right:10px}
+@media (max-width:480px){.win{width:100%}}
+</style>
+</head>
+<body>
+
+<div class="note">
+  <h1>Settings, sorted into categories: proposal for you to confirm</h1>
+  <ul>
+    <li><b>Main window:</b> only two tabs, <b>Connection</b> and <b>Clipboard</b> (history) (R28).</li>
+    <li><b>⋯ → Settings</b> holds everything else, like an Android phone: a list of categories, the ones people use most at the top (R29).</li>
+    <li>Each page: everyday settings first, then a pink <b>Advanced</b> section at the bottom, closed by default (R25).</li>
+    <li class="legend"><span><span class="new">NEW</span> a setting that never had a control (R26)</span><span><span class="os">Windows</span>/<span class="os">Linux</span> shown only on that system</span></li>
+    <li>Every control that exists today is in here. Nothing removed, only moved.</li>
+  </ul>
+</div>
+
+<div class="win">
+  <!-- MAIN WINDOW -->
+  <div class="screen on" id="main">
+    <div class="bar"><h2>mouse-rs</h2><span class="pill">connected · laptop</span><button class="dots" onclick="menu()">⋯</button></div>
+    <div class="menu" id="menu">
+      <div onclick="go('settings')">⚙ Settings</div>
+      <div onclick="go('settings')">Profiles…</div>
+      <div class="sep"></div>
+      <div>Quit mouse-rs</div>
+    </div>
+    <div class="hero">
+      <div class="chips"><div class="chip lit">kali-desktop <small>1440×900</small></div>⇄<div class="chip">laptop <small>1920×1080</small></div></div>
+      <div class="line">← controlled by laptop</div>
+    </div>
+    <div class="tabs"><div class="tab on" id="t1" onclick="tab(1)">Connection</div><div class="tab" id="t2" onclick="tab(2)">Clipboard</div></div>
+    <div class="body" id="b1">
+      <div class="card">
+        <div class="lbl">This computer is the…</div>
+        <div class="seg"><span>Server · has the mouse</span><span class="on">Client · receives</span></div>
+        <div class="lbl">Other computer</div>
+        <div class="in"><span>192.168.137.1</span><b class="btn">Detect</b></div>
+        <div class="lbl">Found on your network</div>
+        <div class="in"><span>laptop · 192.168.137.1 ▾</span></div>
+        <div class="hint">Ports, auto-reconnect and this computer's name are in ⋯ → Settings → Connection.</div>
+      </div>
+    </div>
+    <div class="body" id="b2" style="display:none">
+      <div style="display:flex;align-items:center;margin-bottom:8px"><span style="flex:1;color:var(--txt3);font-size:12px">History · newest first · click to copy again</span><b class="btn">Clear</b></div>
+      <div class="hist"><span class="in-tag">↓ in</span><div class="m">Beautiful.Disaster.2023.mkv<small>2.3 GB · on the other computer · paste any time</small></div><b class="btn">📌</b><b class="btn">✕</b></div>
+      <div class="hist"><span class="out-tag">↑ out</span><div class="m">image 1920×1080<small>575 KB</small></div><b class="btn">📌</b><b class="btn">✕</b></div>
+      <div class="hist"><span class="out-tag">↑ out</span><div class="m">"/home/kalip/Downloads"<small>1 KB</small></div><b class="btn">📌</b><b class="btn">✕</b></div>
+      <div style="display:flex;align-items:center;color:var(--txt3);font-size:11.5px;margin-top:6px"><span style="flex:1">transferred files on disk: 764 KB in 2 files</span><b class="btn">Clear</b></div>
+      <div class="hint">Clipboard settings: ⋯ → Settings → Clipboard.</div>
+    </div>
+    <div class="foot"><span class="msg">anything up to 10 GB comes over without asking</span><b class="btn">Save</b><button class="stop">Stop sharing</button></div>
+  </div>
+
+  <!-- SETTINGS INDEX -->
+  <div class="screen" id="settings">
+    <div class="bar"><button class="back" onclick="go('main')">←</button><h2>Settings</h2></div>
+    <div class="body" style="padding-bottom:20px">
+      <div class="grp">Everyday</div>
+      <div class="cat" onclick="go('p-clip')"><div class="ic">📋</div><div class="t">Clipboard<small>What to share, history, files, transfers</small></div><span class="chev">›</span></div>
+      <div class="cat" onclick="go('p-screens')"><div class="ic">🖥</div><div class="t">Screens &amp; edges<small>Which side the other computer is on</small></div><span class="chev">›</span></div>
+      <div class="cat" onclick="go('p-start')"><div class="ic">⏻</div><div class="t">Startup<small>Start at login, connect automatically</small></div><span class="chev">›</span></div>
+      <div class="cat" onclick="go('p-keys')"><div class="ic">⌨</div><div class="t">Keyboard &amp; hotkeys<small>Getting control back</small></div><span class="chev">›</span></div>
+      <div class="grp">Setup</div>
+      <div class="cat" onclick="go('p-conn')"><div class="ic">🔗</div><div class="t">Connection<small>Name, ports, reconnecting, profiles</small></div><span class="chev">›</span></div>
+      <div class="cat" onclick="go('p-sec')"><div class="ic">🔒</div><div class="t">Security &amp; pairing<small>Shared secret, encryption</small></div><span class="chev">›</span></div>
+      <div class="cat" onclick="go('p-look')"><div class="ic">🎨</div><div class="t">Appearance<small>Theme</small></div><span class="chev">›</span></div>
+      <div class="grp">Help &amp; advanced</div>
+      <div class="cat" onclick="go('p-diag')"><div class="ic">🩺</div><div class="t">Diagnostics<small>Log file, sending logs for support</small></div><span class="chev">›</span></div>
+      <div class="cat" onclick="go('p-about')"><div class="ic">ℹ</div><div class="t">About<small>Version, restore default settings</small></div><span class="chev">›</span></div>
+    </div>
+  </div>
+
+  <!-- CLIPBOARD -->
+  <div class="screen" id="p-clip">
+    <div class="bar"><button class="back" onclick="go('settings')">←</button><h2>Clipboard</h2></div>
+    <div class="body" style="padding-bottom:20px">
+      <div class="card"><div class="sec">Sharing</div>
+        <div class="tg"><div class="t"><div>Sync clipboard</div><small>copy on one computer, paste on the other</small></div><span class="sw"></span></div>
+        <div class="tg"><div class="t"><div>Notify me when a file is waiting</div></div><span class="sw"></span></div>
+      </div>
+      <div class="card"><div class="sec">Big files</div>
+        <div class="lbl">Ask before bringing over anything larger than (MB)</div><div class="in"><span>10240</span></div>
+        <div class="hint">Under this it just arrives; over it, the entry waits for you.</div>
+        <div class="lbl">Or put received files straight into this folder</div><div class="in"><span>(blank: paste wherever you want)</span><b class="btn">Choose</b></div>
+      </div>
+      <div class="card"><div class="sec">History</div>
+        <div class="lbl">Keep this many entries</div><div class="in"><span>25</span></div>
+        <div class="tg"><div class="t"><div>Keep history after restart</div></div><span class="sw"></span></div>
+      </div>
+      <details class="adv"><summary>Advanced</summary>
+        <div class="card"><div class="sec">What crosses</div>
+          <div class="tg"><div class="t"><div>Sync text</div></div><span class="sw"></span></div>
+          <div class="tg"><div class="t"><div>Sync images</div></div><span class="sw"></span></div>
+          <div class="tg"><div class="t"><div>Sync files</div><small>any file or folder, any extension</small></div><span class="sw"></span></div>
+          <div class="lbl">Most files in one copy</div><div class="in"><span>10000</span></div>
+          <div class="tg"><div class="t"><div>Also copy images as a .png file</div></div><span class="sw"></span></div>
+          <div class="tg"><div class="t"><div>Follow shortcuts inside copied folders</div></div><span class="sw off"></span></div>
+          <div class="tg"><div class="t"><div>Pasting a received file moves it there</div></div><span class="sw off"></span></div>
+        </div>
+        <div class="card"><div class="sec">Transfers</div>
+          <div class="lbl">Don't ask if it'll take under (seconds)</div><div class="in"><span>5</span></div>
+          <div class="lbl">Paste files bigger than (MB) straight from the network</div><div class="in"><span>64</span></div>
+          <div class="lbl">Wait for a dropped connection (seconds)</div><div class="in"><span>180</span></div>
+          <div class="tg"><div class="t"><div>Keep a resumable copy while pasting</div><small>survives a restart, but uses the file's size twice on disk</small></div><span class="sw off"></span></div>
+          <div class="tg"><div class="t"><div>Slow transfers while I'm on the other machine</div></div><span class="sw"></span></div>
+          <div class="lbl">Transfer speed limit (MB/s, 0 = automatic)</div><div class="in"><span>0</span></div>
+          <div class="lbl">Send buffer (MB)</div><div class="in"><span>8</span></div>
+          <div class="tg"><div class="t"><div>Separate lane for large transfers</div></div><span class="sw"></span></div>
+          <div class="lbl">Port for that lane (blank = share the main one)</div><div class="in"><span></span></div>
+          <div class="lbl">Don't fingerprint files bigger than (MB)<span class="new">NEW</span></div><div class="in"><span>64</span></div>
+        </div>
+        <div class="card"><div class="sec">Storage &amp; memory</div>
+          <div class="lbl">Disk for transferred files (GB)</div><div class="in"><span>16</span></div>
+          <div class="lbl">Folder for transferred files<span class="new">NEW</span></div><div class="in"><span>~/.mouse_share/cache</span><b class="btn">Choose</b></div>
+          <div class="lbl">Biggest item to keep (MB)</div><div class="in"><span>5</span></div>
+          <div class="lbl">Memory budget (MB)</div><div class="in"><span>64</span></div>
+          <div class="lbl">Largest image edge (px)</div><div class="in"><span>4096</span></div>
+          <div class="lbl">Send images inline up to (KB)</div><div class="in"><span>256</span></div>
+        </div>
+      </details>
+    </div>
+  </div>
+
+  <!-- SCREENS -->
+  <div class="screen" id="p-screens">
+    <div class="bar"><button class="back" onclick="go('settings')">←</button><h2>Screens &amp; edges</h2></div>
+    <div class="body" style="padding-bottom:20px">
+      <div class="card"><div class="sec">Arrangement</div>
+        <div class="lbl">Exit edge: the pointer leaves this screen here <span class="os">server</span></div>
+        <div class="in"><span>[ screen picture with clickable edge strips ]</span></div>
+        <div class="lbl">Entry edge: where the pointer comes back</div>
+        <div class="in"><span>[ screen picture with clickable edge strips ]</span></div>
+        <div class="hint">Warns if the two edges don't face each other.</div>
+      </div>
+      <details class="adv"><summary>Advanced</summary>
+        <div class="card"><div class="sec">This screen</div>
+          <div class="lbl">Screen size (px)</div><div class="in"><span>1440</span><span>900</span><b class="btn">Detect</b></div>
+          <div class="hint">Re-detected on Start; edit only to override.</div>
+        </div>
+        <div class="card"><div class="sec">Crossing feel</div>
+          <div class="lbl">Edge sensitivity (px from the edge)<span class="new">NEW</span></div><div class="in"><span>1</span></div>
+          <div class="lbl">Return distance (px)<span class="new">NEW?</span></div><div class="in"><span>stored but unused today: build it or drop it?</span></div>
+        </div>
+      </details>
+    </div>
+  </div>
+
+  <!-- STARTUP -->
+  <div class="screen" id="p-start">
+    <div class="bar"><button class="back" onclick="go('settings')">←</button><h2>Startup</h2></div>
+    <div class="body" style="padding-bottom:20px">
+      <div class="card"><div class="sec">When I log in</div>
+        <div class="tg"><div class="t"><div>Start at login</div><small>adds ~/.config/autostart/mouse-rs.desktop</small></div><span class="sw"></span></div>
+        <div class="tg"><div class="t"><div>Auto-connect on launch</div></div><span class="sw"></span></div>
+        <div class="tg"><div class="t"><div>Start minimized</div></div><span class="sw off"></span></div>
+      </div>
+      <div class="card"><div class="sec">Before anyone signs in</div>
+        <div class="tg"><div class="t"><div>Share input at the login screen <span class="os">Linux</span></div><small>type the password from the other computer's keyboard</small></div><span class="sw"></span></div>
+      </div>
+      <div class="card"><div class="sec">Permissions <span class="os">Windows</span></div>
+        <div class="in"><span>Permissions: normal</span><b class="btn">Restart as administrator</b></div>
+        <div class="tg"><div class="t"><div>Start at login as administrator</div><small>so admin windows don't block crossing</small></div><span class="sw off"></span></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- KEYS -->
+  <div class="screen" id="p-keys">
+    <div class="bar"><button class="back" onclick="go('settings')">←</button><h2>Keyboard &amp; hotkeys</h2></div>
+    <div class="body" style="padding-bottom:20px">
+      <div class="card"><div class="sec">Getting control back</div>
+        <div class="lbl">Lock / cross hotkey</div><div class="in"><span>scroll_lock</span></div>
+        <div class="hint">Single key. Always returns control, even if the network has stalled.</div>
+      </div>
+      <details class="adv"><summary>Advanced</summary>
+        <div class="card"><div class="lbl">Return hotkey (server)</div><div class="in"><span>ctrl+win+alt+esc</span></div><div class="hint">Optional combo. Empty = none.</div></div>
+      </details>
+    </div>
+  </div>
+
+  <!-- CONNECTION -->
+  <div class="screen" id="p-conn">
+    <div class="bar"><button class="back" onclick="go('settings')">←</button><h2>Connection</h2></div>
+    <div class="body" style="padding-bottom:20px">
+      <div class="card"><div class="sec">This computer</div>
+        <div class="lbl">Machine name</div><div class="in"><span>kali-desktop</span></div>
+        <div class="tg"><div class="t"><div>Auto-reconnect</div><small>retry until the other computer appears</small></div><span class="sw"></span></div>
+      </div>
+      <div class="card"><div class="sec">Profiles</div>
+        <div class="hint" style="margin-top:0">Saved setups for different places or networks. Switch with one click.</div>
+        <div class="in" style="margin-top:6px"><span>home ▾</span><b class="btn">Load</b><b class="btn">Delete</b></div><div class="in" style="margin-top:6px"><span>new profile name</span><b class="btn">Save as</b></div><div class="hint">Stored in ~/.mouse_share/profiles/. They include the shared secret.</div>
+      </div>
+      <details class="adv"><summary>Advanced</summary>
+        <div class="card"><div class="sec">Ports</div>
+          <div class="lbl">Server port <span class="os">client</span></div><div class="in"><span>24800</span></div>
+          <div class="lbl">Listen host <span class="os">server</span></div><div class="in"><span>0.0.0.0</span></div>
+          <div class="lbl">This machine's addresses <span class="os">server</span></div><div class="in"><span>192.168.137.1 ▾</span></div>
+          <div class="lbl">Listen port <span class="os">server</span></div><div class="in"><span>24800</span></div>
+          <div class="lbl">Discovery port (finding the other computer)<span class="new">NEW</span></div><div class="in"><span>24801</span></div>
+        </div>
+      </details>
+    </div>
+  </div>
+
+  <!-- SECURITY -->
+  <div class="screen" id="p-sec">
+    <div class="bar"><button class="back" onclick="go('settings')">←</button><h2>Security &amp; pairing</h2></div>
+    <div class="body" style="padding-bottom:20px">
+      <div class="card"><div class="sec">Pairing</div>
+        <div class="lbl">Shared secret: identical on both computers</div>
+        <div class="in"><span>••••••••••••</span><b class="btn">Show</b><b class="btn">Generate</b></div>
+      </div>
+      <details class="adv"><summary>Advanced</summary>
+        <div class="card"><div class="tg"><div class="t"><div>Encrypt link (TLS)</div><small>turning this off sends everything readable on the network</small></div><span class="sw"></span></div></div>
+      </details>
+    </div>
+  </div>
+
+  <!-- APPEARANCE -->
+  <div class="screen" id="p-look">
+    <div class="bar"><button class="back" onclick="go('settings')">←</button><h2>Appearance</h2></div>
+    <div class="body"><div class="card"><div class="sec">Theme</div><div class="seg" style="flex-wrap:wrap"><span class="on">Midnight</span><span>Oxide</span><span>Synth</span></div><div class="seg" style="margin-top:6px"><span>Matrix</span><span>Nord</span><span>Paper</span></div><div class="hint">Moved here from the ⋯ menu.</div></div></div>
+  </div>
+
+  <!-- DIAGNOSTICS -->
+  <div class="screen" id="p-diag">
+    <div class="bar"><button class="back" onclick="go('settings')">←</button><h2>Diagnostics</h2></div>
+    <div class="body" style="padding-bottom:20px">
+      <div class="card"><div class="sec">Log file</div><div class="hint" style="margin-top:0">/home/kalip/.mouse_share/mouse-rs.log</div><div class="in" style="margin-top:6px"><b class="btn">Open folder</b></div></div>
+      <details class="adv"><summary>Advanced</summary>
+        <div class="card"><div class="sec">Send logs for support</div>
+          <div class="lbl">Log upload address<span class="new">NEW</span></div><div class="in"><span>http://192.168.137.2:8001</span></div>
+          <div class="lbl">Send every (seconds)<span class="new">NEW</span></div><div class="in"><span>30</span></div>
+        </div>
+      </details>
+    </div>
+  </div>
+
+  <!-- ABOUT -->
+  <div class="screen" id="p-about">
+    <div class="bar"><button class="back" onclick="go('settings')">←</button><h2>About</h2></div>
+    <div class="body"><div class="card"><div class="sec">mouse-rs</div><div class="hint" style="margin-top:0">Version 0.x · build a5058d67</div><div class="in" style="margin-top:8px"><b class="btn">Restore default settings</b></div><div class="hint">Resets preferences only, never this computer's name, secret or addresses (R5).</div></div></div>
+  </div>
+</div>
+
+<script>
+function go(id){document.querySelectorAll('.screen').forEach(s=>s.classList.remove('on'));document.getElementById(id).classList.add('on');document.getElementById('menu').style.display='none'}
+function menu(){const m=document.getElementById('menu');m.style.display=m.style.display==='block'?'none':'block'}
+function tab(n){[1,2].forEach(i=>{document.getElementById('t'+i).classList.toggle('on',i===n);document.getElementById('b'+i).style.display=i===n?'block':'none'})}
+</script>
+</body>
+</html>
