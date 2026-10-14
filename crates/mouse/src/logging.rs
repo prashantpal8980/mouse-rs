@@ -35,6 +35,63 @@ const DEFAULT_FILTER: &str = "info,\
      wgpu_core=warn,wgpu_hal=warn,iced_wgpu=warn,iced_winit=warn,iced_graphics=warn,\
      winit=warn,naga=warn,cosmic_text=warn,zbus=warn,calloop=warn";
 
+/// A screen-off period ends after this long without a present timeout.
+const SCREEN_OFF_QUIET: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Keeps one "Timeout when presenting surface" per screen-off period, not one per redraw.
+///
+/// The graphics stack (iced_winit) logs that at error level whenever a frame cannot be
+/// shown. On Kali that is when the display has blanked or powered down (B23): 1,804 of
+/// 1,819 such lines came after more than 10 minutes idle, and the screen blanks after
+/// exactly 600 s. Nothing is wrong, but hundreds an hour buried the lines that matter.
+/// The first in each period is kept, so the log still says when it happened.
+#[derive(Default)]
+struct ScreenOffNoise {
+    last: Mutex<Option<std::time::Instant>>,
+}
+
+impl ScreenOffNoise {
+    /// Whether to keep a present timeout seen at `now`.
+    fn keep(&self, now: std::time::Instant) -> bool {
+        let Ok(mut last) = self.last.lock() else { return true };
+        let new_period = last.map_or(true, |t| now.duration_since(t) > SCREEN_OFF_QUIET);
+        *last = Some(now);
+        new_period
+    }
+}
+
+/// Reads an event's message.
+struct Message(String);
+
+impl tracing::field::Visit for Message {
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        if field.name() == "message" {
+            self.0 = value.to_string();
+        }
+    }
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "message" {
+            self.0 = format!("{value:?}");
+        }
+    }
+}
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for ScreenOffNoise {
+    fn event_enabled(&self, event: &tracing::Event<'_>, _ctx: tracing_subscriber::layer::Context<'_, S>) -> bool {
+        let meta = event.metadata();
+        // Through the `log` bridge the target is the crate's; check it before reading text.
+        if !meta.target().starts_with("iced_winit") {
+            return true;
+        }
+        let mut msg = Message(String::new());
+        event.record(&mut msg);
+        if !(msg.0.contains("Timeout") && msg.0.contains("presenting surface")) {
+            return true;
+        }
+        self.keep(std::time::Instant::now())
+    }
+}
+
 /// Where the GUI writes its log: beside `config.json`, so there is one folder to look in.
 pub fn log_path() -> PathBuf {
     mouse_core::Config::default_path()
@@ -161,8 +218,10 @@ pub fn init(gui: bool) -> Option<PathBuf> {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| DEFAULT_FILTER.into());
 
+    use tracing_subscriber::layer::SubscriberExt as _;
+    use tracing_subscriber::util::SubscriberInitExt as _;
     if !gui {
-        tracing_subscriber::fmt().with_env_filter(filter).init();
+        tracing_subscriber::fmt().with_env_filter(filter).finish().with(ScreenOffNoise::default()).init();
         return None;
     }
 
@@ -175,12 +234,14 @@ pub fn init(gui: bool) -> Option<PathBuf> {
                 // Notepad — which is what a Windows user will open it with.
                 .with_ansi(false)
                 .with_writer(logger)
+                .finish()
+                .with(ScreenOffNoise::default())
                 .init();
             tracing::info!("logging to {}", path.display());
             Some(path)
         }
         Err(e) => {
-            tracing_subscriber::fmt().with_env_filter(filter).init();
+            tracing_subscriber::fmt().with_env_filter(filter).finish().with(ScreenOffNoise::default()).init();
             tracing::warn!("could not open {} ({e}); logging to stdout only", path.display());
             None
         }
@@ -190,6 +251,59 @@ pub fn init(gui: bool) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn one_present_timeout_is_kept_per_screen_off_period() {
+        let f = ScreenOffNoise::default();
+        let t0 = std::time::Instant::now();
+        let s = |secs: u64| t0 + std::time::Duration::from_secs(secs);
+        assert!(f.keep(s(0)), "the first is kept: the log says when the screen went off");
+        // Every 11 s while the screen stays off, as on Kali: all dropped.
+        for i in 1..100 {
+            assert!(!f.keep(s(i * 11)));
+        }
+        // The screen was back for a while, then went off again: a new period.
+        assert!(f.keep(s(99 * 11 + 600)));
+        assert!(!f.keep(s(99 * 11 + 611)));
+    }
+
+    /// End to end through a real subscriber: only the first timeout reaches the output,
+    /// and other iced_winit errors and our own lines are untouched.
+    #[test]
+    fn only_the_present_timeout_is_thinned() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let b2 = buf.clone();
+        let sub = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || Writer(b2.clone()))
+            .finish()
+            .with(ScreenOffNoise::default());
+        tracing::subscriber::with_default(sub, || {
+            for _ in 0..5 {
+                tracing::error!(target: "iced_winit", "Error Timeout when presenting surface.");
+            }
+            tracing::error!(target: "iced_winit", "Error Outdated when presenting surface.");
+            tracing::error!(target: "iced_winit", "something else broke");
+            tracing::info!("connected to server");
+        });
+        let out = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert_eq!(out.matches("Timeout when presenting surface").count(), 1);
+        assert!(out.contains("Outdated when presenting surface"));
+        assert!(out.contains("something else broke"));
+        assert!(out.contains("connected to server"));
+    }
+
+    struct Writer(Arc<Mutex<Vec<u8>>>);
+    impl io::Write for Writer {
+        fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
 
     fn temp_dir(tag: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("mouse-rs-log-{tag}-{}", std::process::id()));

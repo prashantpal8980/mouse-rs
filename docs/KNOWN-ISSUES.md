@@ -523,7 +523,18 @@ the Linux streaming folder.
   logged "the peer cancelled; stopped sending". **Confirmed fixed.** The same run confirms B21:
   485 MB in 6.7 s (about 72 MB/s), with one 2-second slowdown while pointer latency was high.
 
-### B23 — Kali's panel logs "Timeout when presenting surface" every few seconds — open, low
+### B23 — Kali's panel logs "Timeout when presenting surface" every few seconds — **fixed 2026-10-14**
+
+- **Cause, measured.** 1,804 of the 1,819 lines came after more than 10 minutes without input,
+  and Kali's screen saver and DPMS standby trigger at exactly 600 s. With the display blanked or
+  off, the driver will not present a frame, so the panel's timed redraws (median every 11 s)
+  time out. iced_winit logs each one at error level. Nothing is broken.
+- **Fix.** A `ScreenOffNoise` layer (`crates/mouse/src/logging.rs`) reads the message through
+  `Layer::event_enabled`. It keeps the first present timeout of each screen-off period and drops
+  the rest until 2 minutes pass without one. Other iced_winit errors, including other present
+  errors, are untouched. Tests: `one_present_timeout_is_kept_per_screen_off_period` and
+  `only_the_present_timeout_is_thinned` (end to end through a subscriber). Still to confirm: the
+  next real blanking on Kali should leave a single line.
 
 - `iced_winit` logs `ERROR … Error Timeout when presenting surface`, often every 4–15 s.
   The Kali log holds 1,809 of these lines, from 2026-09-17 to 2026-10-14. Nobody has seen
