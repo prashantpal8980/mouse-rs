@@ -159,12 +159,12 @@ rung is done when it works in the direction tested; the reverse direction is its
 |---|---|---|---|
 | 1a | **Image pixels**: a screenshot, or "Copy image" in a browser; pasted into an Explorer folder **and** into apps | Linux → Windows | **signed off 13 Oct** |
 | 1b | **Image file**: a `.png`/`.jpg` copied in the file manager | Linux → Windows | closed 13 Oct (owner: image copy/paste resolved) |
-| 2 | **Video file** (a large one, hundreds of MB) | Linux → Windows | waiting |
+| 2 | **Video file** (a large one, hundreds of MB) | Linux → Windows | **signed off 14 Oct** |
 | 3 | **Folder** with several files and sub-folders | Linux → Windows | waiting |
-| 4 | **Zip file** | Linux → Windows | waiting |
+| 4 | **Zip file** | Linux → Windows | testing |
 | 5 | Image pixels, pasted into an app **and into a Thunar folder** | Windows → Linux | **signed off 13 Oct** |
 | 6 | Image file | Windows → Linux | closed 13 Oct (owner: image copy/paste resolved) |
-| 7 | **Video file** | Windows → Linux | **fixed (streaming folder), waiting for retest** |
+| 7 | **Video file** | Windows → Linux | **signed off 13 Oct** (retests of B19–B22, B25 passed 14 Oct) |
 | 8 | Folder, zip | Windows → Linux | waiting |
 
 Image pixels and image files are different rungs because they take different paths:
