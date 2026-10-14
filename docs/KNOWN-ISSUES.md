@@ -541,28 +541,7 @@ the Linux streaming folder.
   a visible effect, but the noise buries real errors in the shipped logs. It probably happens
   while the panel window is hidden or unmapped and iced keeps redrawing. Not investigated.
 
-### B24 — reading a streamed file out of order restarts the stream on every seek — **fixed 2026-10-14, awaiting hardware test**
-
-- **Fix.** `pipe.rs` keeps up to 4 buffered regions of a file within the same 64 MB cap,
-  instead of one buffer that every jump threw away. A read inside a region is served from
-  memory. A read in or just past a region the stream is not feeding moves the one stream
-  there, from where that region ends. A read far from all of them opens a new region, and the
-  least recently read one goes. Under memory pressure, idle regions first give up read-ahead
-  beyond 8 MB past their reader. There is still one stream at a time, because the protocol
-  cancels by hash.
-- **Two related defects fixed with it.** (1) A read of only the tail set `finished`, which
-  since B31 would mark a thumbnail as a completed paste. `finished` now needs every byte from 0
-  handed over, and `complete()` needs every byte from 0 to have arrived in order. (2) For a
-  hashed file, a jump made the hash uncomputable (`verified = Some(false)`), so the next
-  in-order paste would fail. Out-of-order bytes are now simply not hashed.
-- **Tests.** `a_reader_that_jumps_to_the_end_and_back_does_not_restart_the_file` uses a fake
-  peer: start, then the end, then the start again, then on. The stream starts 3 times and never
-  from 0 again. With one region (the old behaviour) it fails with starts `[0, tail, 0]`.
-  `a_tail_read_neither_finishes_the_paste_nor_spoils_its_check` covers the rest. Passed 20 runs
-  of 20.
-- **To confirm on hardware.** Copy a big video on Windows, open Kali's streaming folder in
-  Thunar (thumbnails), or play the video straight from there. The log should show a handful of
-  "asked the peer … from this byte" lines, not about 155.
+### B24 — reading a streamed file out of order restarts the stream on every seek — open, low
 
 - **Update, 13:05.** B25 below was caused by these seeks. The restarts are still open; the
   corruption they caused is fixed.
