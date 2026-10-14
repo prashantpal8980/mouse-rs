@@ -222,6 +222,53 @@ pub struct StreamFs {
     root: PathBuf,
     inner: Arc<Inner>,
     _session: fuser::BackgroundSession,
+    /// Declared after the session, so a normal shutdown unmounts first.
+    _watch: Option<UnmountWatch>,
+}
+
+/// Unmounts the folder when this process ends, however it ends.
+///
+/// The session unmounts when it is dropped, but a crash, a `kill` or a logout skips that,
+/// leaving a dead mount ("Transport endpoint is not connected") that Thunar and the
+/// clipboard trip over until the next start clears it. FUSE's own `auto_unmount` would
+/// cover this, but fuser allows it only with `allow_other`, which needs root to enable in
+/// `/etc/fuse.conf` and would let other users read the folder.
+///
+/// So a small `sh` waits on a pipe from us. When this process ends, for any reason, the
+/// kernel closes the pipe, `read` returns, and the watcher unmounts. It is started before
+/// the mount so that it cannot inherit the FUSE connection and keep it alive, and it gets
+/// its own process group, so a Ctrl+C in a terminal does not stop it along with us.
+struct UnmountWatch {
+    stdin: Option<std::process::ChildStdin>,
+    child: std::process::Child,
+}
+
+impl UnmountWatch {
+    fn start(at: &Path) -> Option<UnmountWatch> {
+        use std::os::unix::process::CommandExt as _;
+        let spawned = std::process::Command::new("sh")
+            .args(["-c", "trap '' HUP INT TERM; read _ignored; exec fusermount3 -u -z \"$1\" 2>/dev/null", "sh"])
+            .arg(at)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .process_group(0)
+            .spawn();
+        match spawned {
+            Ok(mut child) => Some(UnmountWatch { stdin: child.stdin.take(), child }),
+            Err(e) => {
+                tracing::warn!("streaming folder: no unmount watcher ({e}); a crash would leave the folder broken until the next start");
+                None
+            }
+        }
+    }
+}
+
+impl Drop for UnmountWatch {
+    fn drop(&mut self) {
+        drop(self.stdin.take()); // the watcher unmounts (already done) and exits
+        let _ = self.child.wait();
+    }
 }
 
 impl StreamFs {
@@ -251,6 +298,7 @@ impl StreamFs {
             return None;
         }
         let meta = std::fs::metadata(at).ok()?;
+        let watch = UnmountWatch::start(at);
         let inner = Arc::new(Inner {
             cache,
             tree: Mutex::new(Tree::new()),
@@ -274,7 +322,7 @@ impl StreamFs {
         match fuser::spawn_mount(Fs(inner.clone()), at, &config) {
             Ok(session) => {
                 tracing::info!(path = %at.display(), "streaming folder mounted — large pastes start at once");
-                Some(StreamFs { root: at.to_path_buf(), inner, _session: session })
+                Some(StreamFs { root: at.to_path_buf(), inner, _session: session, _watch: watch })
             }
             Err(e) => {
                 tracing::warn!(
@@ -618,6 +666,50 @@ mod tests {
         assert_eq!(cache.partial_len(&hash), 0, "nothing spooled to disk");
         assert!(!cache.contains(&hash));
         drop(sfs);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Not a test by itself: the child process for the one below. It mounts, then waits
+    /// to be killed.
+    #[test]
+    #[ignore]
+    fn helper_mount_and_wait_to_be_killed() {
+        let Some(at) = std::env::var_os("MOUSE_RS_TEST_MOUNT_AT") else { return };
+        let at = PathBuf::from(at);
+        let cache = Arc::new(BlobCache::new(at.with_file_name("cache")).unwrap());
+        let _sfs = StreamFs::mount(cache, &at, Duration::from_secs(30)).expect("FUSE mount");
+        std::thread::sleep(Duration::from_secs(60));
+    }
+
+    /// Mounts for real, so it needs FUSE: `cargo test -p mouse-clipboard -- --ignored a_killed`.
+    #[test]
+    #[ignore]
+    fn a_killed_process_leaves_no_dead_mount_behind() {
+        let base = std::env::temp_dir().join(format!("mouse-rs-sfs-kill-{}", std::process::id()));
+        let at = base.join("mnt");
+        let mounted = |p: &Path| {
+            std::fs::read_to_string("/proc/self/mountinfo").unwrap().contains(&format!(" {} ", p.display()))
+        };
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--ignored", "--exact", "stream_fs::tests::helper_mount_and_wait_to_be_killed"])
+            .env("MOUSE_RS_TEST_MOUNT_AT", &at)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while !mounted(&at) {
+            assert!(std::time::Instant::now() < deadline, "the helper never mounted");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        child.kill().unwrap(); // SIGKILL: no destructor runs
+        child.wait().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while mounted(&at) {
+            assert!(std::time::Instant::now() < deadline, "the dead mount was left behind");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(std::fs::read_dir(&at).is_ok(), "the folder is usable again, not 'not connected'");
         let _ = std::fs::remove_dir_all(&base);
     }
 }

@@ -566,8 +566,18 @@ Tests: superseded-stream bytes are dropped; a re-copy gets a clean pipe that ask
 re-verifies; the real-mount test checks the pasted copy is writable. 239 tests pass, plus both
 mount tests; clippy is clean on Linux and Windows.
 
-### B26 — stopping mouse-rs with SIGTERM leaves the streaming folder's mount stale — open, low
+### B26 — stopping mouse-rs with SIGTERM leaves the streaming folder's mount stale — **fixed 2026-10-14**
 
 - Seen 2026-10-14 13:02: after `kill`, `/run/user/1000/mouse-rs/incoming` gave "Transport
   endpoint is not connected" until `fusermount3 -u`. Not yet checked whether a fresh start
   recovers from that by itself. A logout or crash could leave it the same way.
+- **Fix.** The next start already cleared a dead mount (`fusermount3 -u -z` before mounting).
+  The gap was the time between dying and starting again. FUSE's `auto_unmount` would close it,
+  but fuser allows it only with `allow_other`, which needs root to enable in
+  `/etc/fuse.conf` and would let other users read the folder. So `StreamFs::mount` now starts a
+  small `sh` watcher before mounting. It is in its own process group, ignores HUP/INT/TERM, and
+  waits on a pipe from mouse-rs. When mouse-rs ends, however it ends, the kernel closes the pipe
+  and the watcher runs `fusermount3 -u -z`.
+- **Checked.** A new test mounts in a child process, kills it with SIGKILL and requires the mount
+  gone within 5 s. It fails without the watcher. On Kali at 13:20, `kill` on the real app left
+  the folder unmounted and usable 1 s later, and the restart remounted and reconnected.
