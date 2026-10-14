@@ -582,7 +582,7 @@ mount tests; clippy is clean on Linux and Windows.
   gone within 5 s. It fails without the watcher. On Kali at 13:20, `kill` on the real app left
   the folder unmounted and usable 1 s later, and the restart remounted and reconnected.
 
-### B27 — cancelling a Linux → Windows paste in Explorer left the entry counting up at 30% — **fixed 2026-10-14**
+### B27 — cancelling a Linux → Windows paste in Explorer left the entry counting up at 30% — **fixed 2026-10-14, confirmed on hardware 13:51**
 
 First hardware run of step 2 (`win_virtual.rs`), 13:30. Pasting an 834 MB video worked at about
 76 MB/s. The same video, copied again and cancelled in Explorer at 30%, was logged as "Explorer
@@ -598,3 +598,17 @@ pipe per file:
 
 Test: `a_cancelled_paste_of_a_recopied_file_is_reported_for_the_new_entry` (pasted in full, copied
 again, cancelled part-way: it must report entry 16). Without the fix it reports `[15]`.
+
+### B28 — a copy of streamed videos plus a small file stayed at "0% of 4.9 GB" after it was all pasted — **fixed 2026-10-14**
+
+Linux → Windows, 13:52. Four videos and one `.md`, 4.9 GB in all, pasted into Explorer in 67 s.
+Every file arrived, but the entry kept showing "0% of 4.9 GB" with a Stop button. The videos
+streamed through memory, so they never entered the cache. The `.md` went through the cache,
+and Explorer asking for it set the whole entry to "fetching". Completion was then judged only
+by "is every file in the cache?", which streamed files can never satisfy, and the pasted `.md`
+had been dropped from the cache anyway. Clearing Kali's history played no part.
+
+Fix: `Transfers` records every file that arrived in full this session, whether streamed to the
+last byte or verified into the cache. `has_arrived(set)` ends "fetching" once every file has
+arrived, even if mouse-rs no longer holds them. Test:
+`a_set_mixing_streamed_and_cached_files_arrives_once_every_file_has`.

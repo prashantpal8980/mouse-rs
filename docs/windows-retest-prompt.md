@@ -16,8 +16,8 @@ Invoke-WebRequest -Uri http://192.168.137.2:8000/mouse-rs.exe -OutFile $HOME\mou
 Get-FileHash $HOME\mouse-rs\mouse-rs.exe -Algorithm SHA256
 ```
 
-Must match exactly — size `12269568` bytes, SHA256
-`85E4A3DC97CA9726F217A8EBCAB77F167E406619F66C22784BCFD9D53AE5EE7D`.
+Must match exactly — size `12272640` bytes, SHA256
+`EC6106C33EB179B2EC314D2F5EABAB598A41E196181050400A5D3F6B82CBB82E`.
 If it doesn't match, stop and tell me.
 
 Note your current state, carried over from last time: **`Start at login` is ON**,

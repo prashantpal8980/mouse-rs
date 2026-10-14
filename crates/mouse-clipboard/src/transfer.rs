@@ -157,6 +157,11 @@ pub struct Transfers {
     /// Large files a paste reads straight from the network, by hash, with their entry.
     /// These never touch the cache: see [`crate::pipe`].
     pipes: HashMap<String, (Arc<crate::pipe::StreamPipe>, u64)>,
+    /// Files that have arrived in full this session: streamed to a paste to the last byte,
+    /// or received and verified into the cache. A streamed file never enters the cache,
+    /// and a pasted cache file is dropped from it, so the cache alone cannot say whether a
+    /// set that mixes the two has been delivered.
+    arrived: std::collections::HashSet<String>,
 }
 
 impl Transfers {
@@ -171,6 +176,7 @@ impl Transfers {
             pending_images: HashMap::new(),
             last_completed: None,
             pipes: HashMap::new(),
+            arrived: Default::default(),
         }
     }
 
@@ -845,9 +851,7 @@ impl Transfers {
                     pipe.interrupted();
                     if pipe.complete() {
                         tracing::info!(hash = %inc.hash, bytes = pipe.size(), "streamed to the paste in full; length verified");
-                        if let Some(id) = inc.entry {
-                            history.set_status(id, ClipStatus::Ready);
-                        }
+                        self.arrived.insert(inc.hash.clone());
                     }
                     return inc.entry;
                 }
@@ -862,6 +866,7 @@ impl Transfers {
                 match self.cache.finish_checked(&inc.hash, content_hashed, inc.total) {
                     Ok(()) => {
                         tracing::info!(hash = %inc.hash, bytes = inc.got, "content received and verified");
+                        self.arrived.insert(inc.hash.clone());
                         inc.entry
                     }
                     Err(e) => {
@@ -908,6 +913,14 @@ impl Transfers {
     /// Do we hold every file in this set?
     pub fn is_complete(&self, set: &FileSet) -> bool {
         set.files.iter().all(|f| self.cache.contains(&f.hash))
+    }
+
+    /// Has every file in this set arrived, whether it is held here or went straight into
+    /// a paste? This is what ends an entry's "fetching". [`Transfers::is_complete`] alone
+    /// never did for a set mixing streamed videos with a small file: it sat at "0% of
+    /// 4.9 GB" after every file had been pasted.
+    pub fn has_arrived(&self, set: &FileSet) -> bool {
+        set.files.iter().all(|f| self.cache.contains(&f.hash) || self.arrived.contains(&f.hash))
     }
 
     /// Materialise a complete set under its real names, ready for the clipboard.
@@ -1487,6 +1500,55 @@ mod tests {
             matches!(peer_rx.try_recv().unwrap(), Message::BlobUnavailable { .. }),
             "changed content must not be sent as if it were the original"
         );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// 2026-10-14: four videos streamed into Explorer plus one small .md through the
+    /// cache. Everything was pasted, yet the entry sat at "0% of 4.9 GB", because the
+    /// streamed files never enter the cache and the pasted .md was dropped from it.
+    #[test]
+    fn a_set_mixing_streamed_and_cached_files_arrives_once_every_file_has() {
+        let (root, mut t, hist) = setup("mixed-arrival");
+        let md = b"# notes".to_vec();
+        let md_hash = cache::hash_bytes(&md);
+        let video_hash = "v".repeat(64);
+        let file = |name: &str, size: u64, hash: &str, hashed: bool| FileRef {
+            name: name.into(),
+            size,
+            hash: hash.into(),
+            content_hashed: hashed,
+            source_path: None,
+            rel: String::new(),
+        };
+        let set = FileSet {
+            files: vec![file("a.mkv", 10, &video_hash, false), file("n.md", md.len() as u64, &md_hash, true)],
+            dirs: Vec::new(),
+            origin: "kali".into(),
+        };
+        let entry = hist.record_files(Arc::new(set.clone()), true, ClipStatus::Remote).unwrap();
+        let pipe = t.pipe_for(&video_hash, 10, false, entry);
+
+        // The video streams into the paste, to the last byte.
+        let meta = serde_json::to_vec(&BlobMeta { hash: video_hash.clone(), name: "a.mkv".into(), offset: 0 }).unwrap();
+        t.on_bulk_frame(BulkFrame::Begin { transfer: 1, total: 10, meta }, &hist);
+        t.on_bulk_frame(BulkFrame::Chunk { transfer: 1, seq: 0, data: b"0123456789".to_vec() }, &hist);
+        assert_eq!(t.on_bulk_frame(BulkFrame::End { transfer: 1 }, &hist), Some(entry));
+        assert!(pipe.complete());
+        assert!(!t.has_arrived(&set), "the .md has not come yet");
+
+        // Then the .md, through the cache.
+        let (to_peer, _rx) = tokio::sync::mpsc::unbounded_channel();
+        t.request_missing(&set, entry, &to_peer, u64::MAX);
+        let meta = serde_json::to_vec(&BlobMeta { hash: md_hash.clone(), name: "n.md".into(), offset: 0 }).unwrap();
+        t.on_bulk_frame(BulkFrame::Begin { transfer: 2, total: md.len() as u64, meta }, &hist);
+        t.on_bulk_frame(BulkFrame::Chunk { transfer: 2, seq: 0, data: md.clone() }, &hist);
+        assert_eq!(t.on_bulk_frame(BulkFrame::End { transfer: 2 }, &hist), Some(entry));
+        assert!(!t.is_complete(&set), "the video is not held here, and never will be");
+        assert!(t.has_arrived(&set), "but every file has arrived");
+
+        // Explorer finished copying the .md, so mouse-rs dropped its own copy.
+        t.cache.discard(&md_hash);
+        assert!(t.has_arrived(&set), "still arrived after the pasted copy is dropped");
         let _ = fs::remove_dir_all(&root);
     }
 

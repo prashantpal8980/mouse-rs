@@ -1242,6 +1242,13 @@ fn run(
                 }
                 if let Some(entry) = entry_opt {
                     if let Some(ClipPayload::Files(set)) = h.payload(entry) {
+                        // Every file went straight into a paste (or was dropped after one),
+                        // so there is nothing here to publish: the paste has it.
+                        if !t.is_complete(&set) && t.has_arrived(&set) {
+                            h.set_status(entry, ClipStatus::Ready);
+                            tracing::info!(entry, count = set.files.len(), "every file of this copy has been pasted");
+                            continue;
+                        }
                         if t.is_complete(&set) {
                             h.set_status(entry, ClipStatus::Ready);
                             // Offered from the streaming folder: it stays offered from there.
