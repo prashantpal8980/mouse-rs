@@ -581,3 +581,20 @@ mount tests; clippy is clean on Linux and Windows.
 - **Checked.** A new test mounts in a child process, kills it with SIGKILL and requires the mount
   gone within 5 s. It fails without the watcher. On Kali at 13:20, `kill` on the real app left
   the folder unmounted and usable 1 s later, and the restart remounted and reconnected.
+
+### B27 — cancelling a Linux → Windows paste in Explorer left the entry counting up at 30% — **fixed 2026-10-14**
+
+First hardware run of step 2 (`win_virtual.rs`), 13:30. Pasting an 834 MB video worked at about
+76 MB/s. The same video, copied again and cancelled in Explorer at 30%, was logged as "Explorer
+closed the streamed file", but the entry was never reset. Two causes, both from reusing one
+pipe per file:
+
+- The first paste had read to the end, so the pipe's `finished` flag was set. The laptop's build
+  never cleared it for the next paste, so the cancel was reported as a completed paste. Already
+  fixed on Kali by B25's full reset in `reopen`; the laptop did not have it yet.
+- `pipe_for` kept the history entry the pipe was **first** made for (15). The re-copy was entry
+  16, so even a correctly reported cancel would have reset 15 and left 16 counting up. It now
+  moves the pipe to the newest entry.
+
+Test: `a_cancelled_paste_of_a_recopied_file_is_reported_for_the_new_entry` (pasted in full, copied
+again, cancelled part-way: it must report entry 16). Without the fix it reports `[15]`.

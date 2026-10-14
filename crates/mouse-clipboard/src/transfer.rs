@@ -176,15 +176,17 @@ impl Transfers {
 
     /// The pipe a paste reads `hash` through, created on first use.
     /// `content_hashed` says whether `hash` is a real content hash to verify on the way.
+    ///
+    /// Copying the same file again reuses the pipe but makes a new history entry, so the
+    /// pipe is moved to the newest one. Otherwise a cancelled paste reset the entry the
+    /// file was first copied as, and the one on screen kept counting up.
     pub fn pipe_for(&mut self, hash: &str, size: u64, content_hashed: bool, entry: u64) -> Arc<crate::pipe::StreamPipe> {
-        self.pipes
-            .entry(hash.to_string())
-            .or_insert_with(|| {
-                let expect = content_hashed.then(|| hash.to_string());
-                (Arc::new(crate::pipe::StreamPipe::new(size, expect)), entry)
-            })
-            .0
-            .clone()
+        let slot = self.pipes.entry(hash.to_string()).or_insert_with(|| {
+            let expect = content_hashed.then(|| hash.to_string());
+            (Arc::new(crate::pipe::StreamPipe::new(size, expect)), entry)
+        });
+        slot.1 = entry;
+        slot.0.clone()
     }
 
     /// Every file of `set` not yet held here streams into a paste, and none is running:
@@ -1157,6 +1159,41 @@ mod tests {
         let root = tmp(tag);
         let cache = Arc::new(BlobCache::new(root.join("cache")).unwrap());
         (root, Transfers::new(cache), ClipboardHistory::new())
+    }
+
+    /// The Linux → Windows case from 2026-10-14: a video pasted in full, copied again,
+    /// then pasted and cancelled at 30%. The cancel must be reported, for the new entry.
+    #[test]
+    fn a_cancelled_paste_of_a_recopied_file_is_reported_for_the_new_entry() {
+        use crate::pipe::PipeCmd;
+        use std::time::Duration;
+        let (root, mut t, _h) = setup("recopy-cancel");
+        let (to_peer, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let hash = "h".repeat(64);
+
+        // First copy, entry 15: pasted to the end.
+        let p = t.pipe_for(&hash, 10, false, 15);
+        let _ = p.read_slice(0, 10, Duration::from_secs(5), Duration::from_millis(1));
+        assert!(t.drive_pipes(&to_peer).is_empty());
+        assert!(p.begin(0));
+        p.push(0, b"0123456789");
+        assert_eq!(p.read(0, 10, Duration::from_secs(1)).unwrap(), b"0123456789");
+        p.release();
+        assert!(t.drive_pipes(&to_peer).is_empty(), "a finished paste is not a cancel");
+
+        // Copied again, entry 16: the same pipe, reopened by the new paste.
+        let p2 = t.pipe_for(&hash, 10, false, 16);
+        assert!(Arc::ptr_eq(&p, &p2));
+        p2.reopen();
+        let _ = p2.read_slice(0, 3, Duration::from_secs(5), Duration::from_millis(1));
+        assert!(t.drive_pipes(&to_peer).is_empty());
+        assert!(p2.begin(0));
+        p2.push(0, b"012");
+        assert_eq!(p2.read(0, 3, Duration::from_secs(1)).unwrap(), b"012");
+        p2.release(); // cancelled in Explorer at 30%
+        assert_eq!(t.drive_pipes(&to_peer), vec![16], "reported as a cancel, for the entry on screen");
+        assert_eq!(p2.take_command(), PipeCmd::Nothing);
+        let _ = fs::remove_dir_all(root);
     }
 
     fn test_queue() -> Arc<BulkQueue> {
