@@ -634,3 +634,15 @@ arrived, even if mouse-rs no longer holds them. Test:
   previous copy is the same copy. Another window, an unknown time, or a re-copy after 2 s still
   counts. Windows stamps carry no time, so there any change still counts. Test:
   `one_copy_seen_twice_by_thunar_is_one_copy`, using the logged stamps.
+
+### B30 — a re-paste counted as done while its video was still streaming; 3,500 identical log lines — **fixed 2026-10-14**
+
+Seen 16:38:30 on Kali, during the folder test (which itself passed both ways). B28's
+`arrived` set kept a file pasted earlier, so a new paste of a set holding that video counted as
+"every file pasted" once the small files arrived, while the video was still streaming. Each
+following frame set Ready again and logged it: 3,528 lines in one second. Not visible to the
+owner, but the entry would show done early on a re-paste, and the log drowned.
+
+Fix: a file leaves `arrived` when a new stream of it begins. The "every file … pasted" line
+and status change happen only on the transition to Ready. Test: the B28 test now pastes the
+set again and requires "not arrived" with half the video in. It fails without the fix.

@@ -756,6 +756,10 @@ impl Transfers {
         match frame {
             BulkFrame::Begin { transfer, total, meta } => {
                 let meta: BlobMeta = serde_json::from_slice(&meta).ok()?;
+                // Arriving again, so not arrived until this stream ends. Left in, a file
+                // pasted earlier made a new paste of it count as done while it was still
+                // streaming.
+                self.arrived.remove(&meta.hash);
                 // Headed straight to a paste: nothing is written to disk.
                 if let Some((pipe, _)) = self.pipes.get(&meta.hash) {
                     if !pipe.begin(meta.offset) {
@@ -1549,6 +1553,14 @@ mod tests {
         // Explorer finished copying the .md, so mouse-rs dropped its own copy.
         t.cache.discard(&md_hash);
         assert!(t.has_arrived(&set), "still arrived after the pasted copy is dropped");
+
+        // Pasted again later: while the video streams again, the copy is not done.
+        let meta = serde_json::to_vec(&BlobMeta { hash: video_hash.clone(), name: "a.mkv".into(), offset: 0 }).unwrap();
+        pipe.release();
+        pipe.reopen();
+        t.on_bulk_frame(BulkFrame::Begin { transfer: 3, total: 10, meta }, &hist);
+        t.on_bulk_frame(BulkFrame::Chunk { transfer: 3, seq: 0, data: b"01234".to_vec() }, &hist);
+        assert!(!t.has_arrived(&set), "half a video has not arrived, whatever an earlier paste did");
         let _ = fs::remove_dir_all(&root);
     }
 

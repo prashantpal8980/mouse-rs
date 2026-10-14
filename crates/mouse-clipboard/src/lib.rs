@@ -1245,8 +1245,11 @@ fn run(
                         // Every file went straight into a paste (or was dropped after one),
                         // so there is nothing here to publish: the paste has it.
                         if !t.is_complete(&set) && t.has_arrived(&set) {
-                            h.set_status(entry, ClipStatus::Ready);
-                            tracing::info!(entry, count = set.files.len(), "every file of this copy has been pasted");
+                            // Once, not for every frame that follows.
+                            if h.status(entry) != Some(ClipStatus::Ready) {
+                                h.set_status(entry, ClipStatus::Ready);
+                                tracing::info!(entry, count = set.files.len(), "every file of this copy has been pasted");
+                            }
                             continue;
                         }
                         if t.is_complete(&set) {
