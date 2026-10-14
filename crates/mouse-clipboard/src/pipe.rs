@@ -15,6 +15,15 @@
 //! So a pipe holds at most [`WINDOW`] bytes. If the paste falls behind and the window
 //! fills, the stream is stopped and restarted from where the paste has got to once it
 //! catches up: flow control by re-request, using the protocol's resume offset.
+//!
+//! **Readers that jump.** A paste reads in order, but a thumbnailer or a video player reads
+//! the start, then the index at the end, then the start again, then wherever the user
+//! seeks. With one buffer, every jump threw away what was held and restarted the stream:
+//! 155 restarts in 30 s for one thumbnail (B24). So the pipe keeps up to [`MAX_REGIONS`]
+//! buffered stretches of the file. A read inside one is answered from memory. A read just
+//! past one moves the single stream there, continuing from where that stretch ends. Only
+//! a read far from all of them opens a new stretch, and the least recently read one goes.
+//! There is one stream at a time because the protocol cancels a file's transfer by hash.
 
 use std::collections::VecDeque;
 
@@ -22,10 +31,17 @@ use sha2::{Digest as _, Sha256};
 use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-/// Most bytes held in memory for one file.
+/// Most bytes held in memory for one file, across all its regions.
 pub const WINDOW: usize = 64 * 1024 * 1024;
+/// Buffered stretches of one file. Enough for a player's start, index and current place.
+pub const MAX_REGIONS: usize = 4;
 /// Bytes kept behind the reader, so a small step back is still served.
 const KEEP_BEHIND: u64 = 4 * 1024 * 1024;
+/// Read-ahead a region keeps beyond its reader when memory runs short and the stream has
+/// moved elsewhere. Trimming that first keeps a region worth returning to.
+const KEEP_AHEAD: u64 = 8 * 1024 * 1024;
+/// A read this far past a region's end still belongs to it: the stream fills the gap.
+const JOIN_AHEAD: u64 = (WINDOW / 2) as u64;
 /// A waiting read re-asks for the stream after this long without progress. That is what
 /// resumes a transfer after the connection drops and comes back.
 const NUDGE: Duration = Duration::from_secs(10);
@@ -43,44 +59,142 @@ pub enum PipeCmd {
     Released { finished: bool },
 }
 
+/// One buffered stretch of the file.
 #[derive(Debug)]
-struct State {
+struct Region {
     /// File offset of `buf[0]`.
     start: u64,
     buf: VecDeque<u8>,
-    /// A stream from the peer is feeding this pipe.
+    /// Last time a read used it, for choosing which region to drop.
+    used: Instant,
+    /// The furthest any read has reached in it.
+    read_to: u64,
+}
+
+impl Region {
+    fn new(start: u64) -> Region {
+        Region { start, buf: VecDeque::new(), used: Instant::now(), read_to: start }
+    }
+    fn end(&self) -> u64 {
+        self.start + self.buf.len() as u64
+    }
+}
+
+#[derive(Debug)]
+struct State {
+    regions: Vec<Region>,
+    /// The region the stream feeds (or will feed once started).
+    active: usize,
+    /// A stream from the peer is feeding the active region.
     running: bool,
     want: Option<u64>,
     stop: bool,
     overfull: bool,
     /// The peer said it cannot send this file: fail the paste now, not after the wait.
     failed: bool,
-    /// Every byte has been handed to a paste at least once.
-    finished: bool,
+    /// Every byte from 0 up to here has been handed to a reader. A paste is finished when
+    /// this reaches the size. Reading only the tail, as a thumbnailer does, is not.
+    served_to: u64,
     /// The last paste closed the file. The next open starts from a clean pipe.
     released: bool,
     grew_at: Instant,
     asked_at: Instant,
-    /// Running content hash, for a file the sender hashed. `None` for length-only files,
-    /// or once the stream skipped bytes and can no longer be hashed in order.
+    /// Running content hash, for a file the sender hashed. `None` for length-only files.
     hasher: Option<Sha256>,
-    /// Bytes fed to `hasher` so far, always a prefix of the file.
-    hashed_to: u64,
+    /// Every byte from 0 up to here has arrived, in order (and been hashed, if hashing).
+    /// Bytes that arrive out of order are simply not hashed; a jump never spoils the check.
+    inorder_to: u64,
     /// For a hashed file: whether the finished hash matched. `None` until it finishes.
     verified: Option<bool>,
 }
 
 impl State {
-    fn have_end(&self) -> u64 {
-        self.start + self.buf.len() as u64
+    fn buffered(&self) -> usize {
+        self.regions.iter().map(|r| r.buf.len()).sum()
     }
-    /// Forget everything and start over from `offset`.
-    fn restart_at(&mut self, offset: u64) {
-        self.buf.clear();
-        self.start = offset;
-        self.want = Some(offset);
+    fn active_end(&self) -> u64 {
+        self.regions[self.active].end()
+    }
+    /// The region a read at `offset` belongs to, if any: of those it is in or just past,
+    /// the one starting closest below it, so a read is never sent to wait on an earlier
+    /// region to stream up to bytes a later one already holds.
+    fn region_for(&self, offset: u64) -> Option<usize> {
+        (0..self.regions.len())
+            .filter(|&i| offset >= self.regions[i].start && offset <= self.regions[i].end() + JOIN_AHEAD)
+            .max_by_key(|&i| self.regions[i].start)
+    }
+    /// Feed the stream to region `i`, from where it ends.
+    fn activate(&mut self, i: usize) {
+        self.active = i;
+        self.want = Some(self.regions[i].end());
+        self.stop = false;
         self.asked_at = Instant::now();
         self.grew_at = Instant::now();
+    }
+    /// A read far from every region: open one at `offset` and point the stream at it.
+    fn jump_to(&mut self, offset: u64) -> usize {
+        if self.regions.len() >= MAX_REGIONS {
+            // Drop the least recently read region, never the active one if avoidable.
+            let victim = (0..self.regions.len())
+                .filter(|&i| i != self.active || self.regions.len() == 1)
+                .min_by_key(|&i| self.regions[i].used)
+                .unwrap_or(0);
+            self.remove(victim);
+        }
+        self.regions.push(Region::new(offset));
+        let i = self.regions.len() - 1;
+        self.activate(i);
+        i
+    }
+    fn remove(&mut self, i: usize) {
+        self.regions.remove(i);
+        if self.regions.is_empty() {
+            self.regions.push(Region::new(0));
+        }
+        if self.active > i || self.active >= self.regions.len() {
+            self.active = self.active.saturating_sub(1);
+        }
+    }
+    /// The active region grew into another: drop the other, whose bytes it now covers.
+    fn absorb_overtaken(&mut self) {
+        let (start, end) = (self.regions[self.active].start, self.active_end());
+        let overtaken: Vec<usize> = (0..self.regions.len())
+            .filter(|&i| i != self.active && self.regions[i].start > start && self.regions[i].start < end)
+            .collect();
+        for i in overtaken.into_iter().rev() {
+            self.remove(i);
+        }
+    }
+    /// Over the memory cap: drop regions nobody is reading, oldest first. Returns whether
+    /// that was enough.
+    fn trim(&mut self, reading: Option<usize>) -> bool {
+        // First, read-ahead nobody is near: what a region holds well past its reader.
+        if self.buffered() >= WINDOW {
+            for i in 0..self.regions.len() {
+                if i == self.active || Some(i) == reading {
+                    continue;
+                }
+                let r = &mut self.regions[i];
+                let keep = (r.read_to + KEEP_AHEAD).saturating_sub(r.start) as usize;
+                if r.buf.len() > keep {
+                    r.buf.truncate(keep);
+                }
+            }
+        }
+        while self.buffered() >= WINDOW && self.regions.len() > 1 {
+            let victim = (0..self.regions.len())
+                .filter(|&i| i != self.active && Some(i) != reading)
+                .min_by_key(|&i| self.regions[i].used);
+            match victim {
+                Some(v) => self.remove(v),
+                None => break,
+            }
+        }
+        self.buffered() < WINDOW
+    }
+    fn reset(&mut self) {
+        self.regions = vec![Region::new(0)];
+        self.active = 0;
     }
 }
 
@@ -100,19 +214,19 @@ impl StreamPipe {
             size,
             expect,
             st: Mutex::new(State {
-                start: 0,
-                buf: VecDeque::new(),
+                regions: vec![Region::new(0)],
+                active: 0,
                 running: false,
                 want: None,
                 stop: false,
                 overfull: false,
                 failed: false,
-                finished: false,
+                served_to: 0,
                 released: false,
                 grew_at: Instant::now(),
                 asked_at: Instant::now(),
                 hasher,
-                hashed_to: 0,
+                inorder_to: 0,
                 verified: None,
             }),
             cv: Condvar::new(),
@@ -132,7 +246,7 @@ impl StreamPipe {
             st.stop = false;
             st.want = None;
             st.running = false;
-            return PipeCmd::Released { finished: st.finished };
+            return PipeCmd::Released { finished: st.served_to >= self.size };
         }
         if let Some(offset) = st.want.take() {
             st.running = true;
@@ -147,33 +261,34 @@ impl StreamPipe {
         PipeCmd::Nothing
     }
 
-    /// A stream begins at `offset`. Accepted only where the buffered bytes end, so the
+    /// A stream begins at `offset`. Accepted only where the active region ends, so the
     /// bytes can never land at the wrong place.
     pub fn begin(&self, offset: u64) -> bool {
         let Ok(st) = self.st.lock() else { return false };
-        offset == st.have_end()
+        offset == st.active_end()
     }
 
     /// Bytes arrived, starting at file offset `at`. Returns false when the window is
     /// full: the caller stops the stream, and it is restarted from here once the paste has
     /// read some of it.
     ///
-    /// Bytes are kept only when `at` is exactly where the buffer ends. A read that jumps
-    /// (a thumbnailer or player seeking) restarts the buffer at once, but the old stream
-    /// goes on delivering until the clipboard thread cancels it. Appending those bytes
-    /// would put them at the wrong offset, and the paste would then copy a corrupt file.
+    /// Bytes are kept only when `at` is exactly where the active region ends. A read that
+    /// jumps moves the stream at once, but the old stream goes on delivering until the
+    /// clipboard thread cancels it. Appending those bytes would put them at the wrong
+    /// offset, and the paste would then copy a corrupt file (B25).
     pub fn push(&self, at: u64, data: &[u8]) -> bool {
         let Ok(mut st) = self.st.lock() else { return false };
-        if at != st.have_end() {
+        if at != st.active_end() {
             return true; // a superseded stream: dropped, and cancelled on the next drive
         }
-        let room = (self.size - st.have_end().min(self.size)) as usize;
-        let at = st.have_end();
+        let room = (self.size - at.min(self.size)) as usize;
         let data = &data[..data.len().min(room)];
-        st.buf.extend(data);
+        let a = st.active;
+        st.regions[a].buf.extend(data);
         self.hash_through(&mut st, at, data);
         st.grew_at = Instant::now();
-        let ok = st.buf.len() < WINDOW;
+        st.absorb_overtaken();
+        let ok = st.trim(None);
         if !ok {
             st.overfull = true;
         }
@@ -181,26 +296,21 @@ impl StreamPipe {
         ok
     }
 
-    /// Feed the in-order part of `data` (which starts at file offset `at`) to the hash.
+    /// Note the in-order part of `data` (which starts at file offset `at`), hashing it
+    /// for a hashed file. Bytes ahead of `inorder_to` are skipped, not held against the
+    /// file: they will arrive again in order when the paste gets there.
     fn hash_through(&self, st: &mut State, at: u64, data: &[u8]) {
-        let Some(expect) = &self.expect else { return };
         let end = at + data.len() as u64;
-        if st.hasher.is_some() && end > st.hashed_to {
-            if at > st.hashed_to {
-                // Bytes were skipped (a jump ahead), so the hash can no longer be computed.
-                st.hasher = None;
-                st.verified = Some(false);
-                tracing::warn!(at, hashed_to = st.hashed_to, "streamed file skipped ahead; it cannot be verified, so the paste will fail");
-                return;
-            }
-            let from = (st.hashed_to - at) as usize;
-            if let Some(h) = st.hasher.as_mut() {
-                h.update(&data[from..]);
-            }
-            st.hashed_to = end;
+        if at > st.inorder_to || end <= st.inorder_to {
+            return;
         }
-        if st.hashed_to >= self.size && st.verified.is_none() {
-            if let Some(h) = st.hasher.take() {
+        let from = (st.inorder_to - at) as usize;
+        if let Some(h) = st.hasher.as_mut() {
+            h.update(&data[from..]);
+        }
+        st.inorder_to = end;
+        if st.inorder_to >= self.size && st.verified.is_none() {
+            if let (Some(expect), Some(h)) = (&self.expect, st.hasher.take()) {
                 let ok = crate::cache::hex(&h.finalize()) == *expect;
                 st.verified = Some(ok);
                 if ok {
@@ -236,14 +346,13 @@ impl StreamPipe {
             st.stop = false;
             if st.released {
                 st.released = false;
-                st.buf.clear();
-                st.start = 0;
+                st.reset();
                 st.want = None;
                 st.running = false;
                 st.overfull = false;
-                st.finished = false;
+                st.served_to = 0;
                 st.hasher = self.expect.as_ref().map(|_| Sha256::new());
-                st.hashed_to = 0;
+                st.inorder_to = 0;
                 st.verified = None;
             }
             st.grew_at = Instant::now();
@@ -259,9 +368,10 @@ impl StreamPipe {
         self.cv.notify_all();
     }
 
-    /// Every byte has arrived.
+    /// Every byte has arrived, in order from the start. A stream that ran from somewhere
+    /// near the end, for a thumbnail, does not count.
     pub fn complete(&self) -> bool {
-        self.st.lock().map(|st| st.have_end() >= self.size).unwrap_or(false)
+        self.st.lock().map(|st| st.inorder_to >= self.size).unwrap_or(false)
     }
 
     // ----- the paste's side -----
@@ -293,12 +403,13 @@ impl StreamPipe {
             if st.failed {
                 return Got::Fail;
             }
-            // A step back past what is kept, or a jump far ahead: start over from there.
-            if offset < st.start || offset > st.have_end() + WINDOW as u64 / 2 {
-                st.restart_at(offset);
-            }
+            let r = match st.region_for(offset) {
+                Some(r) => r,
+                None => st.jump_to(offset),
+            };
+            st.regions[r].used = Instant::now();
             let mut tail_pending = false;
-            if st.have_end() >= end {
+            if st.regions[r].end() >= end {
                 // The last bytes of a hashed file are only handed over once it verified.
                 if end == self.size && self.expect.is_some() && st.verified != Some(true) {
                     if st.verified == Some(false) {
@@ -306,32 +417,39 @@ impl StreamPipe {
                     }
                     tail_pending = true;
                 } else {
-                    let from = (offset - st.start) as usize;
-                    let to = (end - st.start) as usize;
-                    let out: Vec<u8> = st.buf.range(from..to).copied().collect();
-                    if end == self.size {
-                        st.finished = true;
+                    let region = &mut st.regions[r];
+                    region.read_to = region.read_to.max(end);
+                    let from = (offset - region.start) as usize;
+                    let to = (end - region.start) as usize;
+                    let out: Vec<u8> = region.buf.range(from..to).copied().collect();
+                    // Drop what the reader has finished with, keeping a little behind it.
+                    let keep_from = end.saturating_sub(KEEP_BEHIND).max(region.start);
+                    let drop = (keep_from - region.start) as usize;
+                    region.buf.drain(..drop);
+                    region.start = keep_from;
+                    if offset <= st.served_to {
+                        st.served_to = st.served_to.max(end);
                     }
-                    // Drop what the paste has finished with, keeping a little behind it.
-                    let keep_from = end.saturating_sub(KEEP_BEHIND).max(st.start);
-                    let drop = (keep_from - st.start) as usize;
-                    st.buf.drain(..drop);
-                    st.start = keep_from;
                     return Got::Data(out);
                 }
             }
             if !tail_pending {
-                // Missing bytes and nothing on its way, or no progress for a while (a
-                // dropped connection, a stream stopped for flow control): ask from here.
-                let quiet = st.grew_at.elapsed() > NUDGE && st.asked_at.elapsed() > NUDGE;
-                if st.want.is_none() && (!st.running || quiet) {
-                    let at = st.have_end();
-                    st.want = Some(at);
-                    // A reader asking supersedes an earlier release: without this, a
-                    // pending stop swallowed the request and the paste sat idle until the
-                    // next nudge, ten seconds later.
-                    st.stop = false;
-                    st.asked_at = Instant::now();
+                if r != st.active {
+                    // Another region is wanted: move the one stream there, from where it ends.
+                    st.activate(r);
+                } else {
+                    // Missing bytes and nothing on its way, or no progress for a while (a
+                    // dropped connection, a stream stopped for flow control): ask from here.
+                    let quiet = st.grew_at.elapsed() > NUDGE && st.asked_at.elapsed() > NUDGE;
+                    if st.want.is_none() && (!st.running || quiet) {
+                        let at = st.active_end();
+                        st.want = Some(at);
+                        // A reader asking supersedes an earlier release: without this, a
+                        // pending stop swallowed the request and the paste sat idle until
+                        // the next nudge, ten seconds later.
+                        st.stop = false;
+                        st.asked_at = Instant::now();
+                    }
                 }
             }
             if st.grew_at.elapsed() > stall {
@@ -351,9 +469,7 @@ impl StreamPipe {
     /// The paste closed the file. Stop streaming and free the memory.
     pub fn release(&self) {
         if let Ok(mut st) = self.st.lock() {
-            st.buf.clear();
-            st.buf.shrink_to_fit();
-            st.start = 0;
+            st.reset();
             st.want = None;
             st.stop = true;
             st.released = true;
@@ -438,7 +554,7 @@ mod tests {
         // The paste reads; once it needs more than is buffered, the stream restarts there.
         let got = p.read(0, WINDOW as u64, Duration::from_millis(1));
         assert!(got.is_some());
-        assert!(p.st.lock().unwrap().buf.len() <= KEEP_BEHIND as usize + chunk.len());
+        assert!(p.st.lock().unwrap().buffered() <= KEEP_BEHIND as usize + chunk.len());
     }
 
     #[test]
@@ -449,7 +565,7 @@ mod tests {
         p.push(0, &[1u8; 50]);
         p.release();
         assert_eq!(p.take_command(), PipeCmd::Released { finished: false }, "a cancel, reported as one");
-        assert!(p.st.lock().unwrap().buf.is_empty());
+        assert_eq!(p.st.lock().unwrap().buffered(), 0);
     }
 
     #[test]
@@ -519,9 +635,13 @@ mod tests {
         assert_eq!(p.take_command(), PipeCmd::Start(0));
         assert!(p.begin(0));
         p.push(0, &body[..10]);
-        p.st.lock().unwrap().restart_at(150); // the seek
+        p.st.lock().unwrap().jump_to(150); // the seek
         p.push(10, &body[10..20]); // still in flight from the old stream
-        assert_eq!(p.st.lock().unwrap().buf.len(), 0, "the stale bytes were dropped");
+        {
+            let st = p.st.lock().unwrap();
+            assert_eq!(st.regions[st.active].buf.len(), 0, "the stale bytes were dropped");
+            assert_eq!(st.buffered(), 10, "and the first 10 bytes are still held");
+        }
         assert!(p.begin(150));
         p.push(150, &body[150..160]);
         assert_eq!(p.read(150, 10, Duration::from_secs(1)).unwrap(), &body[150..160]);
@@ -549,5 +669,105 @@ mod tests {
         assert!(p.begin(0));
         p.push(0, b"0123456780"); // damaged this time
         assert!(p.read(4, 6, Duration::from_secs(1)).is_none(), "checked again, not waved through");
+    }
+
+    fn byte_at(i: u64) -> u8 {
+        (i.wrapping_mul(7) % 251) as u8
+    }
+
+    /// The peer, reduced to its essentials: each Start streams from that offset, a newer
+    /// Start or a Stop ends the old stream. Returns the offsets it was asked to start at.
+    fn fake_peer(p: Arc<StreamPipe>, done: Arc<std::sync::atomic::AtomicBool>) -> std::thread::JoinHandle<Vec<u64>> {
+        std::thread::spawn(move || {
+            let mut starts = Vec::new();
+            let mut pos: Option<u64> = None;
+            while !done.load(std::sync::atomic::Ordering::SeqCst) {
+                match p.take_command() {
+                    PipeCmd::Start(off) => {
+                        starts.push(off);
+                        pos = p.begin(off).then_some(off);
+                    }
+                    PipeCmd::Stop | PipeCmd::Released { .. } => pos = None,
+                    PipeCmd::Nothing => {}
+                }
+                match pos {
+                    Some(at) if at < p.size() => {
+                        let n = (256 * 1024).min(p.size() - at);
+                        let chunk: Vec<u8> = (at..at + n).map(byte_at).collect();
+                        pos = if p.push(at, &chunk) { Some(at + n) } else { None };
+                    }
+                    Some(_) => {
+                        p.interrupted();
+                        pos = None;
+                    }
+                    None => std::thread::sleep(Duration::from_millis(1)),
+                }
+            }
+            starts
+        })
+    }
+
+    fn expect_bytes(got: &[u8], from: u64) {
+        assert!(got.iter().enumerate().all(|(i, b)| *b == byte_at(from + i as u64)), "wrong bytes at {from}");
+    }
+
+    /// B24: a thumbnailer reads the start, the index at the end, the start again, then on.
+    /// Going back must be answered from memory, and going on must continue the first
+    /// stretch, not start the file over.
+    #[test]
+    fn a_reader_that_jumps_to_the_end_and_back_does_not_restart_the_file() {
+        const MB: u64 = 1024 * 1024;
+        let size = 100 * MB;
+        let p = Arc::new(StreamPipe::new(size, None));
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let peer = fake_peer(p.clone(), done.clone());
+        let stall = Duration::from_secs(10);
+
+        expect_bytes(&p.read(0, MB, stall).unwrap(), 0);
+        let tail = size - 64 * 1024;
+        expect_bytes(&p.read(tail, 64 * 1024, stall).unwrap(), tail);
+        expect_bytes(&p.read(0, MB, stall).unwrap(), 0); // back to the start
+        expect_bytes(&p.read(MB, MB, stall).unwrap(), MB);
+        expect_bytes(&p.read(20 * MB, MB, stall).unwrap(), 20 * MB); // and on
+
+        done.store(true, std::sync::atomic::Ordering::SeqCst);
+        let starts = peer.join().unwrap();
+        assert_eq!(starts[0], 0);
+        assert_eq!(starts[1], tail, "the index is fetched on its own");
+        assert!(starts.iter().filter(|&&s| s == 0).count() == 1, "the file is never started over: {starts:?}");
+        assert!(starts.len() <= 3, "at most one more start, continuing the first stretch: {starts:?}");
+        assert!(p.st.lock().unwrap().buffered() <= WINDOW, "memory stays capped");
+    }
+
+    /// Reading only the tail is not a finished paste, and does not spoil the hash check
+    /// for the paste that reads it all in order afterwards.
+    #[test]
+    fn a_tail_read_neither_finishes_the_paste_nor_spoils_its_check() {
+        let body: Vec<u8> = (0..100u32).map(|i| (i * 3) as u8).collect();
+        let p = StreamPipe::new(100, Some(crate::cache::hash_bytes(&body)));
+        // A thumbnailer jumps to byte 90; the stream for it delivers the tail.
+        p.st.lock().unwrap().jump_to(90);
+        let _ = p.take_command();
+        assert!(p.begin(90));
+        p.push(90, &body[90..]);
+        assert!(!p.complete(), "a tail stream is not every byte");
+        // Then the real paste, from the start.
+        p.st.lock().unwrap().jump_to(0);
+        let _ = p.take_command();
+        assert!(p.begin(0));
+        p.push(0, &body);
+        assert!(p.complete());
+        assert_eq!(p.read(0, 100, Duration::from_secs(1)).unwrap(), body, "verified and served");
+        p.release();
+        assert_eq!(p.take_command(), PipeCmd::Released { finished: true });
+
+        let q = StreamPipe::new(100, None);
+        q.st.lock().unwrap().jump_to(90);
+        let _ = q.take_command();
+        assert!(q.begin(90));
+        q.push(90, &body[90..]);
+        assert_eq!(q.read(90, 10, Duration::from_secs(1)).unwrap(), &body[90..]);
+        q.release();
+        assert_eq!(q.take_command(), PipeCmd::Released { finished: false }, "only the tail was read");
     }
 }
