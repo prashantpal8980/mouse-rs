@@ -67,9 +67,6 @@ fn default_lock_hotkey() -> String {
 fn default_edge_threshold() -> i32 {
     2
 }
-fn default_warp_threshold() -> i32 {
-    120
-}
 fn default_name() -> String {
     "mouse-rs".into()
 }
@@ -395,8 +392,9 @@ pub struct Config {
 
     #[serde(default = "default_edge_threshold")]
     pub edge_threshold_px: i32,
-    #[serde(default = "default_warp_threshold")]
-    pub warp_threshold_px: i32,
+    // `warp_threshold_px` (the Python app's "return distance") was dropped on 2026-10-14
+    // by the owner's decision: the Rust engine never read it. Old config files that still
+    // carry the key load fine, because unknown keys are ignored.
 }
 
 impl Default for Config {
@@ -459,7 +457,6 @@ impl Default for Config {
             screen_width: 1920,
             screen_height: 1080,
             edge_threshold_px: default_edge_threshold(),
-            warp_threshold_px: default_warp_threshold(),
         }
     }
 }
@@ -854,7 +851,7 @@ mod tests {
         let cfg: Config = serde_json::from_str(json).unwrap();
         assert_eq!(cfg.listen_port, 24800);
         assert!(cfg.tls_enabled);
-        assert_eq!(cfg.warp_threshold_px, 120);
+        // The file still carries the dropped `warp_threshold_px`; it must load anyway.
     }
 
     #[test]

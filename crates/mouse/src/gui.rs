@@ -19,43 +19,92 @@ use mouse_input::screen_size;
 use crate::run::EngineHandle;
 use crate::ui_theme::{self, Palette, Theme6};
 
-/// Which config section is showing.
+/// The main window's tabs: only what is used every day (R28). Everything else is a
+/// setting, and settings live in ⋯ → Settings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Tab {
     Connection,
-    Layout,
-    Security,
     Clipboard,
-    Startup,
 }
 
 impl Tab {
-    const ALL: [Tab; 5] = [
-        Tab::Connection,
-        Tab::Layout,
-        Tab::Security,
-        Tab::Clipboard,
-        Tab::Startup,
-    ];
+    const ALL: [Tab; 2] = [Tab::Connection, Tab::Clipboard];
     fn label(self) -> &'static str {
         match self {
             Tab::Connection => "Connection",
-            Tab::Layout => "Layout",
-            Tab::Security => "Security",
             Tab::Clipboard => "Clipboard",
-            Tab::Startup => "Startup",
         }
     }
 }
 
-/// The Clipboard tab has two jobs that do not belong on one screen: *using* the history
-/// and *configuring* it. Showing both at once made the tab read as a pile of unrelated
-/// controls — the history you came for, buried under a dozen numeric fields you did not.
-/// One tab, two views, one visible at a time.
+/// A page of ⋯ → Settings, like a category in a phone's Settings app (R24, R29, R30).
+///
+/// The order of [`Page::CATEGORIES`] is the order on screen: the ones people change most
+/// first. Each page shows its everyday settings and ends with a closed Advanced section.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ClipView {
-    History,
-    Settings,
+enum Page {
+    /// The list of categories.
+    Index,
+    Clipboard,
+    Screens,
+    Startup,
+    Keys,
+    Connection,
+    Security,
+    Appearance,
+    Diagnostics,
+    About,
+}
+
+impl Page {
+    /// (group heading, its pages), in the order shown (R30).
+    const CATEGORIES: [(&'static str, &'static [Page]); 3] = [
+        ("EVERYDAY", &[Page::Clipboard, Page::Screens, Page::Startup, Page::Keys]),
+        ("SETUP", &[Page::Connection, Page::Security, Page::Appearance]),
+        ("HELP & ADVANCED", &[Page::Diagnostics, Page::About]),
+    ];
+    fn title(self) -> &'static str {
+        match self {
+            Page::Index => "Settings",
+            Page::Clipboard => "Clipboard",
+            Page::Screens => "Screens & edges",
+            Page::Startup => "Startup",
+            Page::Keys => "Keyboard & hotkeys",
+            Page::Connection => "Connection",
+            Page::Security => "Security & pairing",
+            Page::Appearance => "Appearance",
+            Page::Diagnostics => "Diagnostics",
+            Page::About => "About",
+        }
+    }
+    fn icon(self) -> &'static str {
+        match self {
+            Page::Index => "⚙",
+            Page::Clipboard => "📋",
+            Page::Screens => "🖥",
+            Page::Startup => "⏻",
+            Page::Keys => "⌨",
+            Page::Connection => "🔗",
+            Page::Security => "🔒",
+            Page::Appearance => "🎨",
+            Page::Diagnostics => "🩺",
+            Page::About => "ℹ",
+        }
+    }
+    fn summary(self) -> &'static str {
+        match self {
+            Page::Index => "",
+            Page::Clipboard => "What to share, history, files, transfers",
+            Page::Screens => "Which side the other computer is on",
+            Page::Startup => "Start at login, connect automatically",
+            Page::Keys => "Getting control back",
+            Page::Connection => "Name, ports, reconnecting, profiles",
+            Page::Security => "Shared secret, encryption",
+            Page::Appearance => "Theme",
+            Page::Diagnostics => "Log file, sending logs for support",
+            Page::About => "Version, restore default settings",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -80,8 +129,18 @@ enum Message {
     ClipRemove(u64),
     ClipClear,
     ClipCacheClear,
-    ClipAdvancedToggled(bool),
-    ClipViewPicked(ClipView),
+    /// Open ⋯ → Settings at this page; `Index` is the list of categories.
+    OpenSettings(Page),
+    /// Back to the main window.
+    CloseSettings,
+    /// Open or close a settings page's Advanced section.
+    AdvancedToggled(Page),
+    EdgeThresholdChanged(String),
+    DiscoveryPortChanged(String),
+    CacheDirChanged(String),
+    HashLimitMbChanged(String),
+    LogUploadUrlChanged(String),
+    LogUploadSecsChanged(String),
     ClipSyncTextToggled(bool),
     ClipSyncImagesToggled(bool),
     ClipItemsChanged(String),
@@ -217,6 +276,8 @@ fn pending_restart_changes(live: &Config, now: &Config) -> Vec<&'static str> {
     chk(live.server_host != now.server_host, "server host");
     chk(live.server_port != now.server_port, "server port");
     chk(live.reconnect != now.reconnect, "auto-reconnect");
+    chk(live.edge_threshold_px != now.edge_threshold_px, "edge sensitivity");
+    chk(live.discovery_port != now.discovery_port, "discovery port");
     chk(live.exit_edge != now.exit_edge, "exit edge");
     chk(live.entry_edge != now.entry_edge, "entry edge");
     chk(
@@ -299,11 +360,15 @@ struct App {
     /// so the footer can hold only the two actions used constantly — the old footer packed
     /// in eight and pushed Stop and Quit off the edge at normal window width.
     menu_open: bool,
-    /// Whether the Clipboard tab's Advanced settings are expanded. Everything is
-    /// configurable, but not everything is shown at once: the four settings most people
-    /// touch stay visible and the rest sit one click away.
-    clip_advanced: bool,
-    clip_view: ClipView,
+    /// The settings page showing, or `None` for the main window.
+    page: Option<Page>,
+    /// Pages whose Advanced section is open. All closed at launch: everything is
+    /// configurable, but the everyday settings are what a page shows first (R25).
+    adv_open: Vec<Page>,
+    edge_threshold_s: String,
+    discovery_port_s: String,
+    hash_limit_mb_s: String,
+    log_upload_secs_s: String,
     // String buffers for the numeric clipboard settings, same reason as the ports:
     // a partial edit ("1" on the way to "128") must not be parsed and written back.
     clip_items_s: String,
@@ -429,8 +494,12 @@ impl App {
             scan: Arc::new(Mutex::new(ScanState::Idle)),
             found_servers: Vec::new(),
             menu_open: false,
-            clip_advanced: false,
-            clip_view: ClipView::History,
+            page: None,
+            adv_open: Vec::new(),
+            edge_threshold_s: String::new(),
+            discovery_port_s: String::new(),
+            hash_limit_mb_s: String::new(),
+            log_upload_secs_s: String::new(),
             clip_items_s: String::new(),
             clip_item_mb_s: String::new(),
             clip_mem_mb_s: String::new(),
@@ -449,6 +518,18 @@ impl App {
             cfg,
         };
         app.sync_buffers();
+        // A screenshot aid: `MOUSE_RS_OPEN_SETTINGS=clipboard` opens the panel at that
+        // settings page with its Advanced section expanded ("index" for the list), so each
+        // page can be checked without clicking through a live panel, where synthetic
+        // clicks can be forwarded to the other machine.
+        if let Ok(want) = std::env::var("MOUSE_RS_OPEN_SETTINGS") {
+            let all = std::iter::once(Page::Index).chain(Page::CATEGORIES.iter().flat_map(|(_, p)| p.iter().copied()));
+            let want = want.to_lowercase();
+            if let Some(pg) = all.into_iter().find(|p| p.title().to_lowercase().starts_with(&want) || (want == "index" && *p == Page::Index)) {
+                app.page = Some(pg);
+                app.adv_open.push(pg);
+            }
+        }
         app
     }
 
@@ -458,6 +539,10 @@ impl App {
         self.listen_port_s = self.cfg.listen_port.to_string();
         self.screen_w_s = self.cfg.screen_width.to_string();
         self.screen_h_s = self.cfg.screen_height.to_string();
+        self.edge_threshold_s = self.cfg.edge_threshold_px.to_string();
+        self.discovery_port_s = self.cfg.discovery_port.to_string();
+        self.hash_limit_mb_s = (self.cfg.clipboard_hash_limit / (1024 * 1024)).to_string();
+        self.log_upload_secs_s = self.cfg.log_upload_secs.to_string();
         self.clip_items_s = self.cfg.clipboard_history_size.to_string();
         self.clip_item_mb_s = mb_of(self.cfg.clipboard_max_item_bytes);
         self.clip_mem_mb_s = mb_of(self.cfg.clipboard_memory_budget);
@@ -791,8 +876,44 @@ impl App {
                     self.feedback = "history cleared (pinned entries kept)".into();
                 }
             }
-            Message::ClipAdvancedToggled(v) => self.clip_advanced = v,
-            Message::ClipViewPicked(v) => self.clip_view = v,
+            Message::OpenSettings(pg) => {
+                self.page = Some(pg);
+                self.menu_open = false;
+            }
+            Message::CloseSettings => self.page = None,
+            Message::AdvancedToggled(pg) => {
+                if let Some(i) = self.adv_open.iter().position(|x| *x == pg) {
+                    self.adv_open.remove(i);
+                } else {
+                    self.adv_open.push(pg);
+                }
+            }
+            Message::EdgeThresholdChanged(s) => {
+                if let Ok(v) = s.trim().parse::<i32>() {
+                    self.cfg.edge_threshold_px = v.max(0);
+                }
+                self.edge_threshold_s = s;
+            }
+            Message::DiscoveryPortChanged(s) => {
+                if let Ok(v) = s.trim().parse::<u16>() {
+                    self.cfg.discovery_port = v;
+                }
+                self.discovery_port_s = s;
+            }
+            Message::CacheDirChanged(s) => self.cfg.cache_dir = s,
+            Message::HashLimitMbChanged(s) => {
+                if let Ok(v) = s.trim().parse::<u64>() {
+                    self.cfg.clipboard_hash_limit = v.saturating_mul(1024 * 1024);
+                }
+                self.hash_limit_mb_s = s;
+            }
+            Message::LogUploadUrlChanged(s) => self.cfg.log_upload_url = s,
+            Message::LogUploadSecsChanged(s) => {
+                if let Ok(v) = s.trim().parse::<u32>() {
+                    self.cfg.log_upload_secs = v.max(1);
+                }
+                self.log_upload_secs_s = s;
+            }
             Message::ClipSyncTextToggled(v) => self.cfg.clipboard_sync_text = v,
             Message::ClipSyncImagesToggled(v) => self.cfg.clipboard_sync_images = v,
             // The numeric settings keep their own string buffer so a half-typed value is
@@ -1179,6 +1300,7 @@ impl App {
             }
             Message::RestoreDefaults => {
                 self.menu_open = false;
+                self.adv_open.clear();
                 // Resets *preferences*, never facts about this machine. Wiping the name,
                 // the screen size or the secret is not "restoring defaults", it is losing
                 // information the user cannot retype from memory:
@@ -1241,12 +1363,14 @@ impl App {
         let running = self.running();
         let snap = self.engine.as_ref().map(|e| e.status());
 
-        let mut content = column![
-            self.header(p, running, snap.as_ref()),
-            self.hero(p, running, snap.as_ref()),
-        ]
-        .spacing(12.0)
-        .padding(16.0);
+        let mut content = column![self.header(p, running, snap.as_ref())]
+            .spacing(12.0)
+            .padding(16.0);
+        // The hero answers "who has the mouse right now", which is what the main window
+        // is for. A settings page is a different task and gets the room instead.
+        if self.page.is_none() {
+            content = content.push(self.hero(p, running, snap.as_ref()));
+        }
         if let Some(banner) = self.restart_banner(p) {
             content = content.push(banner);
         }
@@ -1260,10 +1384,17 @@ impl App {
         if let Some(banner) = self.login_screen_notice(p) {
             content = content.push(banner);
         }
-        let content = content.push(self.tab_bar(p)).push(
-            scrollable(container(self.tab_body(p, running)).padding([4.0, 2.0]))
-                .height(Length::Fill),
-        ).push(self.footer(p, running));
+        let content = match self.page {
+            None => content.push(self.tab_bar(p)).push(
+                scrollable(container(self.tab_body(p, running)).padding([4.0, 2.0]))
+                    .height(Length::Fill),
+            ),
+            Some(pg) => content.push(self.settings_bar(p, pg)).push(
+                scrollable(container(self.settings_body(p, pg)).padding([4.0, 2.0]))
+                    .height(Length::Fill),
+            ),
+        }
+        .push(self.footer(p, running));
 
         let page: Element<'_, Message> = container(content)
             .style(move |_| ui_theme::root(p))
@@ -1447,13 +1578,13 @@ impl App {
     fn tab_body(&self, p: Palette, running: bool) -> Element<'_, Message> {
         match self.tab {
             Tab::Connection => self.tab_connection(p, running),
-            Tab::Layout => self.tab_layout(p),
-            Tab::Security => self.tab_security(p),
             Tab::Clipboard => self.tab_clipboard(p),
-            Tab::Startup => self.tab_startup(p),
         }
     }
 
+    /// The main window's Connection tab: who this computer is, and how it finds the other
+    /// one (R30). Ports, auto-reconnect, the machine name and profiles are in
+    /// ⋯ → Settings → Connection.
     fn tab_connection(&self, p: Palette, _running: bool) -> Element<'_, Message> {
         let server_side = self.cfg.role == Role::Server;
 
@@ -1464,27 +1595,21 @@ impl App {
         ]
         .spacing(6.0);
 
-        let net = if server_side {
-            // Real addresses of this machine, so the bind address is chosen rather than
-            // typed from memory.
+        let net: Element<'_, Message> = if server_side {
+            // The server is found by the client, so what matters here is what to tell it.
+            // Choosing which of these addresses to listen on is in Settings → Connection.
             let local = mouse_core::discover::listen_candidates();
-            let picked = local
-                .iter()
-                .find(|c| **c == self.cfg.listen_host)
-                .cloned();
             column![
-                labeled(p, "Listen host", input(p, "0.0.0.0", &self.cfg.listen_host, Message::ListenHostChanged)),
-                labeled(
-                    p,
-                    "This machine's addresses",
-                    pick_list(local, picked, Message::ListenHostPicked)
-                        .width(Length::Fill)
-                        .padding([10.0, 12.0])
-                        .text_size(13.0),
-                ),
-                labeled(p, "Listen port", input(p, "24800", &self.listen_port_s, Message::ListenPortChanged)),
+                field_label(p, "This computer's addresses"),
+                text(if local.is_empty() { "none found".to_string() } else { local.join("  ·  ") })
+                    .size(13.0)
+                    .color(p.txt2),
+                text("The other computer finds this one by itself on a shared network; type one of these there only if it does not.")
+                    .size(11.0)
+                    .color(p.txt3),
             ]
-            .spacing(12.0)
+            .spacing(6.0)
+            .into()
         } else {
             let scanning = matches!(*self.scan.lock().unwrap(), ScanState::Running);
             let detect = button(
@@ -1525,18 +1650,24 @@ impl App {
                         .text_size(13.0),
                 ));
             }
-
-            col.push(labeled(p, "Server port", input(p, "24800", &self.server_port_s, Message::ServerPortChanged)))
-                .push(toggle_row(p, "Auto-reconnect", "retry with backoff until the server appears", self.cfg.reconnect, Message::ReconnectToggled))
+            col.into()
         };
 
-        card(p, column![field_label(p, "Role"), role, net].spacing(14.0))
+        card(p, column![
+            field_label(p, "Role"),
+            role,
+            net,
+            text("Ports, auto-reconnect and this computer's name: ⋯ → Settings → Connection.")
+                .size(11.0)
+                .color(p.txt3),
+        ]
+        .spacing(14.0))
     }
 
-    /// How the app behaves at login, plus profiles. Split out of Connection because it is a
-    /// different question — how this machine starts the app, not how it reaches the peer —
-    /// and because Connection had grown to nine fields and had to be scrolled.
-    fn tab_startup(&self, p: Palette) -> Element<'_, Message> {
+    /// Settings → Startup: how the app behaves at login. Split out of Connection because it
+    /// is a different question — how this machine starts the app, not how it reaches the
+    /// peer. Every setting here is everyday, so the page has no Advanced section.
+    fn page_startup(&self, p: Palette) -> Element<'_, Message> {
         // The three are deliberately independent: the OS launches the panel (Start at
         // login), the panel brings the link up by itself (Auto-connect), and it stays out
         // of the way while doing so (Start minimized).
@@ -1613,21 +1744,7 @@ impl App {
             }
         }
 
-        // The panel has no console behind it, so name the log file here — otherwise a user
-        // hitting a problem has nothing to look at and nothing to send.
-        let logs = column![
-            field_label(p, "Log file"),
-            text(&self.log_path).size(11.0).color(p.txt3),
-        ]
-        .spacing(6.0);
-
-        card(p, column![
-            labeled(p, "Machine name", input(p, "this-machine", &self.cfg.name, Message::NameChanged)),
-            startup,
-            logs,
-            self.profiles_section(p),
-        ]
-        .spacing(14.0))
+        card(p, column![section(p, "When I log in"), startup].spacing(14.0))
     }
 
     /// Install or remove the login-screen service, then re-read what systemd actually
@@ -1730,7 +1847,7 @@ impl App {
         }
     }
 
-    /// The Layout tab, showing only what this machine's role actually uses.
+    /// Settings → Screens & edges, showing only what this machine's role actually uses.
     ///
     /// The client engine reads `entry_edge` and nothing else — it never looks at
     /// `exit_edge` (`client.rs:37`). So on a client the Exit-edge picker was a dial
@@ -1741,8 +1858,8 @@ impl App {
     /// Deciding where to *leave* from is the server's business, because the server is
     /// what watches its own edges and hands control over. The client's only edge
     /// question is where control comes back.
-    fn tab_layout(&self, p: Palette) -> Element<'_, Message> {
-        let mut body = column![].spacing(14.0);
+    fn page_screens(&self, p: Palette) -> Element<'_, Message> {
+        let mut body = column![section(p, "Arrangement")].spacing(14.0);
 
         if shows_exit_edge(self.cfg.role) {
             // Leaving through one edge means arriving through the facing one; anything
@@ -1777,7 +1894,8 @@ impl App {
                     .width(Length::Fill),
             );
 
-        card(p, body.push(column![
+        let adv = column![
+            section(p, "This screen"),
             field_label(p, "Screen size (px)"),
             row![
                 input(p, "1920", &self.screen_w_s, Message::ScreenWChanged),
@@ -1788,11 +1906,18 @@ impl App {
             .spacing(10.0)
             .align_y(Alignment::Center),
             text("The engine re-detects this on Start; edit only to override.").size(11.0).color(p.txt3),
+            section(p, "Crossing feel"),
+            labeled(p, "Edge sensitivity (px from the edge)", input(p, "2", &self.edge_threshold_s, Message::EdgeThresholdChanged)),
+            text("How close to the edge the pointer must get before it crosses. Raise it if crossing is hard to hit; 0 means the very last pixel.")
+                .size(11.0)
+                .color(p.txt3),
         ]
-        .spacing(14.0)))
+        .spacing(14.0);
+
+        column![card(p, body), self.advanced(p, Page::Screens, adv)].spacing(12.0).into()
     }
 
-    fn tab_security(&self, p: Palette) -> Element<'_, Message> {
+    fn page_security(&self, p: Palette) -> Element<'_, Message> {
         let secret = row![
             input(p, "shared secret", &self.cfg.shared_secret, Message::SecretChanged)
                 .secure(!self.show_secret),
@@ -1803,18 +1928,46 @@ impl App {
         ]
         .spacing(8.0);
 
-        card(p, column![
-            field_label(p, "Shared secret — identical on both machines"),
-            secret,
+        let adv = column![
             toggle_row(p, "Encrypt link (TLS)", "rustls, self-signed cert", self.cfg.tls_enabled, Message::TlsToggled),
-            labeled(p, "Lock / cross hotkey", input(p, "scroll_lock", &self.cfg.lock_hotkey, Message::LockHotkeyChanged)),
-            text("Single key. Always returns control, even if the network or engine has wedged.")
-                .size(11.0).color(p.txt3),
+        ]
+        .spacing(14.0);
+
+        column![
+            card(p, column![
+                section(p, "Pairing"),
+                field_label(p, "Shared secret — identical on both machines"),
+                secret,
+            ]
+            .spacing(14.0)),
+            self.advanced(p, Page::Security, adv),
+        ]
+        .spacing(12.0)
+        .into()
+    }
+
+    /// Settings → Keyboard & hotkeys. The lock key is the everyday way back; the return
+    /// combo is optional, so it is Advanced.
+    fn page_keys(&self, p: Palette) -> Element<'_, Message> {
+        let adv = column![
             labeled(p, "Return hotkey (server)", input(p, "ctrl+win+alt+esc", &self.cfg.return_hotkey, Message::ReturnHotkeyChanged)),
             text("Optional combo, matched on whichever machine is the server. Empty = none.")
                 .size(11.0).color(p.txt3),
         ]
-        .spacing(14.0))
+        .spacing(14.0);
+
+        column![
+            card(p, column![
+                section(p, "Getting control back"),
+                labeled(p, "Lock / cross hotkey", input(p, "scroll_lock", &self.cfg.lock_hotkey, Message::LockHotkeyChanged)),
+                text("Single key. Always returns control, even if the network or engine has wedged.")
+                    .size(11.0).color(p.txt3),
+            ]
+            .spacing(14.0)),
+            self.advanced(p, Page::Keys, adv),
+        ]
+        .spacing(12.0)
+        .into()
     }
 
     /// "The other machine copied something big — want it?"
@@ -2138,27 +2291,6 @@ impl App {
         ]
         .align_y(Alignment::Center);
 
-        // Two views, one at a time. The switch is the first thing on the tab so it is
-        // obvious that the settings still exist — hiding them without saying where they
-        // went would trade one complaint for another.
-        let switch = |label: &'static str, which: ClipView| {
-            let b = button(text(label).size(12.5))
-                .padding([7.0, 16.0])
-                .on_press(Message::ClipViewPicked(which));
-            // The two style helpers are distinct opaque types, so the choice has to be
-            // made by branching on the whole widget rather than on the style.
-            if self.clip_view == which {
-                b.style(ui_theme::primary(p))
-            } else {
-                b.style(ui_theme::ghost(p))
-            }
-        };
-        let view_switch = row![
-            switch("History", ClipView::History),
-            switch("Settings", ClipView::Settings),
-        ]
-        .spacing(6.0);
-
         // What the transferred files are actually costing on disk. Absent before, so
         // there was no way to answer "is this program eating my drive?" short of finding
         // the cache folder by hand — and no way to do anything about it if it was.
@@ -2182,16 +2314,24 @@ impl App {
             _ => Space::new().height(0.0).into(),
         };
 
-        if self.clip_view == ClipView::History {
-            // Just the thing the tab is named after: what you copied, and the one action
-            // per row. Nothing to configure, nothing to read past.
-            return column![view_switch, header, list, usage, disk]
-                .spacing(12.0)
-                .into();
-        }
+        // The history only: what you copied, and the one action per row. Its settings
+        // are in ⋯ → Settings → Clipboard, which the last line says.
+        column![
+            header,
+            list,
+            usage,
+            disk,
+            text("Clipboard settings: ⋯ → Settings → Clipboard.").size(11.0).color(p.txt3),
+        ]
+        .spacing(12.0)
+        .into()
+    }
 
-        let mut body = column![
-            view_switch,
+    /// Settings → Clipboard. The everyday settings first, the rest under Advanced, in
+    /// three groups (R30). Every control is the one the Clipboard tab used to hold.
+    fn page_clipboard(&self, p: Palette) -> Element<'_, Message> {
+        let basic = column![
+            section(p, "Sharing"),
             toggle_row(
                 p,
                 "Sync clipboard",
@@ -2201,27 +2341,12 @@ impl App {
             ),
             toggle_row(
                 p,
-                "Pasting a received file moves it there",
-                "on: the folder you paste into IS the destination, and a big file costs nothing to paste. Off: it is copied out of the cache, so a 40 GB file briefly uses 80 GB.",
-                self.cfg.clipboard_move_on_paste,
-                Message::ClipMoveOnPasteToggled
+                "Notify me when a file is waiting",
+                "a desktop notification, never a pop-up — a window stealing focus is what caused the keyboard bug",
+                self.cfg.clipboard_notify,
+                Message::ClipNotifyToggled
             ),
-            labeled(
-                p,
-                "Or put received files straight into this folder",
-                input(p, "/home/you/Desktop — blank to keep them on the clipboard only", &self.cfg.clipboard_deliver_dir, Message::ClipDeliverDirChanged)
-            ),
-            text(if self.cfg.clipboard_deliver_dir.trim().is_empty() {
-                "Blank is normal — paste wherever you want it and that is where it goes. Set a folder only if you would rather files arrived automatically, with no paste at all.".to_string()
-            } else {
-                format!(
-                    "Files land in {} as they arrive — nothing to paste. They are linked, not copied, so a 40 GB file uses 40 GB and not 80.",
-                    self.cfg.clipboard_deliver_dir.trim()
-                )
-            })
-            .size(11.0)
-            .color(p.txt3),
-            labeled(p, "Keep this many entries", input(p, "25", &self.clip_items_s, Message::ClipItemsChanged)),
+            section(p, "Big files"),
             labeled(
                 p,
                 "Ask before bringing over anything larger than (MB)",
@@ -2240,6 +2365,23 @@ impl App {
             })
             .size(11.0)
             .color(p.txt3),
+            labeled(
+                p,
+                "Or put received files straight into this folder",
+                input(p, "/home/you/Desktop — blank to keep them on the clipboard only", &self.cfg.clipboard_deliver_dir, Message::ClipDeliverDirChanged)
+            ),
+            text(if self.cfg.clipboard_deliver_dir.trim().is_empty() {
+                "Blank is normal — paste wherever you want it and that is where it goes. Set a folder only if you would rather files arrived automatically, with no paste at all.".to_string()
+            } else {
+                format!(
+                    "Files land in {} as they arrive — nothing to paste. They are linked, not copied, so a 40 GB file uses 40 GB and not 80.",
+                    self.cfg.clipboard_deliver_dir.trim()
+                )
+            })
+            .size(11.0)
+            .color(p.txt3),
+            section(p, "History"),
+            labeled(p, "Keep this many entries", input(p, "25", &self.clip_items_s, Message::ClipItemsChanged)),
             toggle_row(
                 p,
                 "Keep history after restart",
@@ -2247,186 +2389,192 @@ impl App {
                 self.cfg.clipboard_persist_history,
                 Message::ClipPersistToggled
             ),
-            toggle_row(
-                p,
-                "Advanced settings",
-                "size limits, memory budget, what gets synced",
-                self.clip_advanced,
-                Message::ClipAdvancedToggled
-            ),
         ]
         .spacing(12.0);
 
-        if self.clip_advanced {
-            // The worst case this configuration allows. Stating the cost is the job;
-            // refusing the value is not — a slow setting chosen deliberately is the
-            // owner's trade to make.
-            let worst = self
-                .cfg
-                .clipboard_history_size
-                .saturating_mul(self.cfg.clipboard_max_item_bytes)
-                .min(self.cfg.clipboard_memory_budget);
-            let px = self.cfg.clipboard_max_image_px;
-            // 4 bytes a pixel of RGBA, allocated while an image is encoded or decoded.
-            let img_cost = px.saturating_mul(px).saturating_mul(4);
+        // The worst case this configuration allows. Stating the cost is the job;
+        // refusing the value is not — a slow setting chosen deliberately is the
+        // owner's trade to make.
+        let worst = self
+            .cfg
+            .clipboard_history_size
+            .saturating_mul(self.cfg.clipboard_max_item_bytes)
+            .min(self.cfg.clipboard_memory_budget);
+        let px = self.cfg.clipboard_max_image_px;
+        // 4 bytes a pixel of RGBA, allocated while an image is encoded or decoded.
+        let img_cost = px.saturating_mul(px).saturating_mul(4);
 
-            body = body.push(
-                column![
-                    toggle_row(p, "Sync text", "copied text crosses machines", self.cfg.clipboard_sync_text, Message::ClipSyncTextToggled),
-                    toggle_row(p, "Sync images", "copied images cross machines", self.cfg.clipboard_sync_images, Message::ClipSyncImagesToggled),
-                    toggle_row(p, "Sync files", "any file or folder, any extension — no allow-list", self.cfg.clipboard_sync_files, Message::ClipSyncFilesToggled),
-                    labeled(p, "Most files in one copy", input(p, "10000", &self.clip_max_files_s, Message::ClipMaxFilesChanged)),
-                    text("Bounds a stray click on an enormous folder. The rest is left behind, and the log says so.")
-                        .size(11.0)
-                        .color(p.txt3),
-                    toggle_row(
-                        p,
-                        "Also copy images as a .png file",
-                        "on: a copied image pastes into a browser AND into a file manager. Off: pixels only, and pasting into Explorer or Thunar does nothing.",
-                        self.cfg.clipboard_images_also_as_file,
-                        Message::ClipImagesAsFileToggled
-                    ),
-                    toggle_row(
-                        p,
-                        "Follow shortcuts inside copied folders",
-                        "off by default: one pointing outside the folder quietly copies files you never picked",
-                        self.cfg.clipboard_follow_symlinks,
-                        Message::ClipFollowSymlinksToggled
-                    ),
-                    toggle_row(
-                        p,
-                        "Notify me when a file is waiting",
-                        "a desktop notification, never a pop-up — a window stealing focus is what caused the keyboard bug",
-                        self.cfg.clipboard_notify,
-                        Message::ClipNotifyToggled
-                    ),
-                    labeled(
-                        p,
-                        "Send images inline up to (KB)",
-                        input(p, "256", &self.clip_inline_kb_s, Message::ClipInlineKbChanged)
-                    ),
-                    text("Bigger images take the separate lane instead, so they can't stall the mouse. Lower this on a slow link; raise it to skip the extra round trip on a fast one.")
-                        .size(11.0)
-                        .color(p.txt3),
-                    labeled(p, "Disk for transferred files (GB)", input(p, "2", &self.clip_cache_gb_s, Message::ClipCacheGbChanged)),
-                    text("Oldest go first when it fills. Pinned entries are never removed.")
-                        .size(11.0)
-                        .color(p.txt3),
-                    labeled(p, "Biggest item to keep (MB)", input(p, "5", &self.clip_item_mb_s, Message::ClipItemMbChanged)),
-                    labeled(p, "Memory budget (MB)", input(p, "64", &self.clip_mem_mb_s, Message::ClipMemMbChanged)),
-                    text(format!(
-                        "This configuration can hold up to {}. Pinned entries are never evicted.",
-                        human_bytes(worst)
-                    ))
-                    .size(11.0)
-                    .color(p.txt3),
-                    labeled(p, "Largest image edge (px)", input(p, "4096", &self.clip_img_px_s, Message::ClipImagePxChanged)),
-                    text(format!(
-                        "An image this size costs about {} of memory for a moment while it is compressed.",
-                        human_bytes(img_cost)
-                    ))
-                    .size(11.0)
-                    .color(if img_cost > 128 * 1024 * 1024 { p.warn } else { p.txt3 }),
-                    labeled(
-                        p,
-                        "Don't ask if it'll take under (seconds)",
-                        input(p, "3", &self.clip_quick_s, Message::ClipQuickSecsChanged)
-                    ),
-                    text(if self.cfg.clipboard_quick_send_secs == 0 {
-                        "0 — the size limit alone decides.".to_string()
-                    } else {
-                        format!(
-                            "On a fast link a big file lands in a moment, so asking is noise. Measured from real transfers, so it still asks on a slow one. Currently {}.",
-                            match self.engine.as_ref().and_then(|e| e.measured_throughput()) {
-                                Some(bps) => format!("measuring ~{}/s", human_bytes(bps as usize)),
-                                None => "no measurement yet, so it always asks".to_string(),
-                            }
-                        )
-                    })
-                    .size(11.0)
-                    .color(p.txt3),
-                    labeled(
-                        p,
-                        "Paste files bigger than (MB) straight from the network",
-                        input(p, "64", &self.clip_stream_mb_s, Message::ClipStreamMbChanged)
-                    ),
-                    text(if self.cfg.clipboard_keep_resumable_copy {
-                        "Off while \"keep a resumable copy\" is on: every paste goes through the cache.".to_string()
-                    } else {
-                        format!(
-                            "Files from {} MB up go network → memory → your folder: they use their own size on disk, once. Smaller ones pass through mouse-rs's cache first.",
-                            self.cfg.clipboard_stream_min_mb
-                        )
-                    })
-                    .size(11.0)
-                    .color(p.txt3),
-                    labeled(
-                        p,
-                        "Wait for a dropped connection (seconds)",
-                        input(p, "180", &self.clip_stream_wait_s, Message::ClipStreamWaitChanged)
-                    ),
-                    text("A paste whose transfer stops (cable pulled, Wi-Fi drop) pauses and continues from the same byte if the connection is back within this time; after that it fails.")
-                        .size(11.0)
-                        .color(p.txt3),
-                    toggle_row(
-                        p,
-                        "Keep a resumable copy while pasting",
-                        "uses the file's size again in disk while a paste runs, but a paste cut short — even by a restart — continues where it stopped when you copy and paste the same file again",
-                        self.cfg.clipboard_keep_resumable_copy,
-                        Message::ClipKeepResumableToggled
-                    ),
-                    toggle_row(
-                        p,
-                        "Slow transfers while I'm on the other machine",
-                        "only if the pointer starts to lag; otherwise transfers run at the network's full speed",
-                        self.cfg.bulk_pause_while_crossed,
-                        Message::BulkPauseToggled
-                    ),
-                    labeled(
-                        p,
-                        "Transfer speed limit (MB/s, 0 = automatic)",
-                        input(p, "0", &self.bulk_rate_s, Message::BulkRateChanged)
-                    ),
-                    text("Automatic watches your mouse latency and backs off by itself. Pin a number if you'd rather decide.")
-                        .size(11.0)
-                        .color(p.txt3),
-                    labeled(
-                        p,
-                        "Send buffer (MB)",
-                        input(p, "8", &self.bulk_buf_s, Message::BulkBufferChanged)
-                    ),
-                    text(format!(
-                        "How much of a file may sit in memory waiting to go out. This is what keeps a 4 GB copy costing the same as a 4 MB one — right now, at most {}.",
-                        human_bytes((self.cfg.bulk_send_buffer_mb.max(1) as usize) * 1024 * 1024)
-                    ))
-                    .size(11.0)
-                    .color(p.txt3),
-                    toggle_row(
-                        p,
-                        "Separate lane for large transfers",
-                        "stops big items queueing in front of the mouse",
-                        self.cfg.bulk_enabled,
-                        Message::BulkEnabledToggled
-                    ),
-                    labeled(
-                        p,
-                        "Port for that lane (blank = share the main one)",
-                        input(p, "same port", &self.bulk_port_s, Message::BulkPortChanged)
-                    ),
-                    text(if self.cfg.bulk_port == 0 {
-                        "Sharing one port — nothing extra to open in a firewall.".to_string()
-                    } else {
-                        format!("Port {} must be reachable between both machines.", self.cfg.bulk_port)
-                    })
-                    .size(11.0)
-                    .color(p.txt3),
-                ]
-                .spacing(12.0),
-            );
-        }
+        let adv = column![
+            section(p, "What crosses"),
+            toggle_row(p, "Sync text", "copied text crosses machines", self.cfg.clipboard_sync_text, Message::ClipSyncTextToggled),
+            toggle_row(p, "Sync images", "copied images cross machines", self.cfg.clipboard_sync_images, Message::ClipSyncImagesToggled),
+            toggle_row(p, "Sync files", "any file or folder, any extension — no allow-list", self.cfg.clipboard_sync_files, Message::ClipSyncFilesToggled),
+            labeled(p, "Most files in one copy", input(p, "10000", &self.clip_max_files_s, Message::ClipMaxFilesChanged)),
+            text("Bounds a stray click on an enormous folder. The rest is left behind, and the log says so.")
+                .size(11.0)
+                .color(p.txt3),
+            toggle_row(
+                p,
+                "Also copy images as a .png file",
+                "on: a copied image pastes into a browser AND into a file manager. Off: pixels only, and pasting into Explorer or Thunar does nothing.",
+                self.cfg.clipboard_images_also_as_file,
+                Message::ClipImagesAsFileToggled
+            ),
+            toggle_row(
+                p,
+                "Follow shortcuts inside copied folders",
+                "off by default: one pointing outside the folder quietly copies files you never picked",
+                self.cfg.clipboard_follow_symlinks,
+                Message::ClipFollowSymlinksToggled
+            ),
+            toggle_row(
+                p,
+                "Pasting a received file moves it there",
+                "on: the folder you paste into IS the destination, and a big file costs nothing to paste. Off: it is copied out of the cache, so a 40 GB file briefly uses 80 GB.",
+                self.cfg.clipboard_move_on_paste,
+                Message::ClipMoveOnPasteToggled
+            ),
+            section(p, "Transfers"),
+            labeled(
+                p,
+                "Don't ask if it'll take under (seconds)",
+                input(p, "3", &self.clip_quick_s, Message::ClipQuickSecsChanged)
+            ),
+            text(if self.cfg.clipboard_quick_send_secs == 0 {
+                "0 — the size limit alone decides.".to_string()
+            } else {
+                format!(
+                    "On a fast link a big file lands in a moment, so asking is noise. Measured from real transfers, so it still asks on a slow one. Currently {}.",
+                    match self.engine.as_ref().and_then(|e| e.measured_throughput()) {
+                        Some(bps) => format!("measuring ~{}/s", human_bytes(bps as usize)),
+                        None => "no measurement yet, so it always asks".to_string(),
+                    }
+                )
+            })
+            .size(11.0)
+            .color(p.txt3),
+            labeled(
+                p,
+                "Paste files bigger than (MB) straight from the network",
+                input(p, "64", &self.clip_stream_mb_s, Message::ClipStreamMbChanged)
+            ),
+            text(if self.cfg.clipboard_keep_resumable_copy {
+                "Off while \"keep a resumable copy\" is on: every paste goes through the cache.".to_string()
+            } else {
+                format!(
+                    "Files from {} MB up go network → memory → your folder: they use their own size on disk, once. Smaller ones pass through mouse-rs's cache first.",
+                    self.cfg.clipboard_stream_min_mb
+                )
+            })
+            .size(11.0)
+            .color(p.txt3),
+            labeled(
+                p,
+                "Wait for a dropped connection (seconds)",
+                input(p, "180", &self.clip_stream_wait_s, Message::ClipStreamWaitChanged)
+            ),
+            text("A paste whose transfer stops (cable pulled, Wi-Fi drop) pauses and continues from the same byte if the connection is back within this time; after that it fails.")
+                .size(11.0)
+                .color(p.txt3),
+            toggle_row(
+                p,
+                "Keep a resumable copy while pasting",
+                "uses the file's size again in disk while a paste runs, but a paste cut short — even by a restart — continues where it stopped when you copy and paste the same file again",
+                self.cfg.clipboard_keep_resumable_copy,
+                Message::ClipKeepResumableToggled
+            ),
+            toggle_row(
+                p,
+                "Slow transfers while I'm on the other machine",
+                "only if the pointer starts to lag; otherwise transfers run at the network's full speed",
+                self.cfg.bulk_pause_while_crossed,
+                Message::BulkPauseToggled
+            ),
+            labeled(
+                p,
+                "Transfer speed limit (MB/s, 0 = automatic)",
+                input(p, "0", &self.bulk_rate_s, Message::BulkRateChanged)
+            ),
+            text("Automatic watches your mouse latency and backs off by itself. Pin a number if you'd rather decide.")
+                .size(11.0)
+                .color(p.txt3),
+            labeled(
+                p,
+                "Send buffer (MB)",
+                input(p, "8", &self.bulk_buf_s, Message::BulkBufferChanged)
+            ),
+            text(format!(
+                "How much of a file may sit in memory waiting to go out. This is what keeps a 4 GB copy costing the same as a 4 MB one — right now, at most {}.",
+                human_bytes((self.cfg.bulk_send_buffer_mb.max(1) as usize) * 1024 * 1024)
+            ))
+            .size(11.0)
+            .color(p.txt3),
+            toggle_row(
+                p,
+                "Separate lane for large transfers",
+                "stops big items queueing in front of the mouse",
+                self.cfg.bulk_enabled,
+                Message::BulkEnabledToggled
+            ),
+            labeled(
+                p,
+                "Port for that lane (blank = share the main one)",
+                input(p, "same port", &self.bulk_port_s, Message::BulkPortChanged)
+            ),
+            text(if self.cfg.bulk_port == 0 {
+                "Sharing one port — nothing extra to open in a firewall.".to_string()
+            } else {
+                format!("Port {} must be reachable between both machines.", self.cfg.bulk_port)
+            })
+            .size(11.0)
+            .color(p.txt3),
+            labeled(
+                p,
+                "Don't fingerprint files bigger than (MB)",
+                input(p, "64", &self.hash_limit_mb_s, Message::HashLimitMbChanged)
+            ),
+            text("Files up to this size are checked by their content when they arrive; bigger ones by their size, so copying a film is announced at once instead of after reading it all.")
+                .size(11.0)
+                .color(p.txt3),
+            section(p, "Storage & memory"),
+            labeled(p, "Disk for transferred files (GB)", input(p, "2", &self.clip_cache_gb_s, Message::ClipCacheGbChanged)),
+            text("Oldest go first when it fills. Pinned entries are never removed.")
+                .size(11.0)
+                .color(p.txt3),
+            labeled(
+                p,
+                "Folder for transferred files",
+                input(p, "blank = ~/.mouse_share/cache", &self.cfg.cache_dir, Message::CacheDirChanged)
+            ),
+            labeled(p, "Biggest item to keep (MB)", input(p, "5", &self.clip_item_mb_s, Message::ClipItemMbChanged)),
+            labeled(p, "Memory budget (MB)", input(p, "64", &self.clip_mem_mb_s, Message::ClipMemMbChanged)),
+            text(format!(
+                "This configuration can hold up to {}. Pinned entries are never evicted.",
+                human_bytes(worst)
+            ))
+            .size(11.0)
+            .color(p.txt3),
+            labeled(p, "Largest image edge (px)", input(p, "4096", &self.clip_img_px_s, Message::ClipImagePxChanged)),
+            text(format!(
+                "An image this size costs about {} of memory for a moment while it is compressed.",
+                human_bytes(img_cost)
+            ))
+            .size(11.0)
+            .color(if img_cost > 128 * 1024 * 1024 { p.warn } else { p.txt3 }),
+            labeled(
+                p,
+                "Send images inline up to (KB)",
+                input(p, "256", &self.clip_inline_kb_s, Message::ClipInlineKbChanged)
+            ),
+            text("Bigger images take the separate lane instead, so they can't stall the mouse. Lower this on a slow link; raise it to skip the extra round trip on a fast one.")
+                .size(11.0)
+                .color(p.txt3),
+        ]
+        .spacing(12.0);
 
-        card(p, body)
+        column![card(p, basic), self.advanced(p, Page::Clipboard, adv)].spacing(12.0).into()
     }
+
 
     // ---------- profiles + footer ----------
 
@@ -2461,19 +2609,9 @@ impl App {
         .into()
     }
 
-    /// The ⋯ menu: appearance, profiles, and the destructive actions.
+    /// The ⋯ menu: the way into Settings, and Quit. The theme moved to Settings →
+    /// Appearance and Restore defaults to Settings → About (R30).
     fn overflow_menu(&self, p: Palette) -> Element<'_, Message> {
-        let mut swatches = row![].spacing(6.0).align_y(Alignment::Center);
-        for t in Theme6::ALL {
-            let base = t.palette();
-            swatches = swatches.push(
-                button(Space::new().width(18.0).height(18.0))
-                    .style(ui_theme::swatch(p, base, t == self.theme))
-                    .padding(0.0)
-                    .on_press(Message::ThemePicked(t)),
-            );
-        }
-
         let item = |label: &'static str, msg: Message, danger: bool| {
             button(text(label).size(12.5).color(if danger { p.danger } else { p.txt2 }))
                 .style(ui_theme::ghost(p))
@@ -2484,18 +2622,212 @@ impl App {
 
         container(
             column![
-                text("APPEARANCE").size(10.0).color(p.txt3),
-                swatches,
-                item("Profiles…", Message::TabPicked(Tab::Startup), false),
-                item("Restore defaults", Message::RestoreDefaults, true),
+                item("⚙  Settings", Message::OpenSettings(Page::Index), false),
+                item("Profiles…", Message::OpenSettings(Page::Connection), false),
                 item("Quit mouse-rs", Message::Quit, true),
             ]
-            .spacing(8.0),
+            .spacing(4.0),
         )
         .style(move |_| ui_theme::card(p))
         .padding(10.0)
         .width(210.0)
         .into()
+    }
+
+    // ---------- ⋯ → Settings ----------
+
+    /// The back button and the page's title. Back from a category goes to the list; back
+    /// from the list goes to the main window.
+    fn settings_bar(&self, p: Palette, pg: Page) -> Element<'_, Message> {
+        let back = if pg == Page::Index { Message::CloseSettings } else { Message::OpenSettings(Page::Index) };
+        row![
+            button(text("←").size(15.0).color(p.txt2))
+                .style(ui_theme::ghost(p))
+                .padding([6.0, 12.0])
+                .on_press(back),
+            text(pg.title()).size(18.0).color(p.txt).width(Length::Fill),
+        ]
+        .spacing(10.0)
+        .align_y(Alignment::Center)
+        .into()
+    }
+
+    fn settings_body(&self, p: Palette, pg: Page) -> Element<'_, Message> {
+        match pg {
+            Page::Index => self.settings_index(p),
+            Page::Clipboard => self.page_clipboard(p),
+            Page::Screens => self.page_screens(p),
+            Page::Startup => self.page_startup(p),
+            Page::Keys => self.page_keys(p),
+            Page::Connection => self.page_connection(p),
+            Page::Security => self.page_security(p),
+            Page::Appearance => self.page_appearance(p),
+            Page::Diagnostics => self.page_diagnostics(p),
+            Page::About => self.page_about(p),
+        }
+    }
+
+    /// The list of categories, grouped and ordered by how often people use them (R29).
+    fn settings_index(&self, p: Palette) -> Element<'_, Message> {
+        let mut col = column![].spacing(6.0);
+        for (group, pages) in Page::CATEGORIES {
+            col = col.push(Space::new().height(4.0)).push(text(group).size(10.5).color(p.txt3));
+            for &pg in pages {
+                col = col.push(
+                    button(
+                        row![
+                            text(pg.icon()).size(18.0),
+                            column![
+                                text(pg.title()).size(14.0).color(p.txt),
+                                text(pg.summary()).size(11.0).color(p.txt3),
+                            ]
+                            .spacing(2.0)
+                            .width(Length::Fill),
+                            text("›").size(16.0).color(p.txt3),
+                        ]
+                        .spacing(12.0)
+                        .align_y(Alignment::Center),
+                    )
+                    .style(ui_theme::ghost(p))
+                    .padding([12.0, 14.0])
+                    .width(Length::Fill)
+                    .on_press(Message::OpenSettings(pg)),
+                );
+            }
+        }
+        col.into()
+    }
+
+    /// A page's Advanced section: at the bottom, closed until opened (R25, R30).
+    fn advanced<'a>(&'a self, p: Palette, pg: Page, body: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
+        let open = self.adv_open.contains(&pg);
+        let head = button(text(if open { "▾  Advanced" } else { "▸  Advanced" }).size(13.0).color(p.txt2))
+            .style(ui_theme::ghost(p))
+            .padding([10.0, 14.0])
+            .width(Length::Fill)
+            .on_press(Message::AdvancedToggled(pg));
+        if open {
+            column![head, card(p, body)].spacing(8.0).into()
+        } else {
+            head.into()
+        }
+    }
+
+    /// Settings → Connection: this computer's name, staying connected and profiles; the
+    /// ports and the discovery port under Advanced. Role and the other computer's address
+    /// are on the main window (R30).
+    fn page_connection(&self, p: Palette) -> Element<'_, Message> {
+        let server_side = self.cfg.role == Role::Server;
+        let mut basic = column![
+            section(p, "This computer"),
+            labeled(p, "Machine name", input(p, "this-machine", &self.cfg.name, Message::NameChanged)),
+        ]
+        .spacing(14.0);
+        if !server_side {
+            basic = basic.push(toggle_row(p, "Auto-reconnect", "retry with backoff until the server appears", self.cfg.reconnect, Message::ReconnectToggled));
+        }
+
+        let mut adv = column![section(p, "Ports")].spacing(14.0);
+        if server_side {
+            // Real addresses of this machine, so the bind address is chosen rather than
+            // typed from memory.
+            let local = mouse_core::discover::listen_candidates();
+            let picked = local
+                .iter()
+                .find(|c| **c == self.cfg.listen_host)
+                .cloned();
+            adv = adv
+                .push(labeled(p, "Listen host", input(p, "0.0.0.0", &self.cfg.listen_host, Message::ListenHostChanged)))
+                .push(labeled(
+                    p,
+                    "This machine's addresses",
+                    pick_list(local, picked, Message::ListenHostPicked)
+                        .width(Length::Fill)
+                        .padding([10.0, 12.0])
+                        .text_size(13.0),
+                ))
+                .push(labeled(p, "Listen port", input(p, "24800", &self.listen_port_s, Message::ListenPortChanged)));
+        } else {
+            adv = adv.push(labeled(p, "Server port", input(p, "24800", &self.server_port_s, Message::ServerPortChanged)));
+        }
+        adv = adv
+            .push(labeled(p, "Discovery port (finding the other computer)", input(p, "24801", &self.discovery_port_s, Message::DiscoveryPortChanged)))
+            .push(
+                text("The two computers find each other on this UDP port. Same number on both; 0 turns finding off, and the address on the main window is used instead.")
+                    .size(11.0)
+                    .color(p.txt3),
+            );
+
+        column![
+            card(p, basic),
+            card(p, self.profiles_section(p)),
+            self.advanced(p, Page::Connection, adv),
+        ]
+        .spacing(12.0)
+        .into()
+    }
+
+    /// Settings → Appearance: the six themes, moved here from the ⋯ menu.
+    fn page_appearance(&self, p: Palette) -> Element<'_, Message> {
+        let mut themes = column![section(p, "Theme")].spacing(8.0);
+        for t in Theme6::ALL {
+            let base = t.palette();
+            themes = themes.push(
+                button(
+                    row![
+                        container(Space::new().width(18.0).height(18.0))
+                            .style(move |_| ui_theme::swatch_fill(base)),
+                        text(t.label()).size(13.5).color(if t == self.theme { p.accent_ink } else { p.txt2 }),
+                    ]
+                    .spacing(10.0)
+                    .align_y(Alignment::Center),
+                )
+                .style(ui_theme::segment(p, t == self.theme))
+                .padding([9.0, 12.0])
+                .width(Length::Fill)
+                .on_press(Message::ThemePicked(t)),
+            );
+        }
+        card(p, themes)
+    }
+
+    /// Settings → Diagnostics: where the log is, and (Advanced) sending it for support.
+    fn page_diagnostics(&self, p: Palette) -> Element<'_, Message> {
+        // The panel has no console behind it, so name the log file here — otherwise a user
+        // hitting a problem has nothing to look at and nothing to send.
+        let logs = column![
+            section(p, "Log file"),
+            text(&self.log_path).size(11.0).color(p.txt3),
+        ]
+        .spacing(6.0);
+
+        let adv = column![
+            section(p, "Send logs for support"),
+            labeled(p, "Log upload address", input(p, "blank = never sent", &self.cfg.log_upload_url, Message::LogUploadUrlChanged)),
+            labeled(p, "Send every (seconds)", input(p, "30", &self.log_upload_secs_s, Message::LogUploadSecsChanged)),
+            text("Nothing leaves this computer unless an address is set. Takes effect the next time mouse-rs starts.")
+                .size(11.0)
+                .color(p.txt3),
+        ]
+        .spacing(14.0);
+
+        column![card(p, logs), self.advanced(p, Page::Diagnostics, adv)].spacing(12.0).into()
+    }
+
+    /// Settings → About: the version, and Restore defaults, moved here from the ⋯ menu.
+    fn page_about(&self, p: Palette) -> Element<'_, Message> {
+        card(p, column![
+            section(p, "mouse-rs"),
+            text(format!("Version {}", env!("CARGO_PKG_VERSION"))).size(12.5).color(p.txt2),
+            button(text("Restore default settings").size(12.5).color(p.danger))
+                .style(ui_theme::ghost(p))
+                .padding([9.0, 12.0])
+                .on_press(Message::RestoreDefaults),
+            text("Resets preferences only — keeps this computer's name, shared secret and screen size. Applied to the form; press Save to keep it.")
+                .size(11.0)
+                .color(p.txt3),
+        ]
+        .spacing(12.0))
     }
 
     /// Profiles, with the sentence that was missing. The feature shipped as an unlabelled
@@ -2510,8 +2842,8 @@ impl App {
         column![
             field_label(p, "Profiles"),
             text(
-                "A named snapshot of every setting on this page — peer address, edges, screen \
-                 size, hotkeys, secret. Save one per setup (say \"desk\" and \"travel\") and switch \
+                "A named snapshot of all your settings — peer address, edges, screen size, \
+                 hotkeys, secret. Save one per setup (say \"desk\" and \"travel\") and switch \
                  without retyping. Loading one fills the form; press Save to keep it."
             )
             .size(11.0)
@@ -2557,6 +2889,11 @@ fn input<'a>(
 
 fn field_label(p: Palette, label: &str) -> Element<'_, Message> {
     text(label.to_string()).size(12.0).color(p.txt2).into()
+}
+
+/// A sub-heading inside a settings page ("Sharing", "Ports", …).
+fn section(p: Palette, title: &str) -> Element<'_, Message> {
+    text(title.to_string()).size(12.5).color(p.accent).into()
 }
 
 fn labeled<'a>(p: Palette, label: &'a str, field: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
@@ -2802,6 +3139,48 @@ pub fn launch(cfg: Config) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// R30, as the owner confirmed it on 2026-10-14: the categories, their order and
+    /// their groups. Every page is listed exactly once.
+    #[test]
+    fn settings_categories_are_in_the_agreed_order() {
+        let order: Vec<&str> = Page::CATEGORIES.iter().flat_map(|(_, pages)| pages.iter().map(|p| p.title())).collect();
+        assert_eq!(
+            order,
+            [
+                "Clipboard",
+                "Screens & edges",
+                "Startup",
+                "Keyboard & hotkeys",
+                "Connection",
+                "Security & pairing",
+                "Appearance",
+                "Diagnostics",
+                "About",
+            ]
+        );
+        let groups: Vec<&str> = Page::CATEGORIES.iter().map(|(g, _)| *g).collect();
+        assert_eq!(groups, ["EVERYDAY", "SETUP", "HELP & ADVANCED"]);
+        assert!(order.iter().all(|t| !Page::Index.title().eq(*t)), "the index is not a category");
+    }
+
+    /// R28: the main window has two tabs, and nothing else.
+    #[test]
+    fn the_main_window_has_only_connection_and_clipboard() {
+        let tabs: Vec<&str> = Tab::ALL.iter().map(|t| t.label()).collect();
+        assert_eq!(tabs, ["Connection", "Clipboard"]);
+    }
+
+    /// The new controls change settings the engine reads at Start, so editing them while
+    /// sharing must raise the restart prompt like every other such setting (R1).
+    #[test]
+    fn the_new_engine_settings_ask_for_a_restart() {
+        let live = Config::default();
+        let mut now = live.clone();
+        now.edge_threshold_px += 3;
+        now.discovery_port = live.discovery_port.wrapping_add(1);
+        assert_eq!(pending_restart_changes(&live, &now), vec!["edge sensitivity", "discovery port"]);
+    }
 
     /// Changing a setting the engine already read must be reported, or the panel says
     /// "saved" while the live session keeps using the old value — the exact confusion

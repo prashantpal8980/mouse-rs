@@ -301,19 +301,12 @@ pub fn segment(p: Palette, active: bool) -> impl Fn(&iced::Theme, button::Status
     }
 }
 
-/// A theme swatch button. `selected` outlines it.
-pub fn swatch(p: Palette, base: Palette, selected: bool) -> impl Fn(&iced::Theme, button::Status) -> button::Style {
-    move |_theme, _status| {
-        button::Style {
-            background: Some(accent_gradient(base)),
-            text_color: Color::TRANSPARENT,
-            border: Border {
-                color: if selected { p.txt } else { alpha(p.txt, 0.15) },
-                width: if selected { 2.0 } else { 1.0 },
-                radius: radius(6.0),
-            },
-            ..button::Style::default()
-        }
+/// A theme's colour sample, for showing beside its name (Settings → Appearance).
+pub fn swatch_fill(base: Palette) -> container::Style {
+    container::Style {
+        background: Some(accent_gradient(base)),
+        border: Border { radius: radius(6.0), ..Border::default() },
+        ..container::Style::default()
     }
 }
 
