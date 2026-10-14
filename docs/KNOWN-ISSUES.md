@@ -463,7 +463,7 @@ from the streaming folder. Same day: the consent banner now shows only while an 
 *waiting*, not after Allow. Files under the ask-first limit no longer prefetch big files to
 disk before a paste, and "Remote" reads "on the other computer · paste any time".
 
-### B19 — copying the same files again was ignored — **fixed 2026-10-13**
+### B19 — copying the same files again was ignored — **fixed 2026-10-13, confirmed on hardware 2026-10-14** (a re-copy at 12:36:12 reached Kali as entry 21 and pasted in full at about 78 MB/s)
 
 After clearing the history and the cache, a second Ctrl+C on the same video in Explorer sent
 nothing, because a local copy was detected by comparing the file list with the last one seen.
@@ -525,3 +525,14 @@ the Linux streaming folder.
   The Kali log holds 1,809 of these lines, from 2026-09-17 to 2026-10-14. Nobody has seen
   a visible effect, but the noise buries real errors in the shipped logs. It probably happens
   while the panel window is hidden or unmapped and iced keeps redrawing. Not investigated.
+
+### B24 — reading a streamed file out of order restarts the stream on every seek — open, low
+
+- At 2026-10-14 12:34:19 something on Kali read the streamed 3.3 GB video from the FUSE folder at
+  scattered offsets: 0, the last 200 KB, 124, 509 MB and so on. It was probably a thumbnailer or a
+  player, since a Thunar paste reads in order. Each jump cancelled the request to the laptop and
+  sent a new one. That made about 155 requests in 30 seconds before the read settled into one
+  sequential pass. Nothing failed, and the following pass ran at full speed. But each restart
+  throws away data already in flight, so playing a video straight from the streaming folder would
+  be slow. Possible fix: serve small reads far from the current position, like the header and
+  index at the end, as one-off range requests, without dropping the main stream. Not investigated.
