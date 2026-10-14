@@ -525,6 +525,9 @@ impl App {
         if let Ok(want) = std::env::var("MOUSE_RS_OPEN_SETTINGS") {
             let all = std::iter::once(Page::Index).chain(Page::CATEGORIES.iter().flat_map(|(_, p)| p.iter().copied()));
             let want = want.to_lowercase();
+            if want == "clipboard-tab" {
+                app.tab = Tab::Clipboard;
+            }
             if let Some(pg) = all.into_iter().find(|p| p.title().to_lowercase().starts_with(&want) || (want == "index" && *p == Page::Index)) {
                 app.page = Some(pg);
                 app.adv_open.push(pg);
@@ -1529,19 +1532,24 @@ impl App {
 
         let local = machine_chip(
             p,
+            "🖥",
             &self.cfg.name,
-            &format!("{}×{}", self.cfg.screen_width, self.cfg.screen_height),
+            &format!("{}×{} · this computer", self.cfg.screen_width, self.cfg.screen_height),
             local_has_control,
         );
         let (peer_name, peer_res) = match snap {
             Some(s) if s.connected => (s.peer.clone(), format!("{}×{}", s.peer_w, s.peer_h)),
-            _ => ("waiting…".to_string(), "—".to_string()),
+            _ => ("waiting…".to_string(), "not connected".to_string()),
         };
-        let peer = machine_chip(p, &peer_name, &peer_res, connected && !local_has_control);
+        let peer = machine_chip(p, "💻", &peer_name, &peer_res, connected && !local_has_control);
 
-        let link = text(if running { "⇄" } else { "—" })
-            .size(18.0)
-            .color(if running { p.accent } else { p.txt3 });
+        let link = column![
+            text(if connected { "⇄" } else { "—" })
+                .size(20.0)
+                .color(if connected { p.accent } else { p.txt3 }),
+        ]
+        .align_x(Alignment::Center)
+        .width(Length::Shrink);
 
         let body = column![
             row![local, link, peer].spacing(10.0).align_y(Alignment::Center),
@@ -1549,7 +1557,7 @@ impl App {
                 .size(12.0)
                 .color(if running { p.accent } else { p.txt3 }),
         ]
-        .spacing(8.0);
+        .spacing(10.0);
 
         container(body)
             .style(move |_| ui_theme::hero(p))
@@ -1564,13 +1572,17 @@ impl App {
         let mut r = row![].spacing(6.0);
         for t in Tab::ALL {
             r = r.push(
-                button(text(t.label()).size(13.0).color(if t == self.tab { p.accent_ink } else { p.txt2 }))
-                    .style(ui_theme::segment(p, t == self.tab))
-                    .padding([8.0, 16.0])
-                    .on_press(Message::TabPicked(t)),
+                button(
+                    container(text(t.label()).size(13.5).color(if t == self.tab { p.accent_ink } else { p.txt2 }))
+                        .center_x(Length::Fill),
+                )
+                .style(ui_theme::segment(p, t == self.tab))
+                .padding([9.0, 16.0])
+                .width(Length::Fill)
+                .on_press(Message::TabPicked(t)),
             );
         }
-        container(r).padding(4.0).style(move |_| ui_theme::well(p)).into()
+        container(r).padding(4.0).width(Length::Fill).style(move |_| ui_theme::well(p)).into()
     }
 
     // ---------- tab bodies ----------
@@ -1600,7 +1612,6 @@ impl App {
             // Choosing which of these addresses to listen on is in Settings → Connection.
             let local = mouse_core::discover::listen_candidates();
             column![
-                field_label(p, "This computer's addresses"),
                 text(if local.is_empty() { "none found".to_string() } else { local.join("  ·  ") })
                     .size(13.0)
                     .color(p.txt2),
@@ -1653,15 +1664,49 @@ impl App {
             col.into()
         };
 
-        card(p, column![
-            field_label(p, "Role"),
-            role,
-            net,
-            text("Ports, auto-reconnect and this computer's name: ⋯ → Settings → Connection.")
-                .size(11.0)
-                .color(p.txt3),
+        // At a glance: the settings that decide how this session behaves, read-only, so the
+        // main window answers "is this set up the way I think?" without becoming a second
+        // settings page (R28).
+        let cb = &self.cfg;
+        let shared: Vec<&str> = [
+            (cb.clipboard_sync_text, "text"),
+            (cb.clipboard_sync_images, "images"),
+            (cb.clipboard_sync_files, "files"),
         ]
-        .spacing(14.0))
+        .into_iter()
+        .filter_map(|(on, what)| on.then_some(what))
+        .collect();
+        let clip = if !cb.clipboard_sync || shared.is_empty() {
+            "not shared".to_string()
+        } else {
+            format!("shares {}", shared.join(", "))
+        };
+        let glance = column![
+            section(p, "At a glance"),
+            info_row(p, "🔒", "Encryption", if cb.tls_enabled { "on (TLS)".to_string() } else { "off".to_string() }),
+            info_row(p, "📋", "Clipboard", clip),
+            info_row(p, "⌨", "Take control back", key_label(&cb.lock_hotkey)),
+        ]
+        .spacing(10.0);
+
+        column![
+            card(p, column![section(p, "This computer is the…"), role].spacing(12.0)),
+            card(p, column![
+                section(p, if server_side { "How the other computer finds this one" } else { "Other computer" }),
+                net,
+            ]
+            .spacing(12.0)),
+            card(p, glance),
+            nav_row(
+                p,
+                "🔗",
+                "More connection settings",
+                "Ports, auto-reconnect, this computer's name, profiles",
+                Message::OpenSettings(Page::Connection),
+            ),
+        ]
+        .spacing(12.0)
+        .into()
     }
 
     /// Settings → Startup: how the app behaves at login. Split out of Connection because it
@@ -2282,8 +2327,12 @@ impl App {
         };
 
         let header = row![
-            container(field_label(p, "History — newest first · click any entry to copy it again"))
-                .width(Length::Fill),
+            column![
+                section(p, "History"),
+                text("Newest first · click an entry to copy it again").size(11.0).color(p.txt3),
+            ]
+            .spacing(3.0)
+            .width(Length::Fill),
             button(text("Clear").size(12.0))
                 .style(ui_theme::ghost(p))
                 .padding([7.0, 12.0])
@@ -2317,11 +2366,14 @@ impl App {
         // The history only: what you copied, and the one action per row. Its settings
         // are in ⋯ → Settings → Clipboard, which the last line says.
         column![
-            header,
-            list,
-            usage,
-            disk,
-            text("Clipboard settings: ⋯ → Settings → Clipboard.").size(11.0).color(p.txt3),
+            card(p, column![header, list, usage, disk].spacing(12.0)),
+            nav_row(
+                p,
+                "📋",
+                "Clipboard settings",
+                "What to share, big files, how much history to keep",
+                Message::OpenSettings(Page::Clipboard),
+            ),
         ]
         .spacing(12.0)
         .into()
@@ -2673,26 +2725,7 @@ impl App {
         for (group, pages) in Page::CATEGORIES {
             col = col.push(Space::new().height(4.0)).push(text(group).size(10.5).color(p.txt3));
             for &pg in pages {
-                col = col.push(
-                    button(
-                        row![
-                            text(pg.icon()).size(18.0),
-                            column![
-                                text(pg.title()).size(14.0).color(p.txt),
-                                text(pg.summary()).size(11.0).color(p.txt3),
-                            ]
-                            .spacing(2.0)
-                            .width(Length::Fill),
-                            text("›").size(16.0).color(p.txt3),
-                        ]
-                        .spacing(12.0)
-                        .align_y(Alignment::Center),
-                    )
-                    .style(ui_theme::ghost(p))
-                    .padding([12.0, 14.0])
-                    .width(Length::Fill)
-                    .on_press(Message::OpenSettings(pg)),
-                );
+                col = col.push(nav_row(p, pg.icon(), pg.title(), pg.summary(), Message::OpenSettings(pg)));
             }
         }
         col.into()
@@ -2891,6 +2924,66 @@ fn field_label(p: Palette, label: &str) -> Element<'_, Message> {
     text(label.to_string()).size(12.0).color(p.txt2).into()
 }
 
+/// A row that opens another page: icon, title, one line of what is there, and ›. The
+/// settings list is made of these, and the main window uses one under each tab.
+fn nav_row(p: Palette, icon: &'static str, title: &'static str, summary: &'static str, msg: Message) -> Element<'static, Message> {
+    button(
+        row![
+            text(icon).size(18.0),
+            column![
+                text(title).size(14.0).color(p.txt),
+                text(summary).size(11.0).color(p.txt3),
+            ]
+            .spacing(2.0)
+            .width(Length::Fill),
+            text("›").size(16.0).color(p.txt3),
+        ]
+        .spacing(12.0)
+        .align_y(Alignment::Center),
+    )
+    .style(ui_theme::ghost(p))
+    .padding([12.0, 14.0])
+    .width(Length::Fill)
+    .on_press(msg)
+    .into()
+}
+
+/// One read-only line of "At a glance": icon, what it is, and its value.
+fn info_row(p: Palette, icon: &'static str, label: &'static str, value: String) -> Element<'static, Message> {
+    row![
+        text(icon).size(14.0).width(Length::Fixed(22.0)),
+        text(label).size(13.0).color(p.txt2).width(Length::Fill),
+        text(value).size(13.0).color(p.txt),
+    ]
+    .spacing(8.0)
+    .align_y(Alignment::Center)
+    .into()
+}
+
+/// A hotkey as people say it: "scroll_lock" reads as "Scroll Lock", "ctrl+alt+f12" as
+/// "Ctrl + Alt + F12".
+fn key_label(key: &str) -> String {
+    if key.trim().is_empty() {
+        return "none set".to_string();
+    }
+    key.split('+')
+        .map(|k| {
+            k.trim()
+                .split('_')
+                .map(|w| {
+                    let mut c = w.chars();
+                    match c.next() {
+                        Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+                        None => String::new(),
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .collect::<Vec<_>>()
+        .join(" + ")
+}
+
 /// A sub-heading inside a settings page ("Sharing", "Ports", …).
 fn section(p: Palette, title: &str) -> Element<'_, Message> {
     text(title.to_string()).size(12.5).color(p.accent).into()
@@ -2979,18 +3072,27 @@ fn edge_picker(p: Palette, current: Edge, on_pick: impl Fn(Edge) -> Message + Co
 
 /// One machine in the hero: name on the left, resolution on the right, highlighted when
 /// that machine currently owns the input.
-fn machine_chip(p: Palette, name: &str, res: &str, active: bool) -> Element<'static, Message> {
-    container(
+/// One computer in the top card: an icon, its name, its screen, and — on the one that
+/// has the mouse and keyboard right now — a "has the mouse" mark.
+fn machine_chip(p: Palette, icon: &str, name: &str, detail: &str, active: bool) -> Element<'static, Message> {
+    let col = column![
         row![
-            text(name.to_string()).size(13.0).color(p.txt).width(Length::Fill),
-            text(res.to_string()).size(11.0).color(p.txt3),
+            text(icon.to_string()).size(16.0),
+            text(name.to_string()).size(14.0).color(p.txt).width(Length::Fill),
         ]
+        .spacing(8.0)
         .align_y(Alignment::Center),
-    )
-    .style(move |_| if active { ui_theme::well_active(p) } else { ui_theme::well(p) })
-    .padding([9.0, 11.0])
-    .width(Length::Fill)
-    .into()
+        text(detail.to_string()).size(11.0).color(p.txt3),
+    ]
+    .spacing(4.0)
+    // Both tiles get the line, blank on the other one, so they stay the same height as
+    // control moves back and forth.
+    .push(text(if active { "● has the mouse" } else { "\u{a0}" }).size(11.0).color(p.accent));
+    container(col)
+        .style(move |_| if active { ui_theme::well_active(p) } else { ui_theme::well(p) })
+        .padding([11.0, 13.0])
+        .width(Length::Fill)
+        .into()
 }
 
 /// Which machine currently holds the mouse and keyboard — `true` for this one.
@@ -3162,6 +3264,14 @@ mod tests {
         let groups: Vec<&str> = Page::CATEGORIES.iter().map(|(g, _)| *g).collect();
         assert_eq!(groups, ["EVERYDAY", "SETUP", "HELP & ADVANCED"]);
         assert!(order.iter().all(|t| !Page::Index.title().eq(*t)), "the index is not a category");
+    }
+
+    /// "At a glance" names the return key the way people say it.
+    #[test]
+    fn hotkeys_read_the_way_people_say_them() {
+        assert_eq!(key_label("scroll_lock"), "Scroll Lock");
+        assert_eq!(key_label("ctrl+win+alt+esc"), "Ctrl + Win + Alt + Esc");
+        assert_eq!(key_label("  "), "none set");
     }
 
     /// R28: the main window has two tabs, and nothing else.

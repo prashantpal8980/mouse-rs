@@ -130,7 +130,7 @@ re-author them.
 | R28 | **The main window has only two tabs: Connection and Clipboard (history).** Layout, the clipboard's settings, Startup, Security and everything else move to ⋯ → Settings | **built 2026-10-14, awaiting the owner's review** | Owner, 2026-10-14: "only the clipboard, the history part and the connection … The layout, the clipboard setting, the startup setting, auto launch all these things are supposed to be properly categorized in the setting panel." Refines R23 |
 | R29 | Inside Settings, **the most-used categories come first and the advanced ones last**, and on each page the everyday settings sit at the top with an **Advanced** section at the bottom, like Android's Settings | **built 2026-10-14, awaiting the owner's review** | Owner, 2026-10-14. Refines R24/R25: order by how often people use a setting, not alphabetically or by subsystem |
 | R30 | **Settings layout confirmed** (mockup `docs/mockups/settings-categories.html`): the main Connection tab keeps the **role** and **the other computer** (address, Detect, found list), and ports, auto-reconnect and machine name go to Settings → Connection. Category order: *Everyday* Clipboard, Screens & edges, Startup, Keyboard & hotkeys; *Setup* Connection, Security & pairing, Appearance; *Help* Diagnostics, About. Advanced is a closed section **at the bottom of each page** (not a global switch). The unused `warp_threshold_px` ("return distance") is **dropped** | **built 2026-10-14, awaiting the owner's review** | Owner, 2026-10-14, answering four questions on the mockup |
-| R31 | **Restyle the main window to match the Settings pages**: the machine chips at the top, the Connection/Clipboard tabs, and the tab contents. No large empty space under the content | **open** | Owner, 2026-10-14, with a screenshot: "the settings part … looking visually very good … do a remake for this part as well … this unnecessary blank space". Stays within R28: the main window still has only Connection and Clipboard |
+| R31 | **Restyle the main window to match the Settings pages**: the machine chips at the top, the Connection/Clipboard tabs, and the tab contents. No large empty space under the content | **built 2026-10-14, awaiting the owner's review** | Owner, 2026-10-14, with a screenshot: "the settings part … looking visually very good … do a remake for this part as well … this unnecessary blank space". Stays within R28: the main window still has only Connection and Clipboard |
 | R26 | **Restore settings that went missing**: edge sensitivity and the Python app's return distance, plus the 6 config fields that never had a control | **built 2026-10-14, awaiting the owner's review** | Owner noticed settings had gone, 2026-10-13. Audit in the plan: 8 of 51 fields have no control; `warp_threshold_px` is stored but unused |
 | R27 | Large-paste settings, all user-configurable: **stream-to-paste size threshold** (default 64 MB), **wait for a dropped connection** (default 180 s), **keep a resumable copy** (default **off**; doubles disk during a paste but survives restarts) | **done** (2026‑10‑13) | Owner, 2026-10-13: "the cost in double memory becomes the feature… by default it would be turned off". In the Clipboard tab's advanced transfer settings; moves to Settings → Clipboard → Transfers with R23 |
 
@@ -164,3 +164,17 @@ re-author them.
 - **Moved out of the ⋯ menu:** theme → Appearance, Restore defaults → About.
 - **Screenshot aid:** `MOUSE_RS_OPEN_SETTINGS=<page>` opens the panel at a page with its
   Advanced section open ("index" for the list).
+
+### R31 — main window restyled (built 2026-10-14)
+
+- **Top card:** each computer is a tile with an icon, its name and "1440×900 · this computer".
+  The one with the mouse is lit and says "● has the mouse". Both tiles keep that line (blank on
+  the other one) so their height doesn't change as control moves.
+- **Tabs:** full width, two equal halves.
+- **Connection:** cards for "This computer is the…" and "Other computer" (on the server, "How the
+  other computer finds this one"), then **At a glance**: encryption, what the clipboard shares,
+  and the take-control-back key, all read-only, so the main window stays free of settings (R28).
+  Then a "More connection settings ›" row into Settings → Connection.
+- **Clipboard:** the history in a card with a heading and Clear, then a "Clipboard settings ›" row.
+- The settings list and these rows share one helper (`nav_row`), so the two parts of the app look
+  the same.
