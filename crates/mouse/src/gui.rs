@@ -220,6 +220,8 @@ enum Message {
     CloseRequested,
     /// "Quit anyway" / "Stop anyway" on the transfer-in-progress warning.
     LeaveAnyway,
+    /// The elevated relaunch itself, once any transfer warning has been answered.
+    RelaunchElevatedNow,
     /// "Keep going" on that warning.
     KeepGoing,
 }
@@ -229,6 +231,10 @@ enum Message {
 enum Leave {
     Quit,
     Stop,
+    /// "Restart now", which applies saved settings by stopping and starting sharing.
+    Restart,
+    /// Windows "Restart as administrator": this copy exits for an elevated one.
+    Elevate,
 }
 
 /// Settings the running engine read at startup and will not notice changing underneath
@@ -708,6 +714,21 @@ impl App {
                 self.stop_engine();
                 Task::none()
             }
+            Leave::Restart => {
+                // Stop, then start: `start_engine` re-saves and re-baselines `live_cfg`,
+                // so the prompt clears itself and the confirmation is truthful.
+                let names = self.pending_changes().join(", ");
+                self.stop_engine();
+                self.engine = None;
+                self.start_engine();
+                self.feedback = if names.is_empty() {
+                    "sharing restarted".into()
+                } else {
+                    format!("restarted — new settings active ({names})")
+                };
+                Task::none()
+            }
+            Leave::Elevate => self.update(Message::RelaunchElevatedNow),
             Leave::Quit => {
                 if let Some(e) = &self.engine {
                     e.request_stop();
@@ -1179,7 +1200,8 @@ impl App {
                 self.login_screen_asking = false;
                 self.feedback = "left off — the toggle is in Startup if you want it later".into();
             }
-            Message::RelaunchElevated => {
+            Message::RelaunchElevated => return self.leave(Leave::Elevate),
+            Message::RelaunchElevatedNow => {
                 // Remember the answer first: whichever way this goes, they have now been
                 // asked, and a UAC prompt they declined must not reappear next launch.
                 self.cfg.elevation_notice_seen = true;
@@ -1354,19 +1376,7 @@ impl App {
                     }
                 };
             }
-            Message::RestartNow => {
-                // Stop, then start: `start_engine` re-saves and re-baselines `live_cfg`,
-                // so the prompt clears itself and the confirmation is truthful.
-                let names = self.pending_changes().join(", ");
-                self.stop_engine();
-                self.engine = None;
-                self.start_engine();
-                self.feedback = if names.is_empty() {
-                    "sharing restarted".into()
-                } else {
-                    format!("restarted — new settings active ({names})")
-                };
-            }
+            Message::RestartNow => return self.leave(Leave::Restart),
             Message::RestartLater => {
                 self.restart_hint_dismissed = true;
             }
@@ -1539,6 +1549,8 @@ impl App {
         let (title, go) = match how {
             Leave::Quit => ("Quit while a transfer is running?", "Quit anyway"),
             Leave::Stop => ("Stop sharing while a transfer is running?", "Stop anyway"),
+            Leave::Restart => ("Restart sharing while a transfer is running?", "Restart anyway"),
+            Leave::Elevate => ("Restart as administrator while a transfer is running?", "Restart anyway"),
         };
         let card = container(
             column![

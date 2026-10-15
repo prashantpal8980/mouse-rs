@@ -108,8 +108,8 @@ unprivileged — that was reporting our own lack of permission as the service's 
 **Current state: installed and enabled, confirmed against systemd.** Untested at a real
 login prompt, which needs a reboot.
 
-### B3 — the stalled-transfer fixes were never confirmed on hardware
-**unverified** · built 2026-09-04 (`01555ac`)
+### B3 — the stalled-transfer fixes were never confirmed on hardware — **confirmed 2026-10-15**
+**closed** · built 2026-09-04 (`01555ac`)
 
 Three receiver-side fixes — "already downloading" no longer read as failure, progress
 surviving a paste retry, and the throttled over-budget log — were measured against the
@@ -118,6 +118,10 @@ pacer fix before it (`38593c1`) is in the same position.
 
 **Next step:** one 4 GB copy, watching whether the progress bar climbs monotonically
 instead of resetting.
+
+**Confirmed 2026-10-15:** a 4.65 GB, 6-file copy from Kali into Explorer. Each file was served once
+at offset 0, with no restarts or retries, at about 76 MB/s. The owner reported steady progress.
+Found B35 along the way.
 
 ---
 
@@ -439,6 +443,21 @@ hand-typed secret offline. Discovery is not affected, because beacons are sealed
 **Fix (planned, layer 1 of the plan):** device key pairs pinned at a one-time pairing, and mutual TLS.
 **Smaller stop-gap if needed before launch:** make the server answer a client nonce with its own HMAC,
 so both sides prove the secret.
+
+### B35 — a copy whose small files are pasted before its big ones is never marked done
+**open** · found 2026-10-15 in the B3 run (laptop log, 11:37–11:38 UTC)
+
+A 4.65 GB, 6-file copy from Kali pasted completely into Explorer: every file streamed in full,
+with no restarts. But the entry never logged "every file of this copy has been pasted", so its
+row keeps its old status (here "waiting", because it was over the ask-first limit). The two
+small files came from the cache and were pasted first. Explorer's paste of a cached file then
+removes mouse-rs's own copy ("pasted copy complete; mouse-rs's own copy removed"), so
+`Transfers::has_arrived` no longer finds those hashes in the cache or in `arrived`, and the set
+never counts as arrived. On 15 Oct at 08:21 the order was the other way round (big files first),
+and it was marked done.
+**Fix (small):** record the hash in `arrived` when a paste removes our own copy, in
+`win_virtual` and `stream_fs`.
+**Impact:** cosmetic, plus a waiting-file count in the tray. The files themselves are complete.
 
 ---
 

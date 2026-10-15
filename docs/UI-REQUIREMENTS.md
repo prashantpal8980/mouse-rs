@@ -202,5 +202,9 @@ re-author them.
   direction, quitting or stopping first shows "Quit while a transfer is running?" with
   **Keep going** / **Quit anyway** (or **Stop anyway**). Quit anyway stops at once, wherever the
   transfer is. Keep going changes nothing. Either choice is the user's.
+- 2026-10-15, extended at the owner's request: **Restart now** (applying saved settings) and
+  Windows **Restart as administrator** get the same warning, because both stop the engine.
+  **Save** only writes the settings file and doesn't touch a running transfer (the change waits
+  for a restart), so it doesn't warn.
 - The login-screen service is not part of this rule. It is a separate system service the user
   turns on explicitly (R21).
