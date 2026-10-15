@@ -385,8 +385,8 @@ integration per desktop. Build it when a Wayland machine has to be the server.
 
 ---
 
-### B33 — Linux has never been the server; Windows has never been the client
-**unverified** · found 2026-10-15
+### B33 — Linux as server / Windows as client — **signed off by the owner 2026-10-15**
+**closed for Linux → Windows** (keys, shortcuts, scrolling, clicks, clipboard, folder round trip all confirmed in daily use) · Linux → Linux and Windows → Windows still need same-OS hardware · found 2026-10-15
 
 Every hardware run so far has had the laptop as server: the shipped logs hold 72 starts with
 `role=Server`, all `name=laptop`, and none on Kali. So the code for the other direction exists
