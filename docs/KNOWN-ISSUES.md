@@ -408,6 +408,19 @@ is dropped unless mouse-rs itself runs elevated.
 **Next step:** the owner swaps roles (Kali = Server, laptop = Client) and runs the
 mouse, keyboard, edge and clipboard checks in both directions.
 
+**15 Oct 2026, first run with the roles swapped (Kali server, laptop client), from the shipped logs:**
+about 25 crossings each way; motion arrived on the laptop; keys and chords arrived
+(Ctrl+Alt+Left/Right, Alt+Tab); the client reconnected by itself when Kali's app restarted;
+clipboard text Kali → laptop (29 bytes) and a file Kali → laptop (60 bytes, hash verified).
+Edges are exit `right`, entry `left`. Kali's take-back key is Scroll Lock (`lock_hotkey`);
+`return_hotkey` is empty there.
+**Still to confirm by hand:** clicks and scrolling land on the laptop (the client doesn't log them),
+and that typing shows up in a Windows app.
+**Linux → Linux and Windows → Windows:** these use the same capture and inject pieces, each of
+which has now run on hardware. Only same-OS hardware can prove them.
+Small nit: the client logs `WARN … MOTION ARRIVED BUT NO KEYS` for every crossing where nothing
+was typed. That is noise, not a fault.
+
 ### B34 — only the client proves who it is; the server is never checked
 **parked** (security phase, after functionality) · found 2026-10-15 while writing `docs/lock-screen-security-plan.html`
 
