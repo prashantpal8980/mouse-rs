@@ -385,6 +385,31 @@ integration per desktop. Build it when a Wayland machine has to be the server.
 
 ---
 
+### B33 — Linux has never been the server; Windows has never been the client
+**unverified** · found 2026-10-15
+
+Every hardware run so far has had the laptop as server: the shipped logs hold 72 starts with
+`role=Server`, all `name=laptop`, and none on Kali. So the code for the other direction exists
+but has never moved a real mouse:
+
+* **Linux capture** (`X11Capture`, `crates/mouse-input/src/linux.rs`): written in the first
+  commit (June 2026), barely touched since, never run on hardware.
+* **Windows injection** (`WinInjector`, `crates/mouse-input/src/windows.rs`): never driven by a
+  real server.
+
+**Windows → Windows** and **Linux → Linux** use only these same pieces, so they are unproven
+too. Clipboard and files do not depend on the role, so they should behave as already
+signed off.
+
+**Expected limit on Windows as client:** Windows does not let a normal program type into a
+window running as administrator (UIPI). Input injected while one of those windows has focus
+is dropped unless mouse-rs itself runs elevated.
+
+**Next step:** the owner swaps roles (Kali = Server, laptop = Client) and runs the
+mouse, keyboard, edge and clipboard checks in both directions.
+
+---
+
 ## Build and release fragility
 
 ### B11 — the served Windows exe was a symlink into the build tree
