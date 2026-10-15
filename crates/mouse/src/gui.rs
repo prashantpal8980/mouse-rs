@@ -128,7 +128,6 @@ enum Message {
     ClipTogglePin(u64),
     ClipRemove(u64),
     ClipClear,
-    ClipCacheClear,
     /// Open ⋯ → Settings at this page; `Index` is the list of categories.
     OpenSettings(Page),
     /// Back to the main window.
@@ -979,22 +978,19 @@ impl App {
                     e.clipboard_remove(id);
                 }
             }
-            // Deliberately not "delete everything": pinned entries and anything still
-            // arriving are kept, because those bytes are not ours to throw away.
-            Message::ClipCacheClear => {
-                if let Some(e) = &self.engine {
-                    let freed = e.cache_clear();
-                    self.feedback = if freed == 0 {
-                        "nothing to clear — what is left is pinned or still arriving".into()
-                    } else {
-                        format!("freed {} (pinned and in-progress files kept)", human_bytes(freed as usize))
-                    };
-                }
-            }
+            // One Clear for the whole history: the entries, and the received-file copies
+            // only they were keeping. Two buttons with the same name doing different
+            // things was a UI bug (owner, 2026-10-15). History first, so the cache sweep
+            // keeps exactly what is still referenced: pinned entries and live transfers.
             Message::ClipClear => {
                 if let Some(e) = &self.engine {
                     e.clipboard_clear();
-                    self.feedback = "history cleared (pinned entries kept)".into();
+                    let freed = e.cache_clear();
+                    self.feedback = if freed == 0 {
+                        "history cleared (pinned entries kept)".into()
+                    } else {
+                        format!("history cleared and {} of received files deleted (pinned kept)", human_bytes(freed as usize))
+                    };
                 }
             }
             Message::OpenSettings(pg) => {
@@ -1790,6 +1786,12 @@ impl App {
             .style(ui_theme::ghost(p))
             .padding([9.0, 14.0]);
             let detect = if scanning { detect } else { detect.on_press(Message::DetectServers) };
+            let detect = hint(
+                p,
+                detect,
+                "Searches the networks this computer is on for the other computer running \
+                 mouse-rs as the server, and fills in its address. Takes a few seconds.",
+            );
 
             let mut col = column![
                 labeled(
@@ -1802,8 +1804,11 @@ impl App {
                     .spacing(8.0)
                     .align_y(Alignment::Center),
                 ),
+                text("The address of the computer that has the mouse (the server). Press Detect to find it on your network, or type its IP address.")
+                    .size(11.0)
+                    .color(p.txt3),
             ]
-            .spacing(12.0);
+            .spacing(8.0);
 
             // Only offered once a sweep has actually found something — an empty picker
             // would imply the feature is broken rather than that nothing answered.
@@ -1843,12 +1848,21 @@ impl App {
             format!("shares {}", shared.join(", "))
         };
         let glance = column![
-            section(p, "At a glance"),
-            info_row(p, "🔒", "Encryption", if cb.tls_enabled { "on (TLS)".to_string() } else { "off".to_string() }),
-            info_row(p, "📋", "Clipboard", clip),
-            info_row(p, "⌨", "Take control back", key_label(&cb.lock_hotkey)),
+            column![
+                section(p, "At a glance"),
+                text("A summary of how sharing is set up. Nothing changes here; click a line to change it in Settings.")
+                    .size(11.0)
+                    .color(p.txt3),
+            ]
+            .spacing(3.0),
+            column![
+                info_row(p, "🔒", "Encryption", if cb.tls_enabled { "on (TLS)".to_string() } else { "off".to_string() }, Page::Security),
+                info_row(p, "📋", "Clipboard", clip, Page::Clipboard),
+                info_row(p, "⌨", "Take control back", key_label(&cb.lock_hotkey), Page::Keys),
+            ]
+            .spacing(2.0),
         ]
-        .spacing(10.0);
+        .spacing(8.0);
 
         column![
             card(p, column![section(p, "This computer is the…"), role].spacing(12.0)),
@@ -2402,11 +2416,21 @@ impl App {
                         row![
                             text(kind).size(12.0).color(p.txt3),
                             text(arrow).size(11.0).color(col),
-                            text(m.preview.clone()).size(13.0).color(p.txt2).width(Length::Fill),
+                            // A file name has no spaces to break at, so it has to be allowed
+                            // to break anywhere, or it runs out over the pin and ✕ buttons.
+                            text(m.preview.clone())
+                                .size(13.0)
+                                .color(p.txt2)
+                                .width(Length::Fill)
+                                .wrapping(iced::widget::text::Wrapping::WordOrGlyph),
                         ]
                         .spacing(8.0)
                         .align_y(Alignment::Center),
-                        text(note).size(11.0).color(note_col).width(Length::Fill),
+                        text(note)
+                            .size(11.0)
+                            .color(note_col)
+                            .width(Length::Fill)
+                            .wrapping(iced::widget::text::Wrapping::WordOrGlyph),
                     ]
                     .spacing(4.0);
                     // A bar while it is moving: a percentage answers "how far", a bar
@@ -2494,10 +2518,16 @@ impl App {
             ]
             .spacing(3.0)
             .width(Length::Fill),
-            button(text("Clear").size(12.0))
-                .style(ui_theme::ghost(p))
-                .padding([7.0, 12.0])
-                .on_press(Message::ClipClear),
+            hint(
+                p,
+                button(text("Clear").size(12.0))
+                    .style(ui_theme::ghost(p))
+                    .padding([7.0, 12.0])
+                    .on_press(Message::ClipClear),
+                "Clear the history and delete mouse-rs's own copies of received files. \
+                 Pinned entries and transfers still running are kept; files you have \
+                 pasted somewhere are never touched.",
+            ),
         ]
         .align_y(Alignment::Center);
 
@@ -2507,17 +2537,13 @@ impl App {
         let disk: Element<'_, Message> = match self.engine.as_ref().and_then(|e| e.cache_usage()) {
             Some((bytes, count)) if count > 0 => row![
                 text(format!(
-                    "transferred files on disk: {} in {count} file{}",
+                    "received files kept by mouse-rs: {} in {count} file{}",
                     human_bytes(bytes as usize),
                     if count == 1 { "" } else { "s" }
                 ))
                 .size(11.0)
                 .color(if bytes > self.cfg.clipboard_cache_budget { p.warn } else { p.txt3 })
                 .width(Length::Fill),
-                button(text("Clear").size(11.0))
-                    .style(ui_theme::ghost(p))
-                    .padding([5.0, 10.0])
-                    .on_press(Message::ClipCacheClear),
             ]
             .align_y(Alignment::Center)
             .into(),
@@ -3109,15 +3135,23 @@ fn nav_row(p: Palette, icon: &'static str, title: &'static str, summary: &'stati
     .into()
 }
 
-/// One read-only line of "At a glance": icon, what it is, and its value.
-fn info_row(p: Palette, icon: &'static str, label: &'static str, value: String) -> Element<'static, Message> {
-    row![
-        text(icon).size(14.0).width(Length::Fixed(22.0)),
-        text(label).size(13.0).color(p.txt2).width(Length::Fill),
-        text(value).size(13.0).color(p.txt),
-    ]
-    .spacing(8.0)
-    .align_y(Alignment::Center)
+/// One line of "At a glance": icon, what it is, and its value. Read-only; clicking it
+/// opens the settings page where it is changed.
+fn info_row(p: Palette, icon: &'static str, label: &'static str, value: String, page: Page) -> Element<'static, Message> {
+    button(
+        row![
+            text(icon).size(14.0).width(Length::Fixed(22.0)),
+            text(label).size(13.0).color(p.txt2).width(Length::Fill),
+            text(value).size(13.0).color(p.txt),
+            text("›").size(14.0).color(p.txt3),
+        ]
+        .spacing(8.0)
+        .align_y(Alignment::Center),
+    )
+    .style(ui_theme::ghost(p))
+    .padding([7.0, 8.0])
+    .width(Length::Fill)
+    .on_press(Message::OpenSettings(page))
     .into()
 }
 

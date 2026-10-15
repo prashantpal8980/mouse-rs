@@ -208,3 +208,17 @@ re-author them.
   for a restart), so it doesn't warn.
 - The login-screen service is not part of this rule. It is a separate system service the user
   turns on explicitly (R21).
+
+### R34 — main-window fixes from the owner's review (2026-10-15)
+
+- **Long names wrap.** A file name in the clipboard history breaks anywhere when it has to, so it
+  never runs out over the 📍 and ✕ buttons.
+- **One Clear.** The history card had two "Clear" buttons: one cleared the history, the other
+  deleted received-file copies. Now there is one. It clears the history and deletes mouse-rs's
+  own copies of received files. Pinned entries and running transfers are kept, and pasted files
+  are never touched. The disk line stays as information: "received files kept by mouse-rs: …".
+- **Detect explains itself.** A hover tip on the button, and a line under the field: what the
+  address is for, and that Detect searches the network for the server.
+- **At a glance is clearly read-only.** A subtitle says so, and each line opens the Settings page
+  where it is changed (Encryption → Security & pairing, Clipboard → Clipboard, Take control
+  back → Keyboard & hotkeys).
