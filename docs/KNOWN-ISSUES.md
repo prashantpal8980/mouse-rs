@@ -409,7 +409,7 @@ is dropped unless mouse-rs itself runs elevated.
 mouse, keyboard, edge and clipboard checks in both directions.
 
 ### B34 — only the client proves who it is; the server is never checked
-**open** · found 2026-10-15 while writing `docs/lock-screen-security-plan.html`
+**parked** (security phase, after functionality) · found 2026-10-15 while writing `docs/lock-screen-security-plan.html`
 
 `client_handshake` (`crates/mouse-core/src/net.rs`) accepts the server's `AuthOk { ok: true }`
 without any proof that the server knows the shared secret. `tls.rs` also accepts any certificate

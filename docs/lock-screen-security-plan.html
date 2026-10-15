@@ -94,7 +94,7 @@
 <p class="lede">A second password, owned by mouse-rs, that has to be given before the other computer's keyboard
 can type anything into a login or lock screen. This page explains the idea, how the encryption works behind it,
 and the decisions we still need to make.</p>
-<p class="sub">Design proposal · 15 Oct 2026 · <b>not built yet</b>. The owner's plan is to build it after the
+<p class="sub">Design proposal · 15 Oct 2026 · <b>PARKED by the owner</b>: functionality first, then a dedicated security phase. The owner's plan is to build it after the
 Linux↔Windows, Linux↔Linux and Windows↔Windows role tests are done.</p>
 
 <!-- ============================================================ -->
@@ -412,6 +412,32 @@ built, it gets the same gate. macOS will work the same way.</div>
   <li>Attack tests, run here on Kali: a fake server, a stolen settings file, a replayed record, repeated wrong
   passwords, and restarting to reset the counter. Each must fail.</li>
   <li>Your hardware test at a real login screen.</li>
+</ol>
+
+<!-- ============================================================ -->
+<h2>10. Review: what the plan above did not cover</h2>
+<p>Added 15 Oct 2026 after a second pass. All of this belongs to the security phase.</p>
+<ol>
+  <li><b>The screen lock.</b> When Kali locks itself after idle, the <i>desktop</i> instance types into the lock
+  screen through XTEST, not the root service. The gate has to sit in that path too.</li>
+  <li><b>Downgrade.</b> An older mouse-rs on the other side must not get round the gate. Kali enforces it whatever
+  version the peer runs, and refuses a peer that can't do the unlock exchange.</li>
+  <li><b>Unlimited connection attempts.</b> The server accepts any number of failed handshakes with no delay. The
+  connection level needs the same rate limiting.</li>
+  <li><b>Beacon replay.</b> Beacons carry no timestamp, so a recorded beacon can be replayed later. It can only offer
+  addresses that really belonged to the server, but after a network change one of those may now belong to someone
+  else. Layer 1 (pinned server key) makes this harmless.</li>
+  <li><b>Clipboard while locked.</b> The clipboard and its history keep syncing while a machine is locked. The
+  history and the received files sit unencrypted on disk.</li>
+  <li><b>Log shipping is plain HTTP</b> (port 8001) and uploads hostnames and file names. That is fine for our test
+  rig. In the product it has to be off by default, or HTTPS with consent.</li>
+  <li><b>Updates are unsigned.</b> <code>irm http://… | iex</code> trusts whatever the network serves. That is fine
+  for testing; the product needs signed releases (Authenticode on Windows) and a signature check before any
+  self-update.</li>
+  <li><b>Secrets in memory.</b> Wipe the unlock password from memory after use (<code>zeroize</code>), and never
+  write it to logs or crash dumps.</li>
+  <li><b>Windows when it is the client.</b> Elevated windows can't receive our input (UIPI). That isn't a hole, but
+  it means a client must never be "fixed" by running mouse-rs as administrator by default.</li>
 </ol>
 
 <footer>mouse-rs · docs/lock-screen-security-plan.html · related: docs/LOGIN-SCREEN.md, KNOWN-ISSUES B2, B9, B33, B34</footer>

@@ -179,7 +179,7 @@ re-author them.
 - The settings list and these rows share one helper (`nav_row`), so the two parts of the app look
   the same.
 
-### R32 — lock-screen unlock password (agreed in principle 2026-10-15, **not built**; after the B33 role tests)
+### R32 — lock-screen unlock password (agreed in principle 2026-10-15, **PARKED**: functionality first, then a security phase)
 
 - The owner's rule: before the other computer's keyboard can type into a login or lock screen, the
   person must give a **mouse-rs unlock password**. It is separate from the OS login password, and
