@@ -216,6 +216,19 @@ enum Message {
     ToggleMenu,
     CloseMenu,
     Quit,
+    /// The window's close button. Treated exactly like Quit.
+    CloseRequested,
+    /// "Quit anyway" / "Stop anyway" on the transfer-in-progress warning.
+    LeaveAnyway,
+    /// "Keep going" on that warning.
+    KeepGoing,
+}
+
+/// What the user asked for when a transfer was still running (R33).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Leave {
+    Quit,
+    Stop,
 }
 
 /// Settings the running engine read at startup and will not notice changing underneath
@@ -330,6 +343,8 @@ struct App {
     /// system is not actually in.
     #[cfg(target_os = "linux")]
     login_screen_asking: bool,
+    /// Set while the "a transfer is still running" warning is on screen (R33).
+    confirm_leave: Option<Leave>,
     /// One-shot latch for the `autoconnect` / `start_minimized` launch actions, so they
     /// fire once on the first tick and never again (e.g. after a manual Stop).
     launch_done: bool,
@@ -487,6 +502,7 @@ impl App {
             login_screen_stale: crate::greeter::installed_copy_is_current() == Some(false),
             #[cfg(target_os = "linux")]
             login_screen_asking: false,
+            confirm_leave: None,
             launch_done: false,
             log_path: crate::logging::log_path().display().to_string(),
             live_cfg: None,
@@ -527,6 +543,9 @@ impl App {
             let want = want.to_lowercase();
             if want == "clipboard-tab" {
                 app.tab = Tab::Clipboard;
+            }
+            if want == "quit-prompt" {
+                app.confirm_leave = Some(Leave::Quit);
             }
             if let Some(pg) = all.into_iter().find(|p| p.title().to_lowercase().starts_with(&want) || (want == "index" && *p == Page::Index)) {
                 app.page = Some(pg);
@@ -629,6 +648,80 @@ impl App {
             e.request_stop();
         }
         self.feedback = "stopping…".into();
+    }
+
+    /// What would be cut off by quitting or stopping now, in words, or `None` when
+    /// nothing is moving. Quitting is always the user's choice (R33); this only makes
+    /// sure it is an informed one.
+    fn transfer_running(&self) -> Option<String> {
+        if !self.running() {
+            return None;
+        }
+        let incoming = mouse_clipboard::transfer::receiving_now();
+        let outgoing = mouse_clipboard::transfer::sending_now();
+        let fetching = self.engine.as_ref().is_some_and(|e| {
+            e.clipboard_meta()
+                .iter()
+                .any(|m| matches!(m.status, mouse_clipboard::ClipStatus::Fetching { .. }))
+        });
+        let peer = self
+            .engine
+            .as_ref()
+            .map(|e| e.status().peer)
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| "the other computer".into());
+        let files = |n: usize| if n == 1 { "1 file".to_string() } else { format!("{n} files") };
+        match (incoming > 0 || fetching, outgoing > 0) {
+            (true, true) => Some(format!(
+                "Files are still being copied both ways between this computer and {peer}."
+            )),
+            (true, false) => Some(format!(
+                "A paste from {peer} is still coming in{}.",
+                if incoming > 0 { format!(" ({})", files(incoming)) } else { String::new() }
+            )),
+            (false, true) => Some(format!(
+                "{peer} is still pasting {} from this computer.",
+                files(outgoing)
+            )),
+            (false, false) => None,
+        }
+    }
+
+    /// Quit or stop now, or first ask if that would cut a transfer off.
+    fn leave(&mut self, how: Leave) -> Task<Message> {
+        self.menu_open = false;
+        if self.transfer_running().is_some() {
+            self.confirm_leave = Some(how);
+            // The request may have come from the tray with the panel minimized; the
+            // question has to be where the user can see it.
+            return iced::window::latest().and_then(|id| {
+                iced::window::minimize(id, false).chain(iced::window::gain_focus(id))
+            });
+        }
+        self.leave_now(how)
+    }
+
+    fn leave_now(&mut self, how: Leave) -> Task<Message> {
+        self.confirm_leave = None;
+        match how {
+            Leave::Stop => {
+                self.stop_engine();
+                Task::none()
+            }
+            Leave::Quit => {
+                if let Some(e) = &self.engine {
+                    e.request_stop();
+                }
+                // Hard backstop so the process always dies even if teardown wedges.
+                std::thread::spawn(|| {
+                    std::thread::sleep(std::time::Duration::from_millis(1500));
+                    std::process::exit(0);
+                });
+                // Close the window → iced returns → App drops → engine teardown runs
+                // (releases the X grab / held keys). The backstop above guarantees exit.
+                iced::window::latest().and_then(iced::window::close)
+            }
+        }
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
@@ -751,6 +844,7 @@ impl App {
                 // Act on tray menu clicks (the tray can't touch the engine/window itself).
                 let mut want_open = false;
                 let mut want_quit = false;
+                let mut want_stop = false;
                 for ev in crate::tray::poll() {
                     match ev {
                         crate::tray::TrayEvent::Start => {
@@ -758,13 +852,16 @@ impl App {
                                 self.start_engine();
                             }
                         }
-                        crate::tray::TrayEvent::Stop => self.stop_engine(),
+                        crate::tray::TrayEvent::Stop => want_stop = true,
                         crate::tray::TrayEvent::Open => want_open = true,
                         crate::tray::TrayEvent::Quit => want_quit = true,
                     }
                 }
                 if want_quit {
                     return self.update(Message::Quit);
+                }
+                if want_stop {
+                    return self.update(Message::Stop);
                 }
                 if want_open {
                     return iced::window::latest().and_then(|id| {
@@ -1237,7 +1334,7 @@ impl App {
                     self.start_engine();
                 }
             }
-            Message::Stop => self.stop_engine(),
+            Message::Stop => return self.leave(Leave::Stop),
             Message::SaveConfig => {
                 let path = Config::default_path();
                 self.feedback = match self.cfg.save(&path) {
@@ -1331,26 +1428,24 @@ impl App {
                     "defaults restored — kept your name, secret and screen ({w}×{h}); press Save to apply"
                 );
             }
-            Message::Quit => {
-                self.menu_open = false;
-                if let Some(e) = &self.engine {
-                    e.request_stop();
+            Message::Quit | Message::CloseRequested => return self.leave(Leave::Quit),
+            Message::LeaveAnyway => {
+                if let Some(how) = self.confirm_leave {
+                    tracing::info!(?how, "left while a transfer was running, as the user chose");
+                    return self.leave_now(how);
                 }
-                // Hard backstop so the process always dies even if teardown wedges.
-                std::thread::spawn(|| {
-                    std::thread::sleep(std::time::Duration::from_millis(1500));
-                    std::process::exit(0);
-                });
-                // Close the window → iced returns → App drops → engine teardown runs
-                // (releases the X grab / held keys). The backstop above guarantees exit.
-                return iced::window::latest().and_then(iced::window::close);
             }
+            Message::KeepGoing => self.confirm_leave = None,
         }
         Task::none()
     }
 
     fn subscription(&self) -> Subscription<Message> {
-        iced::time::every(std::time::Duration::from_millis(150)).map(|_| Message::Tick)
+        Subscription::batch([
+            iced::time::every(std::time::Duration::from_millis(150)).map(|_| Message::Tick),
+            // The close button asks first, like Quit, so it can warn about a transfer.
+            iced::window::close_requests().map(|_| Message::CloseRequested),
+        ])
     }
 
     fn theme(&self) -> iced::Theme {
@@ -1405,6 +1500,9 @@ impl App {
             .height(Length::Fill)
             .into();
 
+        if let Some(how) = self.confirm_leave {
+            return stack![page, self.leave_prompt(p, how)].into();
+        }
         if !self.menu_open {
             return page;
         }
@@ -1430,6 +1528,57 @@ impl App {
         .height(Length::Fill);
 
         stack![page, dismiss, floating].into()
+    }
+
+    /// R33: quitting or stopping during a transfer asks once. Either answer is final:
+    /// "Quit anyway" quits at once, wherever the transfer is; "Keep going" changes nothing.
+    fn leave_prompt(&self, p: Palette, how: Leave) -> Element<'_, Message> {
+        let what = self
+            .transfer_running()
+            .unwrap_or_else(|| "The transfer has just finished.".into());
+        let (title, go) = match how {
+            Leave::Quit => ("Quit while a transfer is running?", "Quit anyway"),
+            Leave::Stop => ("Stop sharing while a transfer is running?", "Stop anyway"),
+        };
+        let card = container(
+            column![
+                text(title).size(15.0).color(p.txt),
+                text(what).size(12.5).color(p.txt2),
+                text("Stopping now ends it where it is; a half-pasted file stays incomplete.")
+                    .size(11.5)
+                    .color(p.warn),
+                row![
+                    Space::new().width(Length::Fill),
+                    button(text("Keep going").size(12.5))
+                        .style(ui_theme::ghost(p))
+                        .padding([9.0, 14.0])
+                        .on_press(Message::KeepGoing),
+                    button(text(go).size(12.5))
+                        .style(ui_theme::danger(p))
+                        .padding([9.0, 14.0])
+                        .on_press(Message::LeaveAnyway),
+                ]
+                .spacing(8.0),
+            ]
+            .spacing(10.0),
+        )
+        .style(move |_| ui_theme::card(p))
+        .padding(18.0)
+        .max_width(420.0);
+
+        // A dimmed full-window layer under the card, which also swallows clicks so the
+        // page behind cannot be used while the question is open.
+        mouse_area(
+            container(card)
+                .center(Length::Fill)
+                .padding(16.0)
+                .style(move |_| container::Style {
+                    background: Some(iced::Color { a: 0.55, ..iced::Color::BLACK }.into()),
+                    ..Default::default()
+                }),
+        )
+        .on_press(Message::Tick)
+        .into()
     }
 
     /// "Restart needed" prompt: the panel's only honest answer to "did my change take
@@ -3232,6 +3381,8 @@ pub fn launch(cfg: Config) -> anyhow::Result<()> {
             // genuinely nowhere for a label and its switch to both go, and allowing it
             // to be dragged narrower only produces a window that looks broken.
             min_size: Some(iced::Size::new(360.0, 420.0)),
+            // Closing still quits; `close_requests` routes it through Quit's check.
+            exit_on_close_request: false,
             ..Default::default()
         })
         .run()

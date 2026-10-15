@@ -318,8 +318,10 @@ our side, so the fix may not be ours to make. Unconfirmed.
 **Impact:** a "cut" leaves the original in place. Nothing is lost, but the user has to
 delete it themselves.
 
-### B5 — files on the clipboard stop working once mouse-rs exits
-**fixed 2026-10-12 on X11** · verified with a real X selection owner, not yet on a desktop paste
+### B5 — files on the clipboard stop working once mouse-rs exits — **intended behaviour; holder removed (owner, 2026-10-15, R33)**
+The owner's rule is that quitting means quitting: nothing may outlive mouse-rs, so copies stop being pasteable when it exits. The `hold-files` helper described below was removed. Kept for the trail.
+
+**was: fixed 2026-10-12 on X11** · verified with a real X selection owner, not yet on a desktop paste
 
 X11 has no clipboard daemon: the selection owner is asked **live** for every paste. So when
 mouse-rs quit, a file list it had put on the clipboard silently stopped being pasteable.

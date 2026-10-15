@@ -189,3 +189,18 @@ re-author them.
 - The proposed design (OPAQUE + Argon2id, device-key pairing, brute-force limits) and 8 open
   decisions are in `docs/lock-screen-security-plan.html`. Nothing there is agreed beyond the rule
   above until the owner answers those decisions.
+
+### R33 — quitting means quitting (agreed 2026-10-15)
+
+- The owner's rule: closing the window (×), **⋯ → Quit**, tray Quit and **Stop sharing** stop
+  mouse-rs at once. Nothing keeps running in the background after that: no helper process, no
+  daemon, nothing holding the clipboard. "If I close any application, it means that I don't want
+  that application to work right now."
+- Once mouse-rs has quit, what it copied stops being pasteable, and a transfer in flight stops.
+  That is expected, not a bug.
+- **The one exception is a warning, never a refusal.** If a file is still being copied in either
+  direction, quitting or stopping first shows "Quit while a transfer is running?" with
+  **Keep going** / **Quit anyway** (or **Stop anyway**). Quit anyway stops at once, wherever the
+  transfer is. Keep going changes nothing. Either choice is the user's.
+- The login-screen service is not part of this rule. It is a separate system service the user
+  turns on explicitly (R21).

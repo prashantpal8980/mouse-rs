@@ -866,9 +866,7 @@ impl ClipboardSync {
         if let Some(j) = self.join.take() {
             join_bounded(j, Duration::from_millis(800));
         }
-        // Stop, quit and exit all come through here. Hand a file list we still serve to
-        // a holder first, so pasting it after mouse-rs is gone still works.
-        files::handoff_on_exit();
+        transfer::clear_receiving();
     }
 }
 
@@ -1331,6 +1329,7 @@ fn run(
                 h.set_status(id, ClipStatus::Remote);
                 tracing::info!(id, "the paste was cancelled; transfer stopped, the file is still offered");
             }
+            t.publish_receiving();
             for id in t.take_pasted() {
                 if let Some(ClipPayload::Files(set)) = h.payload(id) {
                     if !t.is_complete(&set) && t.has_arrived(&set) {

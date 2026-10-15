@@ -36,7 +36,7 @@
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use mouse_core::bulk::{BulkFrame, BulkQueue, CHUNK_BYTES};
@@ -47,6 +47,46 @@ use tokio::sync::mpsc::UnboundedSender;
 use crate::cache::{self, BlobCache};
 use crate::files::FileList;
 use crate::{ClipStatus, ClipboardHistory, FileSet};
+
+/// Files this process is streaming to the peer right now. The panel asks before quitting
+/// while this is non-zero, because quitting stops the other computer's paste.
+static SENDING: AtomicUsize = AtomicUsize::new(0);
+
+/// How many files are being sent to the peer at this moment.
+pub fn sending_now() -> usize {
+    SENDING.load(Ordering::Relaxed)
+}
+
+/// Files this process is waiting to receive right now: a paste streaming in, or a
+/// fetch into the cache. Refreshed by the clipboard thread on every pass.
+static RECEIVING: AtomicUsize = AtomicUsize::new(0);
+
+/// How many files are on their way in from the peer at this moment.
+pub fn receiving_now() -> usize {
+    RECEIVING.load(Ordering::Relaxed)
+}
+
+/// Clear the receive count once the clipboard thread has stopped, so a stale count
+/// cannot make the next quit ask about a transfer that no longer exists.
+pub fn clear_receiving() {
+    RECEIVING.store(0, Ordering::Relaxed);
+}
+
+/// Counts one send for as long as it lives, so a send that panics is still uncounted.
+struct Sending;
+
+impl Sending {
+    fn start() -> Sending {
+        SENDING.fetch_add(1, Ordering::Relaxed);
+        Sending
+    }
+}
+
+impl Drop for Sending {
+    fn drop(&mut self) {
+        SENDING.fetch_sub(1, Ordering::Relaxed);
+    }
+}
 
 /// The "don't ask if it'll be quick" rule, with the measurement it depends on.
 #[derive(Clone, Copy)]
@@ -262,6 +302,11 @@ impl Transfers {
             }
         }
         cancelled
+    }
+
+    /// Publish how many requests are still outstanding, for [`receiving_now`].
+    pub fn publish_receiving(&self) {
+        RECEIVING.store(self.requested.len(), Ordering::Relaxed);
     }
 
     /// Entries whose paste has read a streamed file to the end since the last call.
@@ -673,6 +718,7 @@ impl Transfers {
         let spawned = std::thread::Builder::new()
             .name("clip-serve".into())
             .spawn(move || {
+                let _counted = Sending::start();
                 stream_blob(
                     &mut reader,
                     transfer,
@@ -1173,6 +1219,23 @@ fn stable_transfer_id(hash: &str) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// R33: the quit warning relies on this count, so a finished or panicked send must
+    /// never leave it raised.
+    #[test]
+    fn a_send_is_counted_only_while_it_runs() {
+        let before = sending_now();
+        let a = Sending::start();
+        let b = Sending::start();
+        assert_eq!(sending_now(), before + 2);
+        drop(a);
+        assert_eq!(sending_now(), before + 1);
+        let _ = std::panic::catch_unwind(move || {
+            let _held = b;
+            panic!("a send that dies");
+        });
+        assert_eq!(sending_now(), before);
+    }
     use std::fs;
 
     fn tmp(tag: &str) -> PathBuf {

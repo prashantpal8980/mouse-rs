@@ -35,24 +35,6 @@ mod notify;
 fn main() -> anyhow::Result<()> {
     let sub = std::env::args().nth(1);
 
-    // The clipboard holder: a detached child started when mouse-rs exits while it still
-    // owns a file list. It reads the list from stdin and keeps it pasteable until another
-    // copy takes the selection. It runs none of the normal startup, so it writes no log
-    // file, starts no log shipping and loads no config.
-    #[cfg(all(unix, not(target_os = "macos")))]
-    if sub.as_deref() == Some("hold-files") {
-        use std::io::Read as _;
-        let mut payload = Vec::new();
-        let _ = std::io::stdin().read_to_end(&mut payload);
-        mouse_clipboard::files::hold_from_payload(&payload);
-        return Ok(());
-    }
-    // Tell the clipboard how to start a holder, so a file list survives exit (see
-    // `mouse_clipboard::files::handoff_on_exit`).
-    if let Ok(exe) = std::env::current_exe() {
-        mouse_clipboard::files::set_holder(exe, vec!["hold-files".into()]);
-    }
-
     let is_gui = matches!(sub.as_deref(), None | Some("gui"));
     // The login-screen service logs to a file like the GUI does, because the file is
     // what gets shipped — a service that only logged to the journal would be the one
