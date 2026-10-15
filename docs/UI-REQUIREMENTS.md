@@ -178,3 +178,14 @@ re-author them.
 - **Clipboard:** the history in a card with a heading and Clear, then a "Clipboard settings ›" row.
 - The settings list and these rows share one helper (`nav_row`), so the two parts of the app look
   the same.
+
+### R32 — lock-screen unlock password (agreed in principle 2026-10-15, **not built**; after the B33 role tests)
+
+- The owner's rule: before the other computer's keyboard can type into a login or lock screen, the
+  person must give a **mouse-rs unlock password**. It is separate from the OS login password, and
+  its purpose is to stop anyone at the paired machine from brute-forcing the login password.
+- The protected machine checks the password itself; it never trusts the other side's word. Wrong
+  tries are limited and slowed.
+- The proposed design (OPAQUE + Argon2id, device-key pairing, brute-force limits) and 8 open
+  decisions are in `docs/lock-screen-security-plan.html`. Nothing there is agreed beyond the rule
+  above until the owner answers those decisions.

@@ -408,6 +408,20 @@ is dropped unless mouse-rs itself runs elevated.
 **Next step:** the owner swaps roles (Kali = Server, laptop = Client) and runs the
 mouse, keyboard, edge and clipboard checks in both directions.
 
+### B34 — only the client proves who it is; the server is never checked
+**open** · found 2026-10-15 while writing `docs/lock-screen-security-plan.html`
+
+`client_handshake` (`crates/mouse-core/src/net.rs`) accepts the server's `AuthOk { ok: true }`
+without any proof that the server knows the shared secret. `tls.rs` also accepts any certificate
+identity. A machine that gets the client to connect to it (by taking over `server_host`'s address
+on the LAN) can therefore act as the server and type into the client, including at the login screen.
+It also receives `HMAC(secret, nonce)` for a nonce it chose, which lets it test guesses at a weak,
+hand-typed secret offline. Discovery is not affected, because beacons are sealed with the secret.
+
+**Fix (planned, layer 1 of the plan):** device key pairs pinned at a one-time pairing, and mutual TLS.
+**Smaller stop-gap if needed before launch:** make the server answer a client nonce with its own HMAC,
+so both sides prove the secret.
+
 ---
 
 ## Build and release fragility

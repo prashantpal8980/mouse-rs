@@ -1,0 +1,420 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Lock-screen unlock password</title>
+<style>
+  :root{
+    --bg:#0d1117; --panel:#161b22; --panel2:#1c2230; --line:#2a3441;
+    --ink:#e6edf3; --dim:#8b98a5; --faint:#5c6773;
+    --bad:#f85149; --badbg:#2d1417; --good:#3fb950; --goodbg:#0f2416;
+    --warn:#d29922; --warnbg:#2a2111; --accent:#58a6ff; --accbg:#0f1f33;
+    --violet:#bc8cff;
+    --mono:ui-monospace,"SF Mono",Menlo,Consolas,monospace;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+       font:16px/1.65 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+       -webkit-font-smoothing:antialiased}
+  .wrap{max-width:960px;margin:0 auto;padding:54px 16px 90px}
+  h1{font-size:clamp(28px,5vw,42px);line-height:1.15;margin:0 0 12px;letter-spacing:-.02em}
+  h2{font-size:clamp(19px,3vw,23px);margin:56px 0 14px;letter-spacing:-.01em;
+     padding-bottom:9px;border-bottom:1px solid var(--line)}
+  h3{font-size:17px;margin:26px 0 8px}
+  p{margin:0 0 15px}
+  ul,ol{margin:0 0 15px;padding-left:22px}
+  li{margin:4px 0}
+  .lede{font-size:19px;color:var(--dim)}
+  .sub{color:var(--faint);font-size:14px;margin-bottom:30px}
+  code{font-family:var(--mono);font-size:.88em;background:#21262d;
+       padding:2px 6px;border-radius:4px;color:#a5d6ff;word-break:break-word}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:11px;padding:20px;margin:18px 0}
+  .note{border-left:3px solid var(--accent);background:var(--accbg);border-radius:0 10px 10px 0;padding:14px 18px;margin:18px 0}
+  .warn{border-left:3px solid var(--warn);background:var(--warnbg);border-radius:0 10px 10px 0;padding:14px 18px;margin:18px 0}
+  .bad{border-left:3px solid var(--bad);background:var(--badbg);border-radius:0 10px 10px 0;padding:14px 18px;margin:18px 0}
+  .good{border-left:3px solid var(--good);background:var(--goodbg);border-radius:0 10px 10px 0;padding:14px 18px;margin:18px 0}
+  .tag{display:inline-block;font-size:12px;font-weight:600;letter-spacing:.04em;
+       padding:2px 9px;border-radius:99px;margin-right:6px;vertical-align:2px}
+  .t-good{background:var(--goodbg);color:var(--good);border:1px solid #1d4429}
+  .t-bad{background:var(--badbg);color:#ffa198;border:1px solid #5a1e22}
+  .t-warn{background:var(--warnbg);color:#e3b341;border:1px solid #4d3a12}
+  .t-new{background:var(--accbg);color:var(--accent);border:1px solid #1f3d63}
+
+  .grid2{display:grid;grid-template-columns:1fr;gap:16px}
+  @media(min-width:800px){.grid2{grid-template-columns:1fr 1fr}}
+  .grid3{display:grid;grid-template-columns:1fr;gap:14px}
+  @media(min-width:800px){.grid3{grid-template-columns:1fr 1fr 1fr}}
+  .grid2>div,.grid3>div{background:var(--panel);border:1px solid var(--line);border-radius:11px;padding:18px}
+  .layer-n{font-family:var(--mono);font-size:12px;color:var(--faint);letter-spacing:.08em}
+
+  table{width:100%;border-collapse:collapse;font-size:14.5px;margin:10px 0 18px}
+  th,td{text-align:left;padding:9px 10px;border-bottom:1px solid var(--line);vertical-align:top}
+  th{color:var(--dim);font-weight:600;font-size:13px;text-transform:uppercase;letter-spacing:.05em}
+  .tablewrap{overflow-x:auto}
+
+  /* sequence diagram */
+  .seq{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:16px;overflow-x:auto}
+  .seq svg{display:block;min-width:640px;width:100%;height:auto}
+  .seq text{font-family:system-ui,sans-serif;fill:var(--ink)}
+
+  /* steps */
+  .steps{list-style:none;margin:0;padding:0}
+  .steps li{position:relative;padding:0 0 18px 34px;border-left:2px solid var(--line);margin:0}
+  .steps li:last-child{border-left-color:transparent;padding-bottom:0}
+  .steps li::before{content:"";position:absolute;left:-7px;top:6px;width:12px;height:12px;border-radius:50%;
+       background:var(--panel2);border:2px solid var(--accent)}
+  .steps li.stop::before{border-color:var(--bad);background:var(--bad)}
+  .steps li.ok::before{border-color:var(--good);background:var(--good)}
+  .steps li b{display:block}
+  .steps li span{color:var(--dim);font-size:14.5px}
+
+  /* mock dialog */
+  .mock{max-width:380px;margin:10px auto;background:#1b2130;border:1px solid #33405a;border-radius:12px;
+        box-shadow:0 10px 30px rgba(0,0,0,.45);overflow:hidden;font-size:14px}
+  .mock .bar{background:#232b3d;padding:9px 14px;color:var(--dim);font-size:13px}
+  .mock .body{padding:16px}
+  .mock .field{background:#0d1117;border:1px solid #33405a;border-radius:7px;padding:9px 11px;
+               font-family:var(--mono);letter-spacing:.25em;color:var(--dim);margin:10px 0}
+  .mock .btns{display:flex;gap:8px;justify-content:flex-end;margin-top:12px}
+  .mock .btn{padding:6px 14px;border-radius:7px;border:1px solid #33405a;color:var(--ink)}
+  .mock .btn.p{background:var(--accent);color:#0d1117;border-color:var(--accent);font-weight:600}
+  .mock small{color:var(--faint)}
+
+  .q{background:var(--panel);border:1px solid var(--line);border-radius:11px;padding:16px 18px;margin:12px 0}
+  .q b{color:var(--accent)}
+  .q .rec{color:var(--good);font-size:14.5px}
+  footer{margin-top:60px;color:var(--faint);font-size:13px}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>The lock-screen unlock password</h1>
+<p class="lede">A second password, owned by mouse-rs, that has to be given before the other computer's keyboard
+can type anything into a login or lock screen. This page explains the idea, how the encryption works behind it,
+and the decisions we still need to make.</p>
+<p class="sub">Design proposal · 15 Oct 2026 · <b>not built yet</b>. The owner's plan is to build it after the
+Linux↔Windows, Linux↔Linux and Windows↔Windows role tests are done.</p>
+
+<!-- ============================================================ -->
+<h2>1. The idea in one picture</h2>
+
+<p>Today, once the laptop is paired, its keyboard can type into Kali's login screen straight away. Anyone sitting
+at the laptop can therefore start guessing Kali's login password. The new rule:</p>
+
+<div class="good"><b>Nothing typed on the other computer reaches a login or lock screen until the mouse-rs
+unlock password has been given correctly.</b> The computer being protected (Kali in our setup) checks that
+password itself. It never takes the other computer's word for it.</div>
+
+<div class="seq">
+<svg viewBox="0 0 900 470" role="img" aria-label="Sequence: laptop crosses to Kali's login screen, is asked for the unlock password, and only then can type the login password">
+  <defs>
+    <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#8b98a5"/></marker>
+    <marker id="ag" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#3fb950"/></marker>
+    <marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#f85149"/></marker>
+  </defs>
+  <!-- actors -->
+  <rect x="20" y="10" width="170" height="54" rx="9" fill="#1c2230" stroke="#2a3441"/>
+  <text x="105" y="34" text-anchor="middle" font-size="15" font-weight="600">You at the laptop</text>
+  <text x="105" y="53" text-anchor="middle" font-size="12" fill="#8b98a5">keyboard + mouse</text>
+  <rect x="330" y="10" width="200" height="54" rx="9" fill="#1c2230" stroke="#2a3441"/>
+  <text x="430" y="34" text-anchor="middle" font-size="15" font-weight="600">mouse-rs on laptop</text>
+  <text x="430" y="53" text-anchor="middle" font-size="12" fill="#8b98a5">server</text>
+  <rect x="680" y="10" width="200" height="54" rx="9" fill="#1c2230" stroke="#2a3441"/>
+  <text x="780" y="34" text-anchor="middle" font-size="15" font-weight="600">mouse-rs on Kali</text>
+  <text x="780" y="53" text-anchor="middle" font-size="12" fill="#8b98a5">login-screen service (root)</text>
+  <line x1="105" y1="64" x2="105" y2="460" stroke="#2a3441" stroke-dasharray="4 5"/>
+  <line x1="430" y1="64" x2="430" y2="460" stroke="#2a3441" stroke-dasharray="4 5"/>
+  <line x1="780" y1="64" x2="780" y2="460" stroke="#2a3441" stroke-dasharray="4 5"/>
+
+  <!-- 1 -->
+  <line x1="430" y1="95" x2="775" y2="95" stroke="#8b98a5" marker-end="url(#a)"/>
+  <text x="602" y="88" text-anchor="middle" font-size="13">① encrypted link, both machines prove who they are</text>
+  <!-- 2 -->
+  <line x1="105" y1="135" x2="425" y2="135" stroke="#8b98a5" marker-end="url(#a)"/>
+  <text x="265" y="128" text-anchor="middle" font-size="13">② move the mouse across the edge</text>
+  <!-- 3 -->
+  <line x1="775" y1="170" x2="435" y2="170" stroke="#d29922" marker-end="url(#a)"/>
+  <text x="602" y="163" text-anchor="middle" font-size="13" fill="#e3b341">③ "I'm at a login screen and I'm locked"</text>
+  <!-- 4 -->
+  <line x1="425" y1="210" x2="110" y2="210" stroke="#d29922" marker-end="url(#a)"/>
+  <text x="265" y="203" text-anchor="middle" font-size="13" fill="#e3b341">④ prompt: "Unlock password for kali-desktop"</text>
+  <!-- 5 -->
+  <line x1="105" y1="250" x2="425" y2="250" stroke="#8b98a5" marker-end="url(#a)"/>
+  <text x="265" y="243" text-anchor="middle" font-size="13">⑤ you type the unlock password</text>
+  <!-- 6 -->
+  <line x1="430" y1="290" x2="775" y2="290" stroke="#bc8cff" marker-end="url(#a)"/>
+  <line x1="775" y1="305" x2="435" y2="305" stroke="#bc8cff" marker-end="url(#a)"/>
+  <text x="602" y="283" text-anchor="middle" font-size="13" fill="#bc8cff">⑥ OPAQUE exchange: proves the password,</text>
+  <text x="602" y="325" text-anchor="middle" font-size="12" fill="#8b98a5">the password itself is never sent, not even hashed</text>
+  <!-- 7 -->
+  <line x1="775" y1="365" x2="435" y2="365" stroke="#3fb950" marker-end="url(#ag)"/>
+  <text x="602" y="358" text-anchor="middle" font-size="13" fill="#7ee787">⑦ "unlocked for this login screen, 2 minutes"</text>
+  <!-- 8 -->
+  <line x1="105" y1="410" x2="775" y2="410" stroke="#3fb950" marker-end="url(#ag)"/>
+  <text x="440" y="403" text-anchor="middle" font-size="13" fill="#7ee787">⑧ now your keys reach Kali: you type Kali's own login password</text>
+  <text x="440" y="448" text-anchor="middle" font-size="12" fill="#8b98a5">Wrong unlock password at ⑥ → Kali drops every key, counts the failure, and slows further tries</text>
+</svg>
+</div>
+
+<p>So there are <b>two passwords</b>, and they do different jobs:</p>
+<div class="grid2">
+  <div><span class="tag t-new">NEW</span><b>mouse-rs unlock password</b><br>
+  <span style="color:var(--dim);font-size:14.5px">Belongs to mouse-rs. Proves that the person at the other computer is allowed to type into
+  this machine's login screen at all. Set once in Settings → Security &amp; pairing, on the machine it protects.</span></div>
+  <div><span class="tag t-good">UNCHANGED</span><b>Kali's own login password</b><br>
+  <span style="color:var(--dim);font-size:14.5px">Belongs to the operating system. mouse-rs never sees, stores or checks it. It only
+  delivers the key presses, and only after the unlock password was right.</span></div>
+</div>
+
+<!-- ============================================================ -->
+<h2>2. Who we are protecting against</h2>
+
+<div class="tablewrap"><table>
+<tr><th>Attacker</th><th>What they could do today</th><th>After this plan</th></tr>
+<tr><td><b>A stranger on the same Wi-Fi or router</b></td>
+    <td>Can't connect without the shared secret. <span class="tag t-bad">GAP</span> They <i>can</i> pretend to be the
+    server; see section 3.</td>
+    <td>Blocked. Each machine checks the other's pinned key.</td></tr>
+<tr><td><b>Someone sitting at the unlocked laptop</b> (left unattended, borrowed, stolen)</td>
+    <td>Can move to Kali's login screen and guess Kali's password as often as they like.</td>
+    <td>Must know the unlock password first. Kali allows only a few tries, then waits longer and longer.</td></tr>
+<tr><td><b>Someone who copies the laptop's settings file</b> (backup, malware, a stolen disk)</td>
+    <td>The shared secret sits in that file and works on its own: they can connect as the laptop.</td>
+    <td>The file holds no password and nothing password-like. Copying it does not give them the unlock password.</td></tr>
+<tr><td><b>Someone who copies Kali's stored record</b></td>
+    <td>Same as above: the secret is stored in the clear in <code>/etc/mouse-rs</code>.</td>
+    <td>The record cannot be used to unlock ("pass the hash" does not work). The best they can do is guess passwords offline, and each guess costs a deliberate ~0.5 s and 64 MB.</td></tr>
+<tr><td><b>Someone recording the network traffic</b></td>
+    <td>Sees only encrypted data.</td>
+    <td>Same, and nothing in the recording helps them guess the password, even if they later steal a key.</td></tr>
+</table></div>
+
+<div class="warn"><b>What no software design here can stop:</b> someone who knows both passwords; a keylogger
+or other malware already running on the laptop; someone watching over your shoulder; a person with physical root
+access to Kali itself. This plan narrows the attack to "must know a secret that only you know". It does not make
+a compromised computer safe.</div>
+
+<!-- ============================================================ -->
+<h2>3. What mouse-rs does today, and a gap found while writing this</h2>
+
+<p>Today's link has two parts (<code>crates/mouse-core/src/tls.rs</code> and <code>auth.rs</code>):</p>
+<ol>
+  <li><b>TLS encryption.</b> The server makes a new certificate each time it starts. The client encrypts with it
+  but <b>does not check whose certificate it is</b>; the code says so: <i>"encrypts but does not verify the
+  cert's identity"</i>.</li>
+  <li><b>Shared-secret check (HMAC-SHA256).</b> The server sends a random challenge; the client answers with
+  <code>HMAC(secret, challenge)</code>; the server checks it.</li>
+</ol>
+
+<div class="bad">
+<b>The gap: only the client proves who it is. The server never proves anything.</b><br>
+The server simply replies "ok", and the client believes it. So a machine on the network that gets Kali to connect to
+it can play the server, by taking over the <code>192.168.137.1</code> address or answering in its place. Kali would
+then accept its mouse and keyboard, including at the login screen. Beacons are sealed with the secret, so the attack
+can't come through discovery, but it can through the fixed server address.<br><br>
+A fake server would also receive <code>HMAC(secret, challenge)</code> for a challenge it chose. That is enough to
+test guesses of the secret offline. A 32-character generated secret is far too strong to guess, but a short secret
+typed by hand is not.<br><br>
+<b>Recorded as B34 in KNOWN-ISSUES.</b> Layer 1 below closes it. It is worth fixing before launch, whenever the unlock
+password itself is built.
+</div>
+
+<!-- ============================================================ -->
+<h2>4. "Hybrid" encryption, explained simply</h2>
+
+<p>You remembered a "hybrid" approach. That is the right word. There are two families of encryption, and every
+modern secure link uses both together:</p>
+
+<div class="grid2">
+  <div><b>Asymmetric (public / private key)</b><br>
+  <span style="color:var(--dim);font-size:14.5px">Each side has a key pair. The public half can be shown to anyone; the private
+  half never leaves the machine. Two strangers can use it to <b>agree on a secret over an open wire</b>, and to
+  <b>prove identity</b> by signing. It is slow, so it is only used for the first moments of a connection.<br><br>
+  Used here: <b>X25519</b> (agreeing a key) and <b>Ed25519</b> (identity signatures).</span></div>
+  <div><b>Symmetric (one shared key)</b><br>
+  <span style="color:var(--dim);font-size:14.5px">Both sides use the same key to lock and unlock. It is extremely fast; it carries
+  every mouse move, key press and gigabyte of pasted file. The hard part is getting the same key to both sides
+  safely, and the asymmetric half solves that.<br><br>
+  Used here: <b>AES-256-GCM</b> or <b>ChaCha20-Poly1305</b>.</span></div>
+</div>
+
+<div class="note"><b>Hybrid = asymmetric to agree a fresh key, then symmetric for all the data.</b> TLS 1.3, which
+mouse-rs already uses, works exactly this way. Each connection gets brand-new keys and throws them away afterwards
+("forward secrecy"), so a key stolen next year can't decrypt traffic recorded today.<br><br>
+There is a newer meaning of "hybrid" too: <b>post-quantum hybrid</b>. It mixes classic X25519 with
+<b>ML-KEM-768</b>, a key agreement designed to resist future quantum computers, so the link stays safe unless
+<i>both</i> are broken. rustls offers this as <code>X25519MLKEM768</code> through its <code>aws-lc-rs</code>
+backend. mouse-rs uses the <code>ring</code> backend today because it cross-compiles cleanly to Windows, so switching
+needs a build check first. This is a nice extra, not essential for a LAN tool.</div>
+
+<p><b>The other half of your question: the password is not encrypted.</b> A password should never be stored in a
+form that can be turned back into it. It is turned into a one-way <b>slow hash</b>, and for the unlock password we
+go one step further with OPAQUE (section 5, Layer 2). There, even the hash is useless to a thief for logging in.</p>
+
+<!-- ============================================================ -->
+<h2>5. The proposed design: three layers</h2>
+
+<div class="grid3">
+  <div><div class="layer-n">LAYER 1</div><b>The machines know each other</b><br>
+  <span style="color:var(--dim);font-size:14px">Device keys, paired once, checked by both sides on every connection. Closes the B34
+  gap.</span></div>
+  <div><div class="layer-n">LAYER 2</div><b>The unlock password</b><br>
+  <span style="color:var(--dim);font-size:14px">OPAQUE plus Argon2id. Proves you know the password without sending it, and a stolen
+  record can't be used to unlock.</span></div>
+  <div><div class="layer-n">LAYER 3</div><b>Brute-force limits</b><br>
+  <span style="color:var(--dim);font-size:14px">A few tries, then growing delays, a lockout that survives restarts, and alerts.</span></div>
+</div>
+
+<h3>Layer 1: device keys and pairing</h3>
+<ul>
+  <li>Each install creates an <b>Ed25519 key pair</b> once. The private key stays on that machine: in a root-only
+  file on Linux, and protected by Windows DPAPI on Windows.</li>
+  <li><b>Pairing happens once.</b> One machine shows a 6-digit code and you type it on the other. A
+  <b>PAKE</b> (SPAKE2 or CPace) turns that short code into a strong, verified exchange of public keys. Someone
+  eavesdropping or impersonating gets a single guess at the code, and a wrong guess ends the pairing.</li>
+  <li>From then on, the TLS link is <b>mutual</b>: each side checks that the other presents the <b>exact public key
+  it paired with</b> ("pinning"). An impostor fails at once, and the shared secret in the settings file goes away.</li>
+  <li>Settings → Security &amp; pairing lists paired machines with a short fingerprint each, and a <b>Forget</b>
+  button for each one.</li>
+</ul>
+
+<h3>Layer 2: the unlock password (OPAQUE)</h3>
+<p><b>OPAQUE</b> is an IETF-standard "augmented PAKE". In plain words:</p>
+<ul>
+  <li><b>Setting it</b> (on Kali, as administrator, in Settings → Security &amp; pairing). Kali stores a
+  <b>registration record</b>. That record is not the password and not a hash that can be replayed.</li>
+  <li><b>Using it.</b> The laptop and Kali run a short exchange. Kali learns <i>only</i> "this person knows the
+  password", and the laptop learns <i>only</i> "this really is Kali". <b>The password, and any hash of it, never
+  crosses the wire.</b> Not even a fake Kali would receive anything it could test guesses against.</li>
+  <li><b>Why "they can't use the hash".</b> With an ordinary stored hash, a thief can sometimes present the hash
+  itself in place of the password ("pass the hash"). OPAQUE's record does not work that way: presenting it
+  achieves nothing. To get anywhere, the thief must recover the actual password by guessing.</li>
+  <li><b>Making guessing expensive.</b> Inside OPAQUE, the password is stretched with <b>Argon2id</b>, set to about
+  0.5 s and 64 MB per guess. A thief with the record can then test only a few guesses per second per CPU core,
+  instead of billions. A decent passphrase stays out of reach.</li>
+  <li><b>The check runs on the machine being protected</b> (Kali's root service). A modified laptop app can't skip it,
+  because Kali throws away every key event until its own check has passed.</li>
+</ul>
+
+<p>What the prompt on the laptop could look like:</p>
+<div class="mock">
+  <div class="bar">mouse-rs</div>
+  <div class="body">
+    <b>kali-desktop is at its login screen</b><br>
+    <small>Enter the mouse-rs unlock password to type there. This is not Kali's login password.</small>
+    <div class="field">••••••••••</div>
+    <small>3 tries left before a 30-second wait</small>
+    <div class="btns"><span class="btn">Stay on laptop</span><span class="btn p">Unlock</span></div>
+  </div>
+</div>
+
+<h3>Layer 3: brute-force limits (enforced by Kali)</h3>
+<div class="tablewrap"><table>
+<tr><th>Failed tries in a row</th><th>What Kali does</th></tr>
+<tr><td>1–3</td><td>Says "wrong password" and lets them try again.</td></tr>
+<tr><td>4</td><td>30-second wait.</td></tr>
+<tr><td>5</td><td>2-minute wait.</td></tr>
+<tr><td>6</td><td>10-minute wait.</td></tr>
+<tr><td>7 or more</td><td>Locked until someone logs in at Kali's own keyboard (or a 24-hour wait; your call).</td></tr>
+</table></div>
+<ul>
+  <li>The counter is kept on disk on Kali, so <b>restarting either app does not reset it</b>.</li>
+  <li>A successful unlock is valid <b>only for that one login screen</b>. It ends when the session opens, after
+  2 minutes of no input, or when the link drops. The next lock screen asks again.</li>
+  <li>After you log in, Kali shows <i>"3 failed unlock attempts from MSI at 02:14"</i>, and the attempts go into the
+  shipped log, <b>never with the typed text</b>.</li>
+  <li>Kali refuses the attempt if the laptop isn't a paired device (Layer 1), so a stranger never even reaches the
+  password prompt.</li>
+</ul>
+
+<!-- ============================================================ -->
+<h2>6. Your scenario, step by step</h2>
+<p>The laptop is the server; Kali was just switched on and is showing its login screen.</p>
+<ul class="steps">
+  <li><b>Kali boots</b><span>The root login-screen service starts and links to the laptop. Both sides check each other's pinned key (Layer 1).</span></li>
+  <li><b>You move the mouse to Kali</b><span>Kali says "login screen, locked". The pointer may move (your call, question 2 below), but key presses are dropped.</span></li>
+  <li><b>The laptop shows the unlock prompt</b><span>You type the mouse-rs unlock password into the laptop's own dialog. Those keys stay on the laptop.</span></li>
+  <li class="stop"><b>Wrong password</b><span>Kali counts it and applies the delays above; nothing reaches the login screen.</span></li>
+  <li class="ok"><b>Right password</b><span>The OPAQUE check passes on Kali, and Kali opens the gate for this login screen only.</span></li>
+  <li><b>You type Kali's own login password</b><span>Kali's login screen checks it as usual. mouse-rs only delivered the keys.</span></li>
+  <li><b>The session opens</b><span>The gate closes again. The normal desktop instance takes over, as it does now.</span></li>
+</ul>
+
+<!-- ============================================================ -->
+<h2>7. The building blocks</h2>
+<p>All of these are permissive licences (MIT/Apache), so they fit a commercial product.</p>
+<div class="tablewrap"><table>
+<tr><th>Job</th><th>Algorithm</th><th>Rust crate</th><th>Status</th></tr>
+<tr><td>Encrypt the link (hybrid)</td><td>TLS 1.3: X25519 + AES-256-GCM / ChaCha20-Poly1305</td><td><code>rustls</code> (ring)</td><td><span class="tag t-good">HAVE</span></td></tr>
+<tr><td>Post-quantum hybrid (optional)</td><td>X25519MLKEM768</td><td><code>rustls</code> (aws-lc-rs)</td><td><span class="tag t-warn">LATER?</span></td></tr>
+<tr><td>Device identity</td><td>Ed25519, pinned public keys</td><td><code>rustls</code>, <code>rcgen</code>, <code>ed25519-dalek</code></td><td><span class="tag t-new">NEW</span></td></tr>
+<tr><td>One-time pairing code</td><td>SPAKE2 or CPace</td><td><code>spake2</code></td><td><span class="tag t-new">NEW</span></td></tr>
+<tr><td>Unlock password check</td><td>OPAQUE (augmented PAKE)</td><td><code>opaque-ke</code></td><td><span class="tag t-new">NEW</span></td></tr>
+<tr><td>Password stretching</td><td>Argon2id (~0.5 s, 64 MB)</td><td><code>argon2</code></td><td><span class="tag t-new">NEW</span></td></tr>
+<tr><td>Today's shared-secret check</td><td>HMAC-SHA256</td><td><code>hmac</code>, <code>sha2</code></td><td><span class="tag t-bad">REPLACE</span></td></tr>
+</table></div>
+
+<div class="note"><b>Rule we will follow:</b> no home-made cryptography. Every piece above is a published standard
+with a maintained, reviewed crate. Our job is only to wire the pieces together and test the failure cases.</div>
+
+<!-- ============================================================ -->
+<h2>8. Decisions to talk through</h2>
+
+<div class="q"><b>1. Where is the unlock password typed?</b><br>
+In a dialog on the laptop (shown above), or on Kali's screen inside a small mouse-rs box on the login screen?<br>
+<span class="rec">Suggested: on the laptop. Drawing our own box on top of a login screen is fragile and differs for
+every desktop. A laptop dialog is simple, and Kali still does the checking.</span></div>
+
+<div class="q"><b>2. Before unlocking, may the mouse move on Kali, or nothing at all?</b><br>
+<span class="rec">Suggested: the pointer may move, but no clicks or keys. Then you can see the link works. A click
+on "Restart" or "Shut down" on a login screen is a risk, so clicks stay blocked.</span></div>
+
+<div class="q"><b>3. Only the boot login screen, or the screen lock too?</b><br>
+When Kali locks itself after idle, the normal desktop instance is the one typing into the lock screen, not the
+root service. Should that also ask for the unlock password?<br>
+<span class="rec">Suggested: yes, both. Otherwise anyone at the laptop just waits for the screen lock instead of a
+reboot.</span></div>
+
+<div class="q"><b>4. What happens after 7 wrong tries?</b><br>
+Locked until someone logs in at Kali's own keyboard, or locked for 24 hours?<br>
+<span class="rec">Suggested: until a local login. That is the safest choice, and you can always log in at Kali
+directly.</span></div>
+
+<div class="q"><b>5. Forgotten unlock password?</b><br>
+<span class="rec">Suggested: reset it on Kali itself, as administrator, in Settings → Security &amp; pairing. There is
+no recovery over the network, by design.</span></div>
+
+<div class="q"><b>6. One unlock password per machine, or one for all your machines?</b><br>
+<span class="rec">Suggested: per machine. Each machine sets its own and stores its own record, so a leak on one
+machine does not unlock the others.</span></div>
+
+<div class="q"><b>7. Is it on by default?</b><br>
+<span class="rec">Suggested: login-screen typing stays off until an unlock password is set. Then the feature can
+never be on without a password.</span></div>
+
+<div class="q"><b>8. Windows as the protected machine.</b><br>
+Typing into the Windows login screen isn't possible today (B9: Windows walls off its login desktop). When it is
+built, it gets the same gate. macOS will work the same way.</div>
+
+<!-- ============================================================ -->
+<h2>9. Order of work (when we start)</h2>
+<ol>
+  <li>Finish the role tests: Linux→Windows, Linux→Linux, Windows→Windows (B33). <i>This comes first, as you
+  decided.</i></li>
+  <li>Layer 1: device keys, pairing code and mutual pinned TLS. This replaces the shared secret and closes B34.</li>
+  <li>Layer 2 and Layer 3: the unlock password with OPAQUE and Argon2id, the brute-force limits, and the prompt on the
+  laptop.</li>
+  <li>Attack tests, run here on Kali: a fake server, a stolen settings file, a replayed record, repeated wrong
+  passwords, and restarting to reset the counter. Each must fail.</li>
+  <li>Your hardware test at a real login screen.</li>
+</ol>
+
+<footer>mouse-rs · docs/lock-screen-security-plan.html · related: docs/LOGIN-SCREEN.md, KNOWN-ISSUES B2, B9, B33, B34</footer>
+</div>
+</body>
+</html>
