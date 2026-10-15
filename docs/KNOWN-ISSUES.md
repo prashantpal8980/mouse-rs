@@ -414,6 +414,9 @@ about 25 crossings each way; motion arrived on the laptop; keys and chords arriv
 clipboard text Kali → laptop (29 bytes) and a file Kali → laptop (60 bytes, hash verified).
 Edges are exit `right`, entry `left`. Kali's take-back key is Scroll Lock (`lock_hotkey`);
 `return_hotkey` is empty there.
+**Folder round trip, same day, confirmed:** a `test` folder (`.md`, `.png`, a 699 MB `.zip`, an 834 MB `.mkv`)
+went Kali → Explorer (~77–80 MB/s, "every file of this copy has been pasted") and back
+Explorer → Thunar (~78 MB/s). `sha256sum -c` against the originals passed on all 4 files.
 **Still to confirm by hand:** clicks and scrolling land on the laptop (the client doesn't log them),
 and that typing shows up in a Windows app.
 **Linux → Linux and Windows → Windows:** these use the same capture and inject pieces, each of
