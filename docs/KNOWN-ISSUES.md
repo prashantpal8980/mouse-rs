@@ -36,7 +36,15 @@ equivalent, or a distinct bug seen while sharing.
 
 ## Built but never proven on hardware
 
-### B2 — login-screen sharing: PROVEN 13 Oct 2026 (password typed from the laptop); refresh pending
+### B2 — login-screen sharing — **closed 2026-10-16, signed off by the owner**
+
+**16 Oct 2026, owner sign-off.** On the boot at 19:07 the login-screen service connected to the
+laptop at 13:37:32 UTC, within a second of starting. The laptop took control at 13:37:45, the
+owner typed the password from the laptop, the session opened at 13:38:00, and the service stood
+down cleanly with no double input. It logs 9 key events by count only, never by name. The installed
+copy dates from 15 Oct 13:05. Later builds changed only the panel and the clipboard, which this
+input-only service doesn't use.
+
 
 **13 Oct 2026, proven.** Boot at 12:34. The service connected at 12:34:47; the fifth crossing stuck at 12:34:57; 20 key events were injected; logind opened the session at 12:35:03; the service stood down at 12:35:05. This ran on the 9 Oct copy, so the 12 Oct fixes (toast, no key names logged, no clipboard to the login screen, shipped log, no restart churn) are still waiting for `greeter-install` and the laptop update. `greeter-install` now stages the binary and renames it over the old one, so it cannot fail with ETXTBSY while the old copy churns.
 **on hold at the owner's request 2026-10-09** (they cannot reboot right now) · built 2026-10-08 (`61b0d72`, `7b143a6`) · tested by the owner 2026-10-09 · R21
