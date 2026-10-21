@@ -467,6 +467,26 @@ and it was marked done.
 `win_virtual` and `stream_fs`.
 **Impact:** cosmetic, plus a waiting-file count in the tray. The files themselves are complete.
 
+### B36 — a screenshot arrived on the laptop as a file path after two screenshots in a row — **fixed 2026-10-21**
+Reported by the owner on 21 Oct: twice in half an hour, a screenshot pasted as a path. Stop and
+Start cleared it.
+
+**Cause, on Kali.** Every image received from the laptop is offered on Kali as pixels *and*
+as a `.png` file, so the clipboard also answers text requests with that file's `file://` link.
+Our own text poll must ignore that link, and it did so by remembering only the **newest** one.
+Publishing is asynchronous, so for a moment after a second image arrives the clipboard still
+serves the **first** image's link. The poll read it, saw that it differed from the newest,
+and sent it to the laptop as text. Half a second later it sent the second link too. The
+laptop's clipboard, which held the screenshot, was replaced by a path. Logs: 12:34:42 UTC
+(sent 149 then 147 bytes, after a 1920×1080 and then a 532×576 image) and 12:41:54 (148 + 148).
+These are the only two cases in the logs since 14 Oct. Not network-related: the second happened
+on the cable, with no link change.
+
+**Fix.** The last 8 file links we publish are remembered (`files::own_uri_text`), and the text
+poll ignores any of them (`files::is_own_text`). The test
+`an_older_own_file_link_still_on_the_clipboard_is_not_sent_as_text` replays the sequence, and fails
+without the fix.
+
 ---
 
 ## Build and release fragility

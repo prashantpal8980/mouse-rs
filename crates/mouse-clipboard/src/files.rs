@@ -888,6 +888,38 @@ pub fn uri_text(list: &FileList) -> String {
     format!("{}\r\n", uris.join("\r\n"))
 }
 
+/// How many of our own recent publications the text poll recognises. Two screenshots
+/// a few seconds apart are the case that needs more than one: see [`own_uri_text`].
+const OWN_TEXTS_KEPT: usize = 8;
+
+static OWN_TEXTS: std::sync::Mutex<std::collections::VecDeque<String>> =
+    std::sync::Mutex::new(std::collections::VecDeque::new());
+
+/// [`uri_text`] for a list we are publishing, remembered so the text poll never mistakes
+/// it for something the user copied.
+///
+/// Remembering only the newest one was not enough (B36). Publishing is asynchronous, so
+/// for a moment after a second image arrives the clipboard still serves the *first*
+/// image's file path. The poll read that, saw it differ from the newest, and sent the
+/// path to the other machine as text, replacing the screenshot there with a file link.
+pub fn own_uri_text(list: &FileList) -> String {
+    let text = uri_text(list);
+    if let Ok(mut kept) = OWN_TEXTS.lock() {
+        if !kept.contains(&text) {
+            if kept.len() == OWN_TEXTS_KEPT {
+                kept.pop_front();
+            }
+            kept.push_back(text.clone());
+        }
+    }
+    text
+}
+
+/// Whether `text` is one of our own recent file-list publications.
+pub fn is_own_text(text: &str) -> bool {
+    OWN_TEXTS.lock().map(|kept| kept.iter().any(|t| t == text)).unwrap_or(false)
+}
+
 /// Put a file list on the clipboard with an explicit paste mode.
 ///
 /// `move_on_paste` is what makes a large file cost nothing to paste: the file manager

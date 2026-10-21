@@ -1305,7 +1305,7 @@ fn run(
                                     // paths, so without this the next text poll reads
                                     // them straight back and records a `file:///…cache/
                                     // trees/…` entry as if the user had copied it.
-                                    last = Some(files::uri_text(&list));
+                                    last = Some(files::own_uri_text(&list));
                                     tracing::info!(
                                         count = set.files.len(),
                                         "files received and put on the clipboard"
@@ -1654,6 +1654,10 @@ fn poll_local<C: SystemClipboard>(
     if text.is_empty() || last.as_deref() == Some(text.as_str()) {
         return None;
     }
+    // One of our own file publications, not yet replaced by the newest (B36).
+    if files::is_own_text(&text) {
+        return None;
+    }
     if text.len() > settings.max_item_bytes {
         tracing::debug!(
             bytes = text.len(),
@@ -1860,7 +1864,7 @@ fn publish_files(
         return false;
     }
     *last_files = Some(files::list_key(list));
-    *last = Some(files::uri_text(list));
+    *last = Some(files::own_uri_text(list));
     true
 }
 
@@ -1957,7 +1961,7 @@ fn offer_streaming(
         if !files::publish(&list, how) {
             return None;
         }
-        *last = Some(files::uri_text(&list));
+        *last = Some(files::own_uri_text(&list));
         Some(files::list_key(&list))
     }
     #[cfg(windows)]
@@ -2031,7 +2035,7 @@ fn publish_pending_set(
     *last_files = Some(files::list_key(&list));
     // Our own selection answers UTF8_STRING with these paths, so without this the next
     // text poll reads them straight back and records a `file:///…cache/trees/…` entry.
-    *last = Some(files::uri_text(&list));
+    *last = Some(files::own_uri_text(&list));
     tracing::info!(
         id,
         count = set.files.len(),
@@ -2088,7 +2092,7 @@ fn publish_image_and_file(
         return false;
     }
     *last_files = Some(files::list_key(list));
-    *last = Some(files::uri_text(list));
+    *last = Some(files::own_uri_text(list));
     true
 }
 
@@ -2189,6 +2193,34 @@ mod tests {
         let encoded = encode_png(&original, TEST_PX).expect("encode");
         let decoded = decode_png(&encoded, TEST_PX).expect("decode");
         assert_eq!(decoded, original);
+    }
+
+    /// B36, as it happened on 21 Oct: two screenshots a few seconds apart. Publishing is
+    /// asynchronous, so the poll can still read the *first* image's file link after the
+    /// second is published. That link must not go to the peer as text; it replaced the
+    /// screenshot on the laptop with a path.
+    #[test]
+    fn an_older_own_file_link_still_on_the_clipboard_is_not_sent_as_text() {
+        let (tx, mut rx) = unbounded_channel();
+        let first = files::FileList {
+            paths: vec![std::path::PathBuf::from("/home/u/.mouse_share/cache/names/aa/clipboard-image-1920x1080-aa.png")],
+        };
+        let second = files::FileList {
+            paths: vec![std::path::PathBuf::from("/home/u/.mouse_share/cache/names/bb/clipboard-image-532x576-bb.png")],
+        };
+        let mut last = Some(files::own_uri_text(&first));
+        last = Some(files::own_uri_text(&second)).or(last);
+        // The clipboard has not caught up: it still serves the first link.
+        let mut cb = Fake { content: Some(files::uri_text(&first)), image: None };
+        assert!(poll_local(&mut cb, &mut last, &tx, &set()).is_none());
+        // Then it catches up.
+        cb.content = Some(files::uri_text(&second));
+        assert!(poll_local(&mut cb, &mut last, &tx, &set()).is_none());
+        assert!(rx.try_recv().is_err(), "our own file links must never reach the peer as text");
+
+        // Text the user really copies still goes.
+        cb.content = Some("hello".into());
+        assert!(poll_local(&mut cb, &mut last, &tx, &set()).is_some());
     }
 
     #[test]
