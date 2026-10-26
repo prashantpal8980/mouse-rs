@@ -46,9 +46,11 @@ pub fn local_ipv4s() -> Vec<LocalAddr> {
     out
 }
 
-/// The interface index of every network this machine is on that has an IPv6 link-local
-/// (fe80::) address. Every interface gives itself one, whether or not the network handed out
-/// an address, so these still work when DHCP failed and IPv4 fell back to 169.254.x.x.
+/// The interface index of every network this machine is on, for reaching peers over IPv6
+/// link-local (fe80::). Every interface gives itself such an address, whether or not the
+/// network handed out one, so these still work when DHCP failed and IPv4 fell back to
+/// 169.254.x.x. `if_addrs` leaves fe80:: addresses out of its list, so this takes every
+/// non-loopback interface it does list; a send on one without IPv6 simply fails.
 pub fn link_local_v6_ifaces() -> Vec<u32> {
     let Ok(ifaces) = if_addrs::get_if_addrs() else {
         return Vec::new();
@@ -56,10 +58,7 @@ pub fn link_local_v6_ifaces() -> Vec<u32> {
     let mut out: Vec<u32> = ifaces
         .into_iter()
         .filter(|i| !i.is_loopback())
-        .filter_map(|i| match i.addr {
-            if_addrs::IfAddr::V6(v6) if is_link_local_v6(&v6.ip) => i.index,
-            _ => None,
-        })
+        .filter_map(|i| i.index)
         .collect();
     out.sort_unstable();
     out.dedup();

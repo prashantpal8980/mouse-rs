@@ -331,7 +331,7 @@ pub fn describe_locals(locals: &[LocalAddr], v6_ifaces: &[u32]) -> String {
             }
         })
         .collect();
-    parts.push(format!("IPv6 link-local on {} network(s)", v6_ifaces.len()));
+    parts.push(format!("IPv6 link-local tried on {} network(s)", v6_ifaces.len()));
     parts.join(", ")
 }
 
