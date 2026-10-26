@@ -17,7 +17,7 @@ tokio = { version = "1.40", features = ["rt-multi-thread", "net", "time", "sync"
 tokio-util = { version = "0.7", features = ["codec", "rt"] }
 futures = "0.3"
 bytes = "1.7"
-socket2 = "0.5"
+socket2 = { version = "0.5", features = ["all"] }
 
 # serialization
 serde = { version = "1", features = ["derive"] }

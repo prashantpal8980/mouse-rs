@@ -147,6 +147,14 @@ pub enum LinkStream {
 }
 
 impl LinkStream {
+    fn tcp(&self) -> &TcpStream {
+        match self {
+            LinkStream::Plain(s) => s,
+            LinkStream::ServerTls(s) => s.get_ref().0,
+            LinkStream::ClientTls(s) => s.get_ref().0,
+        }
+    }
+
     /// Keying material exported from this TLS session, which ties the auth proofs to
     /// it (B34). A plain link has nothing to bind to and yields an empty binding.
     fn auth_binding(&self) -> Result<Vec<u8>, String> {
@@ -370,6 +378,7 @@ pub async fn run_server(
                         bulk.take_server_connection(framed, &cancel);
                     }
                     Lane::Input => {
+                        crate::qos::prioritise_input(framed.get_ref().tcp());
                         // A new input connection that has passed the handshake is from the same
                         // trusted peer, now on a newer path. It replaces a session still open on
                         // the old one, rather than being refused until that session times out.
@@ -613,6 +622,7 @@ async fn connect_once(
         local_path(tcp.local_addr().ok())
     );
     enable_keepalive(&tcp);
+    crate::qos::prioritise_input(&tcp);
 
     let stream = if cfg.tls_enabled {
         let connector = match tls::client_connector() {

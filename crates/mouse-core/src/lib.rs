@@ -11,6 +11,7 @@ pub mod config;
 pub mod discover;
 pub mod net;
 pub mod protocol;
+pub mod qos;
 pub mod timing;
 pub mod tls;
 
