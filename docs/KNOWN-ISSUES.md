@@ -136,7 +136,7 @@ Found B35 along the way.
 ## Open defects
 
 ### B13 — Alt+Tab sticks: a modifier release is lost and the key stays logically down
-**fixed 2026-10-26, awaiting hardware check** · reported 2026-10-09 · trigger found by the owner 2026-10-26
+**fixed 2026-10-26, confirmed on hardware the same day** (owner reproduced it at 15:04–15:05 IST before the update: 4 stuck Ctrl crossings; after the update at 15:06, repeated hold-Ctrl-cross-release tests: 0) · reported 2026-10-09
 
 **The trigger (owner, 26 Oct, 14:10–14:15 IST):** back on Windows after a crossing, the wheel
 didn't scroll; on Kali, Alt+Tab didn't work. One tap of Ctrl fixed each.
