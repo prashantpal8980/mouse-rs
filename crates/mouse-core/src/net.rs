@@ -465,7 +465,7 @@ pub async fn run_server(
                         });
                         let sock = if peer_addr.is_ipv6() { &motion_sock6 } else { &motion_sock };
                         let motion = match (sock, framed.get_ref().motion_key()) {
-                            (Some(sock), Some(key)) => Motion::Server(ServerMotion::new(sock.clone(), key)),
+                            (Some(sock), Some(key)) => Motion::Server(ServerMotion::new(sock.clone(), key, peer_addr)),
                             _ => Motion::Off,
                         };
                         let c = cancel.child_token();
@@ -1238,6 +1238,11 @@ async fn pump(
                 ping_sent = Some(Instant::now());
                 if let Motion::Client { live: Some(m), .. } = &motion {
                     m.hello().await;
+                    if let Some(ready) = m.ready() {
+                        if let Err(reason) = send_cancelable(&mut sink, cancel, ready, "send motion ready").await {
+                            return reason;
+                        }
+                    }
                 }
             }
 
@@ -1268,10 +1273,21 @@ async fn pump(
                                 match ClientMotion::start(*server, port, &token, key.clone()).await {
                                     Ok(m) => {
                                         tracing::info!("pointer motion will arrive over UDP from {server} (port {port})");
+                                        let ready = m.ready();
                                         *live = Some(m);
+                                        if let Some(ready) = ready {
+                                            if let Err(reason) = send_cancelable(&mut sink, cancel, ready, "send motion ready").await {
+                                                return reason;
+                                            }
+                                        }
                                     }
                                     Err(e) => tracing::warn!("UDP to {server} (port {port}) unavailable ({e}); pointer motion stays on TCP"),
                                 }
+                            }
+                        }
+                        Message::MotionReady { port, seen } => {
+                            if let Motion::Server(m) = &mut motion {
+                                m.on_ready(port, seen);
                             }
                         }
                         Message::MotionSync { seq, sx, sy } => {

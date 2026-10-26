@@ -51,6 +51,12 @@ pub(crate) const MAX_DATAGRAM: usize = 64;
 /// After motion stops, the final total is sent again this long after the last move.
 const REPEAT_AFTER: [Duration; 2] = [Duration::from_millis(25), Duration::from_millis(80)];
 
+/// Moves sent over UDP and not confirmed by the client for this long mean datagrams don't
+/// arrive: back to TCP. More than two heartbeats, so a normal confirmation is never late.
+const UNCONFIRMED: Duration = Duration::from_secs(5);
+/// After that, how long before UDP is tried again.
+const RETRY: Duration = Duration::from_secs(60);
+
 /// Without a hello for this long, the server goes back to sending motion over TCP.
 /// Hellos come with every heartbeat (2 s), so this tolerates two lost in a row.
 const PEER_STALE: Duration = Duration::from_secs(6);
@@ -147,6 +153,14 @@ pub(crate) struct ServerMotion {
     seq: u64,
     sum: (i64, i64),
     synced: (i64, i64),
+    /// The address the TCP link comes from: where to send when the client names its port.
+    tcp_peer: SocketAddr,
+    /// The latest seq the client says it received, and since when moves have gone
+    /// unconfirmed (None when it has everything).
+    seen: u64,
+    unconfirmed_since: Option<Instant>,
+    /// After datagrams were found not to arrive: don't try UDP again before this.
+    retry_after: Option<Instant>,
     /// When the last move went out, and how many of [`REPEAT_AFTER`] have been sent since.
     last_move: Option<(Instant, SocketAddr)>,
     repeats: usize,
@@ -155,7 +169,7 @@ pub(crate) struct ServerMotion {
 }
 
 impl ServerMotion {
-    pub(crate) fn new(sock: Arc<UdpSocket>, key: Key) -> ServerMotion {
+    pub(crate) fn new(sock: Arc<UdpSocket>, key: Key, tcp_peer: SocketAddr) -> ServerMotion {
         let mut token = [0u8; 16];
         rand::thread_rng().fill_bytes(&mut token);
         ServerMotion {
@@ -166,6 +180,10 @@ impl ServerMotion {
             seq: 0,
             sum: (0, 0),
             synced: (0, 0),
+            tcp_peer,
+            seen: 0,
+            unconfirmed_since: None,
+            retry_after: None,
             last_move: None,
             repeats: 0,
             epoch: Instant::now(),
@@ -186,11 +204,36 @@ impl ServerMotion {
         if decode_hello(&self.key, buf) != Some(self.token) {
             return;
         }
-        if self.peer.map(|(a, _)| a) != Some(from) {
-            tracing::info!("pointer motion now goes over UDP to {from}");
-            crate::qos::prioritise_datagrams(&self.sock, from);
+        self.use_peer(from, "hello");
+    }
+
+    /// The client named its UDP port over TCP. Its hellos may never get here (a firewall
+    /// blocking inbound UDP), but datagrams sent to it still arrive: its own hello opened
+    /// its side.
+    pub(crate) fn on_ready(&mut self, port: u16, seen: u64) {
+        let now = Instant::now();
+        if seen > self.seen {
+            self.seen = seen;
+            self.unconfirmed_since = (seen < self.seq).then_some(now);
         }
-        self.peer = Some((from, Instant::now()));
+        let mut to = self.tcp_peer;
+        to.set_port(port);
+        // A hello's source wins over the TCP address (it is right behind a NAT too).
+        match self.peer {
+            Some((_, heard)) if heard.elapsed() < PEER_STALE => self.peer = self.peer.map(|(a, _)| (a, now)),
+            _ => self.use_peer(to, "TCP link"),
+        }
+    }
+
+    fn use_peer(&mut self, to: SocketAddr, how: &str) {
+        if self.retry_after.is_some_and(|t| Instant::now() < t) {
+            return;
+        }
+        if self.peer.map(|(a, _)| a) != Some(to) {
+            tracing::info!("pointer motion now goes over UDP to {to} (from the {how})");
+            crate::qos::prioritise_datagrams(&self.sock, to);
+        }
+        self.peer = Some((to, Instant::now()));
     }
 
     /// Send one move over UDP. False when there is no live UDP path: the caller then
@@ -200,8 +243,20 @@ impl ServerMotion {
             return false;
         };
         if heard.elapsed() > PEER_STALE {
-            tracing::info!("no UDP hello from {to} for {PEER_STALE:?}; pointer motion back on TCP");
+            tracing::info!("nothing from {to} for {PEER_STALE:?}; pointer motion back on TCP");
             self.peer = None;
+            return false;
+        }
+        if self.unconfirmed_since.is_some_and(|t| t.elapsed() > UNCONFIRMED) {
+            tracing::warn!(
+                "{to} reports no motion datagrams for {UNCONFIRMED:?} (latest it has: {} of {}); \
+                 pointer motion back on TCP, UDP retried in {RETRY:?}",
+                self.seen,
+                self.seq
+            );
+            self.peer = None;
+            self.unconfirmed_since = None;
+            self.retry_after = Some(Instant::now() + RETRY);
             return false;
         }
         self.sum.0 += i64::from(dx);
@@ -211,8 +266,10 @@ impl ServerMotion {
         // next one (or the next `MotionSync`) carries the total anyway.
         let datagram = encode_move(&self.key, self.seq, self.sum.0, self.sum.1, ms_since(self.epoch));
         let _ = self.sock.try_send_to(&datagram, to);
-        self.last_move = Some((Instant::now(), to));
+        let now = Instant::now();
+        self.last_move = Some((now, to));
         self.repeats = 0;
+        self.unconfirmed_since.get_or_insert(now);
         true
     }
 
@@ -291,6 +348,12 @@ impl ClientMotion {
 
     pub(crate) fn socket(&self) -> Arc<UdpSocket> {
         self.sock.clone()
+    }
+
+    /// What to tell the server over TCP: this socket's port, and the latest move received.
+    pub(crate) fn ready(&self) -> Option<Message> {
+        let port = self.sock.local_addr().ok()?.port();
+        Some(Message::MotionReady { port, seen: self.last_seq })
     }
 
     /// (Re)announce this socket to the server. Repeated with every heartbeat. Awaited,
@@ -604,10 +667,42 @@ mod tests {
         flow("[::1]:0").await;
     }
 
+    #[tokio::test]
+    async fn motion_flows_when_the_servers_firewall_drops_every_hello() {
+        // The owner's laptop on Wi-Fi (26 Oct): its firewall let TCP in but not UDP. The
+        // client names its port over TCP instead, and the datagrams still reach it.
+        let server_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let tcp_peer: SocketAddr = "127.0.0.1:40000".parse().unwrap(); // port is replaced
+        let mut s = ServerMotion::new(server_sock.clone(), key(5), tcp_peer);
+        let Some(Message::MotionOffer { port, token }) = s.offer() else { panic!("offer") };
+        let mut c = ClientMotion::start(server_sock.local_addr().unwrap(), port, &token, key(5)).await.unwrap();
+        // The hello is never read: as if dropped. Only the TCP message arrives.
+        let Some(Message::MotionReady { port: cport, seen: 0 }) = c.ready() else { panic!("ready") };
+        s.on_ready(cport, 0);
+        assert!(s.send_move(7, -2));
+        // Skip the hello still waiting on the server's socket; read the move on the client's.
+        let (buf, n, _) = recv(Some(c.socket())).await.unwrap();
+        assert_eq!(c.on_datagram(&buf[..n]), Some(Message::MouseMove { dx: 7, dy: -2 }));
+        let Some(Message::MotionReady { seen: 1, .. }) = c.ready() else { panic!("seen") };
+    }
+
+    #[tokio::test]
+    async fn moves_the_client_never_confirms_go_back_to_tcp() {
+        let server_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let mut s = ServerMotion::new(server_sock.clone(), key(6), "127.0.0.1:1".parse().unwrap());
+        s.on_ready(9, 0); // a port where nobody listens
+        assert!(s.send_move(1, 1));
+        s.on_ready(9, 0); // the client says it has nothing
+        s.unconfirmed_since = Some(Instant::now() - UNCONFIRMED - Duration::from_millis(1));
+        assert!(!s.send_move(1, 1), "datagrams don't arrive: TCP");
+        s.on_ready(9, 0);
+        assert!(!s.send_move(1, 1), "and UDP is not retried at once");
+    }
+
     async fn flow(bind: &str) {
         let server_sock = Arc::new(UdpSocket::bind(bind).await.unwrap());
         let port = server_sock.local_addr().unwrap().port();
-        let mut s = ServerMotion::new(server_sock.clone(), key(4));
+        let mut s = ServerMotion::new(server_sock.clone(), key(4), server_sock.local_addr().unwrap());
         assert!(!s.send_move(1, 1), "no hello yet: TCP");
 
         let Some(Message::MotionOffer { port: p, token }) = s.offer() else { panic!("offer") };

@@ -105,7 +105,8 @@ pub(crate) fn is_clipboard_message(m: &Message) -> bool {
         | Message::Pong
         // Handled inside the link itself; never reach the engine.
         | Message::MotionOffer { .. }
-        | Message::MotionSync { .. } => false,
+        | Message::MotionSync { .. }
+        | Message::MotionReady { .. } => false,
     }
 }
 

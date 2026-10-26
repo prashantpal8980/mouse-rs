@@ -142,6 +142,15 @@ pub enum Message {
         port: u16,
         token: String,
     },
+    /// Client → server, over TCP: "send motion datagrams to my UDP `port`, at the address
+    /// this connection comes from; the latest I received is `seen`". Sent once the client's
+    /// socket is open and again with every heartbeat. It lets the server send motion without
+    /// ever receiving a datagram, which a firewall may block (owner's laptop on Wi-Fi, 26 Oct),
+    /// and `seen` tells it whether the datagrams arrive.
+    MotionReady {
+        port: u16,
+        seen: u64,
+    },
     /// Server → client: the running motion total, sent over TCP ahead of any other
     /// message so it lands where the pointer was.
     MotionSync {
@@ -343,6 +352,7 @@ mod tests {
             },
             Message::MotionOffer { port: 24800, token: "00ff".into() },
             Message::MotionSync { seq: 9, sx: -40, sy: 12 },
+            Message::MotionReady { port: 50000, seen: 7 },
             Message::Ping,
             Message::Pong,
         ];
