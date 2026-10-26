@@ -524,10 +524,11 @@ loss holds back everything behind it until the resend (Windows waits ≥ 300 ms)
 lost datagram is covered by the next one. Measured after: longest gap 133–144 ms (was ~1 s), but
 4–10% of moves still arrive more than 25 ms late and the heartbeat round trip still peaks at
 ~720 ms. Kali's side is clean (−25 dBm, power save off), so the remaining delay is the laptop's
-Wi-Fi adapter or the router. Next: retest after the laptop's adapter power saving is off, and on
-another access point.
+Wi-Fi adapter or the router. On the owner's Motorola hotspot (5 GHz, Wi-Fi 6), with motion still
+on TCP: round trip median 3–4 ms, max 6–143 ms, 1.9% of moves over 25 ms late. So the home 2.4 GHz
+router is most of the remaining stutter.
 
-### B38 — on a phone hotspot the two machines never found each other — **fixed 2026-10-26, awaiting hardware check**
+### B38 — on a phone hotspot the two machines never found each other — **fixed 2026-10-26, confirmed on hardware**
 Both on the owner's Motorola hotspot (5 GHz, Wi-Fi 6): Kali got 10.144.3.242, the laptop's Wi-Fi
 got no address (169.254.85.145), so neither IPv4 discovery nor a connection could work, and the
 log said nothing about why. Now the server also beacons over IPv6 all-nodes multicast from its
@@ -536,6 +537,10 @@ address answers (pointer motion then stays on TCP). While no server answers, the
 a minute what it has, what it heard and what it tried. Still unknown: whether the laptop's
 firewall rule for mouse-rs covers Public networks (a new hotspot is Public by default), and
 whether this phone isolates hotspot clients from each other.
+Confirmed 26 Oct (after a fix: `if_addrs` hides fe80:: addresses, so the first build found no
+interface): with the laptop still at 169.254.x.x, Kali connected over
+`[fe80::…%wlan0]:24800` 4 s after the cable came out, and an image copy worked over the bulk lane.
+UDP motion now also runs over IPv6 (the first hotspot run had motion on TCP).
 
 ### B39 — the bulk lane never connected off the cable — **fixed 2026-10-26**
 The bulk lane always dialled the configured `server_host` (192.168.137.1), so on Wi-Fi it timed
