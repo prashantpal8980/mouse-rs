@@ -536,6 +536,9 @@ struct HookState {
     mouse_calls_at_grab: u64,
     /// Hand-off to the diagnostics thread; see [`DiagEvent`]. Never log inline here.
     diag: std::sync::mpsc::Sender<DiagEvent>,
+    /// Keys Windows saw go down while input was local, so their release is let
+    /// through even if it happens on the peer side (B13).
+    locally_held: crate::held::LocallyHeld,
 }
 
 thread_local! {
@@ -639,14 +642,15 @@ impl HookState {
         // reported "not suppressing" and let the keystroke through to the local app —
         // the "mouse crossed but my typing stayed here" report. Reading the atomic here
         // is O(1) and closes that window by construction rather than narrowing it.
+        let pressed = info.flags & LLKHF_UP == 0;
+        let extended = info.flags & LLKHF_EXTENDED != 0;
+        let vk = info.vkCode as u16;
         if !self.suppress.load(Ordering::SeqCst) {
+            self.locally_held.note(vk, pressed);
             return false; // keys flow to local apps while not suppressing
         }
         // Snapshot held modifiers before forwarding anything, if we got here first.
         self.begin_grab();
-        let pressed = info.flags & LLKHF_UP == 0;
-        let extended = info.flags & LLKHF_EXTENDED != 0;
-        let vk = info.vkCode as u16;
 
         // Failsafe (the Fn+Up fix): the return hotkey self-releases suppression here,
         // in-callback, with no dependency on the network or engine being alive. Still
@@ -671,6 +675,13 @@ impl HookState {
         }
         if pressed {
             self.kbd_swallowed += 1;
+        } else if self.locally_held.take_release(vk) {
+            // Windows saw this key go down before the crossing. Swallowing its release
+            // would leave it held here: Ctrl stuck, the wheel zooming, and the stuck
+            // Ctrl forwarded again on the next crossing (B13). The peer got the press
+            // from the crossing snapshot and the release above, so both sides end up
+            // with the key up.
+            return false;
         }
         true // swallow while suppressing
     }
@@ -1086,6 +1097,7 @@ fn capture_loop(
             raw_keys_at_grab: 0,
             mouse_calls_at_grab: 0,
             diag: diag.clone(),
+            locally_held: Default::default(),
         });
     });
 

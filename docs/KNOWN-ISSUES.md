@@ -136,7 +136,26 @@ Found B35 along the way.
 ## Open defects
 
 ### B13 — Alt+Tab sticks: a modifier release is lost and the key stays logically down
-**parked 2026-10-09 by the owner** · reported 2026-10-09 · **cause unknown**
+**fixed 2026-10-26, awaiting hardware check** · reported 2026-10-09 · trigger found by the owner 2026-10-26
+
+**The trigger (owner, 26 Oct, 14:10–14:15 IST):** back on Windows after a crossing, the wheel
+didn't scroll; on Kali, Alt+Tab didn't work. One tap of Ctrl fixed each.
+
+**Cause, from Kali's log and the hook code:** in 3,350 crossings, the only keys that ever arrive
+within 5 ms of "peer took control" are modifiers (CtrlL 20, AltL 18, ShiftL 8, ShiftR 7). They are the
+crossing snapshot (`emit_held_modifiers`), which forwards what Windows reports as held. At 08:39:54 and
+08:42:30 UTC a CtrlL press arrived that way with **no release** for 13–16 s. Windows thought Ctrl was
+held while nobody held it. How it gets there: the hook swallowed *every* key event while input was on
+the peer, including the release of a key whose press Windows had already seen. Hold Ctrl, cross, let go
+on the other side: Windows never hears the release. Ctrl stays down on Windows (the wheel zooms instead
+of scrolling), and each following crossing forwards the stuck Ctrl to Kali (Alt+Tab becomes Ctrl+Alt+Tab).
+A physical Ctrl tap sends the missing release to whichever side has the keyboard.
+
+**Fix:** `held.rs` records, from hook events only (no polling, per B14), which keys Windows saw go down
+while input was local. While suppressing, the release of such a key is forwarded to the peer **and**
+let through to Windows. Unit-tested on Linux; the Windows hook path compiles but needs the owner's check.
+
+**Was parked 2026-10-09 by the owner** until the trigger was known.
 
 > "Alt tab issue comes up very rarely and I think it only happens due to some trigger,
 > but till the trigger is unknown keep it down right now and park the issue."

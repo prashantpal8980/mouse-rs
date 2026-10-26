@@ -13,6 +13,8 @@
 //!   block the network task.
 
 pub mod event;
+#[cfg(any(target_os = "windows", test))]
+mod held;
 pub mod keys;
 
 pub use event::InputEvent;
