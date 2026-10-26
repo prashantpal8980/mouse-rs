@@ -215,11 +215,27 @@ pub struct LinkHealth {
     /// floor. A single late heartbeat therefore collapsed a 100 MB/s transfer to 64 KB/s
     /// in about eleven chunks, and one chunk then took four seconds.
     samples: AtomicU64,
+    /// Where the input link reached the server last, so the bulk lane goes the same way.
+    /// Until 26 Oct the bulk lane always dialled the configured address (the cable's), so
+    /// on Wi-Fi or a hotspot it never connected and every large item went inline.
+    peer: std::sync::Mutex<Option<std::net::SocketAddr>>,
 }
 
 impl LinkHealth {
     pub fn new() -> Arc<LinkHealth> {
         Arc::new(LinkHealth::default())
+    }
+
+    /// Record the address the input link just connected to.
+    pub fn set_peer(&self, addr: std::net::SocketAddr) {
+        if let Ok(mut p) = self.peer.lock() {
+            *p = Some(addr);
+        }
+    }
+
+    /// The address the input link last connected to, if any.
+    pub fn peer(&self) -> Option<std::net::SocketAddr> {
+        self.peer.lock().ok().and_then(|p| *p)
     }
 
     /// Which measurement the latest reading belongs to, so a decision can be taken
@@ -759,9 +775,18 @@ pub async fn run_bulk_client(
     health: &Arc<LinkHealth>,
     settings: BulkSettings,
 ) -> Result<(), String> {
-    let framed = crate::net::connect_and_handshake(cfg, port, crate::protocol::Lane::Bulk, handshake_timeout, cancel)
-        .await?;
-    tracing::info!("bulk lane connected to {}:{}", cfg.server_host, port);
+    // Follow the input link: same machine, same network path, the bulk port.
+    let to = health.peer().map(|mut a| {
+        a.set_port(port);
+        a
+    });
+    let framed =
+        crate::net::connect_and_handshake(cfg, to, port, crate::protocol::Lane::Bulk, handshake_timeout, cancel)
+            .await?;
+    match to {
+        Some(a) => tracing::info!("bulk lane connected to {a}"),
+        None => tracing::info!("bulk lane connected to {}:{}", cfg.server_host, port),
+    }
     bulk_pump(into_bulk_framed(framed), ch, cancel, health, settings).await;
     Ok(())
 }

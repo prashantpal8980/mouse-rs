@@ -273,6 +273,19 @@ pub async fn run_server(
     if let Ok(addr) = listener.local_addr() {
         let _ = link_events.send(LinkEvent::Listening(addr));
     }
+    // Also listen on IPv6 when listening everywhere, so a client can reach this machine on
+    // its link-local address when the network gave it no IPv4 address (see `beacon`).
+    let listener6 = if listener.local_addr().is_ok_and(|a| a.ip().is_unspecified()) {
+        match listen_v6(cfg.listen_port) {
+            Ok(l) => Some(l),
+            Err(e) => {
+                tracing::info!("no IPv6 listener on {} ({e}); IPv4 only", cfg.listen_port);
+                None
+            }
+        }
+    } else {
+        None
+    };
     // Pointer motion's UDP socket, on the same port number as the TCP listener. Without
     // it motion simply stays on TCP.
     let motion_sock = match tokio::net::UdpSocket::bind(&bind).await {
@@ -345,7 +358,7 @@ pub async fn run_server(
                 }
             }
 
-            accepted = listener.accept() => {
+            accepted = accept_any(&listener, listener6.as_ref()) => {
                 let (tcp, peer_addr) = match accepted {
                     Ok(v) => v,
                     Err(e) => {
@@ -521,6 +534,9 @@ pub async fn run_client(
     // while the server stays offline don't spam Disconnected every backoff tick.
     let mut announced_down = false;
     let mut last_good: Option<SocketAddr> = None;
+    // When the "still looking" line was last logged. While no server answers, one line a
+    // minute says what this machine has, what it heard and what it tried.
+    let mut looking_logged: Option<std::time::Instant> = None;
 
     loop {
         if cancel.is_cancelled() {
@@ -560,6 +576,17 @@ pub async fn run_client(
         match outcome {
             AttemptOutcome::Cancelled | AttemptOutcome::Fatal => return,
             AttemptOutcome::Lost { was_connected, reason } => {
+                let now = std::time::Instant::now();
+                if was_connected {
+                    looking_logged = None;
+                } else if looking_logged.map_or(true, |t| now.saturating_duration_since(t) >= LOOKING_LOG_EVERY) {
+                    looking_logged = Some(now);
+                    tracing::info!(
+                        "still looking for the server: {reason:?}. This machine: {}. Heard: {}.",
+                        beacon::describe_locals(&discover::local_ipv4s(), &discover::link_local_v6_ifaces()),
+                        found.describe(now),
+                    );
+                }
                 // With no network at all, a failed attempt is a fact about this machine, not
                 // about the server, so say so.
                 let reason = if no_network && !was_connected {
@@ -631,10 +658,22 @@ async fn connect_once(
     let listing = targets.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(", ");
     let _ = ch.events.send(LinkEvent::Connecting(listing.clone()));
 
-    let raced = tokio::select! {
-        _ = cancel.cancelled() => return AttemptOutcome::Cancelled,
-        r = race_connect(targets, CONNECT_TRY) => r,
-    };
+    // IPv4 first. IPv6 link-local only when no IPv4 address answers: pointer motion over
+    // UDP is IPv4 only, so a link-local session is the fallback, not a rival.
+    let (v4, v6): (Vec<SocketAddr>, Vec<SocketAddr>) = targets.iter().partition(|a| a.is_ipv4());
+    let mut raced = None;
+    for group in [v4, v6] {
+        if group.is_empty() {
+            continue;
+        }
+        raced = tokio::select! {
+            _ = cancel.cancelled() => return AttemptOutcome::Cancelled,
+            r = race_connect(&group, CONNECT_TRY) => r,
+        };
+        if raced.is_some() {
+            break;
+        }
+    }
     // Connection refused or unreachable on every candidate: recoverable, the server may not
     // be up yet, or may be on a network this machine is not on at the moment.
     let Some((addr, tcp)) = raced else {
@@ -644,6 +683,7 @@ async fn connect_once(
         };
     };
     *last_good = Some(addr);
+    health.set_peer(addr);
     tracing::info!(
         "link to {addr} goes out through {} (candidates tried: {listing})",
         local_path(tcp.local_addr().ok())
@@ -716,7 +756,11 @@ async fn connect_once(
         login_screen: false,
     });
     let motion = match framed.get_ref().motion_key() {
-        Some(key) => Motion::Client { key, server: addr.ip(), live: None },
+        Some(key) if addr.is_ipv4() => Motion::Client { key, server: addr.ip(), live: None },
+        Some(_) => {
+            tracing::info!("connected over IPv6 link-local; pointer motion stays on TCP");
+            Motion::Off
+        }
         None => Motion::Off,
     };
     let reason = pump(framed, params, cancel, ch, health, net, motion).await;
@@ -807,17 +851,27 @@ pub async fn run_bulk_listener(
 /// reconnect policy and its UI events, and neither belongs to a lane whose failure the
 /// user should never have to think about. Errors come back as a string for the caller
 /// to log and retry at its own pace.
+/// Connects to `to`, or to the configured `server_host` on `port` when `to` is None.
 pub async fn connect_and_handshake(
     cfg: &Config,
+    to: Option<SocketAddr>,
     port: u16,
     lane: Lane,
     handshake_timeout: Duration,
     cancel: &CancellationToken,
 ) -> Result<Framed<LinkStream, MessageCodec>, String> {
-    let addr = format!("{}:{}", cfg.server_host, port);
+    let addr = match to {
+        Some(a) => a.to_string(),
+        None => format!("{}:{}", cfg.server_host, port),
+    };
     let tcp = tokio::select! {
         _ = cancel.cancelled() => return Err("cancelled".into()),
-        r = timeout(handshake_timeout, TcpStream::connect(&addr)) => r,
+        r = timeout(handshake_timeout, async {
+            match to {
+                Some(a) => TcpStream::connect(a).await,
+                None => TcpStream::connect(&addr).await,
+            }
+        }) => r,
     };
     let tcp = match tcp {
         Ok(Ok(s)) => s,
@@ -1013,6 +1067,9 @@ async fn network_moved(net: &mut Option<watch::Receiver<u64>>) {
     }
 }
 
+/// How often the client logs what it is trying while no server answers.
+const LOOKING_LOG_EVERY: Duration = Duration::from_secs(60);
+
 /// How long one candidate address gets to accept the TCP connection.
 const CONNECT_TRY: Duration = Duration::from_secs(3);
 
@@ -1022,6 +1079,32 @@ const NO_NETWORK_POLL: Duration = Duration::from_secs(2);
 /// Connect to every candidate at once and keep the first that accepts. Racing, rather than
 /// trying in turn, means a dead address costs nothing. It also picks the faster path: when the
 /// server is reachable over both Ethernet and Wi-Fi, the one that answers first has less delay.
+/// An IPv6-only listener on `port`, beside the IPv4 one.
+fn listen_v6(port: u16) -> std::io::Result<TcpListener> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let sock = Socket::new(Domain::IPV6, Type::STREAM, Some(Protocol::TCP))?;
+    sock.set_only_v6(true)?;
+    #[cfg(unix)]
+    sock.set_reuse_address(true)?;
+    sock.set_nonblocking(true)?;
+    sock.bind(&SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, port)).into())?;
+    sock.listen(128)?;
+    TcpListener::from_std(sock.into())
+}
+
+async fn accept_any(
+    v4: &TcpListener,
+    v6: Option<&TcpListener>,
+) -> std::io::Result<(TcpStream, SocketAddr)> {
+    match v6 {
+        None => v4.accept().await,
+        Some(v6) => tokio::select! {
+            r = v4.accept() => r,
+            r = v6.accept() => r,
+        },
+    }
+}
+
 async fn race_connect(targets: &[SocketAddr], per: Duration) -> Option<(SocketAddr, TcpStream)> {
     let mut attempts: FuturesUnordered<_> = targets
         .iter()
@@ -1698,7 +1781,7 @@ mod tests {
         let cfg = test_cfg(Role::Client, port, false);
         let framed = timeout(
             Duration::from_secs(3),
-            connect_and_handshake(&cfg, port, Lane::Bulk, Duration::from_secs(2), &cancel),
+            connect_and_handshake(&cfg, None, port, Lane::Bulk, Duration::from_secs(2), &cancel),
         )
         .await
         .expect("bulk handshake must not hang")
@@ -1947,6 +2030,59 @@ mod tests {
         ];
         let got = race_connect(&targets, Duration::from_secs(2)).await;
         assert_eq!(got.map(|(a, _)| a), Some(live_addr));
+    }
+
+    #[tokio::test]
+    async fn a_server_listening_everywhere_also_answers_on_ipv6() {
+        let port = free_port().await;
+        let cancel = CancellationToken::new();
+        let mut server_cfg = test_cfg(Role::Server, port, false);
+        server_cfg.listen_host = "0.0.0.0".into();
+        let (s_ch, _s_to, _s_from, _s_events) = channels();
+        let server = tokio::spawn(run_server(
+            server_cfg,
+            fast_params(),
+            cancel.clone(),
+            s_ch,
+            BulkServer::disabled(),
+            LinkHealth::new(),
+        ));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let cfg = test_cfg(Role::Client, port, false);
+        let to: SocketAddr = format!("[::1]:{port}").parse().unwrap();
+        let got = connect_and_handshake(&cfg, Some(to), port, Lane::Input, Duration::from_secs(2), &cancel).await;
+        assert!(got.is_ok(), "IPv6 connect and handshake: {:?}", got.err());
+        cancel.cancel();
+        let _ = timeout(Duration::from_secs(2), server).await;
+    }
+
+    #[tokio::test]
+    async fn a_beacon_is_heard_over_ipv6_link_local_with_its_interface() {
+        // The hotspot case (26 Oct 2026): a network that gave no IPv4 address. Needs an
+        // interface with a link-local address, so it is skipped on a machine without one.
+        if crate::discover::link_local_v6_ifaces().is_empty() {
+            return;
+        }
+        let disc = free_port().await;
+        let cancel = CancellationToken::new();
+        let found = beacon::Found::new();
+        tokio::spawn(beacon::run_listener("s".into(), disc, found.clone(), cancel.child_token()));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::spawn(beacon::run_sender("s".into(), "srv".into(), 4321, disc, cancel.child_token()));
+        let mut heard = None;
+        for _ in 0..40 {
+            heard = found
+                .candidates(std::time::Instant::now())
+                .into_iter()
+                .find(|a| matches!(a, SocketAddr::V6(v6) if v6.scope_id() != 0));
+            if heard.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        cancel.cancel();
+        let heard = heard.expect("a link-local candidate with its interface");
+        assert_eq!(heard.port(), 4321);
     }
 
     #[tokio::test]

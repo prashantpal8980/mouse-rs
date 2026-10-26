@@ -14,7 +14,7 @@
 //! * **Bounded.** Beacons are small and sent every [`BEACON_EVERY`]. Nothing is sent when the
 //!   machine has no network.
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -26,10 +26,19 @@ use tokio::net::UdpSocket;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
-use crate::discover::{local_ipv4s, LocalAddr};
+use crate::discover::{is_link_local_v6, link_local_v6_ifaces, local_ipv4s, LocalAddr};
 
 /// The UDP port beacons are sent to and heard on, unless the config says otherwise.
 pub const DEFAULT_DISCOVERY_PORT: u16 = 24801;
+
+/// Beacons also go to every IPv6 host on each network (all-nodes multicast), from the
+/// sender's link-local address. A client that hears one connects back to that address, so
+/// two machines on the same Wi-Fi still find each other when the network handed one of them
+/// no IPv4 address (Windows then shows 169.254.x.x): seen on a phone hotspot, 26 Oct 2026.
+const ALL_NODES: Ipv6Addr = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 1);
+
+/// Beacons heard this close together came from the same tick of the sender.
+const SAME_TICK: Duration = Duration::from_millis(500);
 
 /// How often a server sends its beacon.
 pub const BEACON_EVERY: Duration = Duration::from_secs(2);
@@ -126,8 +135,7 @@ pub struct Found {
 
 struct Heard {
     name: String,
-    port: u16,
-    addrs: Vec<Ipv4Addr>,
+    addrs: Vec<SocketAddr>,
     at: Instant,
 }
 
@@ -138,17 +146,42 @@ impl Found {
 
     /// Record a beacon. `source` is the address the packet came from. It is a real address
     /// of the sender on the network the beacon arrived on, so it is kept even when the body
-    /// omits it.
-    pub fn record(&self, body: &BeaconBody, source: Option<Ipv4Addr>, now: Instant) {
-        let mut addrs: Vec<Ipv4Addr> = body.addrs.iter().filter_map(|a| a.parse().ok()).collect();
+    /// omits it. An IPv6 source is kept only if link-local, with its interface (scope).
+    pub fn record(&self, body: &BeaconBody, source: Option<SocketAddr>, now: Instant) {
+        let mut addrs: Vec<SocketAddr> = body
+            .addrs
+            .iter()
+            .filter_map(|a| a.parse::<Ipv4Addr>().ok())
+            .map(|ip| SocketAddr::new(IpAddr::V4(ip), body.port))
+            .collect();
+        let source = match source {
+            Some(SocketAddr::V4(v4)) => Some(SocketAddr::new(IpAddr::V4(*v4.ip()), body.port)),
+            Some(SocketAddr::V6(v6)) if is_link_local_v6(v6.ip()) => {
+                Some(SocketAddr::V6(SocketAddrV6::new(*v6.ip(), body.port, 0, v6.scope_id())))
+            }
+            _ => None,
+        };
         if let Some(src) = source {
             if !addrs.contains(&src) {
                 addrs.push(src);
             }
         }
         let Ok(mut heard) = self.inner.lock() else { return };
+        // One tick's IPv4 and IPv6 beacons arrive as separate packets a moment apart: merge
+        // those. A later tick's beacon replaces, so addresses the server lost are forgotten.
+        if let Some(h) = heard.iter_mut().find(|h| h.name == body.name) {
+            if now.saturating_duration_since(h.at) < SAME_TICK {
+                for a in addrs {
+                    if !h.addrs.contains(&a) {
+                        h.addrs.push(a);
+                    }
+                }
+                h.at = now;
+                return;
+            }
+        }
         heard.retain(|h| h.name != body.name);
-        heard.push(Heard { name: body.name.clone(), port: body.port, addrs, at: now });
+        heard.push(Heard { name: body.name.clone(), addrs, at: now });
     }
 
     /// Every address of every server heard within [`BEACON_TTL`], most recently heard first.
@@ -161,14 +194,33 @@ impl Found {
         fresh.sort_by_key(|h| std::cmp::Reverse(h.at));
         let mut out: Vec<SocketAddr> = Vec::new();
         for h in fresh {
-            for ip in &h.addrs {
-                let sa = SocketAddr::new(IpAddr::V4(*ip), h.port);
-                if !out.contains(&sa) {
-                    out.push(sa);
+            for sa in &h.addrs {
+                if !out.contains(sa) {
+                    out.push(*sa);
                 }
             }
         }
         out
+    }
+
+    /// What has been heard, for the "still looking" log line.
+    pub fn describe(&self, now: Instant) -> String {
+        let Ok(heard) = self.inner.lock() else { return String::new() };
+        if heard.is_empty() {
+            return "no beacon heard".into();
+        }
+        heard
+            .iter()
+            .map(|h| {
+                let addrs = h.addrs.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(", ");
+                format!(
+                    "'{}' at [{addrs}], {:.0}s ago",
+                    h.name,
+                    now.saturating_duration_since(h.at).as_secs_f32()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ")
     }
 }
 
@@ -182,6 +234,22 @@ fn bind_udp(port: u16, broadcast: bool) -> std::io::Result<UdpSocket> {
     }
     sock.set_nonblocking(true)?;
     sock.bind(&SocketAddr::from(([0, 0, 0, 0], port)).into())?;
+    UdpSocket::from_std(sock.into())
+}
+
+/// The IPv6 counterpart of [`bind_udp`]: IPv6 only, joined to all-nodes on every network
+/// so beacons sent there are heard (Linux delivers them anyway; Windows wants the join).
+fn bind_udp6(port: u16) -> std::io::Result<UdpSocket> {
+    let sock = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
+    sock.set_only_v6(true)?;
+    sock.set_reuse_address(true)?;
+    sock.set_nonblocking(true)?;
+    sock.bind(&SocketAddr::from((Ipv6Addr::UNSPECIFIED, port)).into())?;
+    if port != 0 {
+        for idx in link_local_v6_ifaces() {
+            let _ = sock.join_multicast_v6(&ALL_NODES, idx);
+        }
+    }
     UdpSocket::from_std(sock.into())
 }
 
@@ -204,14 +272,23 @@ pub async fn run_sender(
             return;
         }
     };
+    // Without IPv6 the IPv4 beacons still go out.
+    let sock6 = bind_udp6(0).ok();
     let mut tick = tokio::time::interval(BEACON_EVERY);
+    let mut last_said = String::new();
     loop {
         tokio::select! {
             _ = cancel.cancelled() => return,
             _ = tick.tick() => {}
         }
         let locals = local_ipv4s();
-        if locals.is_empty() {
+        let v6_ifaces = link_local_v6_ifaces();
+        let said = describe_locals(&locals, &v6_ifaces);
+        if said != last_said {
+            tracing::info!("announcing this server on: {said}");
+            last_said = said;
+        }
+        if locals.is_empty() && v6_ifaces.is_empty() {
             continue;
         }
         let body = BeaconBody {
@@ -226,11 +303,36 @@ pub async fn run_sender(
                 .collect(),
         };
         let packet = seal(&secret, &body);
-        for target in broadcast_targets(&locals) {
-            // A send can fail on a network that just went away. The next tick retries.
-            let _ = sock.send_to(&packet, (target, discovery_port)).await;
+        if !locals.is_empty() {
+            for target in broadcast_targets(&locals) {
+                // A send can fail on a network that just went away. The next tick retries.
+                let _ = sock.send_to(&packet, (target, discovery_port)).await;
+            }
+        }
+        if let Some(sock6) = &sock6 {
+            for idx in &v6_ifaces {
+                let to = SocketAddrV6::new(ALL_NODES, discovery_port, 0, *idx);
+                let _ = sock6.send_to(&packet, to).await;
+            }
         }
     }
+}
+
+/// This machine's networks, for the log: each IPv4 address, flagging 169.254.x.x (the network
+/// gave no address), and how many networks can be reached over IPv6 link-local.
+pub fn describe_locals(locals: &[LocalAddr], v6_ifaces: &[u32]) -> String {
+    let mut parts: Vec<String> = locals
+        .iter()
+        .map(|a| {
+            if a.ip.is_link_local() {
+                format!("{} {} (no address from the network)", a.iface, a.ip)
+            } else {
+                format!("{} {}/{}", a.iface, a.ip, a.prefix)
+            }
+        })
+        .collect();
+    parts.push(format!("IPv6 link-local on {} network(s)", v6_ifaces.len()));
+    parts.join(", ")
 }
 
 /// Client side: listen for beacons and record the servers that send valid ones, until
@@ -251,26 +353,43 @@ pub async fn run_listener(
             return;
         }
     };
+    let sock6 = match bind_udp6(discovery_port) {
+        Ok(s) => Some(s),
+        Err(e) => {
+            tracing::info!("no IPv6 discovery on {discovery_port} ({e}); IPv4 only");
+            None
+        }
+    };
     let mut buf = vec![0u8; 2048];
+    let mut buf6 = vec![0u8; 2048];
     loop {
-        tokio::select! {
+        let received = tokio::select! {
             _ = cancel.cancelled() => return,
-            received = sock.recv_from(&mut buf) => match received {
-                Ok((n, from)) => {
-                    if let Some(body) = open(&secret, &buf[..n]) {
-                        let source = match from.ip() {
-                            IpAddr::V4(v4) => Some(v4),
-                            IpAddr::V6(_) => None,
-                        };
-                        found.record(&body, source, Instant::now());
-                    }
+            r = sock.recv_from(&mut buf) => r.map(|(n, from)| (&buf[..n], from)),
+            r = recv6(sock6.as_ref(), &mut buf6) => r,
+        };
+        match received {
+            Ok((packet, from)) => {
+                if let Some(body) = open(&secret, packet) {
+                    found.record(&body, Some(from), Instant::now());
                 }
-                // On Windows an unreachable beacon target can surface here as an error on
-                // the next receive. That is noise, not a reason to stop listening.
-                Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
             }
+            // On Windows an unreachable beacon target can surface here as an error on
+            // the next receive. That is noise, not a reason to stop listening.
+            Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
         }
     }
+}
+
+async fn recv6<'a>(
+    sock: Option<&UdpSocket>,
+    buf: &'a mut [u8],
+) -> std::io::Result<(&'a [u8], SocketAddr)> {
+    let Some(sock) = sock else {
+        return std::future::pending().await;
+    };
+    let (n, from) = sock.recv_from(buf).await?;
+    Ok((&buf[..n], from))
 }
 
 /// The part of this machine's network that a reconnect depends on: which addresses it has.
@@ -356,7 +475,7 @@ mod tests {
     fn a_server_heard_recently_is_a_candidate_and_a_stale_one_is_not() {
         let found = Found::new();
         let t0 = Instant::now();
-        found.record(&body(), Some(Ipv4Addr::new(192, 168, 1, 77)), t0);
+        found.record(&body(), Some(SocketAddr::from(([192, 168, 1, 77], 5555))), t0);
         let now = t0 + Duration::from_secs(1);
         let c = found.candidates(now);
         assert!(c.contains(&"192.168.137.2:24800".parse().unwrap()));
@@ -365,6 +484,30 @@ mod tests {
 
         let later = t0 + BEACON_TTL + Duration::from_secs(1);
         assert!(found.candidates(later).is_empty(), "a server not heard for a while expires");
+    }
+
+    #[test]
+    fn a_link_local_ipv6_beacon_is_reachable_with_its_interface() {
+        // The hotspot case: the server has only 169.254.x.x, which it does not announce, so
+        // its IPv6 link-local source is the only way back to it.
+        let found = Found::new();
+        let t0 = Instant::now();
+        let none = BeaconBody { addrs: vec![], ..body() };
+        found.record(&none, Some("[fe80::1234%7]:5555".parse().unwrap()), t0);
+        found.record(&none, Some("[2409::1]:5555".parse().unwrap()), t0);
+        let c = found.candidates(t0);
+        assert_eq!(c, vec![SocketAddr::V6(SocketAddrV6::new("fe80::1234".parse().unwrap(), 24800, 0, 7))]);
+    }
+
+    #[test]
+    fn one_ticks_ipv4_and_ipv6_beacons_merge() {
+        let found = Found::new();
+        let t0 = Instant::now();
+        found.record(&body(), None, t0);
+        found.record(&body(), Some("[fe80::1%3]:5555".parse().unwrap()), t0 + Duration::from_millis(5));
+        let c = found.candidates(t0 + Duration::from_millis(5));
+        assert!(c.contains(&"192.168.1.9:24800".parse().unwrap()));
+        assert!(c.contains(&"[fe80::1%3]:24800".parse().unwrap()));
     }
 
     #[test]

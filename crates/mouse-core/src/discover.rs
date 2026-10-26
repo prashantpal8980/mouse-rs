@@ -46,6 +46,31 @@ pub fn local_ipv4s() -> Vec<LocalAddr> {
     out
 }
 
+/// The interface index of every network this machine is on that has an IPv6 link-local
+/// (fe80::) address. Every interface gives itself one, whether or not the network handed out
+/// an address, so these still work when DHCP failed and IPv4 fell back to 169.254.x.x.
+pub fn link_local_v6_ifaces() -> Vec<u32> {
+    let Ok(ifaces) = if_addrs::get_if_addrs() else {
+        return Vec::new();
+    };
+    let mut out: Vec<u32> = ifaces
+        .into_iter()
+        .filter(|i| !i.is_loopback())
+        .filter_map(|i| match i.addr {
+            if_addrs::IfAddr::V6(v6) if is_link_local_v6(&v6.ip) => i.index,
+            _ => None,
+        })
+        .collect();
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// fe80::/10. (`Ipv6Addr::is_unicast_link_local` is not stable on our minimum Rust.)
+pub fn is_link_local_v6(ip: &std::net::Ipv6Addr) -> bool {
+    ip.segments()[0] & 0xffc0 == 0xfe80
+}
+
 /// Addresses a server can bind to: the wildcard first (the usual right answer), then each
 /// specific interface for the case where binding everywhere is not wanted.
 pub fn listen_candidates() -> Vec<String> {
