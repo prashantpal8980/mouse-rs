@@ -99,9 +99,60 @@ impl MotionLog {
     }
 }
 
+/// How late pointer moves arrive, summarised once a minute. Each UDP motion datagram carries
+/// the sender's clock; the transit time (arrival minus send) includes an unknown clock offset,
+/// so each one is measured against the fastest transit seen this session. What is left is the
+/// delay the network added to that move: what the hand feels as lag, including the freezes a
+/// gap count can't see because moves were held back rather than lost.
+#[derive(Default)]
+pub struct DelayLog {
+    since: Option<Instant>,
+    best: Option<i64>,
+    transits: Vec<i64>,
+}
+
+impl DelayLog {
+    /// Record one move: `transit_ms` is arrival on this clock minus send on the sender's.
+    /// Returns the summary line when a minute has passed.
+    pub fn push(&mut self, transit_ms: i64, now: Instant) -> Option<String> {
+        let since = *self.since.get_or_insert(now);
+        self.best = Some(self.best.map_or(transit_ms, |b| b.min(transit_ms)));
+        self.transits.push(transit_ms);
+        if now.duration_since(since) < WINDOW {
+            return None;
+        }
+        self.since = Some(now);
+        let best = self.best.unwrap_or(transit_ms);
+        let mut late: Vec<i64> = std::mem::take(&mut self.transits).into_iter().map(|t| t - best).collect();
+        late.sort_unstable();
+        let n = late.len();
+        let over = late.iter().filter(|&&d| d > 50).count();
+        Some(format!(
+            "pointer delay over the last minute ({n} moves, above the fastest seen): median {} ms, \
+             99% under {} ms, max {} ms, {over} over 50 ms",
+            late[n / 2],
+            late[(n * 99 / 100).min(n - 1)],
+            late[n - 1]
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn delay_is_measured_against_the_fastest_transit() {
+        let t0 = Instant::now();
+        let mut log = DelayLog::default();
+        // A clock offset of 5000 ms is invisible: only the extra over the best counts.
+        assert!(log.push(5003, t0).is_none());
+        assert!(log.push(5002, t0 + Duration::from_secs(1)).is_none());
+        assert!(log.push(5142, t0 + Duration::from_secs(2)).is_none());
+        let line = log.push(5002, t0 + Duration::from_secs(61)).unwrap();
+        assert!(line.contains("4 moves"), "{line}");
+        assert!(line.contains("max 140 ms") && line.contains("1 over 50 ms"), "{line}");
+    }
 
     #[test]
     fn rtt_summary_comes_once_a_minute() {

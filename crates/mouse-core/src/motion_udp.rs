@@ -40,10 +40,11 @@ type HmacSha256 = Hmac<Sha256>;
 pub(crate) const KEY_LABEL: &[u8] = b"EXPORTER-mouse-rs-motion";
 
 const HELLO: &[u8; 4] = b"MRH1";
-const MOVE: &[u8; 4] = b"MRM1";
+const MOVE: &[u8; 4] = b"MRM2";
 const TAG: usize = 16;
 const HELLO_LEN: usize = 4 + 16 + TAG;
-const MOVE_LEN: usize = 4 + 8 + 8 + 8 + TAG;
+/// Magic, seq, total x, total y, send time (ms on the sender's clock), tag.
+const MOVE_LEN: usize = 4 + 8 + 8 + 8 + 4 + TAG;
 /// Room for any datagram we send, with margin.
 pub(crate) const MAX_DATAGRAM: usize = 64;
 
@@ -87,19 +88,21 @@ fn decode_hello(key: &Key, buf: &[u8]) -> Option<[u8; 16]> {
     buf[4..20].try_into().ok()
 }
 
-fn encode_move(key: &Key, seq: u64, sx: i64, sy: i64) -> [u8; MOVE_LEN] {
+fn encode_move(key: &Key, seq: u64, sx: i64, sy: i64, sent_ms: u32) -> [u8; MOVE_LEN] {
     let mut out = [0u8; MOVE_LEN];
     out[..4].copy_from_slice(MOVE);
     out[4..12].copy_from_slice(&seq.to_be_bytes());
     out[12..20].copy_from_slice(&sx.to_be_bytes());
     out[20..28].copy_from_slice(&sy.to_be_bytes());
-    let t = tag(key, &out[..28]);
-    out[28..].copy_from_slice(&t);
+    out[28..32].copy_from_slice(&sent_ms.to_be_bytes());
+    let t = tag(key, &out[..32]);
+    out[32..].copy_from_slice(&t);
     out
 }
 
-fn decode_move(key: &Key, buf: &[u8]) -> Option<(u64, i64, i64)> {
-    if buf.len() != MOVE_LEN || &buf[..4] != MOVE || !tag_ok(key, &buf[..28], &buf[28..]) {
+/// (seq, total x, total y, send time in ms on the sender's clock)
+fn decode_move(key: &Key, buf: &[u8]) -> Option<(u64, i64, i64, u32)> {
+    if buf.len() != MOVE_LEN || &buf[..4] != MOVE || !tag_ok(key, &buf[..32], &buf[32..]) {
         return None;
     }
     let n = |r: std::ops::Range<usize>| -> [u8; 8] { buf[r].try_into().expect("8 bytes") };
@@ -107,7 +110,13 @@ fn decode_move(key: &Key, buf: &[u8]) -> Option<(u64, i64, i64)> {
         u64::from_be_bytes(n(4..12)),
         i64::from_be_bytes(n(12..20)),
         i64::from_be_bytes(n(20..28)),
+        u32::from_be_bytes(buf[28..32].try_into().expect("4 bytes")),
     ))
+}
+
+/// Milliseconds since `epoch`, wrapping (a session would need 49 days to wrap).
+fn ms_since(epoch: Instant) -> u32 {
+    epoch.elapsed().as_millis() as u32
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -135,13 +144,24 @@ pub(crate) struct ServerMotion {
     seq: u64,
     sum: (i64, i64),
     synced: (i64, i64),
+    /// Zero of the send times in the datagrams.
+    epoch: Instant,
 }
 
 impl ServerMotion {
     pub(crate) fn new(sock: Arc<UdpSocket>, key: Key) -> ServerMotion {
         let mut token = [0u8; 16];
         rand::thread_rng().fill_bytes(&mut token);
-        ServerMotion { sock, key, token, peer: None, seq: 0, sum: (0, 0), synced: (0, 0) }
+        ServerMotion {
+            sock,
+            key,
+            token,
+            peer: None,
+            seq: 0,
+            sum: (0, 0),
+            synced: (0, 0),
+            epoch: Instant::now(),
+        }
     }
 
     pub(crate) fn socket(&self) -> Arc<UdpSocket> {
@@ -181,7 +201,8 @@ impl ServerMotion {
         self.seq += 1;
         // Never waits. A datagram the socket can't take now is a lost datagram, and the
         // next one (or the next `MotionSync`) carries the total anyway.
-        let _ = self.sock.try_send_to(&encode_move(&self.key, self.seq, self.sum.0, self.sum.1), to);
+        let datagram = encode_move(&self.key, self.seq, self.sum.0, self.sum.1, ms_since(self.epoch));
+        let _ = self.sock.try_send_to(&datagram, to);
         true
     }
 
@@ -203,6 +224,8 @@ pub(crate) struct ClientMotion {
     token: [u8; 16],
     last_seq: u64,
     applied: (i64, i64),
+    epoch: Instant,
+    delay: crate::timing::DelayLog,
 }
 
 impl ClientMotion {
@@ -225,7 +248,15 @@ impl ClientMotion {
         let sock = UdpSocket::bind((any, 0)).await?;
         sock.connect(to).await?;
         crate::qos::prioritise_datagrams(&sock, to);
-        let me = ClientMotion { sock: Arc::new(sock), key, token, last_seq: 0, applied: (0, 0) };
+        let me = ClientMotion {
+            sock: Arc::new(sock),
+            key,
+            token,
+            last_seq: 0,
+            applied: (0, 0),
+            epoch: Instant::now(),
+            delay: Default::default(),
+        };
         me.hello().await;
         Ok(me)
     }
@@ -242,7 +273,11 @@ impl ClientMotion {
     }
 
     pub(crate) fn on_datagram(&mut self, buf: &[u8]) -> Option<Message> {
-        let (seq, sx, sy) = decode_move(&self.key, buf)?;
+        let (seq, sx, sy, sent_ms) = decode_move(&self.key, buf)?;
+        let transit = i64::from(ms_since(self.epoch)) - i64::from(sent_ms);
+        if let Some(line) = self.delay.push(transit, Instant::now()) {
+            tracing::info!("{line}");
+        }
         self.advance(seq, sx, sy)
     }
 
@@ -287,8 +322,8 @@ mod tests {
     #[test]
     fn datagrams_round_trip_and_reject_another_key() {
         let k = key(1);
-        let m = encode_move(&k, 7, -3, 1200);
-        assert_eq!(decode_move(&k, &m), Some((7, -3, 1200)));
+        let m = encode_move(&k, 7, -3, 1200, 99);
+        assert_eq!(decode_move(&k, &m), Some((7, -3, 1200, 99)));
         assert_eq!(decode_move(&key(2), &m), None, "another session's key");
         let mut bad = m;
         bad[13] ^= 1;
