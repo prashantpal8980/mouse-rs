@@ -206,8 +206,10 @@ pub(crate) struct ClientMotion {
 }
 
 impl ClientMotion {
+    /// `server` is the address the TCP link reached, with its interface for an IPv6
+    /// link-local one; the offered `port` replaces its port.
     pub(crate) async fn start(
-        server: IpAddr,
+        server: SocketAddr,
         port: u16,
         token: &str,
         key: Key,
@@ -215,12 +217,14 @@ impl ClientMotion {
         let token = unhex16(token)
             .ok_or_else(|| std::io::Error::other("malformed motion token"))?;
         let any = match server {
-            IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-            IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+            SocketAddr::V4(_) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            SocketAddr::V6(_) => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
         };
+        let mut to = server;
+        to.set_port(port);
         let sock = UdpSocket::bind((any, 0)).await?;
-        sock.connect((server, port)).await?;
-        crate::qos::prioritise_datagrams(&sock, SocketAddr::new(server, port));
+        sock.connect(to).await?;
+        crate::qos::prioritise_datagrams(&sock, to);
         let me = ClientMotion { sock: Arc::new(sock), key, token, last_seq: 0, applied: (0, 0) };
         me.hello().await;
         Ok(me)
@@ -298,7 +302,7 @@ mod tests {
     fn a_lost_datagram_is_covered_by_the_next_and_old_ones_are_ignored() {
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         rt.block_on(async {
-            let mut c = ClientMotion::start(IpAddr::V4(Ipv4Addr::LOCALHOST), 9, &hex(&[0; 16]), key(1))
+            let mut c = ClientMotion::start(SocketAddr::from((Ipv4Addr::LOCALHOST, 9)), 9, &hex(&[0; 16]), key(1))
                 .await
                 .unwrap();
             // Totals 5, 9 (lost), 12: the client moves 5, then 7, and nothing is lost.
@@ -313,14 +317,24 @@ mod tests {
 
     #[tokio::test]
     async fn motion_flows_over_udp_once_the_client_says_hello_and_syncs_before_a_click() {
-        let server_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        flow("127.0.0.1:0").await;
+    }
+
+    #[tokio::test]
+    async fn motion_flows_over_ipv6_too() {
+        // The hotspot fallback connects over IPv6 link-local; motion must not drop to TCP there.
+        flow("[::1]:0").await;
+    }
+
+    async fn flow(bind: &str) {
+        let server_sock = Arc::new(UdpSocket::bind(bind).await.unwrap());
         let port = server_sock.local_addr().unwrap().port();
         let mut s = ServerMotion::new(server_sock.clone(), key(4));
         assert!(!s.send_move(1, 1), "no hello yet: TCP");
 
         let Some(Message::MotionOffer { port: p, token }) = s.offer() else { panic!("offer") };
         assert_eq!(p, port);
-        let mut c = ClientMotion::start(IpAddr::V4(Ipv4Addr::LOCALHOST), p, &token, key(4)).await.unwrap();
+        let mut c = ClientMotion::start(server_sock.local_addr().unwrap(), p, &token, key(4)).await.unwrap();
         let (buf, n, from) = recv(Some(server_sock.clone())).await.unwrap();
         s.on_datagram(&buf[..n], from);
 

@@ -295,6 +295,17 @@ pub async fn run_server(
             None
         }
     };
+    // And beside the IPv6 listener, for a client that reached us over link-local.
+    let motion_sock6 = match &listener6 {
+        Some(_) => match udp_v6_only(cfg.listen_port) {
+            Ok(s) => Some(Arc::new(s)),
+            Err(e) => {
+                tracing::info!("UDP [::]:{} unavailable ({e}); motion over IPv6 stays on TCP", cfg.listen_port);
+                None
+            }
+        },
+        None => None,
+    };
     // Tell any client on any network we are attached to where to find us. Stops with `cancel`.
     tokio::spawn(beacon::run_sender(
         cfg.shared_secret.clone(),
@@ -452,7 +463,8 @@ pub async fn run_server(
                             height: peer_h,
                             login_screen: peer_login_screen,
                         });
-                        let motion = match (&motion_sock, framed.get_ref().motion_key()) {
+                        let sock = if peer_addr.is_ipv6() { &motion_sock6 } else { &motion_sock };
+                        let motion = match (sock, framed.get_ref().motion_key()) {
                             (Some(sock), Some(key)) => Motion::Server(ServerMotion::new(sock.clone(), key)),
                             _ => Motion::Off,
                         };
@@ -658,8 +670,8 @@ async fn connect_once(
     let listing = targets.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(", ");
     let _ = ch.events.send(LinkEvent::Connecting(listing.clone()));
 
-    // IPv4 first. IPv6 link-local only when no IPv4 address answers: pointer motion over
-    // UDP is IPv4 only, so a link-local session is the fallback, not a rival.
+    // IPv4 first. IPv6 link-local only when no IPv4 address answers: it is the fallback for
+    // a network that gave no address, not a rival.
     let (v4, v6): (Vec<SocketAddr>, Vec<SocketAddr>) = targets.iter().partition(|a| a.is_ipv4());
     let mut raced = None;
     for group in [v4, v6] {
@@ -756,11 +768,7 @@ async fn connect_once(
         login_screen: false,
     });
     let motion = match framed.get_ref().motion_key() {
-        Some(key) if addr.is_ipv4() => Motion::Client { key, server: addr.ip(), live: None },
-        Some(_) => {
-            tracing::info!("connected over IPv6 link-local; pointer motion stays on TCP");
-            Motion::Off
-        }
+        Some(key) => Motion::Client { key, server: addr, live: None },
         None => Motion::Off,
     };
     let reason = pump(framed, params, cancel, ch, health, net, motion).await;
@@ -1092,6 +1100,16 @@ fn listen_v6(port: u16) -> std::io::Result<TcpListener> {
     TcpListener::from_std(sock.into())
 }
 
+/// An IPv6-only UDP socket on `port`, beside the IPv4 one on the same port.
+fn udp_v6_only(port: u16) -> std::io::Result<tokio::net::UdpSocket> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let sock = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
+    sock.set_only_v6(true)?;
+    sock.set_nonblocking(true)?;
+    sock.bind(&SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, port)).into())?;
+    tokio::net::UdpSocket::from_std(sock.into())
+}
+
 async fn accept_any(
     v4: &TcpListener,
     v6: Option<&TcpListener>,
@@ -1125,7 +1143,7 @@ enum Motion {
     Server(ServerMotion),
     Client {
         key: crate::motion_udp::Key,
-        server: std::net::IpAddr,
+        server: SocketAddr,
         /// Set once the server's offer arrives.
         live: Option<ClientMotion>,
     },
@@ -1226,10 +1244,10 @@ async fn pump(
                             if let Motion::Client { key, server, live } = &mut motion {
                                 match ClientMotion::start(*server, port, &token, key.clone()).await {
                                     Ok(m) => {
-                                        tracing::info!("pointer motion will arrive over UDP from {server}:{port}");
+                                        tracing::info!("pointer motion will arrive over UDP from {server} (port {port})");
                                         *live = Some(m);
                                     }
-                                    Err(e) => tracing::warn!("UDP to {server}:{port} unavailable ({e}); pointer motion stays on TCP"),
+                                    Err(e) => tracing::warn!("UDP to {server} (port {port}) unavailable ({e}); pointer motion stays on TCP"),
                                 }
                             }
                         }
