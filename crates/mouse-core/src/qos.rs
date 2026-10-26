@@ -27,20 +27,39 @@ const OFF_SWITCH: &str = "MOUSE_RS_NO_WIFI_PRIORITY";
 
 /// Mark an input connection for Wi-Fi priority. Call once it is connected.
 pub fn prioritise_input(stream: &TcpStream) {
+    prioritise("input link", stream, None);
+}
+
+/// Mark the UDP motion socket for Wi-Fi priority, for datagrams to `to`.
+pub(crate) fn prioritise_datagrams(sock: &tokio::net::UdpSocket, to: std::net::SocketAddr) {
+    prioritise("pointer motion", sock, Some(to));
+}
+
+#[cfg(unix)]
+trait Sock: std::os::fd::AsFd {}
+#[cfg(unix)]
+impl<T: std::os::fd::AsFd> Sock for T {}
+#[cfg(windows)]
+trait Sock: std::os::windows::io::AsSocket {}
+#[cfg(windows)]
+impl<T: std::os::windows::io::AsSocket> Sock for T {}
+
+fn prioritise(what: &str, sock: &impl Sock, to: Option<std::net::SocketAddr>) {
     if std::env::var_os(OFF_SWITCH).is_some() {
-        tracing::info!("input link NOT marked for Wi-Fi priority ({OFF_SWITCH} is set)");
+        tracing::info!("{what} NOT marked for Wi-Fi priority ({OFF_SWITCH} is set)");
         return;
     }
-    match mark(stream) {
-        Ok(how) => tracing::info!("input link marked for Wi-Fi priority ({how})"),
-        Err(e) => tracing::warn!("could not mark the input link for Wi-Fi priority: {e}"),
+    match mark(sock, to) {
+        Ok(how) => tracing::info!("{what} marked for Wi-Fi priority ({how})"),
+        Err(e) => tracing::warn!("could not mark {what} for Wi-Fi priority: {e}"),
     }
 }
 
 #[cfg(unix)]
-fn mark(stream: &TcpStream) -> std::io::Result<&'static str> {
-    let sock = socket2::SockRef::from(stream);
-    if stream.local_addr()?.is_ipv4() {
+fn mark(sock: &impl Sock, _to: Option<std::net::SocketAddr>) -> std::io::Result<&'static str> {
+    let sock = socket2::SockRef::from(sock);
+    let v4 = sock.local_addr()?.as_socket().map_or(true, |a| a.is_ipv4());
+    if v4 {
         sock.set_tos(DSCP_EF_TOS)?;
     } else {
         #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -50,7 +69,7 @@ fn mark(stream: &TcpStream) -> std::io::Result<&'static str> {
 }
 
 #[cfg(windows)]
-fn mark(stream: &TcpStream) -> std::io::Result<&'static str> {
+fn mark(sock: &impl Sock, to: Option<std::net::SocketAddr>) -> std::io::Result<&'static str> {
     use std::os::windows::io::AsRawSocket;
     use std::sync::OnceLock;
     use windows_sys::Win32::NetworkManagement::QoS::{
@@ -72,13 +91,16 @@ fn mark(stream: &TcpStream) -> std::io::Result<&'static str> {
         return Err(std::io::Error::other("QOSCreateHandle failed"));
     };
     let mut flow = 0u32;
-    // SAFETY: the socket is connected (so no destination address is needed) and
-    // stays open for the call; `flow` is a valid out-pointer.
+    // A connected socket needs no destination; an unconnected one (the server's UDP
+    // socket) names the peer the flow is for.
+    let dest = to.map(socket2::SockAddr::from);
+    // SAFETY: the socket stays open for the call, `dest` outlives it, and `flow` is a
+    // valid out-pointer.
     let ok = unsafe {
         QOSAddSocketToFlow(
             handle as _,
-            stream.as_raw_socket() as _,
-            std::ptr::null(),
+            sock.as_socket().as_raw_socket() as _,
+            dest.as_ref().map_or(std::ptr::null(), |d| d.as_ptr() as *const _),
             QOSTrafficTypeVoice,
             QOS_NON_ADAPTIVE_FLOW,
             &mut flow,

@@ -102,7 +102,10 @@ pub(crate) fn is_clipboard_message(m: &Message) -> bool {
         | Message::MouseScroll { .. }
         | Message::Key { .. }
         | Message::Ping
-        | Message::Pong => false,
+        | Message::Pong
+        // Handled inside the link itself; never reach the engine.
+        | Message::MotionOffer { .. }
+        | Message::MotionSync { .. } => false,
     }
 }
 

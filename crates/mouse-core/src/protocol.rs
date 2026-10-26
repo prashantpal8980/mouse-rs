@@ -136,6 +136,20 @@ pub enum Message {
     Leave,
     LeaveRequest,
 
+    // --- pointer motion over UDP (see `motion_udp`) ---
+    /// Server → client: send UDP hellos to this port with this token (hex).
+    MotionOffer {
+        port: u16,
+        token: String,
+    },
+    /// Server → client: the running motion total, sent over TCP ahead of any other
+    /// message so it lands where the pointer was.
+    MotionSync {
+        seq: u64,
+        sx: i64,
+        sy: i64,
+    },
+
     // --- input events ---
     MouseMove {
         dx: i32,
@@ -327,6 +341,8 @@ mod tests {
                 key: "a".into(),
                 pressed: false,
             },
+            Message::MotionOffer { port: 24800, token: "00ff".into() },
+            Message::MotionSync { seq: 9, sx: -40, sy: 12 },
             Message::Ping,
             Message::Pong,
         ];

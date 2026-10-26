@@ -37,6 +37,7 @@ use std::sync::Arc;
 use crate::bulk::{BulkServer, LinkHealth};
 use crate::protocol::{CodecError, Lane, Message, MessageCodec, PROTOCOL_VERSION};
 use crate::auth::Side;
+use crate::motion_udp::{ClientMotion, ServerMotion};
 use crate::{auth, tls};
 
 /// Tunable timing for the link. Defaults are conservative for a LAN.
@@ -147,6 +148,19 @@ pub enum LinkStream {
 }
 
 impl LinkStream {
+    /// The key for this session's motion datagrams, from the TLS exporter. None on a
+    /// plain link: without TLS there is nothing to derive it from, and motion stays on TCP.
+    fn motion_key(&self) -> Option<crate::motion_udp::Key> {
+        let out = [0u8; 32];
+        let label = crate::motion_udp::KEY_LABEL;
+        let exported = match self {
+            LinkStream::Plain(_) => return None,
+            LinkStream::ServerTls(s) => s.get_ref().1.export_keying_material(out, label, None),
+            LinkStream::ClientTls(s) => s.get_ref().1.export_keying_material(out, label, None),
+        };
+        exported.ok().map(crate::motion_udp::Key)
+    }
+
     fn tcp(&self) -> &TcpStream {
         match self {
             LinkStream::Plain(s) => s,
@@ -259,6 +273,15 @@ pub async fn run_server(
     if let Ok(addr) = listener.local_addr() {
         let _ = link_events.send(LinkEvent::Listening(addr));
     }
+    // Pointer motion's UDP socket, on the same port number as the TCP listener. Without
+    // it motion simply stays on TCP.
+    let motion_sock = match tokio::net::UdpSocket::bind(&bind).await {
+        Ok(s) => Some(Arc::new(s)),
+        Err(e) => {
+            tracing::warn!("UDP {bind} unavailable ({e}); pointer motion stays on TCP");
+            None
+        }
+    };
     // Tell any client on any network we are attached to where to find us. Stops with `cancel`.
     tokio::spawn(beacon::run_sender(
         cfg.shared_secret.clone(),
@@ -416,11 +439,15 @@ pub async fn run_server(
                             height: peer_h,
                             login_screen: peer_login_screen,
                         });
+                        let motion = match (&motion_sock, framed.get_ref().motion_key()) {
+                            (Some(sock), Some(key)) => Motion::Server(ServerMotion::new(sock.clone(), key)),
+                            _ => Motion::Off,
+                        };
                         let c = cancel.child_token();
                         session_cancel = Some(c.clone());
                         let h = health.clone();
                         session = Some(tokio::spawn(async move {
-                            let reason = pump(framed, params, &c, &mut owned, &h, None).await;
+                            let reason = pump(framed, params, &c, &mut owned, &h, None, motion).await;
                             (owned, reason)
                         }));
                     }
@@ -688,7 +715,11 @@ async fn connect_once(
         height: server_h,
         login_screen: false,
     });
-    let reason = pump(framed, params, cancel, ch, health, net).await;
+    let motion = match framed.get_ref().motion_key() {
+        Some(key) => Motion::Client { key, server: addr.ip(), live: None },
+        None => Motion::Off,
+    };
+    let reason = pump(framed, params, cancel, ch, health, net, motion).await;
     match reason {
         DisconnectReason::Cancelled => AttemptOutcome::Cancelled,
         reason => AttemptOutcome::Lost {
@@ -1004,6 +1035,29 @@ async fn race_connect(targets: &[SocketAddr], per: Duration) -> Option<(SocketAd
     None
 }
 
+/// Pointer motion over UDP for this session (see `motion_udp`).
+enum Motion {
+    /// No UDP: plain link, or the socket couldn't be opened. Motion goes over TCP.
+    Off,
+    Server(ServerMotion),
+    Client {
+        key: crate::motion_udp::Key,
+        server: std::net::IpAddr,
+        /// Set once the server's offer arrives.
+        live: Option<ClientMotion>,
+    },
+}
+
+impl Motion {
+    fn socket(&self) -> Option<Arc<tokio::net::UdpSocket>> {
+        match self {
+            Motion::Server(m) => Some(m.socket()),
+            Motion::Client { live: Some(m), .. } => Some(m.socket()),
+            _ => None,
+        }
+    }
+}
+
 async fn pump(
     framed: Framed<LinkStream, MessageCodec>,
     params: LinkParams,
@@ -1011,8 +1065,16 @@ async fn pump(
     ch: &mut LinkChannels,
     health: &Arc<LinkHealth>,
     mut net: Option<watch::Receiver<u64>>,
+    mut motion: Motion,
 ) -> DisconnectReason {
     let (mut sink, mut stream) = framed.split();
+    if let Motion::Server(m) = &motion {
+        if let Some(offer) = m.offer() {
+            if let Err(reason) = send_cancelable(&mut sink, cancel, offer, "send motion offer").await {
+                return reason;
+            }
+        }
+    }
     // Only changes from here on count. The network was already settled when we connected.
     if let Some(r) = net.as_mut() {
         r.borrow_and_update();
@@ -1028,6 +1090,7 @@ async fn pump(
     let mut rtt_log = crate::timing::RttLog::default();
 
     loop {
+        let udp = motion.socket();
         tokio::select! {
             // Local Stop/Reload: return immediately, no blocking.
             _ = cancel.cancelled() => return DisconnectReason::Cancelled,
@@ -1049,6 +1112,9 @@ async fn pump(
                 // permanent congestion and throttled forever.
                 health.decay_baseline();
                 ping_sent = Some(Instant::now());
+                if let Motion::Client { live: Some(m), .. } = &motion {
+                    m.hello().await;
+                }
             }
 
             // Incoming frame from the peer.
@@ -1073,6 +1139,24 @@ async fn pump(
                                 }
                             }
                         }
+                        Message::MotionOffer { port, token } => {
+                            if let Motion::Client { key, server, live } = &mut motion {
+                                match ClientMotion::start(*server, port, &token, key.clone()).await {
+                                    Ok(m) => {
+                                        tracing::info!("pointer motion will arrive over UDP from {server}:{port}");
+                                        *live = Some(m);
+                                    }
+                                    Err(e) => tracing::warn!("UDP to {server}:{port} unavailable ({e}); pointer motion stays on TCP"),
+                                }
+                            }
+                        }
+                        Message::MotionSync { seq, sx, sy } => {
+                            if let Motion::Client { live: Some(m), .. } = &mut motion {
+                                if let Some(mv) = m.on_sync(seq, sx, sy) {
+                                    let _ = ch.from_peer.send(mv);
+                                }
+                            }
+                        }
                         other => {
                             // Never blocks the read loop (unbounded). A dropped
                             // send only happens if the engine is gone → we'll be
@@ -1087,10 +1171,34 @@ async fn pump(
             out = ch.to_peer.recv() => match out {
                 None => return DisconnectReason::Cancelled, // engine dropped the sender
                 Some(msg) => {
+                    if let Motion::Server(m) = &mut motion {
+                        if let Message::MouseMove { dx, dy } = msg {
+                            if m.send_move(dx, dy) {
+                                continue;
+                            }
+                        } else if let Some(sync) = m.sync() {
+                            if let Err(reason) = send_cancelable(&mut sink, cancel, sync, "send motion sync").await {
+                                return reason;
+                            }
+                        }
+                    }
                     if let Err(reason) = send_cancelable(&mut sink, cancel, msg, "send").await {
                         return reason;
                     }
                 }
+            },
+
+            // Pointer motion datagrams: hellos on the server, moves on the client.
+            got = crate::motion_udp::recv(udp) => match (got, &mut motion) {
+                (Ok((buf, n, from)), Motion::Server(m)) => m.on_datagram(&buf[..n], from),
+                (Ok((buf, n, _)), Motion::Client { live: Some(m), .. }) => {
+                    if let Some(mv) = m.on_datagram(&buf[..n]) {
+                        let _ = ch.from_peer.send(mv);
+                    }
+                }
+                // A failed receive (e.g. ICMP port unreachable surfacing on Windows) is not a
+                // reason to drop the session; TCP carries on.
+                _ => {}
             },
         }
     }

@@ -9,6 +9,7 @@ pub mod beacon;
 pub mod bulk;
 pub mod config;
 pub mod discover;
+mod motion_udp;
 pub mod net;
 pub mod protocol;
 pub mod qos;
