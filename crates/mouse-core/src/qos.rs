@@ -22,8 +22,15 @@ use tokio::net::TcpStream;
 #[cfg(unix)]
 const DSCP_EF_TOS: u32 = 46 << 2;
 
+/// Set (to anything) to leave the input link unmarked, for a with/without comparison.
+const OFF_SWITCH: &str = "MOUSE_RS_NO_WIFI_PRIORITY";
+
 /// Mark an input connection for Wi-Fi priority. Call once it is connected.
 pub fn prioritise_input(stream: &TcpStream) {
+    if std::env::var_os(OFF_SWITCH).is_some() {
+        tracing::info!("input link NOT marked for Wi-Fi priority ({OFF_SWITCH} is set)");
+        return;
+    }
     match mark(stream) {
         Ok(how) => tracing::info!("input link marked for Wi-Fi priority ({how})"),
         Err(e) => tracing::warn!("could not mark the input link for Wi-Fi priority: {e}"),
