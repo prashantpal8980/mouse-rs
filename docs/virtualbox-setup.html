@@ -1,0 +1,171 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VirtualBox Test Setup</title>
+<style>
+:root{--bg:#fbfaf7;--card:#fff;--txt:#1d1d1b;--txt2:#5b5a55;--line:#e4e1d8;--accent:#2f6fde;--warn:#b26a00;--warnbg:#fff4e0;--code:#f2f0ea;--good:#1f8a4c}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#17171a;--card:#202024;--txt:#ecebe7;--txt2:#a9a8a2;--line:#33333a;--accent:#7aa7ff;--warn:#f0b35a;--warnbg:#2e2618;--code:#2a2a30;--good:#5fd08f}}
+:root[data-theme="dark"]{--bg:#17171a;--card:#202024;--txt:#ecebe7;--txt2:#a9a8a2;--line:#33333a;--accent:#7aa7ff;--warn:#f0b35a;--warnbg:#2e2618;--code:#2a2a30;--good:#5fd08f}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--txt);font:16px/1.6 system-ui,-apple-system,"Segoe UI",sans-serif}
+main{max-width:860px;margin:0 auto;padding:32px 16px 80px}
+h1{font-size:1.9rem;margin:0 0 4px}
+h2{font-size:1.3rem;margin:40px 0 10px;padding-top:16px;border-top:1px solid var(--line)}
+h3{font-size:1.05rem;margin:22px 0 6px}
+p.sub{color:var(--txt2);margin:0 0 20px}
+code,pre{font-family:ui-monospace,"JetBrains Mono",Consolas,monospace;font-size:.88em}
+code{background:var(--code);padding:1px 5px;border-radius:4px}
+pre{background:var(--code);padding:12px 14px;border-radius:8px;overflow-x:auto;white-space:pre}
+table{border-collapse:collapse;width:100%;margin:8px 0;font-size:.95rem}
+th,td{border:1px solid var(--line);padding:7px 10px;text-align:left;vertical-align:top}
+th{background:var(--code)}
+.box{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px 16px;margin:12px 0}
+.warn{background:var(--warnbg);border-color:var(--warn)}
+.warn b:first-child{color:var(--warn)}
+.why{color:var(--txt2);font-size:.93rem}
+ol li,ul li{margin:4px 0}
+.step{display:inline-block;background:var(--accent);color:#fff;border-radius:999px;padding:0 10px;font-size:.85rem;margin-right:6px}
+.map{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+@media (max-width:640px){.map{grid-template-columns:1fr}}
+.tick{color:var(--good)}
+</style>
+</head>
+<body>
+<main>
+<h1>VirtualBox test setup</h1>
+<p class="sub">For the Linux ↔ Linux and Windows ↔ Windows tests (B33). Everything happens on <b>Kali</b>. Nothing needs installing on the laptop.<br>Written 26 Oct 2026 · total time about 2 hours, mostly waiting</p>
+
+<h2>1. How the testing works</h2>
+<div class="map">
+  <div class="box"><b>Linux ↔ Linux</b><br>Kali (the real machine) ↔ a <b>Linux Mint</b> VM running on Kali.</div>
+  <div class="box"><b>Windows ↔ Windows</b><br>The laptop (the real machine) ↔ a <b>Windows 11</b> VM running on Kali.</div>
+</div>
+<p>The VMs use a <b>Bridged</b> network, so they join your network as if they were separate computers, each with its own IP address. mouse-rs in a VM therefore behaves exactly as it would on a customer's second PC.</p>
+<p class="why">A VM is good for checking that things <i>work</i>: connecting, crossing, keys, copy/paste. It is <b>not</b> good for judging smoothness. Judge that only between the real Kali and the real laptop.</p>
+
+<h2>2. Disk space</h2>
+<table>
+<tr><th>Disk</th><th>Free now</th><th>What goes there</th></tr>
+<tr><td>SSD 256 GB (Kali system)</td><td>52 GB</td><td>Only the VirtualBox program (~300 MB). <b>Nothing else.</b></td></tr>
+<tr><td>Hard disk 1 TB (Toshiba, "New Volume")</td><td>771 GB</td><td>Both VMs and both ISO files, in a new folder <code>VMs</code>. Your existing folders are not touched.</td></tr>
+</table>
+<table>
+<tr><th>Item</th><th>Space actually used</th></tr>
+<tr><td>Windows 11 ISO</td><td>~7.9 GB</td></tr>
+<tr><td>Linux Mint ISO</td><td>~3 GB</td></tr>
+<tr><td>Windows 11 VM (64 GB disk, "dynamically allocated")</td><td>~25 GB</td></tr>
+<tr><td>Linux Mint VM (30 GB disk, dynamically allocated)</td><td>~12 GB</td></tr>
+<tr><td><b>Total</b></td><td><b>~48 GB, all on the hard disk</b></td></tr>
+</table>
+<p><b>Can both OSes share one virtual disk?</b> No. Each OS needs its own disk. But <i>dynamically allocated</i> disks only take the space that is really written, not their full size, so the two together stay under 40 GB. The ISOs can be deleted after installing.</p>
+<p class="why">The hard disk spins at 5400 rpm, so Windows will boot slowly (1–2 min). That's fine for testing. Close Chrome while installing Windows to keep RAM free.</p>
+
+<h3><span class="step">A</span>Give the hard disk a fixed place that mounts at every boot</h3>
+<p>Right now it only mounts when you click it, at a path with a space in it. A VM whose disk isn't mounted shows as "inaccessible". Make it permanent at <code>/mnt/data</code>:</p>
+<pre>sudo mkdir -p /mnt/data
+echo 'UUID=7C11-146B /mnt/data exfat defaults,uid=1000,gid=1000,nofail 0 0' | sudo tee -a /etc/fstab
+sudo umount "/run/media/kalip/New Volume"
+sudo mount -a
+mkdir -p /mnt/data/VMs/iso
+df -h /mnt/data</pre>
+<p class="why">Line 2 tells Linux to mount this disk (identified by its ID, 7C11-146B) at /mnt/data at every boot, owned by you. <code>nofail</code> means Kali still boots normally if the disk is ever missing. The last line should show about 771 GB free.</p>
+
+<h2>3. Install VirtualBox</h2>
+<pre>sudo apt update
+sudo apt install -y linux-headers-$(uname -r) virtualbox virtualbox-qt
+sudo usermod -aG vboxusers kalip
+sudo modprobe -r kvm_intel kvm
+sudo modprobe vboxdrv</pre>
+<ul>
+<li><b>linux-headers</b>: VirtualBox builds a small kernel driver for your exact kernel (6.19), and it needs these files to do that.</li>
+<li><b>usermod</b>: lets you use VirtualBox without root. It takes effect after you log out and back in.</li>
+<li><b>modprobe -r kvm_intel kvm</b>: Kali loads <b>KVM</b> (Linux's built-in virtual machine system) at boot. KVM and VirtualBox can't both use the CPU's virtualization at the same time; with KVM loaded, VirtualBox fails with <i>"VT-x is being used by another hypervisor"</i>. This line unloads KVM. <b>You have to repeat it after every reboot</b>, before starting a VM (or see the fix in section 9).</li>
+<li><b>modprobe vboxdrv</b>: loads VirtualBox's driver. No output means it worked.</li>
+</ul>
+<div class="box warn"><b>If it says "Key was rejected by service":</b> Secure Boot is on, and it blocks unsigned drivers. Tell me before changing anything.</div>
+<div class="box warn"><b>Don't install the "Extension Pack".</b> It isn't needed for these tests, and its license (PUEL) is only free for personal use. mouse-rs is a commercial product.</div>
+
+<h2>4. Downloads (start these first; they run while you do the rest)</h2>
+<table>
+<tr><th>What</th><th>Where</th><th>Pick</th></tr>
+<tr><td><b>Windows 11</b> (~7.9 GB)</td><td>microsoft.com/software-download/windows11</td><td>Section "Download Windows 11 Disk Image (ISO) for x64 devices" → Windows 11 → English (United States) → 64-bit Download</td></tr>
+<tr><td><b>Linux Mint</b> (~3 GB)</td><td>linuxmint.com/download.php</td><td>The newest version, <b>Cinnamon Edition</b>, from any mirror near you (India)</td></tr>
+</table>
+<p>Save both into <code>/mnt/data/VMs/iso</code>.</p>
+<p class="why">Why Mint and not another Kali: a second Kali would only test the setup we already have. Mint is the most common desktop for people coming from Windows, and like Kali it uses X11, which mouse-rs needs on the controlling machine. Windows 11 needs no product key for testing; it just shows an "Activate Windows" watermark.</p>
+
+<h2>5. VirtualBox: one setting first</h2>
+<p>Open VirtualBox → <b>File → Preferences → General → Default Machine Folder</b> → <code>/mnt/data/VMs</code>. Every new VM now goes on the hard disk.</p>
+
+<h2>6. Create the Windows 11 VM</h2>
+<ol>
+<li><b>New</b> → Name <code>Win11-test</code> · ISO Image: the Windows ISO · tick <b>Skip Unattended Installation</b>.</li>
+<li><b>Hardware:</b> Base Memory <b>4096 MB</b> · Processors <b>4</b> · <b>Enable EFI</b> ticked.</li>
+<li><b>Hard disk:</b> Create a virtual hard disk, <b>64 GB</b>, <i>Pre-allocate Full Size</i> <b>unticked</b>.</li>
+<li>Finish. Then <b>Settings</b> (before the first start):
+  <ul>
+  <li>System → Motherboard: <b>TPM 2.0</b> (Windows 11 refuses to install without it) · Secure Boot ticked.</li>
+  <li>Display: Video Memory <b>128 MB</b>.</li>
+  <li>Network → Adapter 1: Attached to <b>Bridged Adapter</b>, Name <b><code>eth0</code></b>.</li>
+  <li>General → Advanced: Shared Clipboard <b>Disabled</b>, Drag'n'Drop <b>Disabled</b> (see section 8).</li>
+  </ul></li>
+<li><b>Start</b> → press a key when it says "Press any key to boot from CD".</li>
+<li>Setup: "I don't have a product key" → <b>Windows 11 Pro</b> → Custom install → the empty disk → Next. About 20–30 min.</li>
+<li><b>Local account without Microsoft sign-in:</b> on the network/sign-in screen press <b>Shift+F10</b>, type <code>start ms-cxh:localonly</code> and press Enter. Create user <code>test</code>. (On older builds the command is <code>OOBE\BYPASSNRO</code>.)</li>
+<li>When on the desktop: <b>Devices → Insert Guest Additions CD image</b> → open the CD in Explorer → run <code>VBoxWindowsAdditions.exe</code> → reboot. This gives correct screen resizing.</li>
+</ol>
+<p class="why">Why eth0 for Windows: the cable between Kali and the laptop is where the laptop hands out 192.168.137.x addresses. A VM bridged to it gets one of those, reaches the laptop directly, and can download mouse-rs from Kali the same way the laptop does.</p>
+
+<h2>7. Create the Linux Mint VM</h2>
+<ol>
+<li><b>New</b> → Name <code>Mint-test</code> · ISO: the Mint ISO · <b>Skip Unattended Installation</b>.</li>
+<li>Memory <b>3072 MB</b> · Processors <b>2</b> · disk <b>30 GB</b>, not pre-allocated.</li>
+<li>Settings: Display 128 MB · Network <b>Bridged Adapter → <code>eth0</code></b> · Shared Clipboard and Drag'n'Drop <b>Disabled</b>.</li>
+<li>Start → Mint opens a live desktop → double-click <b>Install Linux Mint</b> → defaults → "Erase disk and install" (this only erases the <i>virtual</i> 30 GB disk) → user <code>test</code>. About 10–15 min.</li>
+<li>After the reboot, in Mint's terminal:
+<pre>sudo apt update && sudo apt install -y virtualbox-guest-x11 libgtk-3-0 libayatana-appindicator3-1</pre>
+<span class="why">The first package does the VM screen resizing; the other two are what the mouse-rs window needs on any Linux.</span></li>
+</ol>
+
+<h2>8. Settings that matter for mouse-rs tests</h2>
+<table>
+<tr><th>Setting</th><th>Why</th></tr>
+<tr><td><b>Shared Clipboard: Disabled</b><br>Drag'n'Drop: Disabled</td><td>VirtualBox has its own copy/paste between Kali and the VM. If it is on, a paste could come from VirtualBox and not from mouse-rs, and the copy/paste test would prove nothing.</td></tr>
+<tr><td><b>Mouse integration OFF when the VM is the server</b><br>(Input → Mouse Integration, or Right Ctrl+I)</td><td>With integration on, the VM gets the pointer's absolute position from VirtualBox, and the edge-crossing capture can't work. Off = the VM sees real mouse movement, like a real PC. Click into the VM to give it the mouse; <b>Right Ctrl</b> gives it back to Kali.</td></tr>
+<tr><td>Mouse integration can stay ON when the VM is the client</td><td>The VM is only receiving; just keep Kali's own pointer away from the VM window.</td></tr>
+<tr><td>Run the VM <b>full screen</b> (Right Ctrl+F)</td><td>The screen edges of the VM are then the real edges, so crossing works the same way as on a real PC.</td></tr>
+<tr><td>Windows Firewall prompt the first time mouse-rs runs</td><td>Click <b>Allow</b> (private networks). Otherwise the other machine can't find it.</td></tr>
+<tr><td>Only one VM running at a time</td><td>15 GB of RAM: Windows 4 + Mint 3 + Kali is fine, but each test only needs one VM.</td></tr>
+</table>
+
+<h2>9. Avoid repeating the KVM line after each reboot (optional)</h2>
+<pre>echo 'blacklist kvm_intel' | sudo tee /etc/modprobe.d/no-kvm.conf</pre>
+<p class="why">KVM is then never loaded at boot. Nothing on this machine uses it today. Undo by deleting that file.</p>
+
+<h2>10. When both VMs are installed</h2>
+<p>Tell me. I'll give you the exact command to install mouse-rs in each VM (the same "download, run, done" a customer gets) and the test list. It's the same list you already did between Kali and the laptop:</p>
+<ul>
+<li>Connect / pairing, with no static IP set</li>
+<li>Pointer crossing both ways, clicks, scroll, keys and shortcuts</li>
+<li>Copy text, a screenshot, a file and a folder, both ways</li>
+<li>Swap roles (server ↔ client) and repeat</li>
+<li>Quit and Stop leave nothing running</li>
+</ul>
+
+<h2>11. Problems you might hit</h2>
+<table>
+<tr><th>You see</th><th>Do</th></tr>
+<tr><td>"VT-x is being used by another hypervisor"</td><td><code>sudo modprobe -r kvm_intel kvm</code>, then start the VM again.</td></tr>
+<tr><td>"Kernel driver not installed (rc=-1908)"</td><td><code>sudo modprobe vboxdrv</code>. If that fails, send me the message.</td></tr>
+<tr><td>VM shows "inaccessible"</td><td>The hard disk isn't mounted: <code>sudo mount -a</code>.</td></tr>
+<tr><td>Windows says "This PC can't run Windows 11"</td><td>TPM 2.0 or EFI is off in the VM settings (section 6, step 4).</td></tr>
+<tr><td>VM has no network / no IP</td><td>Settings → Network: still "Bridged Adapter" and <code>eth0</code>? Is the cable plugged in? As a fallback, pick <code>wlan0</code>.</td></tr>
+</table>
+
+<h2>12. After testing</h2>
+<p>Keep the VMs until launch. They're useful again for checking the update notice and for the fresh-install test on Thursday. After launch, right-click → <b>Remove → Delete all files</b> frees the ~40 GB.</p>
+</main>
+</body>
+</html>
