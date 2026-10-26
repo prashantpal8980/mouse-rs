@@ -530,9 +530,14 @@ router is most of the remaining stutter.
 Every minute on Wi-Fi still had a 127–148 ms freeze. The owner found the trigger by hand (27 Oct):
 opening Kali's Wi-Fi menu (nm-applet) made the pointer lag at once, because it starts a scan and
 the adapter leaves the channel to listen on the others. Windows scans by itself in the background.
-Built: while mouse-rs runs, each Windows Wi-Fi adapter is put in media streaming mode with
-background scans off (`qos::wifi_low_latency`); Windows reverts it when the process exits. Linux
-needs root for the same, so Kali is not covered. Motion datagrams now carry the send time and the
+Built (owner's choice of options, 27 Oct): only while the pointer is on the other machine, each
+Windows Wi-Fi adapter is put in media streaming mode with background scans off
+(`qos::wifi_quiet`); back on the laptop, on disconnect or at exit the WLAN handle closes and
+Windows restores its settings, so the network list and auto-connect are normal whenever the user
+is at that machine. Linux needs root for the same, so Kali is not covered. Also built: the
+receiving side carries the pointer through a gap of up to ~30 ms at its speed
+(`motion_udp::Conceal`), and the server repeats the final total 25 and 80 ms after motion stops,
+which takes back a guess past where the hand stopped and covers a lost final datagram. Motion datagrams now carry the send time and the
 client logs "pointer delay over the last minute", which sees held-back moves, not just gaps.
 
 ### B38 — on a phone hotspot the two machines never found each other — **fixed 2026-10-26, confirmed on hardware**
