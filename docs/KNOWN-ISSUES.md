@@ -438,19 +438,29 @@ which has now run on hardware. Only same-OS hardware can prove them.
 Small nit: the client logs `WARN … MOTION ARRIVED BUT NO KEYS` for every crossing where nothing
 was typed. That is noise, not a fault.
 
-### B34 — only the client proves who it is; the server is never checked
-**parked** (security phase, after functionality) · found 2026-10-15 while writing `docs/lock-screen-security-plan.html`
+### B34 — only the client proves who it is; the server is never checked — **fixed 2026-10-26, awaiting hardware check**
+found 2026-10-15 while writing `docs/lock-screen-security-plan.html`
 
-`client_handshake` (`crates/mouse-core/src/net.rs`) accepts the server's `AuthOk { ok: true }`
-without any proof that the server knows the shared secret. `tls.rs` also accepts any certificate
-identity. A machine that gets the client to connect to it (by taking over `server_host`'s address
-on the LAN) can therefore act as the server and type into the client, including at the login screen.
-It also receives `HMAC(secret, nonce)` for a nonce it chose, which lets it test guesses at a weak,
-hand-typed secret offline. Discovery is not affected, because beacons are sealed with the secret.
+**Was:** `client_handshake` accepted the server's `AuthOk { ok: true }` with no proof that the server
+knew the shared secret, and `tls.rs` accepts any certificate. A machine that took over the
+server's address could act as the server and type into the client, including at the login screen.
+The HMAC was also not tied to the TLS session, so a machine in the middle could pass the
+handshake through between the real client and server and then read every keystroke.
 
-**Fix (planned, layer 1 of the plan):** device key pairs pinned at a one-time pairing, and mutual TLS.
-**Smaller stop-gap if needed before launch:** make the server answer a client nonce with its own HMAC,
-so both sides prove the secret.
+**Fix (protocol 2):** mutual, TLS-bound proofs (`auth.rs`). The client sends a nonce in its Hello;
+the server answers with its nonce and `HMAC(secret, "server" ‖ binding ‖ client nonce ‖ server nonce)`;
+the client checks it **before** sending its own proof (label "client"). `binding` is 32 bytes from
+the TLS keying-material exporter, which differs on each side of a machine in the middle, so relayed
+proofs fail. A version 1 peer is refused (`old_version`), so there is no downgrade.
+A refusal is now shown in the window ("refused — the other machine runs an older mouse-rs; update it",
+and so on), and the client keeps retrying instead of stopping, so updating the other machine is enough.
+Tests: a fake server is refused before the client proves anything; a v1 client is refused;
+proofs fail across sessions, across sides, and with other nonces.
+
+**Still open (by design, fixed by pairing on 27 Oct):** whoever proves first gives out one HMAC an
+attacker could test guesses against offline. A generated 32-character secret makes that useless;
+a short hand-typed secret does not. The pairing code (PAKE) removes the typed secret.
+With `tls_enabled: false` (config file only, not in the UI) there is no binding.
 
 ### B35 — a copy whose small files are pasted before its big ones is never marked done
 **open** · found 2026-10-15 in the B3 run (laptop log, 11:37–11:38 UTC)

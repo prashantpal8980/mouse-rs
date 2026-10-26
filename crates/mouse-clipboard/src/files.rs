@@ -1092,8 +1092,6 @@ mod paste_trigger_tests {
 
 #[cfg(all(test, unix, not(target_os = "macos")))]
 mod handoff_tests {
-    use super::*;
-
     /// Needs a live X display and xclip: `cargo test -p mouse-clipboard -- --ignored recopy`.
     #[test]
     #[ignore]

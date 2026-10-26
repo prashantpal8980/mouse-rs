@@ -3324,6 +3324,9 @@ fn status_pill(p: Palette, running: bool, snap: Option<&StatusSnapshot>) -> (ice
             p.good,
             format!("connected — {} ({}×{})", s.peer, s.peer_w, s.peer_h),
         ),
+        (true, Some(StatusSnapshot { refused: Some(why), .. })) => {
+            (ui_theme::alpha(p.danger, 0.16), p.danger, format!("refused — {why}"))
+        }
         (true, _) => (ui_theme::alpha(p.warn, 0.16), p.warn, "waiting for peer…".into()),
     }
 }
@@ -3389,6 +3392,7 @@ fn tray_tooltip(running: bool, snap: Option<&StatusSnapshot>, waiting: usize) ->
             }
             t
         }
+        (true, Some(StatusSnapshot { refused: Some(why), .. })) => format!("mouse-rs — refused: {why}"),
         (true, _) => "mouse-rs — waiting for peer".to_owned(),
     }
 }
@@ -3400,6 +3404,7 @@ fn hero_line(running: bool, role: Role, snap: Option<&StatusSnapshot>) -> String
             Role::Client => format!("← controlled by {}", s.peer),
         },
         Some(s) if s.connected => format!("connected to {}", s.peer),
+        Some(StatusSnapshot { refused: Some(why), .. }) if running => format!("refused: {why}"),
         _ if running => "waiting for peer…".into(),
         _ => "stopped".into(),
     }

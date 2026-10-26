@@ -36,6 +36,7 @@ use std::sync::Arc;
 
 use crate::bulk::{BulkServer, LinkHealth};
 use crate::protocol::{CodecError, Lane, Message, MessageCodec, PROTOCOL_VERSION};
+use crate::auth::Side;
 use crate::{auth, tls};
 
 /// Tunable timing for the link. Defaults are conservative for a LAN.
@@ -143,6 +144,24 @@ pub enum LinkStream {
     Plain(TcpStream),
     ServerTls(Box<ServerTlsStream<TcpStream>>),
     ClientTls(Box<ClientTlsStream<TcpStream>>),
+}
+
+impl LinkStream {
+    /// Keying material exported from this TLS session, which ties the auth proofs to
+    /// it (B34). A plain link has nothing to bind to and yields an empty binding.
+    fn auth_binding(&self) -> Result<Vec<u8>, String> {
+        let out = [0u8; 32];
+        let exported = match self {
+            LinkStream::Plain(_) => return Ok(Vec::new()),
+            LinkStream::ServerTls(s) => {
+                s.get_ref().1.export_keying_material(out, auth::TLS_EXPORTER_LABEL, None)
+            }
+            LinkStream::ClientTls(s) => {
+                s.get_ref().1.export_keying_material(out, auth::TLS_EXPORTER_LABEL, None)
+            }
+        };
+        exported.map(|b| b.to_vec()).map_err(|e| format!("tls exporter: {e}"))
+    }
 }
 
 impl AsyncRead for LinkStream {
@@ -633,10 +652,16 @@ async fn connect_once(
     };
     let (server_name, server_w, server_h) = match server_name {
         Ok(Ok(v)) => v,
-        // Rejected (e.g. bad secret / protocol mismatch): retrying can't help.
+        // Refused (a different secret, an older version, a server that can't prove the
+        // secret). Keep retrying with the usual backoff: the fix happens on the other
+        // machine, and the link should come up by itself once it does. Giving up would
+        // also let a fake server switch the client off for good.
         Ok(Err(reason)) => {
-            let _ = ch.events.send(LinkEvent::AuthFailed(reason));
-            return AttemptOutcome::Fatal;
+            let _ = ch.events.send(LinkEvent::AuthFailed(reason.clone()));
+            return AttemptOutcome::Lost {
+                was_connected: false,
+                reason: DisconnectReason::Io(format!("refused: {reason}")),
+            };
         }
         // A handshake timeout can be a transient/overloaded server: recoverable.
         Err(_) => {
@@ -792,18 +817,32 @@ async fn server_handshake(
     cfg: &Config,
 ) -> Result<(String, i32, i32, Lane, bool), String> {
     let hello = framed.next().await;
-    let (name, width, height, lane, login_screen) = match hello {
-        Some(Ok(Message::Hello { name, width, height, lane, login_screen, .. })) => {
-            (name, width, height, lane, login_screen)
+    let (name, width, height, lane, login_screen, version, client_nonce) = match hello {
+        Some(Ok(Message::Hello { name, width, height, lane, login_screen, version, nonce })) => {
+            (name, width, height, lane, login_screen, version, nonce)
         }
         Some(Ok(other)) => return Err(format!("expected hello, got {other:?}")),
         Some(Err(e)) => return Err(format!("hello decode: {e}")),
         None => return Err("peer closed before hello".into()),
     };
+    // A version 1 peer can't prove anything about this session: refuse it rather than
+    // fall back, or anyone could downgrade a connection to the one-way check (B34).
+    let client_nonce = match client_nonce {
+        Some(n) if version >= PROTOCOL_VERSION => n,
+        _ => {
+            let _ = framed.send(refusal("old_version")).await;
+            return Err(format!(
+                "{name} runs an older mouse-rs (protocol {version}); update both machines"
+            ));
+        }
+    };
 
+    let binding = framed.get_ref().auth_binding()?;
     let nonce = auth::generate_nonce_hex();
+    let proof = auth::proof_hex(&cfg.shared_secret, Side::Server, &binding, &client_nonce, &nonce)
+        .map_err(|e| format!("bad nonce from {name}: {e}"))?;
     framed
-        .send(Message::AuthChallenge { nonce: nonce.clone() })
+        .send(Message::AuthChallenge { nonce: nonce.clone(), proof: Some(proof) })
         .await
         .map_err(|e| format!("send challenge: {e}"))?;
 
@@ -815,16 +854,9 @@ async fn server_handshake(
         None => return Err("peer closed before auth response".into()),
     };
 
-    if !auth::verify(&cfg.shared_secret, &nonce, &hmac) {
-        let _ = framed
-            .send(Message::AuthOk {
-                ok: false,
-                server: None,
-                width: None,
-                height: None,
-                reason: Some("bad_secret".into()),
-            })
-            .await;
+    if !auth::verify_proof(&cfg.shared_secret, Side::Client, &binding, &client_nonce, &nonce, &hmac)
+    {
+        let _ = framed.send(refusal("bad_secret")).await;
         return Err(format!("bad secret from {name}"));
     }
 
@@ -842,11 +874,17 @@ async fn server_handshake(
     Ok((name, width, height, lane, login_screen))
 }
 
+fn refusal(reason: &str) -> Message {
+    Message::AuthOk { ok: false, server: None, width: None, height: None, reason: Some(reason.into()) }
+}
+
 async fn client_handshake(
     framed: &mut Framed<LinkStream, MessageCodec>,
     cfg: &Config,
     lane: Lane,
 ) -> Result<(String, i32, i32), String> {
+    let binding = framed.get_ref().auth_binding()?;
+    let client_nonce = auth::generate_nonce_hex();
     framed
         .send(Message::Hello {
             name: cfg.name.clone(),
@@ -855,18 +893,32 @@ async fn client_handshake(
             version: PROTOCOL_VERSION,
             lane,
             login_screen: cfg.at_login_screen,
+            nonce: Some(client_nonce.clone()),
         })
         .await
         .map_err(|e| format!("send hello: {e}"))?;
 
-    let nonce = match framed.next().await {
-        Some(Ok(Message::AuthChallenge { nonce })) => nonce,
+    let (nonce, proof) = match framed.next().await {
+        Some(Ok(Message::AuthChallenge { nonce, proof })) => (nonce, proof),
+        Some(Ok(Message::AuthOk { ok: false, reason, .. })) => {
+            return Err(reason.unwrap_or_else(|| "rejected".into()))
+        }
         Some(Ok(other)) => return Err(format!("expected challenge, got {other:?}")),
         Some(Err(e)) => return Err(format!("challenge decode: {e}")),
         None => return Err("peer closed before challenge".into()),
     };
 
-    let hmac = auth::compute_hmac_hex(&cfg.shared_secret, &nonce)
+    // The server proves itself first; nothing about our secret is sent to a server
+    // that can't (B34).
+    let Some(proof) = proof else {
+        return Err("old_version".into());
+    };
+    if !auth::verify_proof(&cfg.shared_secret, Side::Server, &binding, &client_nonce, &nonce, &proof)
+    {
+        return Err("server_not_verified".into());
+    }
+
+    let hmac = auth::proof_hex(&cfg.shared_secret, Side::Client, &binding, &client_nonce, &nonce)
         .map_err(|e| format!("hmac: {e}"))?;
     framed
         .send(Message::AuthResponse { hmac })
@@ -963,6 +1015,7 @@ async fn pump(
     // The heartbeat already exists for liveness; reading its timing costs nothing and
     // gives the bulk lane a true measurement of the latency it must not damage.
     let mut ping_sent: Option<Instant> = None;
+    let mut rtt_log = crate::timing::RttLog::default();
 
     loop {
         tokio::select! {
@@ -1005,6 +1058,9 @@ async fn pump(
                             // the bulk lane paces against.
                             if let Some(sent) = ping_sent.take() {
                                 health.record_rtt(sent.elapsed());
+                                if let Some(line) = rtt_log.push(sent.elapsed(), std::time::Instant::now()) {
+                                    tracing::info!("{line}");
+                                }
                             }
                         }
                         other => {
@@ -1171,6 +1227,7 @@ mod tests {
     async fn silent_client_after_handshake(port: u16, secret: &str) {
         let tcp = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
         let mut framed = Framed::new(LinkStream::Plain(tcp), MessageCodec::new());
+        let client_nonce = auth::generate_nonce_hex();
         framed
             .send(Message::Hello {
                 name: "silent".into(),
@@ -1179,14 +1236,15 @@ mod tests {
                 version: PROTOCOL_VERSION,
                 lane: Lane::Input,
                 login_screen: false,
+                nonce: Some(client_nonce.clone()),
             })
             .await
             .unwrap();
         let nonce = match framed.next().await {
-            Some(Ok(Message::AuthChallenge { nonce })) => nonce,
+            Some(Ok(Message::AuthChallenge { nonce, .. })) => nonce,
             other => panic!("expected challenge, got {other:?}"),
         };
-        let hmac = auth::compute_hmac_hex(secret, &nonce).unwrap();
+        let hmac = auth::proof_hex(secret, Side::Client, &[], &client_nonce, &nonce).unwrap();
         framed.send(Message::AuthResponse { hmac }).await.unwrap();
         let _ = framed.next().await; // consume AuthOk
         // Go silent but keep the socket alive — do not answer pings.
@@ -1272,6 +1330,108 @@ mod tests {
         cancel.cancel();
         let _ = timeout(Duration::from_secs(2), server).await;
         let _ = timeout(Duration::from_secs(2), client).await;
+    }
+
+    /// A fake server that doesn't know the secret: the client must refuse it before it
+    /// sends a proof of its own (B34).
+    #[tokio::test]
+    async fn a_server_that_cannot_prove_the_secret_is_refused() {
+        let port = free_port().await;
+        let listener = TcpListener::bind(("127.0.0.1", port)).await.unwrap();
+        let fake = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut framed = Framed::new(LinkStream::Plain(tcp), MessageCodec::new());
+            let client_nonce = match framed.next().await {
+                Some(Ok(Message::Hello { nonce: Some(n), .. })) => n,
+                other => panic!("expected a v2 hello, got {other:?}"),
+            };
+            let nonce = auth::generate_nonce_hex();
+            let proof = auth::proof_hex("GUESS", Side::Server, &[], &client_nonce, &nonce).unwrap();
+            framed.send(Message::AuthChallenge { nonce, proof: Some(proof) }).await.unwrap();
+            // Whatever comes next must not be the client's proof.
+            timeout(Duration::from_secs(2), framed.next()).await.ok().flatten()
+        });
+
+        let cancel = CancellationToken::new();
+        let (c_ch, _c_to, _c_from, mut c_events) = channels();
+        let client = tokio::spawn(run_client(
+            test_cfg(Role::Client, port, false),
+            fast_params(),
+            cancel.clone(),
+            c_ch,
+            LinkHealth::new(),
+        ));
+
+        let mut refused = None;
+        while let Ok(Some(ev)) = timeout(Duration::from_secs(3), c_events.recv()).await {
+            match ev {
+                LinkEvent::AuthFailed(reason) => {
+                    refused = Some(reason);
+                    break;
+                }
+                LinkEvent::Connected { .. } => panic!("connected to a server without the secret"),
+                _ => {}
+            }
+        }
+        assert_eq!(refused.as_deref(), Some("server_not_verified"));
+        let after = fake.await.unwrap();
+        assert!(
+            !matches!(after, Some(Ok(Message::AuthResponse { .. }))),
+            "the client sent its proof to an unverified server: {after:?}"
+        );
+
+        cancel.cancel();
+        let _ = timeout(Duration::from_secs(2), client).await;
+    }
+
+    /// A version 1 client (no nonce) is refused, so a connection can't be downgraded to
+    /// the old one-way check.
+    #[tokio::test]
+    async fn an_old_client_is_refused() {
+        let port = free_port().await;
+        let cancel = CancellationToken::new();
+        let (s_ch, _s_to, _s_from, mut s_events) = channels();
+        let server = tokio::spawn(run_server(
+            test_cfg(Role::Server, port, false),
+            fast_params(),
+            cancel.clone(),
+            s_ch,
+            BulkServer::disabled(),
+            LinkHealth::new(),
+        ));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let tcp = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let mut framed = Framed::new(LinkStream::Plain(tcp), MessageCodec::new());
+        framed
+            .send(Message::Hello {
+                name: "old".into(),
+                width: 1920,
+                height: 1080,
+                version: 1,
+                lane: Lane::Input,
+                login_screen: false,
+                nonce: None,
+            })
+            .await
+            .unwrap();
+        match framed.next().await {
+            Some(Ok(Message::AuthOk { ok: false, reason, .. })) => {
+                assert_eq!(reason.as_deref(), Some("old_version"))
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        let mut saw_auth_failed = false;
+        while let Ok(Some(ev)) = timeout(Duration::from_secs(2), s_events.recv()).await {
+            if let LinkEvent::AuthFailed(_) = ev {
+                saw_auth_failed = true;
+                break;
+            }
+        }
+        assert!(saw_auth_failed, "server must report AuthFailed");
+
+        cancel.cancel();
+        let _ = timeout(Duration::from_secs(2), server).await;
     }
 
     #[tokio::test]

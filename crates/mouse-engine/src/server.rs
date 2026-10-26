@@ -17,7 +17,10 @@ use tokio_util::sync::CancellationToken;
 
 use crate::geometry::{entry_point, in_edge_band, is_opposing};
 use crate::hotkey::{self, Hotkey};
-use crate::status::{set_crossed, set_status_connected, set_status_disconnected, set_status_engaged};
+use crate::status::{
+    set_crossed, set_status_connected, set_status_disconnected, set_status_engaged,
+    set_status_refused,
+};
 use crate::{set_clipboard_connected, ClipboardRoute, EngineLink};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -179,6 +182,7 @@ pub async fn run_server_engine(
                         set_status_disconnected(&status);
                         tracing::info!("peer disconnected: {reason:?}");
                     }
+                    Some(LinkEvent::AuthFailed(reason)) => set_status_refused(&status, &reason),
                     Some(_) => {}
                 }
             }

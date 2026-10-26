@@ -20,6 +20,8 @@ struct Inner {
     peer: Mutex<String>,
     /// The peer is the login-screen instance: its machine is at a password prompt.
     peer_at_login_screen: AtomicBool,
+    /// Why the last connection attempt was refused, in words for the user.
+    refused: Mutex<Option<String>>,
 }
 
 /// A shared, cheaply-cloned handle to the engine's live status.
@@ -36,6 +38,9 @@ pub struct StatusSnapshot {
     pub peer_h: i32,
     /// The peer is at its login screen. Input reaches it once the pointer crosses over.
     pub peer_at_login_screen: bool,
+    /// Why the last connection attempt was refused (wrong secret, older version…).
+    /// Cleared by the next successful connection.
+    pub refused: Option<String>,
 }
 
 impl StatusHandle {
@@ -52,6 +57,13 @@ impl StatusHandle {
         self.0.peer_h.store(h, Ordering::SeqCst);
         self.0.engaged.store(false, Ordering::SeqCst);
         self.0.connected.store(true, Ordering::SeqCst);
+        self.set_refused(None);
+    }
+
+    pub(crate) fn set_refused(&self, why: Option<String>) {
+        if let Ok(mut r) = self.0.refused.lock() {
+            *r = why;
+        }
     }
 
     pub(crate) fn set_disconnected(&self) {
@@ -73,6 +85,7 @@ impl StatusHandle {
             peer_w: self.0.peer_w.load(Ordering::SeqCst),
             peer_h: self.0.peer_h.load(Ordering::SeqCst),
             peer_at_login_screen: self.0.peer_at_login_screen.load(Ordering::SeqCst),
+            refused: self.0.refused.lock().map(|r| r.clone()).unwrap_or_default(),
         }
     }
 }
@@ -88,6 +101,35 @@ pub(crate) fn set_status_connected(
     if let Some(s) = s {
         s.set_connected(peer, w, h, login_screen);
     }
+}
+
+/// Record a refused connection attempt. Only refusals the user can act on are shown;
+/// a timeout or a dropped handshake is retried and would only be noise.
+pub(crate) fn set_status_refused(s: &Option<StatusHandle>, reason: &str) {
+    tracing::warn!("connection refused: {reason}");
+    if let (Some(s), Some(why)) = (s, refusal_text(reason)) {
+        s.set_refused(Some(why));
+    }
+}
+
+/// The words shown for an authentication refusal (B34), or None for one not worth showing.
+pub(crate) fn refusal_text(reason: &str) -> Option<String> {
+    let text = match reason {
+        "bad_secret" => "the other machine has a different shared secret".to_owned(),
+        "old_version" => "the other machine runs an older mouse-rs; update it".to_owned(),
+        "server_not_verified" => {
+            "the server could not prove it has the shared secret; check it on both machines"
+                .to_owned()
+        }
+        r if r.starts_with("bad secret from ") => {
+            format!("{} has a different shared secret", &r["bad secret from ".len()..])
+        }
+        r if r.contains("runs an older mouse-rs") => {
+            r.split(" (protocol").next().unwrap_or(r).to_owned() + "; update it"
+        }
+        _ => return None,
+    };
+    Some(text)
 }
 
 /// Mark the peer disconnected, if a status handle is wired in.
@@ -115,5 +157,30 @@ pub(crate) fn set_crossed(
 ) {
     if let Some(h) = h {
         h.set_crossed(crossed);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn refusals_the_user_can_act_on_are_worded_and_cleared_by_a_connection() {
+        assert_eq!(
+            refusal_text("bad secret from MSI").as_deref(),
+            Some("MSI has a different shared secret")
+        );
+        assert_eq!(
+            refusal_text("MSI runs an older mouse-rs (protocol 1); update both machines").as_deref(),
+            Some("MSI runs an older mouse-rs; update it")
+        );
+        assert!(refusal_text("server_not_verified").is_some());
+        assert_eq!(refusal_text("handshake timed out"), None);
+
+        let s = StatusHandle::new();
+        s.set_refused(refusal_text("bad_secret"));
+        assert!(s.snapshot().refused.is_some());
+        s.set_connected("MSI", 1920, 1080, false);
+        assert_eq!(s.snapshot().refused, None);
     }
 }

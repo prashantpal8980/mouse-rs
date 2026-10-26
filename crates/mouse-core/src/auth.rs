@@ -1,9 +1,14 @@
-//! HMAC-SHA256 challenge/response authentication.
+//! HMAC-SHA256 mutual authentication (B34).
 //!
-//! Same scheme as the Python app: the server sends a random nonce, the client
-//! replies with `HMAC-SHA256(shared_secret, nonce)`, the server compares in
-//! constant time. The transport (async handshake) lives in `net`; this module is
-//! the pure, testable crypto core.
+//! Both sides prove they know the shared secret. The client sends a nonce in its
+//! Hello; the server answers with its own nonce and a server proof; the client
+//! checks that proof before sending its own. Each proof is
+//! `HMAC-SHA256(secret, label || binding || client_nonce || server_nonce)`, where
+//! the label differs per side (a proof can't be echoed back) and `binding` is
+//! keying material exported from this TLS session. A machine in the middle runs two
+//! TLS sessions with two different bindings, so proofs relayed through it fail.
+//! The transport (async handshake) lives in `net`; this module is the pure,
+//! testable crypto core.
 
 use hmac::{Hmac, Mac};
 use rand::RngCore;
@@ -18,26 +23,72 @@ pub fn generate_nonce_hex() -> String {
     hex_encode(&nonce)
 }
 
-/// Compute `HMAC-SHA256(secret, nonce_bytes)` as a lowercase hex string.
-/// `nonce_hex` is the hex challenge as received on the wire.
-pub fn compute_hmac_hex(secret: &str, nonce_hex: &str) -> Result<String, AuthError> {
-    let nonce = hex_decode(nonce_hex)?;
+/// Which side a proof comes from. Part of the MAC input, so a server proof is never
+/// accepted as a client proof or the other way round.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Side {
+    Server,
+    Client,
+}
+
+impl Side {
+    fn label(self) -> &'static [u8] {
+        match self {
+            Side::Server => b"mouse-rs v2 server proof",
+            Side::Client => b"mouse-rs v2 client proof",
+        }
+    }
+}
+
+/// Label for the TLS keying-material exporter that yields the session binding.
+pub const TLS_EXPORTER_LABEL: &[u8] = b"EXPORTER-mouse-rs-auth";
+
+fn proof_mac(
+    secret: &str,
+    side: Side,
+    binding: &[u8],
+    client_nonce_hex: &str,
+    server_nonce_hex: &str,
+) -> Result<HmacSha256, AuthError> {
+    let client_nonce = hex_decode(client_nonce_hex)?;
+    let server_nonce = hex_decode(server_nonce_hex)?;
     let mut mac =
         HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC accepts any key length");
-    mac.update(&nonce);
+    // Every field is length-prefixed, so no two inputs can run together into the same bytes.
+    for part in [side.label(), binding, &client_nonce, &server_nonce] {
+        mac.update(&(part.len() as u32).to_be_bytes());
+        mac.update(part);
+    }
+    Ok(mac)
+}
+
+/// The proof `side` sends for this session, as lowercase hex.
+pub fn proof_hex(
+    secret: &str,
+    side: Side,
+    binding: &[u8],
+    client_nonce_hex: &str,
+    server_nonce_hex: &str,
+) -> Result<String, AuthError> {
+    let mac = proof_mac(secret, side, binding, client_nonce_hex, server_nonce_hex)?;
     Ok(hex_encode(&mac.finalize().into_bytes()))
 }
 
-/// Constant-time check that `candidate_hex` is the expected HMAC for `nonce_hex`.
-pub fn verify(secret: &str, nonce_hex: &str, candidate_hex: &str) -> bool {
-    match (hex_decode(nonce_hex), hex_decode(candidate_hex)) {
-        (Ok(nonce), Ok(candidate)) => {
-            let mut mac = HmacSha256::new_from_slice(secret.as_bytes())
-                .expect("HMAC accepts any key length");
-            mac.update(&nonce);
-            // verify_slice is constant-time on the tag comparison.
-            mac.verify_slice(&candidate).is_ok()
-        }
+/// Constant-time check that `candidate_hex` is `side`'s proof for this session.
+pub fn verify_proof(
+    secret: &str,
+    side: Side,
+    binding: &[u8],
+    client_nonce_hex: &str,
+    server_nonce_hex: &str,
+    candidate_hex: &str,
+) -> bool {
+    match (
+        proof_mac(secret, side, binding, client_nonce_hex, server_nonce_hex),
+        hex_decode(candidate_hex),
+    ) {
+        // verify_slice is constant-time on the tag comparison.
+        (Ok(mac), Ok(candidate)) => mac.verify_slice(&candidate).is_ok(),
         _ => false,
     }
 }
@@ -77,30 +128,57 @@ fn hex_decode(s: &str) -> Result<Vec<u8>, AuthError> {
 mod tests {
     use super::*;
 
+    fn proof(secret: &str, side: Side, binding: &[u8], c: &str, s: &str) -> String {
+        proof_hex(secret, side, binding, c, s).unwrap()
+    }
+
     #[test]
     fn correct_secret_verifies() {
-        let secret = "a-very-long-shared-secret";
-        let nonce = generate_nonce_hex();
-        let resp = compute_hmac_hex(secret, &nonce).unwrap();
-        assert!(verify(secret, &nonce, &resp));
+        let (c, s) = (generate_nonce_hex(), generate_nonce_hex());
+        for side in [Side::Server, Side::Client] {
+            let p = proof("a-very-long-shared-secret", side, b"tls", &c, &s);
+            assert!(verify_proof("a-very-long-shared-secret", side, b"tls", &c, &s, &p));
+        }
     }
 
     #[test]
     fn wrong_secret_rejected() {
-        let nonce = generate_nonce_hex();
-        let resp = compute_hmac_hex("right-secret", &nonce).unwrap();
-        assert!(!verify("wrong-secret", &nonce, &resp));
+        let (c, s) = (generate_nonce_hex(), generate_nonce_hex());
+        let p = proof("right-secret", Side::Client, b"tls", &c, &s);
+        assert!(!verify_proof("wrong-secret", Side::Client, b"tls", &c, &s, &p));
     }
 
     #[test]
-    fn tampered_response_rejected() {
-        let secret = "s";
-        let nonce = generate_nonce_hex();
-        let mut resp = compute_hmac_hex(secret, &nonce).unwrap();
+    fn a_server_proof_is_not_a_client_proof() {
+        let (c, s) = (generate_nonce_hex(), generate_nonce_hex());
+        let p = proof("k", Side::Server, b"tls", &c, &s);
+        assert!(!verify_proof("k", Side::Client, b"tls", &c, &s, &p));
+    }
+
+    #[test]
+    fn a_proof_from_another_tls_session_is_rejected() {
+        // A machine in the middle holds two sessions with two different bindings.
+        let (c, s) = (generate_nonce_hex(), generate_nonce_hex());
+        let p = proof("k", Side::Client, b"session-a", &c, &s);
+        assert!(!verify_proof("k", Side::Client, b"session-b", &c, &s, &p));
+    }
+
+    #[test]
+    fn a_proof_for_other_nonces_is_rejected() {
+        let (c, s) = (generate_nonce_hex(), generate_nonce_hex());
+        let p = proof("k", Side::Client, b"tls", &c, &s);
+        assert!(!verify_proof("k", Side::Client, b"tls", &generate_nonce_hex(), &s, &p));
+        assert!(!verify_proof("k", Side::Client, b"tls", &c, &generate_nonce_hex(), &p));
+    }
+
+    #[test]
+    fn tampered_proof_rejected() {
+        let (c, s) = (generate_nonce_hex(), generate_nonce_hex());
+        let mut p = proof("k", Side::Server, b"", &c, &s);
         // Flip the last hex digit.
-        let last = resp.pop().unwrap();
-        resp.push(if last == '0' { '1' } else { '0' });
-        assert!(!verify(secret, &nonce, &resp));
+        let last = p.pop().unwrap();
+        p.push(if last == '0' { '1' } else { '0' });
+        assert!(!verify_proof("k", Side::Server, b"", &c, &s, &p));
     }
 
     #[test]

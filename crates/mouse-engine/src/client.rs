@@ -14,7 +14,10 @@ use tokio_util::sync::CancellationToken;
 
 use crate::geometry::in_edge_band;
 use crate::injector::{InjectCmd, InjectorTx};
-use crate::status::{set_crossed, set_status_connected, set_status_disconnected, set_status_engaged};
+use crate::status::{
+    set_crossed, set_status_connected, set_status_disconnected, set_status_engaged,
+    set_status_refused,
+};
 use crate::{set_clipboard_connected, ClipboardRoute, EngineLink};
 
 /// Run the client engine until cancelled (or the link shuts down).
@@ -55,6 +58,7 @@ pub async fn run_client_engine(
     // and `keys>0` localises it to injection or window focus on this machine.
     let (mut moves, mut keys) = (0u64, 0u64);
 
+    let mut motion_log = mouse_core::timing::MotionLog::default();
     loop {
         tokio::select! {
             _ = cancel.cancelled() => {
@@ -90,6 +94,7 @@ pub async fn run_client_engine(
                         set_status_engaged(&status, false);
                         set_crossed(&health, false);
                         report_crossing(moves, keys);
+                        motion_log.paused();
                     }
                     Message::MouseMove { dx, dy } if active => {
                         // saturating_add so a malformed/hostile peer delta can't
@@ -99,6 +104,9 @@ pub async fn run_client_engine(
                         vy = ny;
                         moves += 1;
                         inject.send(InjectCmd::Apply(InputEvent::MouseMove { dx, dy }));
+                        if let Some(line) = motion_log.moved(std::time::Instant::now()) {
+                            tracing::info!("{line}");
+                        }
                         if !in_edge_band(entry_edge, vx, vy, w, h, threshold) {
                             armed = true;
                         } else if armed {
@@ -166,6 +174,7 @@ pub async fn run_client_engine(
                         set_status_connected(&status, &peer, width, height, false);
                         tracing::info!("connected to server '{peer}': {width}x{height}");
                     }
+                    Some(LinkEvent::AuthFailed(reason)) => set_status_refused(&status, &reason),
                     Some(_) => {}
                 }
             }

@@ -54,7 +54,11 @@ Code for items 1–5 depends on these. A suggested answer is given for each; "ye
 ### Mon 26 Oct (today)
 - [ ] Owner: answer the 6 decisions above
 - [ ] Claude: **B34 fix**. The server proves it knows the secret too (mutual HMAC), and the certificate is pinned at first pairing.
+      *Built 26 Oct: mutual proofs tied to the TLS session (stops a machine in the middle as well).
+      The certificate pinning moves to pairing on Tue.*
 - [ ] Claude: **Wi-Fi measurement**. Log the round-trip time and jitter of each connection, so the lag shows up as numbers and not just a feeling.
+      *Built 26 Oct: one line a minute, "link round trip …" (both sides) and "pointer motion … hitches"
+      (on the machine being driven).*
 - [ ] Owner, evening: 10 minutes on Wi-Fi, 10 on Ethernet, normal use. The logs ship themselves.
 - [ ] Owner: check that the laptop's RAM and disk can hold a Windows VM (8 GB+ free RAM is best). Download the Windows 11 evaluation ISO
       and VirtualBox on both machines. The big downloads should run overnight.

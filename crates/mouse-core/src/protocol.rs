@@ -9,7 +9,9 @@ use serde::{Deserialize, Serialize};
 use tokio_util::codec::{Decoder, Encoder, LengthDelimitedCodec};
 
 /// Protocol version, bumped on incompatible changes. Sent in `Hello`.
-pub const PROTOCOL_VERSION: u32 = 1;
+/// 2: mutual, TLS-bound authentication (B34). Version 1 peers are refused, so an attacker
+/// can't downgrade a connection to the old one-way check.
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// Mouse buttons we forward.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -99,9 +101,17 @@ pub enum Message {
         /// Absent from an older peer, which never runs at a login screen.
         #[serde(default)]
         login_screen: bool,
+        /// The client's nonce for mutual authentication, hex-encoded. Absent from a
+        /// version 1 peer, which is refused.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        nonce: Option<String>,
     },
     AuthChallenge {
         nonce: String, // hex-encoded
+        /// The server's proof that it knows the shared secret, hex-encoded. Absent from a
+        /// version 1 server, which the client refuses.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        proof: Option<String>,
     },
     AuthResponse {
         hmac: String, // hex-encoded
@@ -285,6 +295,7 @@ mod tests {
             version: PROTOCOL_VERSION,
             lane: Lane::Input,
             login_screen: true,
+            nonce: None,
         };
         let mut value = serde_json::to_value(&hello).unwrap();
         assert!(value.as_object_mut().unwrap().remove("login_screen").is_some());
@@ -304,8 +315,9 @@ mod tests {
                 version: PROTOCOL_VERSION,
                 lane: Lane::Bulk,
                 login_screen: true,
+                nonce: Some("cd".into()),
             },
-            Message::AuthChallenge { nonce: "ab".into() },
+            Message::AuthChallenge { nonce: "ab".into(), proof: Some("ef".into()) },
             Message::MouseMove { dx: 3, dy: -7 },
             Message::MouseButton {
                 button: Button::Left,
