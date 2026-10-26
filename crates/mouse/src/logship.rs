@@ -64,6 +64,8 @@ struct Target {
     port: u16,
     path: String,
     file: PathBuf,
+    /// Shown to the collector, which requires it from anywhere but the cable.
+    token: String,
 }
 
 impl LogShipper {
@@ -71,7 +73,13 @@ impl LogShipper {
     ///
     /// Returns `None` when shipping is switched off or the URL cannot be understood —
     /// a malformed URL is reported once here rather than failing silently every cycle.
-    pub fn spawn(base_url: &str, log_path: &Path, machine: &str, secs: u32) -> Option<LogShipper> {
+    pub fn spawn(
+        base_url: &str,
+        log_path: &Path,
+        machine: &str,
+        secs: u32,
+        token: String,
+    ) -> Option<LogShipper> {
         let base = base_url.trim();
         if base.is_empty() {
             return None;
@@ -84,7 +92,7 @@ impl LogShipper {
             .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
             .collect();
         let path = format!("{}/{}-mouse-rs.log", prefix.trim_end_matches('/'), safe);
-        let target = Target { host, port, path, file: log_path.to_path_buf() };
+        let target = Target { host, port, path, file: log_path.to_path_buf(), token };
 
         tracing::info!(
             url = %format!("http://{}:{}{}", target.host, target.port, target.path),
@@ -188,10 +196,21 @@ fn parse_base(url: &str) -> Option<(String, u16, String)> {
     Some((host, port, path.to_string()))
 }
 
+/// Upload to the configured collector; when that is unreachable (the cable is out), to the
+/// same port on the linked peer, which is where the collector is when testing on Wi-Fi.
 fn put(t: &Target) -> std::io::Result<()> {
+    let first = put_to(t, &t.host);
+    let Err(e) = first else { return Ok(()) };
+    match mouse_core::net::last_peer_ip() {
+        Some(ip @ std::net::IpAddr::V4(_)) if ip.to_string() != t.host => put_to(t, &ip.to_string()),
+        _ => Err(e),
+    }
+}
+
+fn put_to(t: &Target, host: &str) -> std::io::Result<()> {
     let body = tail_of(&t.file, MAX_TAIL_BYTES)?;
 
-    let addr = format!("{}:{}", t.host, t.port);
+    let addr = format!("{}:{}", host, t.port);
     let mut sock = None;
     // Resolve and connect with a timeout: a collector that has gone away must fail
     // fast rather than park this thread.
@@ -208,10 +227,11 @@ fn put(t: &Target) -> std::io::Result<()> {
     sock.set_read_timeout(Some(NET_TIMEOUT))?;
 
     let head = format!(
-        "PUT {} HTTP/1.1\r\nHost: {}\r\nContent-Length: {}\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n",
+        "PUT {} HTTP/1.1\r\nHost: {}\r\nContent-Length: {}\r\nContent-Type: text/plain\r\nX-Mouse-Token: {}\r\nConnection: close\r\n\r\n",
         t.path,
-        t.host,
-        body.len()
+        host,
+        body.len(),
+        t.token
     );
     sock.write_all(head.as_bytes())?;
     sock.write_all(&body)?;

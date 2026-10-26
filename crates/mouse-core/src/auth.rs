@@ -17,6 +17,15 @@ use sha2::Sha256;
 type HmacSha256 = Hmac<Sha256>;
 
 /// 32 random bytes, hex-encoded, suitable for an auth challenge nonce.
+/// The token a machine shows the development log collector when uploading over Wi-Fi:
+/// HMAC of a fixed label under the shared secret, so only a paired machine can upload,
+/// and the secret itself never goes over the network.
+pub fn log_upload_token(secret: &str) -> String {
+    let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC accepts any key length");
+    mac.update(b"mouse-rs log upload v1");
+    mac.finalize().into_bytes().iter().map(|b| format!("{b:02x}")).collect()
+}
+
 pub fn generate_nonce_hex() -> String {
     let mut nonce = [0u8; 32];
     rand::thread_rng().fill_bytes(&mut nonce);

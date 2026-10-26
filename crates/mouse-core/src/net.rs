@@ -426,6 +426,7 @@ pub async fn run_server(
                     }
                     Lane::Input => {
                         crate::qos::prioritise_input(framed.get_ref().tcp());
+                        note_peer_ip(peer_addr.ip());
                         // A new input connection that has passed the handshake is from the same
                         // trusted peer, now on a newer path. It replaces a session still open on
                         // the old one, rather than being refused until that session times out.
@@ -696,6 +697,7 @@ async fn connect_once(
     };
     *last_good = Some(addr);
     health.set_peer(addr);
+    note_peer_ip(addr.ip());
     tracing::info!(
         "link to {addr} goes out through {} (candidates tried: {listing})",
         local_path(tcp.local_addr().ok())
@@ -1090,6 +1092,20 @@ const NO_NETWORK_POLL: Duration = Duration::from_secs(2);
 /// Connect to every candidate at once and keep the first that accepts. Racing, rather than
 /// trying in turn, means a dead address costs nothing. It also picks the faster path: when the
 /// server is reachable over both Ethernet and Wi-Fi, the one that answers first has less delay.
+/// The address of the peer this machine is linked to now (or was last), for the development
+/// log shipper: it falls back to the peer when the cable's collector address is unreachable.
+static PEER_IP: std::sync::Mutex<Option<std::net::IpAddr>> = std::sync::Mutex::new(None);
+
+pub fn last_peer_ip() -> Option<std::net::IpAddr> {
+    PEER_IP.lock().ok().and_then(|p| *p)
+}
+
+fn note_peer_ip(ip: std::net::IpAddr) {
+    if let Ok(mut p) = PEER_IP.lock() {
+        *p = Some(ip);
+    }
+}
+
 /// An IPv6-only listener on `port`, beside the IPv4 one.
 fn listen_v6(port: u16) -> std::io::Result<TcpListener> {
     use socket2::{Domain, Protocol, Socket, Type};
@@ -1236,7 +1252,7 @@ async fn pump(
                 // permanent congestion and throttled forever.
                 health.decay_baseline();
                 ping_sent = Some(Instant::now());
-                if let Motion::Client { live: Some(m), .. } = &motion {
+                if let Motion::Client { live: Some(m), .. } = &mut motion {
                     m.hello().await;
                     if let Some(ready) = m.ready() {
                         if let Err(reason) = send_cancelable(&mut sink, cancel, ready, "send motion ready").await {
@@ -1273,6 +1289,7 @@ async fn pump(
                                 match ClientMotion::start(*server, port, &token, key.clone()).await {
                                     Ok(m) => {
                                         tracing::info!("pointer motion will arrive over UDP from {server} (port {port})");
+                                        let mut m = m;
                                         let ready = m.ready();
                                         *live = Some(m);
                                         if let Some(ready) = ready {

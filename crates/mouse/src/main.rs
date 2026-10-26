@@ -90,6 +90,7 @@ fn main() -> anyhow::Result<()> {
         &logging::log_path(),
         &ship_name,
         cfg.log_upload_secs,
+        mouse_core::auth::log_upload_token(&cfg.shared_secret),
     );
 
     match sub.as_deref() {

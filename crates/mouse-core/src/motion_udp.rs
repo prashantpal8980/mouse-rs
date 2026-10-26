@@ -51,6 +51,37 @@ pub(crate) const MAX_DATAGRAM: usize = 64;
 /// After motion stops, the final total is sent again this long after the last move.
 const REPEAT_AFTER: [Duration; 2] = [Duration::from_millis(25), Duration::from_millis(80)];
 
+/// How often each side logs its UDP motion counters.
+const STATS_EVERY: Duration = Duration::from_secs(60);
+
+struct ServerStats {
+    since: Instant,
+    udp: u64,
+    tcp: u64,
+    hellos: u64,
+    readies: u64,
+    junk: u64,
+}
+
+impl ServerStats {
+    fn new() -> ServerStats {
+        ServerStats { since: Instant::now(), udp: 0, tcp: 0, hellos: 0, readies: 0, junk: 0 }
+    }
+}
+
+struct ClientStats {
+    since: Instant,
+    datagrams: u64,
+    rejected: u64,
+    guesses: u64,
+}
+
+impl ClientStats {
+    fn new() -> ClientStats {
+        ClientStats { since: Instant::now(), datagrams: 0, rejected: 0, guesses: 0 }
+    }
+}
+
 /// Moves sent over UDP and not confirmed by the client for this long mean datagrams don't
 /// arrive: back to TCP. More than two heartbeats, so a normal confirmation is never late.
 const UNCONFIRMED: Duration = Duration::from_secs(5);
@@ -161,6 +192,7 @@ pub(crate) struct ServerMotion {
     unconfirmed_since: Option<Instant>,
     /// After datagrams were found not to arrive: don't try UDP again before this.
     retry_after: Option<Instant>,
+    stats: ServerStats,
     /// When the last move went out, and how many of [`REPEAT_AFTER`] have been sent since.
     last_move: Option<(Instant, SocketAddr)>,
     repeats: usize,
@@ -184,6 +216,7 @@ impl ServerMotion {
             seen: 0,
             unconfirmed_since: None,
             retry_after: None,
+            stats: ServerStats::new(),
             last_move: None,
             repeats: 0,
             epoch: Instant::now(),
@@ -202,8 +235,10 @@ impl ServerMotion {
 
     pub(crate) fn on_datagram(&mut self, buf: &[u8], from: SocketAddr) {
         if decode_hello(&self.key, buf) != Some(self.token) {
+            self.stats.junk += 1;
             return;
         }
+        self.stats.hellos += 1;
         self.use_peer(from, "hello");
     }
 
@@ -212,6 +247,22 @@ impl ServerMotion {
     /// its side.
     pub(crate) fn on_ready(&mut self, port: u16, seen: u64) {
         let now = Instant::now();
+        self.stats.readies += 1;
+        if now.duration_since(self.stats.since) >= STATS_EVERY {
+            let peer = self.peer.map_or("none".to_string(), |(a, _)| a.to_string());
+            tracing::info!(
+                "UDP motion over the last minute: {} moves by UDP, {} by TCP; heard {} hellos, \
+                 {} reports over TCP, {} junk datagrams; client has {} of {}; sending to {peer}",
+                self.stats.udp,
+                self.stats.tcp,
+                self.stats.hellos,
+                self.stats.readies,
+                self.stats.junk,
+                seen.max(self.seen),
+                self.seq
+            );
+            self.stats = ServerStats::new();
+        }
         if seen > self.seen {
             self.seen = seen;
             self.unconfirmed_since = (seen < self.seq).then_some(now);
@@ -240,11 +291,13 @@ impl ServerMotion {
     /// sends it over TCP as before.
     pub(crate) fn send_move(&mut self, dx: i32, dy: i32) -> bool {
         let Some((to, heard)) = self.peer else {
+            self.stats.tcp += 1;
             return false;
         };
         if heard.elapsed() > PEER_STALE {
             tracing::info!("nothing from {to} for {PEER_STALE:?}; pointer motion back on TCP");
             self.peer = None;
+            self.stats.tcp += 1;
             return false;
         }
         if self.unconfirmed_since.is_some_and(|t| t.elapsed() > UNCONFIRMED) {
@@ -257,6 +310,7 @@ impl ServerMotion {
             self.peer = None;
             self.unconfirmed_since = None;
             self.retry_after = Some(Instant::now() + RETRY);
+            self.stats.tcp += 1;
             return false;
         }
         self.sum.0 += i64::from(dx);
@@ -270,6 +324,7 @@ impl ServerMotion {
         self.last_move = Some((now, to));
         self.repeats = 0;
         self.unconfirmed_since.get_or_insert(now);
+        self.stats.udp += 1;
         true
     }
 
@@ -310,6 +365,7 @@ pub(crate) struct ClientMotion {
     epoch: Instant,
     delay: crate::timing::DelayLog,
     conceal: Conceal,
+    stats: ClientStats,
 }
 
 impl ClientMotion {
@@ -341,6 +397,7 @@ impl ClientMotion {
             epoch: Instant::now(),
             delay: Default::default(),
             conceal: Conceal::default(),
+            stats: ClientStats::new(),
         };
         me.hello().await;
         Ok(me)
@@ -351,7 +408,18 @@ impl ClientMotion {
     }
 
     /// What to tell the server over TCP: this socket's port, and the latest move received.
-    pub(crate) fn ready(&self) -> Option<Message> {
+    pub(crate) fn ready(&mut self) -> Option<Message> {
+        if self.stats.since.elapsed() >= STATS_EVERY {
+            tracing::info!(
+                "UDP motion over the last minute: {} datagrams in, {} rejected; {} gap-hiding \
+                 moves; latest seq {}",
+                self.stats.datagrams,
+                self.stats.rejected,
+                self.stats.guesses,
+                self.last_seq
+            );
+            self.stats = ClientStats::new();
+        }
         let port = self.sock.local_addr().ok()?.port();
         Some(Message::MotionReady { port, seen: self.last_seq })
     }
@@ -364,7 +432,11 @@ impl ClientMotion {
     }
 
     pub(crate) fn on_datagram(&mut self, buf: &[u8]) -> Option<Message> {
-        let (seq, sx, sy, sent_ms) = decode_move(&self.key, buf)?;
+        self.stats.datagrams += 1;
+        let Some((seq, sx, sy, sent_ms)) = decode_move(&self.key, buf) else {
+            self.stats.rejected += 1;
+            return None;
+        };
         let now = Instant::now();
         let transit = i64::from(ms_since(self.epoch)) - i64::from(sent_ms);
         if let Some(line) = self.delay.push(transit, now) {
@@ -396,6 +468,7 @@ impl ClientMotion {
     /// against what has been applied.
     pub(crate) fn conceal(&mut self, now: Instant) -> Option<Message> {
         let (dx, dy) = self.conceal.tick(now)?;
+        self.stats.guesses += 1;
         self.applied.0 += i64::from(dx);
         self.applied.1 += i64::from(dy);
         Some(Message::MouseMove { dx, dy })
