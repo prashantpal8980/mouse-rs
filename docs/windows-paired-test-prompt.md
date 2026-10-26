@@ -52,8 +52,8 @@ Invoke-WebRequest -Uri http://192.168.137.2:8000/mouse-rs.exe -OutFile $HOME\mou
 (Get-FileHash $HOME\mouse-rs\mouse-rs.exe -Algorithm SHA256).Hash
 ```
 
-Must be exactly size `12448768` bytes, SHA256
-`6576D35CA42A359C23F0675644692DB05B8246250B116D8C62CF9570F086E557`.
+Must be exactly size `12464640` bytes, SHA256
+`9FE94CAD89431C357BF4F5435018CDAC14001364A01244BBBFF2AEAF131EA107`.
 If either differs, stop and say so — do not launch it.
 
 Rotate the log so this run stands alone, then relaunch:
