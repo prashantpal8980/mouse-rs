@@ -222,3 +222,21 @@ re-author them.
 - **At a glance is clearly read-only.** A subtitle says so, and each line opens the Settings page
   where it is changed (Encryption → Security & pairing, Clipboard → Clipboard, Take control
   back → Keyboard & hotkeys).
+
+### R35 — connection PIN (agreed 2026-10-26)
+A short PIN (4 digits, like a UPI PIN) must be entered before two devices connect. It is set on the server, typed
+on the client, and checked on the server with try limits. **On by default.** The user can change it or turn it off
+in Settings → Security; turning it off needs the current PIN. The owner's words: security people want it on,
+but "if the person don't want their password because that is annoying for them they can turn it off".
+R32 (lock-screen password) gets the same rule: on by default, and the user can change it or turn it off.
+Timing and try limits are listed in `docs/LAUNCH-PLAN.md`.
+
+### R36 — update notice (agreed 2026-10-26)
+When a newer version is published, the app says so ("Version x.y is available") and offers **Update**.
+Users won't go looking on a website, so without this nobody updates. The check runs at start and once a day,
+only while mouse-rs is running (R33).
+
+### R37 — no manual network setup (agreed 2026-10-26)
+A user who can't set a static IP must still be able to connect. Two devices on the same Wi-Fi, hotspot or
+Ethernet find each other on their own, and switching between Wi-Fi and Ethernet needs no settings change.
+Typing an IP address stays available as an Advanced option.
