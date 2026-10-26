@@ -516,6 +516,32 @@ poll ignores any of them (`files::is_own_text`). The test
 `an_older_own_file_link_still_on_the_clipboard_is_not_sent_as_text` replays the sequence, and fails
 without the fix.
 
+### B37 — on Wi-Fi the pointer froze, then jumped — **UDP motion built 2026-10-26; stutter remains**
+On the home 2.4 GHz router, with a video loading, the pointer vanished for up to ~1 s and then jumped.
+Kali's `ss -tin` showed 9.4% of the input connection's packets lost or reordered; over TCP each
+loss holds back everything behind it until the resend (Windows waits ≥ 300 ms). Priority marking
+(qos.rs) did not help. Pointer motion now goes over UDP as running totals (`motion_udp.rs`), so a
+lost datagram is covered by the next one. Measured after: longest gap 133–144 ms (was ~1 s), but
+4–10% of moves still arrive more than 25 ms late and the heartbeat round trip still peaks at
+~720 ms. Kali's side is clean (−25 dBm, power save off), so the remaining delay is the laptop's
+Wi-Fi adapter or the router. Next: retest after the laptop's adapter power saving is off, and on
+another access point.
+
+### B38 — on a phone hotspot the two machines never found each other — **fixed 2026-10-26, awaiting hardware check**
+Both on the owner's Motorola hotspot (5 GHz, Wi-Fi 6): Kali got 10.144.3.242, the laptop's Wi-Fi
+got no address (169.254.85.145), so neither IPv4 discovery nor a connection could work, and the
+log said nothing about why. Now the server also beacons over IPv6 all-nodes multicast from its
+link-local address and listens on IPv6, and the client falls back to that address when no IPv4
+address answers (pointer motion then stays on TCP). While no server answers, the client logs once
+a minute what it has, what it heard and what it tried. Still unknown: whether the laptop's
+firewall rule for mouse-rs covers Public networks (a new hotspot is Public by default), and
+whether this phone isolates hotspot clients from each other.
+
+### B39 — the bulk lane never connected off the cable — **fixed 2026-10-26**
+The bulk lane always dialled the configured `server_host` (192.168.137.1), so on Wi-Fi it timed
+out and every large item went inline. It now dials the address the input link connected to
+(`LinkHealth::peer`).
+
 ---
 
 ## Build and release fragility
