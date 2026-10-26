@@ -527,6 +527,13 @@ lost datagram is covered by the next one. Measured after: longest gap 133–144 
 Wi-Fi adapter or the router. On the owner's Motorola hotspot (5 GHz, Wi-Fi 6), with motion still
 on TCP: round trip median 3–4 ms, max 6–143 ms, 1.9% of moves over 25 ms late. So the home 2.4 GHz
 router is most of the remaining stutter.
+Every minute on Wi-Fi still had a 127–148 ms freeze. The owner found the trigger by hand (27 Oct):
+opening Kali's Wi-Fi menu (nm-applet) made the pointer lag at once, because it starts a scan and
+the adapter leaves the channel to listen on the others. Windows scans by itself in the background.
+Built: while mouse-rs runs, each Windows Wi-Fi adapter is put in media streaming mode with
+background scans off (`qos::wifi_low_latency`); Windows reverts it when the process exits. Linux
+needs root for the same, so Kali is not covered. Motion datagrams now carry the send time and the
+client logs "pointer delay over the last minute", which sees held-back moves, not just gaps.
 
 ### B38 — on a phone hotspot the two machines never found each other — **fixed 2026-10-26, confirmed on hardware**
 Both on the owner's Motorola hotspot (5 GHz, Wi-Fi 6): Kali got 10.144.3.242, the laptop's Wi-Fi
