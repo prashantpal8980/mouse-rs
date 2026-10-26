@@ -157,6 +157,7 @@ pub async fn run_client_engine(
                         inject.send(InjectCmd::ReleaseAll);
                         active = false;
                         armed = false;
+                        set_crossed(&health, false);
                         set_clipboard_connected(&clipboard, false);
                         set_status_disconnected(&status);
                         tracing::info!("disconnected from server: {reason:?}");

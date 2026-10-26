@@ -178,6 +178,7 @@ pub async fn run_server_engine(
                         state = State::Local;
                         held_mods = 0;
                         suppress.set(false);
+                        set_crossed(&health, false);
                         set_clipboard_connected(&clipboard, false);
                         set_status_disconnected(&status);
                         tracing::info!("peer disconnected: {reason:?}");

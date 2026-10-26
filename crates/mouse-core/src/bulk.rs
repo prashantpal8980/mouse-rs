@@ -268,7 +268,11 @@ impl LinkHealth {
     }
 
     pub fn set_crossed(&self, crossed: bool) {
-        self.crossed.store(crossed, Ordering::Relaxed);
+        // While the user drives the other machine, keep this machine's Wi-Fi from scanning
+        // (see `qos::wifi_quiet`); back on this machine, scanning is normal again.
+        if self.crossed.swap(crossed, Ordering::Relaxed) != crossed {
+            crate::qos::wifi_quiet(crossed);
+        }
     }
 
     pub fn crossed(&self) -> bool {

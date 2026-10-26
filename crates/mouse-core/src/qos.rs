@@ -28,101 +28,156 @@ const OFF_SWITCH: &str = "MOUSE_RS_NO_WIFI_PRIORITY";
 /// Mark an input connection for Wi-Fi priority. Call once it is connected.
 pub fn prioritise_input(stream: &TcpStream) {
     prioritise("input link", stream, None);
-    wifi_low_latency();
 }
 
-/// Windows: put every Wi-Fi adapter in "media streaming mode" with background scanning off,
-/// for as long as mouse-rs runs. This is what game-streaming apps do.
+/// Windows: keep this machine's Wi-Fi from scanning while the user drives the other machine.
 ///
 /// On 26 Oct 2026, on both the home router and a phone hotspot, every minute on Wi-Fi had a
-/// pointer freeze of 130–150 ms that the cable never had: the laptop's adapter leaving the
-/// channel to scan for other networks, or dozing to save power. Video buffers through that;
-/// a pointer can't. Windows undoes both settings by itself when our WLAN handle closes, which
-/// happens when the process exits, so nothing outlives a quit (R33). Safe to call often: each
-/// adapter is set once, and a new adapter is picked up on the next connection.
+/// pointer freeze of 130–150 ms that the cable never had. The owner found the trigger: a Wi-Fi
+/// scan (opening Kali's network menu caused it at once). To scan, the adapter leaves the
+/// channel, and nothing gets through, however small. Windows also scans by itself in the
+/// background.
+///
+/// So while the pointer is on the other machine, each Wi-Fi adapter is put in media streaming
+/// mode with background scans off, as game-streaming apps do. Only then: when the pointer is
+/// back on this machine, or the link drops, the WLAN handle is closed, and Windows restores its
+/// own settings at once, so the network list and roaming behave normally whenever the user is
+/// actually at this machine. Closing the process does the same (R33).
+///
+/// The WLAN calls are requests to a system service, so they run on their own thread: a
+/// crossing never waits for them.
 #[cfg(windows)]
-pub fn wifi_low_latency() {
-    use std::ptr::{null, null_mut};
-    use std::sync::Mutex;
-    use windows_sys::Win32::NetworkManagement::WiFi::{
-        wlan_intf_opcode_background_scan_enabled, wlan_intf_opcode_media_streaming_mode,
-        WlanEnumInterfaces, WlanFreeMemory, WlanOpenHandle, WlanSetInterface, WLAN_INTERFACE_INFO,
-        WLAN_INTERFACE_INFO_LIST,
-    };
+pub fn wifi_quiet(on: bool) {
+    use std::sync::mpsc::{channel, Sender};
+    use std::sync::{Mutex, OnceLock};
 
-    /// The WLAN handle (as an integer, to be Send) and the adapters already set on it.
-    static STATE: Mutex<Option<(usize, Vec<u128>)>> = Mutex::new(None);
+    static WORKER: OnceLock<Mutex<Sender<bool>>> = OnceLock::new();
 
     if std::env::var_os(OFF_SWITCH).is_some() {
         return;
     }
-    let Ok(mut state) = STATE.lock() else { return };
-    if state.is_none() {
-        let mut version = 0u32;
-        let mut handle = null_mut();
-        // SAFETY: plain out-parameters; the handle is kept for the life of the process.
-        let rc = unsafe { WlanOpenHandle(2, null(), &mut version, &mut handle) };
-        if rc != 0 {
-            // No WLAN service: a machine without Wi-Fi. Nothing to do, and nothing to retry.
-            tracing::info!("no Wi-Fi service (error {rc}); Wi-Fi low-latency mode not needed");
-            *state = Some((0, Vec::new()));
-            return;
-        }
-        *state = Some((handle as usize, Vec::new()));
+    let tx = WORKER.get_or_init(|| {
+        let (tx, rx) = channel::<bool>();
+        let _ = std::thread::Builder::new().name("wifi-quiet".into()).spawn(move || {
+            let mut quiet: Option<wlan::Quiet> = None;
+            while let Ok(mut want) = rx.recv() {
+                // Only the latest wish matters after a burst of crossings.
+                while let Ok(newer) = rx.try_recv() {
+                    want = newer;
+                }
+                match (want, quiet.is_some()) {
+                    (true, false) => quiet = wlan::Quiet::start(),
+                    (false, true) => quiet = None, // dropping it restores Windows' settings
+                    _ => {}
+                }
+            }
+        });
+        Mutex::new(tx)
+    });
+    if let Ok(tx) = tx.lock() {
+        let _ = tx.send(on);
     }
-    let Some((handle, done)) = state.as_mut() else { return };
-    if *handle == 0 {
-        return;
-    }
-    let handle = *handle as windows_sys::Win32::Foundation::HANDLE;
-    let mut list: *mut WLAN_INTERFACE_INFO_LIST = null_mut();
-    // SAFETY: the handle is open; the list is freed below with WlanFreeMemory.
-    if unsafe { WlanEnumInterfaces(handle, null(), &mut list) } != 0 || list.is_null() {
-        return;
-    }
-    // SAFETY: the list holds dwNumberOfItems entries laid out from InterfaceInfo.
-    let infos: &[WLAN_INTERFACE_INFO] = unsafe {
-        std::slice::from_raw_parts(
-            std::ptr::addr_of!((*list).InterfaceInfo).cast::<WLAN_INTERFACE_INFO>(),
-            (*list).dwNumberOfItems as usize,
-        )
-    };
-    for info in infos {
-        let g = info.InterfaceGuid;
-        let id = (u128::from(g.data1) << 96)
-            | (u128::from(g.data2) << 80)
-            | (u128::from(g.data3) << 64)
-            | u128::from(u64::from_be_bytes(g.data4));
-        if done.contains(&id) {
-            continue;
-        }
-        let on: u32 = 1;
-        let off: u32 = 0;
-        // SAFETY: each call passes a 4-byte BOOL, as these opcodes take.
-        let streaming = unsafe {
-            WlanSetInterface(handle, &g, wlan_intf_opcode_media_streaming_mode, 4, (&on as *const u32).cast(), null())
-        };
-        let no_scan = unsafe {
-            WlanSetInterface(handle, &g, wlan_intf_opcode_background_scan_enabled, 4, (&off as *const u32).cast(), null())
-        };
-        let len = info.strInterfaceDescription.iter().position(|&c| c == 0).unwrap_or(256);
-        let name = String::from_utf16_lossy(&info.strInterfaceDescription[..len]);
-        let said = |rc: u32| if rc == 0 { "on".to_string() } else { format!("refused (error {rc})") };
-        tracing::info!(
-            "Wi-Fi low-latency mode for {name}: media streaming {}, background scans off {}",
-            said(streaming),
-            said(no_scan)
-        );
-        done.push(id);
-    }
-    // SAFETY: allocated by WlanEnumInterfaces above.
-    unsafe { WlanFreeMemory(list.cast()) };
 }
 
-/// Nothing to do outside Windows: Linux needs root for the same, and Kali's power saving is
-/// set by hand (`iw dev wlan0 set power_save off`).
+#[cfg(windows)]
+mod wlan {
+    use std::ptr::{null, null_mut};
+    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::NetworkManagement::WiFi::{
+        wlan_intf_opcode_background_scan_enabled, wlan_intf_opcode_media_streaming_mode,
+        WlanCloseHandle, WlanEnumInterfaces, WlanFreeMemory, WlanOpenHandle, WlanSetInterface,
+        WLAN_INTERFACE_INFO, WLAN_INTERFACE_INFO_LIST,
+    };
+
+    /// An open WLAN handle with quiet settings applied. Windows ties the settings to the
+    /// handle, so closing it (on drop) restores them.
+    pub(super) struct Quiet(HANDLE);
+
+    // SAFETY: a WLAN client handle may be used and closed from any thread.
+    unsafe impl Send for Quiet {}
+
+    impl Quiet {
+        /// None on a machine without Wi-Fi, or when Windows refused.
+        pub(super) fn start() -> Option<Quiet> {
+            let mut version = 0u32;
+            let mut handle: HANDLE = null_mut();
+            // SAFETY: plain out-parameters.
+            if unsafe { WlanOpenHandle(2, null(), &mut version, &mut handle) } != 0 {
+                return None; // no WLAN service: no Wi-Fi to quieten
+            }
+            let quiet = Quiet(handle);
+            let mut list: *mut WLAN_INTERFACE_INFO_LIST = null_mut();
+            // SAFETY: the handle is open; the list is freed below.
+            if unsafe { WlanEnumInterfaces(handle, null(), &mut list) } != 0 || list.is_null() {
+                return Some(quiet);
+            }
+            // SAFETY: the list holds dwNumberOfItems entries laid out from InterfaceInfo.
+            let infos: &[WLAN_INTERFACE_INFO] = unsafe {
+                std::slice::from_raw_parts(
+                    std::ptr::addr_of!((*list).InterfaceInfo).cast::<WLAN_INTERFACE_INFO>(),
+                    (*list).dwNumberOfItems as usize,
+                )
+            };
+            let mut said = Vec::new();
+            for info in infos {
+                let on: u32 = 1;
+                let off: u32 = 0;
+                // SAFETY: each call passes a 4-byte BOOL, as these opcodes take.
+                let streaming = unsafe {
+                    WlanSetInterface(
+                        handle,
+                        &info.InterfaceGuid,
+                        wlan_intf_opcode_media_streaming_mode,
+                        4,
+                        (&on as *const u32).cast(),
+                        null(),
+                    )
+                };
+                let no_scan = unsafe {
+                    WlanSetInterface(
+                        handle,
+                        &info.InterfaceGuid,
+                        wlan_intf_opcode_background_scan_enabled,
+                        4,
+                        (&off as *const u32).cast(),
+                        null(),
+                    )
+                };
+                if streaming != 0 || no_scan != 0 {
+                    let len = info.strInterfaceDescription.iter().position(|&c| c == 0).unwrap_or(256);
+                    let name = String::from_utf16_lossy(&info.strInterfaceDescription[..len]);
+                    said.push(format!("{name}: streaming error {streaming}, scan-off error {no_scan}"));
+                }
+            }
+            // SAFETY: allocated by WlanEnumInterfaces above.
+            unsafe { WlanFreeMemory(list.cast()) };
+            static FIRST: std::sync::Once = std::sync::Once::new();
+            if said.is_empty() {
+                FIRST.call_once(|| {
+                    tracing::info!(
+                        "Wi-Fi quiet mode works: no scans while driving the other machine ({} adapter(s))",
+                        infos.len()
+                    )
+                });
+            } else {
+                // Logged every crossing while it fails; a refusal is worth seeing.
+                tracing::info!("Wi-Fi quiet mode partly refused: {}", said.join("; "));
+            }
+            Some(quiet)
+        }
+    }
+
+    impl Drop for Quiet {
+        fn drop(&mut self) {
+            // SAFETY: opened in `start`, closed once here.
+            unsafe { WlanCloseHandle(self.0, null()) };
+        }
+    }
+}
+
+/// Nothing to do outside Windows: Linux needs root for the same.
 #[cfg(not(windows))]
-pub fn wifi_low_latency() {}
+pub fn wifi_quiet(_on: bool) {}
 
 /// Mark the UDP motion socket for Wi-Fi priority, for datagrams to `to`.
 pub(crate) fn prioritise_datagrams(sock: &tokio::net::UdpSocket, to: std::net::SocketAddr) {

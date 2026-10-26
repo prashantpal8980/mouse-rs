@@ -48,6 +48,9 @@ const MOVE_LEN: usize = 4 + 8 + 8 + 8 + 4 + TAG;
 /// Room for any datagram we send, with margin.
 pub(crate) const MAX_DATAGRAM: usize = 64;
 
+/// After motion stops, the final total is sent again this long after the last move.
+const REPEAT_AFTER: [Duration; 2] = [Duration::from_millis(25), Duration::from_millis(80)];
+
 /// Without a hello for this long, the server goes back to sending motion over TCP.
 /// Hellos come with every heartbeat (2 s), so this tolerates two lost in a row.
 const PEER_STALE: Duration = Duration::from_secs(6);
@@ -144,6 +147,9 @@ pub(crate) struct ServerMotion {
     seq: u64,
     sum: (i64, i64),
     synced: (i64, i64),
+    /// When the last move went out, and how many of [`REPEAT_AFTER`] have been sent since.
+    last_move: Option<(Instant, SocketAddr)>,
+    repeats: usize,
     /// Zero of the send times in the datagrams.
     epoch: Instant,
 }
@@ -160,6 +166,8 @@ impl ServerMotion {
             seq: 0,
             sum: (0, 0),
             synced: (0, 0),
+            last_move: None,
+            repeats: 0,
             epoch: Instant::now(),
         }
     }
@@ -203,7 +211,25 @@ impl ServerMotion {
         // next one (or the next `MotionSync`) carries the total anyway.
         let datagram = encode_move(&self.key, self.seq, self.sum.0, self.sum.1, ms_since(self.epoch));
         let _ = self.sock.try_send_to(&datagram, to);
+        self.last_move = Some((Instant::now(), to));
+        self.repeats = 0;
         true
+    }
+
+    /// When the final total of the latest motion is next due to be sent again, if it is.
+    pub(crate) fn repeat_due(&self) -> Option<Instant> {
+        let (at, _) = self.last_move?;
+        REPEAT_AFTER.get(self.repeats).map(|d| at + *d)
+    }
+
+    /// Send the final total again once motion has stopped. The receiving side may have
+    /// carried the pointer on into what it took for a gap (see `Conceal`); this puts it back
+    /// where the hand stopped, and covers a final datagram that was lost.
+    pub(crate) fn send_repeat(&mut self) {
+        let Some((_, to)) = self.last_move else { return };
+        self.repeats += 1;
+        let datagram = encode_move(&self.key, self.seq, self.sum.0, self.sum.1, ms_since(self.epoch));
+        let _ = self.sock.try_send_to(&datagram, to);
     }
 
     /// The running total, if it moved since last said over TCP. Sent ahead of any other
@@ -226,6 +252,7 @@ pub(crate) struct ClientMotion {
     applied: (i64, i64),
     epoch: Instant,
     delay: crate::timing::DelayLog,
+    conceal: Conceal,
 }
 
 impl ClientMotion {
@@ -256,6 +283,7 @@ impl ClientMotion {
             applied: (0, 0),
             epoch: Instant::now(),
             delay: Default::default(),
+            conceal: Conceal::default(),
         };
         me.hello().await;
         Ok(me)
@@ -274,21 +302,47 @@ impl ClientMotion {
 
     pub(crate) fn on_datagram(&mut self, buf: &[u8]) -> Option<Message> {
         let (seq, sx, sy, sent_ms) = decode_move(&self.key, buf)?;
+        let now = Instant::now();
         let transit = i64::from(ms_since(self.epoch)) - i64::from(sent_ms);
-        if let Some(line) = self.delay.push(transit, Instant::now()) {
+        if let Some(line) = self.delay.push(transit, now) {
             tracing::info!("{line}");
+        }
+        if seq > self.last_seq {
+            self.conceal.on_real((sx, sy), sent_ms, now);
+        } else {
+            // A repeat of the final total: motion has stopped.
+            self.conceal.halt();
         }
         self.advance(seq, sx, sy)
     }
 
     pub(crate) fn on_sync(&mut self, seq: u64, sx: i64, sy: i64) -> Option<Message> {
+        // A click or key follows: stop guessing, land exactly on the total.
+        self.conceal.halt();
         self.advance(seq, sx, sy)
     }
 
+    /// Whether [`conceal`](Self::conceal) may have something to do soon: motion is under way.
+    pub(crate) fn concealing(&self, now: Instant) -> bool {
+        self.conceal.active(now)
+    }
+
+    /// Called every few ms while [`concealing`](Self::concealing): when moves stop arriving
+    /// in the middle of steady motion, carry the pointer on at its speed for a moment. The
+    /// next real total corrects whatever the guess got wrong, because moves are computed
+    /// against what has been applied.
+    pub(crate) fn conceal(&mut self, now: Instant) -> Option<Message> {
+        let (dx, dy) = self.conceal.tick(now)?;
+        self.applied.0 += i64::from(dx);
+        self.applied.1 += i64::from(dy);
+        Some(Message::MouseMove { dx, dy })
+    }
+
     /// The move that brings this machine from what it has applied to the server's
-    /// total. Older or repeated totals are ignored.
+    /// total. Older totals are ignored. The latest one again still applies when the pointer is
+    /// not on it, which is how a guess past where the hand stopped is taken back.
     fn advance(&mut self, seq: u64, sx: i64, sy: i64) -> Option<Message> {
-        if seq <= self.last_seq {
+        if seq < self.last_seq || (seq == self.last_seq && (sx, sy) == self.applied) {
             return None;
         }
         self.last_seq = seq;
@@ -296,6 +350,133 @@ impl ClientMotion {
         let (dx, dy) = (clamp(sx - self.applied.0), clamp(sy - self.applied.1));
         self.applied = (sx, sy);
         (dx != 0 || dy != 0).then_some(Message::MouseMove { dx, dy })
+    }
+}
+
+/// Hiding short gaps in pointer motion (owner's request, 27 Oct 2026).
+///
+/// Wi-Fi sometimes holds moves back for 20–30 ms. The pointer then stops and jumps, which feels
+/// rough even though nothing is lost. When moves stop arriving in the middle of steady motion,
+/// the pointer carries on at the speed it had, at full speed for [`FULL`], easing off to a
+/// stop by [`HIDE`]. Nothing is hidden beyond that: a longer gap is real, and guessing
+/// further would overshoot visibly. When the next real move arrives, the pointer is set to the
+/// true total, so a wrong guess is corrected straight away and never accumulates.
+#[derive(Default)]
+struct Conceal {
+    /// When the last real move arrived, and how far apart they usually arrive.
+    last_at: Option<Instant>,
+    interval_ms: f64,
+    /// Real moves in a row that arrived as part of continuous motion.
+    steady: u32,
+    /// Speed in px/ms, measured on the sender's clock so a held-back burst can't inflate it.
+    vel: (f64, f64),
+    base_total: (i64, i64),
+    base_sent: u32,
+    /// Within one gap: the last tick, the sub-pixel remainder, and the distance guessed so far.
+    last_tick: Option<Instant>,
+    carry: (f64, f64),
+    guessed_px: f64,
+}
+
+/// A gap starts this long after the last move at the least (two usual intervals otherwise).
+const GAP_MIN: Duration = Duration::from_millis(12);
+/// How long a gap is carried at full speed, and when it has eased to a stop.
+const FULL: Duration = Duration::from_millis(20);
+const HIDE: Duration = Duration::from_millis(30);
+/// Never guess further than this in one gap.
+const GUESS_CAP_PX: f64 = 60.0;
+/// Slower than this (px/ms) the pointer is nearly still: nothing worth carrying.
+const MIN_SPEED: f64 = 0.05;
+/// Moves in a row before motion counts as steady.
+const STEADY: u32 = 3;
+
+impl Conceal {
+    fn on_real(&mut self, total: (i64, i64), sent_ms: u32, now: Instant) {
+        match self.last_at {
+            Some(prev) => {
+                let arrived = now.saturating_duration_since(prev).as_secs_f64() * 1000.0;
+                if arrived < 50.0 {
+                    self.steady += 1;
+                    self.interval_ms = 0.8 * self.interval_ms + 0.2 * arrived;
+                } else {
+                    self.steady = 0;
+                    self.vel = (0.0, 0.0);
+                    self.base_total = total;
+                    self.base_sent = sent_ms;
+                }
+                // Speed over at least 4 ms of the sender's time; 1 ms ticks are too coarse.
+                let sent_dt = f64::from(sent_ms.wrapping_sub(self.base_sent));
+                if (4.0..50.0).contains(&sent_dt) {
+                    let v = (
+                        (total.0 - self.base_total.0) as f64 / sent_dt,
+                        (total.1 - self.base_total.1) as f64 / sent_dt,
+                    );
+                    self.vel = (0.5 * self.vel.0 + 0.5 * v.0, 0.5 * self.vel.1 + 0.5 * v.1);
+                    self.base_total = total;
+                    self.base_sent = sent_ms;
+                } else if sent_dt >= 50.0 {
+                    self.base_total = total;
+                    self.base_sent = sent_ms;
+                }
+            }
+            None => {
+                self.interval_ms = 8.0;
+                self.base_total = total;
+                self.base_sent = sent_ms;
+            }
+        }
+        self.last_at = Some(now);
+        self.last_tick = None;
+        self.carry = (0.0, 0.0);
+        self.guessed_px = 0.0;
+    }
+
+    fn halt(&mut self) {
+        self.steady = 0;
+        self.vel = (0.0, 0.0);
+    }
+
+    fn gap_start(&self) -> Duration {
+        Duration::from_secs_f64(self.interval_ms * 2.0 / 1000.0).max(GAP_MIN)
+    }
+
+    fn active(&self, now: Instant) -> bool {
+        self.steady >= STEADY
+            && self.last_at.is_some_and(|t| now.saturating_duration_since(t) < self.gap_start() + HIDE)
+    }
+
+    fn tick(&mut self, now: Instant) -> Option<(i32, i32)> {
+        if !self.active(now) || self.vel.0.hypot(self.vel.1) < MIN_SPEED {
+            return None;
+        }
+        let into_gap = now.saturating_duration_since(self.last_at?).checked_sub(self.gap_start())?;
+        let from = self.last_tick.unwrap_or(now - into_gap).max(now - into_gap);
+        self.last_tick = Some(now);
+        let ms = |d: Duration| d.as_secs_f64() * 1000.0;
+        // Average of the easing factor over this tick: 1 up to FULL, then down to 0 at HIDE.
+        let ease = |t: f64| {
+            if t <= ms(FULL) {
+                1.0
+            } else {
+                ((ms(HIDE) - t) / (ms(HIDE) - ms(FULL))).max(0.0)
+            }
+        };
+        let (t0, t1) = (ms(into_gap) - ms(now - from), ms(into_gap));
+        let span = (t1 - t0).max(0.0);
+        let factor = (ease(t0) + ease(t1)) / 2.0;
+        let room = (GUESS_CAP_PX - self.guessed_px).max(0.0);
+        let speed = self.vel.0.hypot(self.vel.1);
+        let step = (speed * span * factor).min(room);
+        if step <= 0.0 {
+            return None;
+        }
+        self.guessed_px += step;
+        self.carry.0 += self.vel.0 / speed * step;
+        self.carry.1 += self.vel.1 / speed * step;
+        let (dx, dy) = (self.carry.0.trunc(), self.carry.1.trunc());
+        self.carry.0 -= dx;
+        self.carry.1 -= dy;
+        (dx != 0.0 || dy != 0.0).then_some((dx as i32, dy as i32))
     }
 }
 
@@ -347,6 +528,68 @@ mod tests {
             assert_eq!(c.advance(2, 9, 0), None);
             // A sync for what already arrived changes nothing.
             assert_eq!(c.on_sync(3, 12, -2), None);
+        });
+    }
+
+    /// Steady motion at 1 px/ms to the right, a move every 4 ms, starting at `t0`.
+    fn steady(c: &mut Conceal, t0: Instant, moves: u32) -> Instant {
+        let mut t = t0;
+        for i in 0..moves {
+            t = t0 + Duration::from_millis(4 * u64::from(i));
+            c.on_real((4 * i64::from(i), 0), 4 * i, t);
+        }
+        t
+    }
+
+    fn run(c: &mut Conceal, from: Instant, for_ms: u64) -> (i32, i32) {
+        let mut sum = (0, 0);
+        for ms in (2..=for_ms).step_by(2) {
+            if let Some((dx, dy)) = c.tick(from + Duration::from_millis(ms)) {
+                sum = (sum.0 + dx, sum.1 + dy);
+            }
+        }
+        sum
+    }
+
+    #[test]
+    fn a_short_gap_in_steady_motion_is_carried_at_its_speed() {
+        let mut c = Conceal::default();
+        let last = steady(&mut c, Instant::now(), 10);
+        // Gap starts 12 ms after the last move; 20 ms at 1 px/ms, then 10 ms easing (5 px).
+        let (dx, dy) = run(&mut c, last, 100);
+        assert!((24..=26).contains(&dx), "carried {dx}");
+        assert_eq!(dy, 0);
+    }
+
+    #[test]
+    fn nothing_is_guessed_without_steady_motion_or_after_a_sync() {
+        let mut c = Conceal::default();
+        let t0 = Instant::now();
+        c.on_real((0, 0), 0, t0);
+        c.on_real((4, 0), 4, t0 + Duration::from_millis(4));
+        assert_eq!(run(&mut c, t0 + Duration::from_millis(4), 100), (0, 0), "two moves are not steady");
+
+        let mut c = Conceal::default();
+        let last = steady(&mut c, t0, 10);
+        c.halt();
+        assert_eq!(run(&mut c, last, 100), (0, 0), "a click is coming: land exactly");
+    }
+
+    #[test]
+    fn the_next_real_total_corrects_a_wrong_guess() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let mut c = ClientMotion::start(SocketAddr::from((Ipv4Addr::LOCALHOST, 9)), 9, &hex(&[0; 16]), key(1))
+                .await
+                .unwrap();
+            assert_eq!(c.advance(1, 100, 0), Some(Message::MouseMove { dx: 100, dy: 0 }));
+            // Say the guess carried the pointer 25 px further, but the hand had stopped.
+            c.applied.0 += 25;
+            assert_eq!(c.advance(2, 100, 0), Some(Message::MouseMove { dx: -25, dy: 0 }));
+            // The hand stopped: no new move, only the server's repeat of the same total.
+            c.applied.0 += 25;
+            assert_eq!(c.advance(2, 100, 0), Some(Message::MouseMove { dx: -25, dy: 0 }));
+            assert_eq!(c.advance(2, 100, 0), None, "already there");
         });
     }
 

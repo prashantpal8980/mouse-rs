@@ -1078,6 +1078,9 @@ async fn network_moved(net: &mut Option<watch::Receiver<u64>>) {
 /// How often the client logs what it is trying while no server answers.
 const LOOKING_LOG_EVERY: Duration = Duration::from_secs(60);
 
+/// While motion is under way, how often to check for a gap to hide.
+const CONCEAL_TICK: Duration = Duration::from_millis(2);
+
 /// How long one candidate address gets to accept the TCP connection.
 const CONNECT_TRY: Duration = Duration::from_secs(3);
 
@@ -1192,7 +1195,27 @@ async fn pump(
 
     loop {
         let udp = motion.socket();
+        let concealing = matches!(&motion, Motion::Client { live: Some(m), .. } if m.concealing(std::time::Instant::now()));
+        let repeat_at = match &motion {
+            Motion::Server(m) => m.repeat_due(),
+            _ => None,
+        };
         tokio::select! {
+            _ = tokio::time::sleep_until(repeat_at.unwrap_or_else(std::time::Instant::now).into()), if repeat_at.is_some() => {
+                if let Motion::Server(m) = &mut motion {
+                    m.send_repeat();
+                }
+            }
+
+            // Hide a short gap in pointer motion (see `motion_udp::Conceal`).
+            _ = tokio::time::sleep(CONCEAL_TICK), if concealing => {
+                if let Motion::Client { live: Some(m), .. } = &mut motion {
+                    if let Some(mv) = m.conceal(std::time::Instant::now()) {
+                        let _ = ch.from_peer.send(mv);
+                    }
+                }
+            }
+
             // Local Stop/Reload: return immediately, no blocking.
             _ = cancel.cancelled() => return DisconnectReason::Cancelled,
 
