@@ -1,0 +1,663 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>mouse-rs Current UI</title>
+<!--
+  A faithful HTML copy of the mouse-rs control panel as built on 27 Oct 2026
+  (crates/mouse/src/gui.rs + ui_theme.rs), for redesign. Every page and every state the
+  panel can show, with the real wording. Window: 560 × 720 (minimum 360 × 420).
+  Colours: the six palettes from ui_theme.rs, switchable at the top.
+-->
+<style>
+:root {
+  /* Midnight (default theme) */
+  --bg:#0a0e1a; --bg2:#111726; --bg3:#0e1420; --inset:#0b111d; --line:#1f2839; --line2:#2a3550;
+  --txt:#eef2fb; --txt2:#9aa7c2; --txt3:#5f6d8a; --accent:#38d6e6; --accent2:#6a7bff; --ink:#04121a;
+  --good:#37e0a0; --warn:#ffcf5c; --danger:#ff6b7a;
+}
+[data-pal="oxide"]  { --bg:#100b08; --bg2:#1b130d; --bg3:#150e09; --inset:#120c07; --line:#2c1f15; --line2:#3d2c1d; --txt:#f6ede3; --txt2:#c2ab97; --txt3:#836a55; --accent:#ff7a3d; --accent2:#ffb23d; --ink:#1a0d04; --good:#8bd450; --warn:#ffc94d; --danger:#ff5c5c; }
+[data-pal="synth"]  { --bg:#100320; --bg2:#1c0b33; --bg3:#160828; --inset:#12061f; --line:#331452; --line2:#4a1d75; --txt:#fbe9ff; --txt2:#c39cd8; --txt3:#805a9c; --accent:#ff4fa3; --accent2:#31d0ff; --ink:#1a0416; --good:#5cffc4; --warn:#ffd24f; --danger:#ff5c8a; }
+[data-pal="matrix"] { --bg:#030a06; --bg2:#07160e; --bg3:#050f09; --inset:#040d07; --line:#0e2b1a; --line2:#164026; --txt:#d6ffe6; --txt2:#5fbf88; --txt3:#357a52; --accent:#39ff88; --accent2:#7dffb0; --ink:#022012; --good:#39ff88; --warn:#d8ff5c; --danger:#ff6b5c; }
+[data-pal="nord"]   { --bg:#242a35; --bg2:#2e3440; --bg3:#2a303c; --inset:#272d38; --line:#3b4252; --line2:#4c566a; --txt:#eceff4; --txt2:#a9b3c7; --txt3:#6b7488; --accent:#88c0d0; --accent2:#a3be8c; --ink:#132029; --good:#a3be8c; --warn:#ebcb8b; --danger:#bf616a; }
+[data-pal="paper"]  { --bg:#eceae4; --bg2:#faf9f6; --bg3:#f2f0ea; --inset:#e7e4dc; --line:#dcd8ce; --line2:#c9c4b8; --txt:#1d1c19; --txt2:#5c584f; --txt3:#918b7e; --accent:#5b52e0; --accent2:#e0527a; --ink:#ffffff; --good:#1f9d5b; --warn:#b5820f; --danger:#d13c4b; }
+
+* { box-sizing: border-box; }
+body { margin:0; background:#1a1d22; color:#e8eaee; font:14px/1.4 system-ui,-apple-system,"Segoe UI",sans-serif; }
+.top { position:sticky; top:0; z-index:5; background:#101215; border-bottom:1px solid #2a2e35; padding:12px 16px; display:flex; flex-wrap:wrap; gap:8px; align-items:center; }
+.top b { margin-right:8px; }
+.top button { background:#23272e; color:#dfe3ea; border:1px solid #3a3f48; border-radius:8px; padding:6px 10px; cursor:pointer; font:inherit; }
+.top button.on { border-color:#7aa2ff; color:#fff; }
+.intro { max-width:1200px; margin:16px auto 0; padding:0 16px; color:#aab1bd; }
+.intro code { color:#dfe3ea; }
+.gallery { display:flex; flex-wrap:wrap; gap:28px; justify-content:center; padding:24px 16px 64px; }
+figure { margin:0; }
+figcaption { color:#aab1bd; font-size:13px; margin:0 0 8px; max-width:560px; }
+figcaption b { color:#fff; }
+
+/* ---------- the app window ---------- */
+.win { width:560px; max-width:calc(100vw - 32px); height:720px; background:var(--bg); color:var(--txt); border-radius:10px; overflow:hidden; display:flex; flex-direction:column; padding:16px; gap:12px; position:relative; box-shadow:0 20px 60px rgba(0,0,0,.5); font-size:13px; }
+.scroll { flex:1; overflow:auto; display:flex; flex-direction:column; gap:12px; padding:4px 2px; }
+.header { display:flex; align-items:center; gap:10px; }
+.header .title { font-size:22px; flex:1; }
+.pill { font-size:12px; padding:4px 10px; border-radius:999px; }
+.pill.stopped { background:color-mix(in srgb,var(--txt3) 18%,transparent); color:var(--txt3); }
+.pill.ok { background:color-mix(in srgb,var(--good) 16%,transparent); color:var(--good); }
+.pill.wait { background:color-mix(in srgb,var(--warn) 16%,transparent); color:var(--warn); }
+.pill.bad { background:color-mix(in srgb,var(--danger) 16%,transparent); color:var(--danger); }
+
+.btn { font:inherit; border:0; cursor:pointer; border-radius:11px; padding:9px 14px; font-size:12.5px; }
+.btn.primary { background:linear-gradient(135deg,var(--accent),var(--accent2)); color:var(--ink); box-shadow:0 8px 20px color-mix(in srgb,var(--accent) 50%,transparent); }
+.btn.danger { background:var(--danger); color:#fff; }
+.btn.ghost { background:var(--bg3); color:var(--txt); border:1px solid var(--line2); border-radius:10px; }
+.btn.ghost:hover { color:var(--accent); border-color:var(--accent); }
+.btn.big { padding:12px 20px; font-size:14px; }
+.btn.dots { padding:6px 12px; font-size:16px; color:var(--txt2); }
+
+.hero { background:var(--bg2); border:1px solid color-mix(in srgb,var(--accent) 40%,transparent); border-radius:16px; box-shadow:0 0 28px color-mix(in srgb,var(--accent) 28%,transparent); padding:12px; display:flex; flex-direction:column; gap:10px; }
+.chips { display:flex; align-items:center; gap:10px; }
+.chip { flex:1; background:var(--inset); border:1px solid var(--line2); border-radius:12px; padding:11px 13px; display:flex; flex-direction:column; gap:4px; }
+.chip.active { border:1.5px solid var(--accent); box-shadow:0 0 22px color-mix(in srgb,var(--accent) 50%,transparent); }
+.chip .name { font-size:14px; display:flex; gap:8px; }
+.chip .detail { font-size:11px; color:var(--txt3); }
+.chip .has { font-size:11px; color:var(--accent); min-height:15px; }
+.link { font-size:20px; color:var(--accent); }
+.link.off { color:var(--txt3); }
+.heroline { font-size:12px; color:var(--accent); }
+.heroline.off { color:var(--txt3); }
+
+.tabs { background:var(--inset); border:1px solid var(--line2); border-radius:12px; padding:4px; display:flex; gap:6px; }
+.seg { flex:1; text-align:center; padding:9px 16px; border-radius:9px; color:var(--txt2); font-size:13.5px; }
+.seg.on { background:linear-gradient(135deg,var(--accent),var(--accent2)); color:var(--ink); }
+
+.card { background:var(--bg2); border:1px solid var(--line); border-radius:14px; box-shadow:0 6px 20px rgba(0,0,0,.25); padding:18px; display:flex; flex-direction:column; gap:14px; }
+.card.tight { gap:8px; }
+.section { font-size:12.5px; color:var(--accent); }
+.label { font-size:12px; color:var(--txt2); }
+.hint { font-size:11px; color:var(--txt3); }
+.warntext { font-size:11px; color:var(--warn); }
+.field { display:flex; flex-direction:column; gap:6px; }
+.row { display:flex; gap:8px; align-items:center; }
+.input { flex:1; background:var(--inset); border:1px solid var(--line2); border-radius:10px; padding:9px 11px; color:var(--txt); font-size:13px; min-height:36px; }
+.input.ph { color:var(--txt3); }
+.input.focus { border:1.5px solid var(--accent); }
+.select { flex:1; background:var(--inset); border:1px solid var(--line2); border-radius:10px; padding:10px 12px; color:var(--txt); font-size:13px; display:flex; justify-content:space-between; }
+
+.toggle { background:var(--inset); border:1px solid var(--line2); border-radius:12px; padding:13px 15px; display:flex; gap:12px; align-items:center; }
+.toggle .t { flex:1; display:flex; flex-direction:column; gap:2px; }
+.toggle .t1 { font-size:14px; color:var(--txt); }
+.toggle .t2 { font-size:11px; color:var(--txt3); }
+.sw { width:44px; height:24px; border-radius:12px; background:var(--line2); position:relative; flex:none; }
+.sw::after { content:""; position:absolute; top:4px; left:4px; width:16px; height:16px; border-radius:50%; background:#fff; }
+.sw.on { background:linear-gradient(135deg,var(--accent),var(--accent2)); }
+.sw.on::after { left:24px; }
+
+.nav { background:var(--bg3); border:1px solid var(--line2); border-radius:10px; padding:12px 14px; display:flex; gap:12px; align-items:center; }
+.nav .ic { font-size:18px; }
+.nav .tx { flex:1; display:flex; flex-direction:column; gap:2px; }
+.nav .t1 { font-size:14px; }
+.nav .t2 { font-size:11px; color:var(--txt3); }
+.nav .chev { color:var(--txt3); font-size:16px; }
+.group { font-size:10.5px; color:var(--txt3); margin-top:4px; }
+
+.info { background:var(--bg3); border:1px solid var(--line2); border-radius:10px; padding:7px 8px; display:flex; gap:8px; align-items:center; font-size:13px; }
+.info .ic { width:22px; font-size:14px; }
+.info .k { flex:1; color:var(--txt2); }
+.info .chev { color:var(--txt3); }
+
+.well { background:var(--inset); border:1px solid var(--line2); border-radius:12px; padding:11px 14px; display:flex; flex-direction:column; gap:8px; color:var(--txt2); }
+.well .t1 { font-size:13.5px; color:var(--txt); }
+.banner { background:var(--bg2); border:1px solid var(--line); border-radius:14px; padding:10px 12px; display:flex; flex-direction:column; gap:8px; }
+
+.footer { display:flex; gap:8px; align-items:center; }
+.footer .fb { flex:1; font-size:12px; color:var(--txt3); }
+.sbar { display:flex; gap:10px; align-items:center; }
+.sbar .back { padding:6px 12px; font-size:15px; color:var(--txt2); }
+.sbar .pt { font-size:18px; flex:1; }
+.adv { background:var(--bg3); border:1px solid var(--line2); border-radius:10px; padding:10px 14px; color:var(--txt2); font-size:13px; }
+
+.clip { display:flex; gap:6px; align-items:center; }
+.clip .main { flex:1; background:var(--bg3); border:1px solid var(--line2); border-radius:10px; padding:12px 14px; display:flex; flex-direction:column; gap:4px; }
+.clip .head { display:flex; gap:8px; align-items:center; }
+.clip .kind { font-size:12px; color:var(--txt3); }
+.clip .dir { font-size:11px; }
+.clip .pv { font-size:13px; color:var(--txt2); flex:1; word-break:break-all; }
+.clip .note { font-size:11px; }
+.clip .ib { background:var(--bg3); border:1px solid var(--line2); border-radius:10px; padding:9px 10px; font-size:12px; color:var(--txt); }
+.bar { height:3px; background:var(--line2); border-radius:2px; overflow:hidden; margin-top:2px; }
+.bar i { display:block; height:100%; background:var(--accent); }
+
+.edge { background:var(--inset); border:1px solid var(--line2); border-radius:12px; padding:14px; display:grid; grid-template-columns:8px 1fr 8px; grid-template-rows:8px 40px 8px; gap:6px; align-items:center; justify-items:center; }
+.edge .e { background:var(--line2); border-radius:6px; }
+.edge .e.sel { background:linear-gradient(135deg,var(--accent),var(--accent2)); }
+.edge .top, .edge .bot { grid-column:2; width:60px; height:8px; }
+.edge .lft { grid-row:2; grid-column:1; width:8px; height:40px; }
+.edge .rgt { grid-row:2; grid-column:3; width:8px; height:40px; }
+.edge .scr { grid-row:2; grid-column:2; font-size:11px; color:var(--txt3); }
+.edge .bot { grid-row:3; }
+
+.swatchrow { display:flex; gap:10px; align-items:center; padding:9px 12px; border-radius:9px; color:var(--txt2); font-size:13.5px; }
+.swatchrow.on { background:linear-gradient(135deg,var(--accent),var(--accent2)); color:var(--ink); }
+.sw18 { width:18px; height:18px; border-radius:6px; }
+
+.menu { position:absolute; top:68px; right:16px; width:210px; background:var(--bg2); border:1px solid var(--line); border-radius:14px; box-shadow:0 6px 20px rgba(0,0,0,.4); padding:10px; display:flex; flex-direction:column; gap:4px; z-index:3; }
+.menu .mi { background:var(--bg3); border:1px solid var(--line2); border-radius:10px; padding:9px 11px; font-size:12.5px; color:var(--txt2); }
+.menu .mi.d { color:var(--danger); }
+.dim { position:absolute; inset:0; background:rgba(0,0,0,.55); display:flex; align-items:center; justify-content:center; padding:16px; z-index:4; }
+.dialog { max-width:420px; background:var(--bg2); border:1px solid var(--line); border-radius:14px; padding:18px; display:flex; flex-direction:column; gap:10px; }
+.code { font-size:34px; color:var(--accent); letter-spacing:1px; }
+.bigpin { font-size:28px; color:var(--accent); }
+</style>
+</head>
+<body>
+<div class="top">
+  <b>Theme</b>
+  <button data-p="" class="on">Midnight (default)</button>
+  <button data-p="oxide">Oxide</button>
+  <button data-p="synth">Synthwave</button>
+  <button data-p="matrix">Matrix</button>
+  <button data-p="nord">Nord</button>
+  <button data-p="paper">Paper (light)</button>
+</div>
+<p class="intro">Every screen of the mouse-rs control panel as it is today, built from <code>crates/mouse/src/gui.rs</code>.
+One window is 560 × 720 (the minimum size is 360 × 420). The <b>laptop</b> is the server, the machine with the mouse.
+<b>Kali</b> is the client, the machine being driven. The panel is the same program on both, and shows different
+controls depending on which role it has.</p>
+
+<div class="gallery">
+
+<!-- ================= 1. MAIN · CONNECTION · SERVER ================= -->
+<figure><figcaption><b>1 · Main window — Connection tab — on the laptop (server)</b>, connected and driving Kali.</figcaption>
+<div class="win">
+  <div class="header"><div class="title">mouse-rs</div><span class="pill ok">connected — kali-desktop (1440×900)</span><button class="btn ghost dots">⋯</button></div>
+  <div class="hero">
+    <div class="chips">
+      <div class="chip"><div class="name">🖥 MSI</div><div class="detail">1920×1080 · this computer</div><div class="has"></div></div>
+      <div class="link">⇄</div>
+      <div class="chip active"><div class="name">💻 kali-desktop</div><div class="detail">1440×900</div><div class="has">● has the mouse</div></div>
+    </div>
+    <div class="heroline">→ controlling kali-desktop</div>
+  </div>
+  <div class="tabs"><div class="seg on">Connection</div><div class="seg">Clipboard</div></div>
+  <div class="scroll">
+    <div class="card"><div class="section">This computer is the…</div>
+      <div class="tabs" style="background:none;border:0;padding:0"><div class="seg on">Server · has mouse</div><div class="seg">Client · receives</div></div></div>
+    <div class="card"><div class="section">How the other computer finds this one</div>
+      <div style="display:flex;flex-direction:column;gap:6px"><div style="color:var(--txt2)">192.168.137.1  ·  192.168.1.2  ·  100.107.193.75</div>
+      <div class="hint">The other computer finds this one by itself on a shared network; type one of these there only if it does not.</div></div></div>
+    <div class="card tight"><div><div class="section">At a glance</div><div class="hint">A summary of how sharing is set up. Nothing changes here; click a line to change it in Settings.</div></div>
+      <div class="info"><span class="ic">🔒</span><span class="k">Encryption</span><span>on (TLS)</span><span class="chev">›</span></div>
+      <div class="info"><span class="ic">🔢</span><span class="k">Password</span><span>set on the computer you drive</span><span class="chev">›</span></div>
+      <div class="info"><span class="ic">📋</span><span class="k">Clipboard</span><span>shares text, images, files</span><span class="chev">›</span></div>
+      <div class="info"><span class="ic">⌨</span><span class="k">Take control back</span><span>Scroll Lock</span><span class="chev">›</span></div></div>
+    <div class="nav"><span class="ic">🔗</span><div class="tx"><span class="t1">More connection settings</span><span class="t2">Ports, auto-reconnect, this computer's name, profiles</span></div><span class="chev">›</span></div>
+  </div>
+  <div class="footer"><span class="fb">started</span><button class="btn ghost">Save</button><button class="btn danger big">Stop sharing</button></div>
+</div></figure>
+
+<!-- ================= 2. MAIN · CONNECTION · CLIENT ================= -->
+<figure><figcaption><b>2 · Main window — Connection tab — on Kali (client)</b>, connected, with the once-a-day password reminder.</figcaption>
+<div class="win">
+  <div class="header"><div class="title">mouse-rs</div><span class="pill ok">connected — MSI (1920×1080)</span><button class="btn ghost dots">⋯</button></div>
+  <div class="hero">
+    <div class="chips">
+      <div class="chip"><div class="name">🖥 kali-desktop</div><div class="detail">1440×900 · this computer</div><div class="has"></div></div>
+      <div class="link">⇄</div>
+      <div class="chip active"><div class="name">💻 MSI</div><div class="detail">1920×1080</div><div class="has">● has the mouse</div></div>
+    </div>
+    <div class="heroline">connected to MSI</div>
+  </div>
+  <div class="well"><span class="t1">Protect this computer with a password</span>
+    <span class="hint">Without one, anyone on this network who has paired a computer with this one can drive it. With one, they also need the password, and 3 wrong tries lock them out for an hour.</span>
+    <div class="row"><button class="btn primary">Set a password</button><button class="btn ghost">Not now</button><button class="btn ghost">Don't show this again</button></div></div>
+  <div class="tabs"><div class="seg on">Connection</div><div class="seg">Clipboard</div></div>
+  <div class="scroll">
+    <div class="card"><div class="section">This computer is the…</div>
+      <div class="tabs" style="background:none;border:0;padding:0"><div class="seg">Server · has mouse</div><div class="seg on">Client · receives</div></div></div>
+    <div class="card"><div class="section">Other computer</div>
+      <div class="field"><span class="label">Server host / IP</span><div class="row"><div class="input">192.168.137.1</div><button class="btn ghost">Detect</button></div></div>
+      <div class="hint">The address of the computer that has the mouse (the server). Press Detect to find it on your network, or type its IP address.</div>
+      <div class="field"><span class="label">Found on your network</span><div class="select"><span>192.168.137.1</span><span>⌄</span></div></div></div>
+    <div class="card tight"><div><div class="section">At a glance</div><div class="hint">A summary of how sharing is set up. Nothing changes here; click a line to change it in Settings.</div></div>
+      <div class="info"><span class="ic">🔒</span><span class="k">Encryption</span><span>on (TLS)</span><span class="chev">›</span></div>
+      <div class="info"><span class="ic">🔢</span><span class="k">Password</span><span>off</span><span class="chev">›</span></div>
+      <div class="info"><span class="ic">📋</span><span class="k">Clipboard</span><span>shares text, images, files</span><span class="chev">›</span></div>
+      <div class="info"><span class="ic">⌨</span><span class="k">Take control back</span><span>Scroll Lock</span><span class="chev">›</span></div></div>
+    <div class="nav"><span class="ic">🔗</span><div class="tx"><span class="t1">More connection settings</span><span class="t2">Ports, auto-reconnect, this computer's name, profiles</span></div><span class="chev">›</span></div>
+  </div>
+  <div class="footer"><span class="fb"></span><button class="btn ghost">Save</button><button class="btn danger big">Stop sharing</button></div>
+</div></figure>
+
+<!-- ================= 3. SERVER ASKED FOR PASSWORD ================= -->
+<figure><figcaption><b>3 · Laptop (server) — Kali asks for its password.</b> The box appears first in the "How the other computer finds this one" card. The status pill shows the refusal.</figcaption>
+<div class="win">
+  <div class="header"><div class="title">mouse-rs</div><span class="pill bad">refused — type kali-desktop's connection PIN here to connect</span><button class="btn ghost dots">⋯</button></div>
+  <div class="hero">
+    <div class="chips">
+      <div class="chip active"><div class="name">🖥 MSI</div><div class="detail">1920×1080 · this computer</div><div class="has">● has the mouse</div></div>
+      <div class="link off">—</div>
+      <div class="chip"><div class="name">💻 waiting…</div><div class="detail">not connected</div><div class="has"></div></div>
+    </div>
+    <div class="heroline">refused: type kali-desktop's connection PIN here to connect</div>
+  </div>
+  <div class="tabs"><div class="seg on">Connection</div><div class="seg">Clipboard</div></div>
+  <div class="scroll">
+    <div class="card"><div class="section">This computer is the…</div>
+      <div class="tabs" style="background:none;border:0;padding:0"><div class="seg on">Server · has mouse</div><div class="seg">Client · receives</div></div></div>
+    <div class="card"><div class="section">How the other computer finds this one</div>
+      <div style="display:flex;flex-direction:column;gap:6px">
+        <span style="font-size:12px;color:var(--warn)">kali-desktop has a connection PIN. Type it here to drive kali-desktop. It is shown on kali-desktop's screen, or in Settings → Security &amp; pairing there.</span>
+        <div class="row"><div class="input focus">•••••</div><button class="btn primary">Connect</button></div>
+        <div style="color:var(--txt2)">192.168.137.1  ·  192.168.1.2  ·  100.107.193.75</div>
+        <div class="hint">The other computer finds this one by itself on a shared network; type one of these there only if it does not.</div></div></div>
+    <div class="card"><div class="section">Other states of the same box</div>
+      <span style="font-size:12px;color:var(--warn)">Wrong PIN for kali-desktop. 2 tries left before kali-desktop stops accepting PINs for a while.</span>
+      <span style="font-size:12px;color:var(--warn)">Too many wrong PINs. kali-desktop accepts none for 60 min.</span></div>
+  </div>
+  <div class="footer"><span class="fb">sent; kali-desktop connects in a moment if the PIN is right</span><button class="btn ghost">Save</button><button class="btn danger big">Stop sharing</button></div>
+</div></figure>
+
+<!-- ================= 4. CLIENT WAITING / FIRST SETUP ================= -->
+<figure><figcaption><b>4 · Kali (client) — first run, not paired yet, and a server being refused.</b> Pairing shows on the main window only until the computer is paired.</figcaption>
+<div class="win">
+  <div class="header"><div class="title">mouse-rs</div><span class="pill bad">refused — waiting for this computer's PIN to be typed on the server</span><button class="btn ghost dots">⋯</button></div>
+  <div class="hero">
+    <div class="chips">
+      <div class="chip active"><div class="name">🖥 kali-desktop</div><div class="detail">1440×900 · this computer</div><div class="has">● has the mouse</div></div>
+      <div class="link off">—</div>
+      <div class="chip"><div class="name">💻 waiting…</div><div class="detail">not connected</div><div class="has"></div></div>
+    </div>
+    <div class="heroline">refused: waiting for this computer's PIN to be typed on the server</div>
+  </div>
+  <div class="tabs"><div class="seg on">Connection</div><div class="seg">Clipboard</div></div>
+  <div class="scroll">
+    <div class="card"><div class="section">Other computer</div>
+      <div class="field"><span class="label">Server host / IP</span><div class="row"><div class="input ph">press Detect, or type the other machine's IP</div><button class="btn ghost">Detect</button></div></div>
+      <div class="hint">The address of the computer that has the mouse (the server). Press Detect to find it on your network, or type its IP address.</div>
+      <span style="font-size:12px;color:var(--warn)">A computer is asking to drive this one. Type this computer's password on it to allow it.</span>
+      <div class="field"><span class="label">First-time setup: pair with a code</span>
+        <div class="row"><div class="input ph">6-digit code</div><button class="btn primary">Pair</button></div>
+        <span class="hint">Only for first-time setup: on the computer with the mouse, press "Pair a new device" and type the code it shows here.</span></div></div>
+  </div>
+  <div class="footer"><span class="fb">no server is showing a pairing code; press "Pair a new device" on it first</span><button class="btn ghost">Save</button><button class="btn danger big">Stop sharing</button></div>
+</div></figure>
+
+<!-- ================= 5. CLIPBOARD TAB ================= -->
+<figure><figcaption><b>5 · Main window — Clipboard tab</b>, with every kind of entry: text, image, a file coming over with progress, a file on the other computer, a file waiting, and one that can't be fetched. Also the "file waiting" banner.</figcaption>
+<div class="win">
+  <div class="header"><div class="title">mouse-rs</div><span class="pill ok">connected — MSI (1920×1080)</span><button class="btn ghost dots">⋯</button></div>
+  <div class="hero">
+    <div class="chips">
+      <div class="chip active"><div class="name">🖥 kali-desktop</div><div class="detail">1440×900 · this computer</div><div class="has">● has the mouse</div></div>
+      <div class="link">⇄</div>
+      <div class="chip"><div class="name">💻 MSI</div><div class="detail">1920×1080</div><div class="has"></div></div>
+    </div>
+    <div class="heroline">connected to MSI</div>
+  </div>
+  <div class="well"><div class="row" style="align-items:center">
+    <div style="flex:1;display:flex;flex-direction:column;gap:3px"><span class="t1">ubuntu-24.04.iso is ready to paste</span>
+      <span class="hint">6.1 GB — over your 1 MB limit, so it is not fetched until you paste it. Paste works now; this is only a heads-up.</span></div>
+    <button class="btn primary">Bring it over</button><button class="btn ghost">Not now</button><button class="btn ghost">Always allow 6144 MB</button></div></div>
+  <div class="tabs"><div class="seg">Connection</div><div class="seg on">Clipboard</div></div>
+  <div class="scroll">
+    <div class="card">
+      <div class="row"><div style="flex:1;display:flex;flex-direction:column;gap:3px"><span class="section">History</span><span class="hint">Newest first · click an entry to copy it again</span></div><button class="btn ghost" style="padding:7px 12px;font-size:12px">Clear</button></div>
+      <div style="display:flex;flex-direction:column;gap:10px">
+        <div class="clip"><div class="main"><div class="head"><span class="kind">🗎</span><span class="dir" style="color:var(--accent)">↓ in</span><span class="pv">holiday-video.mp4</span></div><span class="note" style="color:var(--accent)">22% of 1.4 GB · 48.2 MB/s · 23 s left</span><div class="bar"><i style="width:22%"></i></div></div><span class="ib">Stop</span><span class="ib">📍</span><span class="ib">✕</span></div>
+        <div class="clip"><div class="main"><div class="head"><span class="kind">¶</span><span class="dir" style="color:var(--good)">↑ out</span><span class="pv">cargo build --release -p mouse</span></div><span class="note" style="color:var(--txt3)">30 B</span></div><span class="ib">📌</span><span class="ib">✕</span></div>
+        <div class="clip"><div class="main"><div class="head"><span class="kind">🖼</span><span class="dir" style="color:var(--accent)">↓ in</span><span class="pv">image 1920×1080</span></div><span class="note" style="color:var(--txt3)">412 KB</span></div><span class="ib">📍</span><span class="ib">✕</span></div>
+        <div class="clip"><div class="main"><div class="head"><span class="kind">🗎</span><span class="dir" style="color:var(--accent)">↓ in</span><span class="pv">report-final.pdf</span></div><span class="note" style="color:var(--good)">2.3 MB · ready</span></div><span class="ib">📍</span><span class="ib">✕</span></div>
+        <div class="clip"><div class="main"><div class="head"><span class="kind">🗎</span><span class="dir" style="color:var(--accent)">↓ in</span><span class="pv">ubuntu-24.04.iso</span></div><span class="note" style="color:var(--accent)">6.1 GB · on the other computer · paste any time</span></div><span class="ib">📍</span><span class="ib">✕</span></div>
+        <div class="clip"><div class="main"><div class="head"><span class="kind">🗎</span><span class="dir" style="color:var(--accent)">↓ in</span><span class="pv">photos (folder)</span></div><span class="note" style="color:var(--txt3)">840 MB · paste it anywhere</span></div><span class="ib">📍</span><span class="ib">✕</span></div>
+        <div class="clip"><div class="main"><div class="head"><span class="kind">🗎</span><span class="dir" style="color:var(--accent)">↓ in</span><span class="pv">old-notes.txt</span></div><span class="note" style="color:var(--danger)">no longer at the recorded path on the other machine</span></div><span class="ib">📍</span><span class="ib">✕</span></div>
+      </div>
+      <span class="hint">7 of 25 entries · 2.1 MB of 64.0 MB</span>
+      <span class="hint">received files kept by mouse-rs: 2.3 MB in 1 file</span>
+    </div>
+    <div class="nav"><span class="ic">📋</span><div class="tx"><span class="t1">Clipboard settings</span><span class="t2">What to share, big files, how much history to keep</span></div><span class="chev">›</span></div>
+  </div>
+  <div class="footer"><span class="fb">copied again</span><button class="btn ghost">Save</button><button class="btn danger big">Stop sharing</button></div>
+</div></figure>
+
+<!-- ================= 6. STOPPED + MENU ================= -->
+<figure><figcaption><b>6 · Stopped, with the ⋯ menu open.</b> Empty clipboard state shown underneath. The footer button becomes "Start sharing".</figcaption>
+<div class="win">
+  <div class="header"><div class="title">mouse-rs</div><span class="pill stopped">stopped</span><button class="btn ghost dots">⋯</button></div>
+  <div class="menu"><div class="mi">⚙  Settings</div><div class="mi">Profiles…</div><div class="mi d">Quit mouse-rs</div></div>
+  <div class="hero">
+    <div class="chips">
+      <div class="chip active"><div class="name">🖥 kali-desktop</div><div class="detail">1440×900 · this computer</div><div class="has">● has the mouse</div></div>
+      <div class="link off">—</div>
+      <div class="chip"><div class="name">💻 waiting…</div><div class="detail">not connected</div><div class="has"></div></div>
+    </div>
+    <div class="heroline off">stopped</div>
+  </div>
+  <div class="tabs"><div class="seg">Connection</div><div class="seg on">Clipboard</div></div>
+  <div class="scroll">
+    <div class="card"><div class="row"><div style="flex:1;display:flex;flex-direction:column;gap:3px"><span class="section">History</span><span class="hint">Newest first · click an entry to copy it again</span></div><button class="btn ghost" style="padding:7px 12px;font-size:12px">Clear</button></div>
+      <span style="font-size:12px;color:var(--txt3)">Start sharing to build up clipboard history.</span></div>
+    <div class="nav"><span class="ic">📋</span><div class="tx"><span class="t1">Clipboard settings</span><span class="t2">What to share, big files, how much history to keep</span></div><span class="chev">›</span></div>
+  </div>
+  <div class="footer"><span class="fb"></span><button class="btn ghost">Save</button><button class="btn primary big">Start sharing</button></div>
+</div></figure>
+
+<!-- ================= 7. BANNERS ================= -->
+<figure><figcaption><b>7 · Banners that can appear above the tabs.</b> Restart needed (full and collapsed after "Later"), the Windows permissions notice, and waiting for the peer.</figcaption>
+<div class="win">
+  <div class="header"><div class="title">mouse-rs</div><span class="pill wait">waiting for peer…</span><button class="btn ghost dots">⋯</button></div>
+  <div class="hero">
+    <div class="chips">
+      <div class="chip active"><div class="name">🖥 MSI</div><div class="detail">1920×1080 · this computer</div><div class="has">● has the mouse</div></div>
+      <div class="link off">—</div>
+      <div class="chip"><div class="name">💻 waiting…</div><div class="detail">not connected</div><div class="has"></div></div>
+    </div>
+    <div class="heroline">waiting for peer…</div>
+  </div>
+  <div class="banner"><span style="font-size:14px;color:var(--warn)">⚠ Restart needed</span><span style="font-size:12px">2 changes saved but not yet active: machine name, exit edge.</span>
+    <div class="row"><button class="btn primary" style="font-size:12px;padding:8px 12px">Restart sharing now</button><button class="btn ghost" style="font-size:12px;padding:8px 12px">Later</button></div></div>
+  <div class="banner" style="padding:6px 10px"><span style="font-size:12px;color:var(--warn)">⚠ 2 changes saved but not yet active: machine name, exit edge.  (restart to apply)</span></div>
+  <div class="well"><span class="t1">mouse-rs is running with normal permissions</span>
+    <span class="hint">That is fine for everyday use. The one limitation: Windows will not let us see the mouse while a window running as administrator is in front — a game launcher, an installer, or a Windows permission prompt — so the pointer cannot cross to the other machine until you click away from it. No setting inside this program can change that; only running as administrator can.</span>
+    <div class="row"><button class="btn primary">Restart as administrator</button><button class="btn ghost">Keep normal permissions</button></div></div>
+  <div class="tabs"><div class="seg on">Connection</div><div class="seg">Clipboard</div></div>
+  <div class="scroll"></div>
+  <div class="footer"><span class="fb">saved</span><button class="btn ghost">Save</button><button class="btn danger big">Stop sharing</button></div>
+</div></figure>
+
+<!-- ================= 8. QUIT DIALOG ================= -->
+<figure><figcaption><b>8 · Quit while a transfer is running</b> (R33). Same dialog for Stop, Restart and Restart as administrator, with their own titles.</figcaption>
+<div class="win">
+  <div class="header"><div class="title">mouse-rs</div><span class="pill ok">connected — MSI (1920×1080)</span><button class="btn ghost dots">⋯</button></div>
+  <div class="hero"><div class="chips"><div class="chip active"><div class="name">🖥 kali-desktop</div><div class="detail">1440×900 · this computer</div><div class="has">● has the mouse</div></div><div class="link">⇄</div><div class="chip"><div class="name">💻 MSI</div><div class="detail">1920×1080</div><div class="has"></div></div></div><div class="heroline">connected to MSI</div></div>
+  <div class="tabs"><div class="seg">Connection</div><div class="seg on">Clipboard</div></div>
+  <div class="scroll"></div>
+  <div class="footer"><span class="fb"></span><button class="btn ghost">Save</button><button class="btn danger big">Stop sharing</button></div>
+  <div class="dim"><div class="dialog">
+    <span style="font-size:15px">Quit while a transfer is running?</span>
+    <span style="font-size:12.5px;color:var(--txt2)">holiday-video.mp4 is still coming over (22% of 1.4 GB).</span>
+    <span style="font-size:11.5px;color:var(--warn)">Stopping now ends it where it is; a half-pasted file stays incomplete.</span>
+    <div class="row" style="justify-content:flex-end"><button class="btn ghost">Keep going</button><button class="btn danger">Quit anyway</button></div>
+  </div></div>
+</div></figure>
+
+<!-- ================= 9. SETTINGS INDEX ================= -->
+<figure><figcaption><b>9 · ⋯ → Settings</b>, the list of categories. The hero is hidden on settings pages.</figcaption>
+<div class="win">
+  <div class="header"><div class="title">mouse-rs</div><span class="pill ok">connected — MSI (1920×1080)</span><button class="btn ghost dots">⋯</button></div>
+  <div class="sbar"><button class="btn ghost back">←</button><span class="pt">Settings</span></div>
+  <div class="scroll" style="gap:6px">
+    <div class="group">EVERYDAY</div>
+    <div class="nav"><span class="ic">📋</span><div class="tx"><span class="t1">Clipboard</span><span class="t2">What to share, history, files, transfers</span></div><span class="chev">›</span></div>
+    <div class="nav"><span class="ic">🖥</span><div class="tx"><span class="t1">Screens &amp; edges</span><span class="t2">Which side the other computer is on</span></div><span class="chev">›</span></div>
+    <div class="nav"><span class="ic">⏻</span><div class="tx"><span class="t1">Startup</span><span class="t2">Start at login, connect automatically</span></div><span class="chev">›</span></div>
+    <div class="nav"><span class="ic">⌨</span><div class="tx"><span class="t1">Keyboard &amp; hotkeys</span><span class="t2">Getting control back</span></div><span class="chev">›</span></div>
+    <div class="group">SETUP</div>
+    <div class="nav"><span class="ic">🔗</span><div class="tx"><span class="t1">Connection</span><span class="t2">Name, ports, reconnecting, profiles</span></div><span class="chev">›</span></div>
+    <div class="nav"><span class="ic">🔒</span><div class="tx"><span class="t1">Security &amp; pairing</span><span class="t2">Pairing, connection PIN, encryption</span></div><span class="chev">›</span></div>
+    <div class="nav"><span class="ic">🎨</span><div class="tx"><span class="t1">Appearance</span><span class="t2">Theme</span></div><span class="chev">›</span></div>
+    <div class="group">HELP &amp; ADVANCED</div>
+    <div class="nav"><span class="ic">🩺</span><div class="tx"><span class="t1">Diagnostics</span><span class="t2">Log file, sending logs for support</span></div><span class="chev">›</span></div>
+    <div class="nav"><span class="ic">ℹ</span><div class="tx"><span class="t1">About</span><span class="t2">Version, restore default settings</span></div><span class="chev">›</span></div>
+  </div>
+  <div class="footer"><span class="fb"></span><button class="btn ghost">Save</button><button class="btn danger big">Stop sharing</button></div>
+</div></figure>
+
+<!-- ================= 10. CLIPBOARD SETTINGS ================= -->
+<figure><figcaption><b>10 · Settings → Clipboard</b>, everyday part, with Advanced opened below (it scrolls; all of it is shown here).</figcaption>
+<div class="win" style="height:auto;min-height:720px">
+  <div class="header"><div class="title">mouse-rs</div><span class="pill ok">connected — MSI (1920×1080)</span><button class="btn ghost dots">⋯</button></div>
+  <div class="sbar"><button class="btn ghost back">←</button><span class="pt">Clipboard</span></div>
+  <div class="scroll" style="overflow:visible">
+    <div class="card" style="gap:12px">
+      <div class="section">Sharing</div>
+      <div class="toggle"><div class="t"><span class="t1">Sync clipboard</span><span class="t2">copy here, paste there — text and images</span></div><span class="sw on"></span></div>
+      <div class="toggle"><div class="t"><span class="t1">Notify me when a file is waiting</span><span class="t2">a desktop notification, never a pop-up — a window stealing focus is what caused the keyboard bug</span></div><span class="sw on"></span></div>
+      <div class="section">Big files</div>
+      <div class="field"><span class="label">Ask before bringing over anything larger than (MB)</span><div class="input">1</div></div>
+      <span class="hint">Under 1.0 MB it just arrives; over it, the entry waits for you.</span>
+      <div class="field"><span class="label">Or put received files straight into this folder</span><div class="input ph">/home/you/Desktop — blank to keep them on the clipboard only</div></div>
+      <span class="hint">Blank is normal — paste wherever you want it and that is where it goes. Set a folder only if you would rather files arrived automatically, with no paste at all.</span>
+      <div class="section">History</div>
+      <div class="field"><span class="label">Keep this many entries</span><div class="input">25</div></div>
+      <div class="toggle"><div class="t"><span class="t1">Keep history after restart</span><span class="t2">convenient — but clipboard contents, including anything you copied that was private, are written to your disk</span></div><span class="sw"></span></div>
+    </div>
+    <div class="adv">▾  Advanced</div>
+    <div class="card" style="gap:12px">
+      <div class="section">What crosses</div>
+      <div class="toggle"><div class="t"><span class="t1">Sync text</span><span class="t2">copied text crosses machines</span></div><span class="sw on"></span></div>
+      <div class="toggle"><div class="t"><span class="t1">Sync images</span><span class="t2">copied images cross machines</span></div><span class="sw on"></span></div>
+      <div class="toggle"><div class="t"><span class="t1">Sync files</span><span class="t2">any file or folder, any extension — no allow-list</span></div><span class="sw on"></span></div>
+      <div class="field"><span class="label">Most files in one copy</span><div class="input">10000</div></div>
+      <span class="hint">Bounds a stray click on an enormous folder. The rest is left behind, and the log says so.</span>
+      <div class="toggle"><div class="t"><span class="t1">Also copy images as a .png file</span><span class="t2">on: a copied image pastes into a browser AND into a file manager. Off: pixels only, and pasting into Explorer or Thunar does nothing.</span></div><span class="sw on"></span></div>
+      <div class="toggle"><div class="t"><span class="t1">Follow shortcuts inside copied folders</span><span class="t2">off by default: one pointing outside the folder quietly copies files you never picked</span></div><span class="sw"></span></div>
+      <div class="toggle"><div class="t"><span class="t1">Pasting a received file moves it there</span><span class="t2">on: the folder you paste into IS the destination, and a big file costs nothing to paste. Off: it is copied out of the cache, so a 40 GB file briefly uses 80 GB.</span></div><span class="sw on"></span></div>
+      <div class="section">Transfers</div>
+      <div class="field"><span class="label">Don't ask if it'll take under (seconds)</span><div class="input">3</div></div>
+      <span class="hint">On a fast link a big file lands in a moment, so asking is noise. Measured from real transfers, so it still asks on a slow one. Currently measuring ~48.2 MB/s.</span>
+      <div class="field"><span class="label">Paste files bigger than (MB) straight from the network</span><div class="input">64</div></div>
+      <span class="hint">Files from 64 MB up go network → memory → your folder: they use their own size on disk, once. Smaller ones pass through mouse-rs's cache first.</span>
+      <div class="field"><span class="label">Wait for a dropped connection (seconds)</span><div class="input">180</div></div>
+      <span class="hint">A paste whose transfer stops (cable pulled, Wi-Fi drop) pauses and continues from the same byte if the connection is back within this time; after that it fails.</span>
+      <div class="toggle"><div class="t"><span class="t1">Keep a resumable copy while pasting</span><span class="t2">uses the file's size again in disk while a paste runs, but a paste cut short — even by a restart — continues where it stopped when you copy and paste the same file again</span></div><span class="sw"></span></div>
+      <div class="toggle"><div class="t"><span class="t1">Slow transfers while I'm on the other machine</span><span class="t2">only if the pointer starts to lag; otherwise transfers run at the network's full speed</span></div><span class="sw on"></span></div>
+      <div class="field"><span class="label">Transfer speed limit (MB/s, 0 = automatic)</span><div class="input">0</div></div>
+      <span class="hint">Automatic watches your mouse latency and backs off by itself. Pin a number if you'd rather decide.</span>
+      <div class="field"><span class="label">Send buffer (MB)</span><div class="input">8</div></div>
+      <span class="hint">How much of a file may sit in memory waiting to go out. This is what keeps a 4 GB copy costing the same as a 4 MB one — right now, at most 8.0 MB.</span>
+      <div class="toggle"><div class="t"><span class="t1">Separate lane for large transfers</span><span class="t2">stops big items queueing in front of the mouse</span></div><span class="sw on"></span></div>
+      <div class="field"><span class="label">Port for that lane (blank = share the main one)</span><div class="input ph">same port</div></div>
+      <span class="hint">Sharing one port — nothing extra to open in a firewall.</span>
+      <div class="field"><span class="label">Don't fingerprint files bigger than (MB)</span><div class="input">64</div></div>
+      <span class="hint">Files up to this size are checked by their content when they arrive; bigger ones by their size, so copying a film is announced at once instead of after reading it all.</span>
+      <div class="section">Storage &amp; memory</div>
+      <div class="field"><span class="label">Disk for transferred files (GB)</span><div class="input">2</div></div>
+      <span class="hint">Oldest go first when it fills. Pinned entries are never removed.</span>
+      <div class="field"><span class="label">Folder for transferred files</span><div class="input ph">blank = ~/.mouse_share/cache</div></div>
+      <div class="field"><span class="label">Biggest item to keep (MB)</span><div class="input">5</div></div>
+      <div class="field"><span class="label">Memory budget (MB)</span><div class="input">64</div></div>
+      <span class="hint">This configuration can hold up to 64.0 MB. Pinned entries are never evicted.</span>
+      <div class="field"><span class="label">Largest image edge (px)</span><div class="input">4096</div></div>
+      <span class="hint">An image this size costs about 64.0 MB of memory for a moment while it is compressed.</span>
+      <div class="field"><span class="label">Send images inline up to (KB)</span><div class="input">256</div></div>
+      <span class="hint">Bigger images take the separate lane instead, so they can't stall the mouse. Lower this on a slow link; raise it to skip the extra round trip on a fast one.</span>
+    </div>
+  </div>
+  <div class="footer"><span class="fb"></span><button class="btn ghost">Save</button><button class="btn danger big">Stop sharing</button></div>
+</div></figure>
+
+<!-- ================= 11. SCREENS ================= -->
+<figure><figcaption><b>11 · Settings → Screens &amp; edges — on the laptop (server)</b>, with the overlap warning and Advanced open. The client sees only the entry edge, worded "where the pointer arrives, and where to push back".</figcaption>
+<div class="win">
+  <div class="header"><div class="title">mouse-rs</div><span class="pill ok">connected — kali-desktop (1440×900)</span><button class="btn ghost dots">⋯</button></div>
+  <div class="sbar"><button class="btn ghost back">←</button><span class="pt">Screens &amp; edges</span></div>
+  <div class="scroll">
+    <div class="card"><div class="section">Arrangement</div>
+      <span class="label">Exit edge — the pointer leaves this screen here</span>
+      <div class="edge"><span class="e top"></span><span class="e lft"></span><span class="scr">screen</span><span class="e rgt sel"></span><span class="e bot"></span></div>
+      <span class="warntext">⚠ Leaving at the right edge should bring the cursor in at the left edge of the other screen — top will feel like the screens overlap.</span>
+      <span class="label">Entry edge — the pointer appears here on the other screen</span>
+      <div class="edge"><span class="e top sel"></span><span class="e lft"></span><span class="scr">screen</span><span class="e rgt"></span><span class="e bot"></span></div>
+      <span class="hint">Set this to the edge facing this machine, so the two screens sit side by side rather than overlapping.</span></div>
+    <div class="adv">▾  Advanced</div>
+    <div class="card"><div class="section">This screen</div><span class="label">Screen size (px)</span>
+      <div class="row"><div class="input">1920</div><span style="color:var(--txt3);font-size:16px">×</span><div class="input">1080</div><button class="btn ghost">Detect</button></div>
+      <span class="hint">The engine re-detects this on Start; edit only to override.</span>
+      <div class="section">Crossing feel</div>
+      <div class="field"><span class="label">Edge sensitivity (px from the edge)</span><div class="input">2</div></div>
+      <span class="hint">How close to the edge the pointer must get before it crosses. Raise it if crossing is hard to hit; 0 means the very last pixel.</span></div>
+  </div>
+  <div class="footer"><span class="fb"></span><button class="btn ghost">Save</button><button class="btn danger big">Stop sharing</button></div>
+</div></figure>
+
+<!-- ================= 12. STARTUP ================= -->
+<figure><figcaption><b>12 · Settings → Startup.</b> Top: Windows (permissions line and "as administrator"). Bottom: Linux (login-screen sharing) and its one-time explanation, which appears above the tabs when it is first turned on.</figcaption>
+<div class="win" style="height:auto;min-height:720px">
+  <div class="header"><div class="title">mouse-rs</div><span class="pill ok">connected — kali-desktop (1440×900)</span><button class="btn ghost dots">⋯</button></div>
+  <div class="sbar"><button class="btn ghost back">←</button><span class="pt">Startup</span></div>
+  <div class="scroll" style="overflow:visible">
+    <div class="card"><div class="section">When I log in — Windows</div>
+      <div class="toggle"><div class="t"><span class="t1">Start at login</span><span class="t2">adds a per-user entry under the Windows Run key</span></div><span class="sw on"></span></div>
+      <div class="toggle"><div class="t"><span class="t1">Auto-connect on launch</span><span class="t2">begin sharing as soon as the panel opens</span></div><span class="sw on"></span></div>
+      <div class="toggle"><div class="t"><span class="t1">Start minimized</span><span class="t2">open out of the way, into the tray/taskbar</span></div><span class="sw"></span></div>
+      <div class="row"><span style="flex:1;font-size:12px;color:var(--txt2)">Permissions: normal</span><button class="btn ghost" style="font-size:11.5px;padding:7px 12px">Restart as administrator</button></div>
+      <div class="toggle"><div class="t"><span class="t1">Start at login as administrator</span><span class="t2">keeps administrator rights after a reboot — a normal login entry always starts without them. Setting this up needs mouse-rs to be running as administrator now.</span></div><span class="sw"></span></div>
+    </div>
+    <div class="card"><div class="section">When I log in — Linux</div>
+      <div class="toggle"><div class="t"><span class="t1">Start at login</span><span class="t2">adds ~/.config/autostart/mouse-rs.desktop</span></div><span class="sw on"></span></div>
+      <div class="toggle"><div class="t"><span class="t1">Auto-connect on launch</span><span class="t2">begin sharing as soon as the panel opens</span></div><span class="sw on"></span></div>
+      <div class="toggle"><div class="t"><span class="t1">Start minimized</span><span class="t2">open out of the way, into the tray/taskbar</span></div><span class="sw"></span></div>
+      <div class="toggle"><div class="t"><span class="t1">Share input at the login screen</span><span class="t2">starts before the password prompt, as a system service, so the other machine's keyboard can type it. Needs your password to set up, and accepts keystrokes over the network before anyone has signed in.</span></div><span class="sw on"></span></div>
+      <span class="warntext">the login screen runs an older version than this one — turn it off and on to update it</span>
+    </div>
+    <div class="well"><span class="t1">Share the keyboard before anyone logs in?</span>
+      <span class="hint">This installs a small system service that starts at boot, like NetworkManager does, so the other machine's keyboard works at the password screen and you no longer need a second one plugged in here.</span>
+      <span class="warntext">What it costs: this machine will accept keystrokes over the network before anyone has signed in. Anything holding your shared secret could type at the password prompt, so that secret becomes what stands between your network and this login. The service needs administrator rights to install, and asks for your password now.</span>
+      <div class="row"><button class="btn primary">Turn it on</button><button class="btn ghost">Leave it off</button></div></div>
+  </div>
+  <div class="footer"><span class="fb">set a password first: whoever drives the login screen will be asked for it</span><button class="btn ghost">Save</button><button class="btn danger big">Stop sharing</button></div>
+</div></figure>
+
+<!-- ================= 13. KEYS ================= -->
+<figure><figcaption><b>13 · Settings → Keyboard &amp; hotkeys</b>, Advanced open.</figcaption>
+<div class="win">
+  <div class="header"><div class="title">mouse-rs</div><span class="pill ok">connected — kali-desktop (1440×900)</span><button class="btn ghost dots">⋯</button></div>
+  <div class="sbar"><button class="btn ghost back">←</button><span class="pt">Keyboard &amp; hotkeys</span></div>
+  <div class="scroll">
+    <div class="card"><div class="section">Getting control back</div>
+      <div class="field"><span class="label">Lock / cross hotkey</span><div class="input">scroll_lock</div></div>
+      <span class="hint">Single key. Always returns control, even if the network or engine has wedged.</span></div>
+    <div class="adv">▾  Advanced</div>
+    <div class="card"><div class="field"><span class="label">Return hotkey (server)</span><div class="input ph">ctrl+win+alt+esc</div></div>
+      <span class="hint">Optional combo, matched on whichever machine is the server. Empty = none.</span></div>
+  </div>
+  <div class="footer"><span class="fb"></span><button class="btn ghost">Save</button><button class="btn danger big">Stop sharing</button></div>
+</div></figure>
+
+<!-- ================= 14. CONNECTION ================= -->
+<figure><figcaption><b>14 · Settings → Connection — on the laptop (server)</b>, Advanced open. A client shows "Auto-reconnect" under the name, and only "Server port" under Ports.</figcaption>
+<div class="win" style="height:auto;min-height:720px">
+  <div class="header"><div class="title">mouse-rs</div><span class="pill ok">connected — kali-desktop (1440×900)</span><button class="btn ghost dots">⋯</button></div>
+  <div class="sbar"><button class="btn ghost back">←</button><span class="pt">Connection</span></div>
+  <div class="scroll" style="overflow:visible">
+    <div class="card"><div class="section">This computer</div><div class="field"><span class="label">Machine name</span><div class="input">MSI</div></div>
+      <div class="toggle"><div class="t"><span class="t1">Auto-reconnect</span><span class="t2">retry with backoff until the server appears  (client only)</span></div><span class="sw on"></span></div></div>
+    <div class="card" style="gap:8px"><span class="label">Profiles</span>
+      <span class="hint">A named snapshot of all your settings — peer address, edges, screen size, hotkeys, secret. Save one per setup (say "desk" and "travel") and switch without retyping. Loading one fills the form; press Save to keep it.</span>
+      <div class="row"><div class="select"><span style="color:var(--txt3)">no profiles saved yet</span><span>⌄</span></div><button class="btn ghost" style="font-size:12px;padding:8px 12px">Load</button><button class="btn ghost" style="font-size:12px;padding:8px 12px">Delete</button></div>
+      <div class="row"><div class="input ph">name this setup…</div><button class="btn ghost" style="font-size:12px;padding:8px 12px">Save as</button></div>
+      <span class="hint" style="font-size:10.5px">Stored in ~/.mouse_share/profiles/. They include the shared secret.</span></div>
+    <div class="adv">▾  Advanced</div>
+    <div class="card"><div class="section">Ports</div>
+      <div class="field"><span class="label">Listen host</span><div class="input">0.0.0.0</div></div>
+      <div class="field"><span class="label">This machine's addresses</span><div class="select"><span>192.168.137.1</span><span>⌄</span></div></div>
+      <div class="field"><span class="label">Listen port</span><div class="input">24800</div></div>
+      <div class="field"><span class="label">Discovery port (finding the other computer)</span><div class="input">24801</div></div>
+      <span class="hint">The two computers find each other on this UDP port. Same number on both; 0 turns finding off, and the address on the main window is used instead.</span></div>
+  </div>
+  <div class="footer"><span class="fb"></span><button class="btn ghost">Save</button><button class="btn danger big">Stop sharing</button></div>
+</div></figure>
+
+<!-- ================= 15. SECURITY CLIENT ================= -->
+<figure><figcaption><b>15 · Settings → Security &amp; pairing — on Kali (client)</b>, with a password set and Advanced open. This is where the password lives.</figcaption>
+<div class="win" style="height:auto;min-height:720px">
+  <div class="header"><div class="title">mouse-rs</div><span class="pill ok">connected — MSI (1920×1080)</span><button class="btn ghost dots">⋯</button></div>
+  <div class="sbar"><button class="btn ghost back">←</button><span class="pt">Security &amp; pairing</span></div>
+  <div class="scroll" style="overflow:visible">
+    <div class="card"><div class="section">Pairing</div>
+      <div class="row"><div class="input ph">6-digit code</div><button class="btn primary">Pair</button></div>
+      <span class="hint">Only for first-time setup: on the computer with the mouse, press "Pair a new device" and type the code it shows here.</span></div>
+    <div class="card" style="gap:8px"><div class="section">Connection PIN</div>
+      <div class="row"><span style="flex:1;font-size:14px">Password: ••••</span><button class="btn ghost" style="padding:7px 12px">Show</button></div>
+      <span class="hint">Whoever wants to drive this computer types this password on their own computer. 3 wrong tries and this computer accepts none for 1 hour, then 2, 4, 8 hours…</span>
+      <div class="toggle"><div class="t"><span class="t1">Ask when someone is logged in here</span><span class="t2">off by default</span></div><span class="sw on"></span></div>
+      <div class="toggle"><div class="t"><span class="t1">Ask at the login screen</span><span class="t2">on by default; only matters when login-screen sharing is on (Settings → Startup)</span></div><span class="sw on"></span></div>
+      <span class="label">New password (forgot it? just set a new one — being at this computer is enough)</span>
+      <div class="row"><div class="input ph">password</div><div class="input ph">again</div></div>
+      <div><button class="btn primary">Change password</button></div></div>
+    <div class="adv">▾  Advanced</div>
+    <div class="card"><span class="label">Shared secret — identical on both machines (pairing sets it for you)</span>
+      <div class="row"><div class="input">••••••••••••••••••••••••••••••••</div><button class="btn ghost">Show</button><button class="btn ghost">Generate</button></div>
+      <div class="toggle"><div class="t"><span class="t1">Encrypt link (TLS)</span><span class="t2">rustls, self-signed cert</span></div><span class="sw on"></span></div></div>
+  </div>
+  <div class="footer"><span class="fb">password saved</span><button class="btn ghost">Save</button><button class="btn danger big">Stop sharing</button></div>
+</div></figure>
+
+<!-- ================= 16. SECURITY SERVER ================= -->
+<figure><figcaption><b>16 · Settings → Security &amp; pairing — on the laptop (server)</b>, showing a pairing code. Before pressing it, the card shows only the "Pair a new device" button (below).</figcaption>
+<div class="win">
+  <div class="header"><div class="title">mouse-rs</div><span class="pill ok">connected — kali-desktop (1440×900)</span><button class="btn ghost dots">⋯</button></div>
+  <div class="sbar"><button class="btn ghost back">←</button><span class="pt">Security &amp; pairing</span></div>
+  <div class="scroll">
+    <div class="card"><div class="section">Pairing</div>
+      <div style="display:flex;flex-direction:column;gap:6px"><span style="font-size:12px;color:var(--txt2)">Type this code on the other computer (its main window, "Pair with a code"):</span>
+      <span class="code">482 913</span>
+      <div class="row"><span class="hint" style="flex:1">valid for 4:37 · works once</span><button class="btn ghost" style="padding:7px 12px">Cancel</button></div></div></div>
+    <div class="card"><div class="section">Pairing — before a code is shown</div>
+      <div><button class="btn primary">Pair a new device</button></div>
+      <span class="hint">Only for setting up a new computer. Press it, then type the 6-digit code it shows into that computer's mouse-rs window. The two are then linked and find each other by themselves from then on.</span></div>
+    <div class="card"><div class="section">Connection PIN</div>
+      <span style="font-size:12px;color:var(--txt2)">The password belongs to the computer you drive, and is set there. When it asks, a box appears on this window's main page; type its password there. It is asked once each time mouse-rs starts here, not after a Wi-Fi drop.</span></div>
+    <div class="adv">▸  Advanced</div>
+  </div>
+  <div class="footer"><span class="fb">pairing code shown; type it on the other computer</span><button class="btn ghost">Save</button><button class="btn danger big">Stop sharing</button></div>
+</div></figure>
+
+<!-- ================= 17. APPEARANCE ================= -->
+<figure><figcaption><b>17 · Settings → Appearance.</b> The six themes; the swatch is each theme's accent gradient.</figcaption>
+<div class="win">
+  <div class="header"><div class="title">mouse-rs</div><span class="pill ok">connected — kali-desktop (1440×900)</span><button class="btn ghost dots">⋯</button></div>
+  <div class="sbar"><button class="btn ghost back">←</button><span class="pt">Appearance</span></div>
+  <div class="scroll">
+    <div class="card" style="gap:8px"><div class="section">Theme</div>
+      <div class="swatchrow on"><span class="sw18" style="background:linear-gradient(135deg,#38d6e6,#6a7bff)"></span>Midnight</div>
+      <div class="swatchrow"><span class="sw18" style="background:linear-gradient(135deg,#ff7a3d,#ffb23d)"></span>Oxide</div>
+      <div class="swatchrow"><span class="sw18" style="background:linear-gradient(135deg,#ff4fa3,#31d0ff)"></span>Synthwave</div>
+      <div class="swatchrow"><span class="sw18" style="background:linear-gradient(135deg,#39ff88,#7dffb0)"></span>Matrix</div>
+      <div class="swatchrow"><span class="sw18" style="background:linear-gradient(135deg,#88c0d0,#a3be8c)"></span>Nord</div>
+      <div class="swatchrow"><span class="sw18" style="background:linear-gradient(135deg,#5b52e0,#e0527a)"></span>Paper</div></div>
+  </div>
+  <div class="footer"><span class="fb"></span><button class="btn ghost">Save</button><button class="btn danger big">Stop sharing</button></div>
+</div></figure>
+
+<!-- ================= 18. DIAGNOSTICS ================= -->
+<figure><figcaption><b>18 · Settings → Diagnostics</b>, Advanced open.</figcaption>
+<div class="win">
+  <div class="header"><div class="title">mouse-rs</div><span class="pill ok">connected — kali-desktop (1440×900)</span><button class="btn ghost dots">⋯</button></div>
+  <div class="sbar"><button class="btn ghost back">←</button><span class="pt">Diagnostics</span></div>
+  <div class="scroll">
+    <div class="card" style="gap:6px"><div class="section">Log file</div><span class="hint">C:\Users\you\.mouse_share\mouse-rs.log</span></div>
+    <div class="adv">▾  Advanced</div>
+    <div class="card"><div class="section">Send logs for support</div>
+      <div class="field"><span class="label">Log upload address</span><div class="input ph">blank = never sent</div></div>
+      <div class="field"><span class="label">Send every (seconds)</span><div class="input">30</div></div>
+      <span class="hint">Nothing leaves this computer unless an address is set. Takes effect the next time mouse-rs starts.</span></div>
+  </div>
+  <div class="footer"><span class="fb"></span><button class="btn ghost">Save</button><button class="btn danger big">Stop sharing</button></div>
+</div></figure>
+
+<!-- ================= 19. ABOUT ================= -->
+<figure><figcaption><b>19 · Settings → About.</b></figcaption>
+<div class="win">
+  <div class="header"><div class="title">mouse-rs</div><span class="pill ok">connected — kali-desktop (1440×900)</span><button class="btn ghost dots">⋯</button></div>
+  <div class="sbar"><button class="btn ghost back">←</button><span class="pt">About</span></div>
+  <div class="scroll">
+    <div class="card" style="gap:12px"><div class="section">mouse-rs</div><span style="font-size:12.5px;color:var(--txt2)">Version 0.1.0</span>
+      <div><button class="btn ghost" style="color:var(--danger)">Restore default settings</button></div>
+      <span class="hint">Resets preferences only — keeps this computer's name, shared secret and screen size. Applied to the form; press Save to keep it.</span></div>
+  </div>
+  <div class="footer"><span class="fb"></span><button class="btn ghost">Save</button><button class="btn danger big">Stop sharing</button></div>
+</div></figure>
+
+</div>
+
+<script>
+document.querySelectorAll('.top button').forEach(b => b.addEventListener('click', () => {
+  document.querySelectorAll('.top button').forEach(x => x.classList.toggle('on', x === b));
+  if (b.dataset.p) document.documentElement.setAttribute('data-pal', b.dataset.p);
+  else document.documentElement.removeAttribute('data-pal');
+}));
+</script>
+</body>
+</html>
