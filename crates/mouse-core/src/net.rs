@@ -411,6 +411,12 @@ pub async fn run_server(
                         tracing::info!("{reason}");
                         continue;
                     }
+                    // Opened and closed without a word: a client that raced several of our
+                    // addresses and kept a better one, or a Detect scan. Not a login attempt.
+                    Ok(Err(reason)) if reason == "peer closed before hello" => {
+                        tracing::debug!("{peer_addr} connected and left without a hello");
+                        continue;
+                    }
                     Ok(Err(reason)) => {
                         let _ = events.send(LinkEvent::AuthFailed(reason));
                         continue;
@@ -693,7 +699,7 @@ async fn connect_once(
         }
         raced = tokio::select! {
             _ = cancel.cancelled() => return AttemptOutcome::Cancelled,
-            r = race_connect(&group, CONNECT_TRY) => r,
+            r = race_connect(&group, CONNECT_TRY, cfg.network_preference) => r,
         };
         if raced.is_some() {
             break;
@@ -711,8 +717,9 @@ async fn connect_once(
     health.set_peer(addr);
     note_peer_ip(addr.ip());
     tracing::info!(
-        "link to {addr} goes out through {} (candidates tried: {listing})",
-        local_path(tcp.local_addr().ok())
+        "link to {addr} goes out through {} (candidates tried: {listing}; preference: {})",
+        local_path(tcp.local_addr().ok()),
+        cfg.network_preference
     );
     enable_keepalive(&tcp);
     crate::qos::prioritise_input(&tcp);
@@ -1320,17 +1327,71 @@ async fn accept_any(
     }
 }
 
-async fn race_connect(targets: &[SocketAddr], per: Duration) -> Option<(SocketAddr, TcpStream)> {
+/// Once a less preferred network has answered, how long a preferred one still pending gets
+/// to answer too. Short: on a working cable the answer takes about a millisecond.
+const PREFER_WAIT: Duration = Duration::from_millis(400);
+
+/// How much `pref` wants `addr`, lower first: the network it is reached on directly (its
+/// subnet is one of this machine's), then any network, then through a router or tunnel.
+fn path_rank(addr: &SocketAddr, pref: crate::config::NetworkPreference) -> u8 {
+    use crate::config::NetworkPreference as P;
+    use discover::NetKind as K;
+    let kind = match addr {
+        SocketAddr::V4(a) => discover::on_link_kind(*a.ip()),
+        SocketAddr::V6(_) => None,
+    };
+    match (pref, kind) {
+        (P::Fastest, _) => 0,
+        (P::Cable, Some(K::Cable)) | (P::Wifi, Some(K::Wifi)) => 0,
+        (_, Some(K::Cable | K::Wifi)) => 1,
+        (_, Some(K::Other)) => 2,
+        (_, None) => 3,
+    }
+}
+
+/// Connect to every candidate at once and keep the best that accepts: the preferred
+/// network's if it answers within [`PREFER_WAIT`] of the first answer, else the first.
+/// Racing means a dead address costs nothing; ranking means a Wi-Fi address that happens
+/// to answer first no longer wins over the cable (27 Oct 2026: after a network change the
+/// laptop's Wi-Fi address won the race and the link was counted as Wi-Fi for a minute).
+async fn race_connect(
+    targets: &[SocketAddr],
+    per: Duration,
+    pref: crate::config::NetworkPreference,
+) -> Option<(SocketAddr, TcpStream)> {
+    let ranks: Vec<u8> = targets.iter().map(|a| path_rank(a, pref)).collect();
+    let mut pending = vec![true; targets.len()];
     let mut attempts: FuturesUnordered<_> = targets
         .iter()
-        .map(|a| async move { (*a, timeout(per, TcpStream::connect(a)).await) })
+        .enumerate()
+        .map(|(i, a)| async move { (i, timeout(per, TcpStream::connect(a)).await) })
         .collect();
-    while let Some((addr, result)) = attempts.next().await {
+    let mut best: Option<(u8, SocketAddr, TcpStream)> = None;
+    let mut deadline: Option<Instant> = None;
+    loop {
+        if let Some((have, ..)) = &best {
+            let better_pending = (0..targets.len()).any(|i| pending[i] && ranks[i] < *have);
+            if !better_pending {
+                break;
+            }
+        }
+        let next = match deadline {
+            Some(d) => tokio::select! {
+                r = attempts.next() => r,
+                _ = tokio::time::sleep_until(d) => break,
+            },
+            None => attempts.next().await,
+        };
+        let Some((i, result)) = next else { break };
+        pending[i] = false;
         if let Ok(Ok(stream)) = result {
-            return Some((addr, stream));
+            if best.as_ref().map_or(true, |(have, ..)| ranks[i] < *have) {
+                best = Some((ranks[i], targets[i], stream));
+                deadline.get_or_insert_with(|| Instant::now() + PREFER_WAIT);
+            }
         }
     }
-    None
+    best.map(|(_, addr, stream)| (addr, stream))
 }
 
 /// Pointer motion over UDP for this session (see `motion_udp`).
@@ -2372,7 +2433,7 @@ mod tests {
             SocketAddr::from(([127, 0, 0, 1], dead)),
             live_addr,
         ];
-        let got = race_connect(&targets, Duration::from_secs(2)).await;
+        let got = race_connect(&targets, Duration::from_secs(2), crate::config::NetworkPreference::Fastest).await;
         assert_eq!(got.map(|(a, _)| a), Some(live_addr));
     }
 

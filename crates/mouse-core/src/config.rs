@@ -16,6 +16,34 @@ pub enum Role {
     Client,
 }
 
+/// Which network the client's link should use when the server is reachable over more than
+/// one (owner, 27 Oct 2026: "cable should be priority for me… choose from the drop down").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum NetworkPreference {
+    /// Ethernet first, then Wi-Fi, then anything else.
+    #[default]
+    Cable,
+    /// Wi-Fi first, then Ethernet.
+    Wifi,
+    /// Whichever address answers first.
+    Fastest,
+}
+
+impl NetworkPreference {
+    pub const ALL: [NetworkPreference; 3] = [NetworkPreference::Cable, NetworkPreference::Wifi, NetworkPreference::Fastest];
+}
+
+impl std::fmt::Display for NetworkPreference {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            NetworkPreference::Cable => "Cable (Ethernet) first",
+            NetworkPreference::Wifi => "Wi-Fi first",
+            NetworkPreference::Fastest => "Whichever answers first",
+        })
+    }
+}
+
 /// A screen edge the cursor can cross through.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -379,6 +407,8 @@ pub struct Config {
 
     // client side
     pub server_host: String,
+    /// Client: which network to use when the server is reachable over several.
+    pub network_preference: NetworkPreference,
     #[serde(default = "default_port")]
     pub server_port: u16,
     /// UDP port for the discovery beacons (see `beacon`). The server sends on it and the
@@ -471,6 +501,7 @@ impl Default for Config {
             // configured one, so "restore defaults" used to hand back a plausible
             // wrong answer. Empty is honest, and the panel offers Detect.
             server_host: String::new(),
+            network_preference: NetworkPreference::Cable,
             server_port: default_port(),
             discovery_port: default_discovery_port(),
             at_login_screen: false,

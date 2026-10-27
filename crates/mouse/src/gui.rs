@@ -190,6 +190,7 @@ enum Message {
     LockHotkeyChanged(String),
     ReturnHotkeyChanged(String),
     ServerHostChanged(String),
+    NetworkPreferencePicked(mouse_core::NetworkPreference),
     ServerPortChanged(String),
     ListenHostChanged(String),
     ListenPortChanged(String),
@@ -321,6 +322,7 @@ fn pending_restart_changes(live: &Config, now: &Config) -> Vec<&'static str> {
     chk(live.listen_port != now.listen_port, "listen port");
     chk(live.server_host != now.server_host, "server host");
     chk(live.server_port != now.server_port, "server port");
+    chk(live.network_preference != now.network_preference, "preferred network");
     chk(live.reconnect != now.reconnect, "auto-reconnect");
     chk(live.edge_threshold_px != now.edge_threshold_px, "edge sensitivity");
     chk(live.discovery_port != now.discovery_port, "discovery port");
@@ -1581,6 +1583,7 @@ impl App {
                 self.cfg.pin_reminder_off = true;
                 let _ = self.cfg.save(&Config::default_path());
             }
+            Message::NetworkPreferencePicked(v) => self.cfg.network_preference = v,
             Message::RestartNow => return self.leave(Leave::Restart),
             Message::RestartLater => {
                 self.restart_hint_dismissed = true;
@@ -3389,6 +3392,23 @@ impl App {
         .spacing(14.0);
         if !server_side {
             basic = basic.push(toggle_row(p, "Auto-reconnect", "retry with backoff until the server appears", self.cfg.reconnect, Message::ReconnectToggled));
+            basic = basic.push(labeled(
+                p,
+                "Preferred network",
+                pick_list(
+                    mouse_core::NetworkPreference::ALL,
+                    Some(self.cfg.network_preference),
+                    Message::NetworkPreferencePicked,
+                )
+                .width(Length::Fill)
+                .padding([10.0, 12.0])
+                .text_size(13.0),
+            ));
+            basic = basic.push(
+                text("When the other computer can be reached over both the cable and Wi-Fi, use this one. If it stops working, the other takes over by itself; plugging the cable back in switches back.")
+                    .size(11.0)
+                    .color(p.txt3),
+            );
         }
 
         let mut adv = column![section(p, "Ports")].spacing(14.0);

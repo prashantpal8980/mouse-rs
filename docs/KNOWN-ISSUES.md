@@ -917,3 +917,17 @@ end frame, the paste is recorded. Test:
 - The counters live in memory: the login-screen service restarting (it restarts when a session ends) resets its count.
 - The login screen reads the password from `/etc/mouse-rs/config.json`. The panel refreshes it after a change only
   while login-screen sharing is on, and only if the user accepts the permission prompt.
+
+### B41 — pointer shook back and forth on the cable (27 Oct 2026) — **fixed in code, not yet confirmed by the owner**
+Owner: "even when i was on ethernet… the mouse go front and back… like it is vibrating". Kali's log, 14:24 UTC: delay
+1 ms, round trip 0.5 ms, yet 3,498 guessed frames for 1,235 real moves in a minute. At a 1 ms delay, playback passed the
+newest move between every two moves and guessed ahead; when the hand slowed, the guess was ahead of it and had to come
+back. Fix: guess only once the next move is overdue by 1.5 × the usual gap between moves. A new test drives a slowing
+hand over a clean link and fails if the pointer is ever ahead of the hand (it failed on the old code: 21.75 px vs 20).
+
+### B42 — the link could pick Wi-Fi with the cable plugged in (27 Oct 2026) — **fixed in code**
+After a network change at 14:09:34 UTC the client raced all the laptop's addresses and its Wi-Fi address answered
+first, so for a minute the laptop counted the link as Wi-Fi. The race now ranks addresses by the network they are
+reached on (R39) and waits up to 400 ms for the preferred one. A connection that opens and closes without a hello
+(a dropped race loser, a Detect scan) is no longer reported by the server as a failed login.
+

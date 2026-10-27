@@ -262,3 +262,10 @@ Typing an IP address stays available as an Advanced option.
   With no server address set, the client tries every machine on its networks that answers on the server port. The code
   works once and dies after 3 wrong tries. A fresh server's placeholder secret is replaced by a random one first.
   The typed shared secret moved to Security → Advanced.
+
+### R39 — preferred network (agreed 2026-10-27)
+When the server can be reached over both the cable and Wi-Fi, the client uses the one the user prefers. Settings →
+Connection on the client: **Preferred network** = Cable (Ethernet) first (default) / Wi-Fi first / Whichever answers
+first. Owner: "cable should be priority for me… choose from the drop down". If the preferred network stops working the
+other takes over, and the network watch switches back when it returns.
+

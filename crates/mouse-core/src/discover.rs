@@ -24,6 +24,62 @@ pub struct LocalAddr {
     pub prefix: u8,
 }
 
+/// What kind of network an interface is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NetKind {
+    Cable,
+    Wifi,
+    /// A tunnel, bridge or anything not recognised (Tailscale, VPNs, virtual adapters).
+    Other,
+}
+
+/// The kind of the interface called `iface`. On Linux the kernel says: a wireless device
+/// has `/sys/class/net/<name>/wireless`, a physical one has `device`. On Windows the
+/// interface's name is all there is, and the system names them "Ethernet…" and "Wi-Fi…".
+pub fn iface_kind(iface: &str) -> NetKind {
+    #[cfg(target_os = "linux")]
+    {
+        let base = std::path::Path::new("/sys/class/net").join(iface);
+        if base.exists() {
+            if base.join("wireless").exists() || base.join("phy80211").exists() {
+                return NetKind::Wifi;
+            }
+            if base.join("device").exists() {
+                return NetKind::Cable;
+            }
+            return NetKind::Other;
+        }
+    }
+    kind_from_name(iface)
+}
+
+fn kind_from_name(iface: &str) -> NetKind {
+    let n = iface.to_ascii_lowercase();
+    if ["wi-fi", "wifi", "wlan", "wireless", "wlp", "wlo"].iter().any(|k| n.contains(k)) {
+        NetKind::Wifi
+    } else if ["tailscale", "vpn", "tun", "tap", "wg", "zt", "vethernet", "virtual", "loopback"].iter().any(|k| n.contains(k)) {
+        NetKind::Other
+    } else if ["ethernet", "eth", "enp", "eno", "ens", "enx", "lan"].iter().any(|k| n.contains(k)) {
+        NetKind::Cable
+    } else {
+        NetKind::Other
+    }
+}
+
+/// The kind of network `target` is reached through directly: the interface whose subnet
+/// contains it. `None` when it is on none of them (reached through a router or a tunnel).
+pub fn on_link_kind(target: Ipv4Addr) -> Option<NetKind> {
+    local_ipv4s().into_iter().find(|a| same_subnet(a.ip, target, a.prefix)).map(|a| iface_kind(&a.iface))
+}
+
+fn same_subnet(a: Ipv4Addr, b: Ipv4Addr, prefix: u8) -> bool {
+    if prefix == 0 || prefix > 32 {
+        return false;
+    }
+    let mask = u32::MAX << (32 - prefix as u32);
+    (u32::from(a) & mask) == (u32::from(b) & mask)
+}
+
 /// Every non-loopback IPv4 address on this machine, with its subnet size.
 pub fn local_ipv4s() -> Vec<LocalAddr> {
     let Ok(ifaces) = if_addrs::get_if_addrs() else {
@@ -147,6 +203,25 @@ pub fn scan_for_servers(port: u16, timeout: Duration) -> Vec<Ipv4Addr> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn interface_names_say_cable_wifi_or_other() {
+        assert_eq!(kind_from_name("Ethernet 2"), NetKind::Cable);
+        assert_eq!(kind_from_name("eth0"), NetKind::Cable);
+        assert_eq!(kind_from_name("enp3s0"), NetKind::Cable);
+        assert_eq!(kind_from_name("Wi-Fi 2"), NetKind::Wifi);
+        assert_eq!(kind_from_name("wlan0"), NetKind::Wifi);
+        assert_eq!(kind_from_name("Tailscale"), NetKind::Other);
+        assert_eq!(kind_from_name("vEthernet (WSL)"), NetKind::Other);
+    }
+
+    #[test]
+    fn subnets_match_by_prefix() {
+        let ip = |s: &str| s.parse::<Ipv4Addr>().unwrap();
+        assert!(same_subnet(ip("192.168.137.2"), ip("192.168.137.1"), 24));
+        assert!(!same_subnet(ip("192.168.137.2"), ip("192.168.1.2"), 24));
+        assert!(!same_subnet(ip("192.168.137.2"), ip("192.168.137.1"), 0));
+    }
 
     #[test]
     fn netmask_becomes_a_prefix_length() {

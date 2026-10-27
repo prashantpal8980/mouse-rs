@@ -62,6 +62,11 @@ const SLEW_DOWN: f64 = 0.01;
 const PLAYED_KEPT: usize = 32;
 /// Speed is measured over at least this much of the sender's time.
 const SPEED_SPAN_MS: f64 = 8.0;
+/// A move counts as overdue only once this many of the usual gaps between moves have
+/// passed. Before that, the next one is simply not due yet, and guessing ahead of it is
+/// what made the pointer shake back and forth on a clean cable (owner, 27 Oct 2026: 3,498
+/// guessed frames for 1,235 real moves in a minute, at a 1 ms delay).
+const OVERDUE_GAPS: f64 = 1.5;
 
 /// A position or a velocity, in pixels (or pixels per ms).
 type Point = (f64, f64);
@@ -254,12 +259,25 @@ impl Playout {
             return Some((as_f(a.pos), false, (0.0, 0.0)));
         }
         let Some(v) = self.speed() else { return Some((as_f(a.pos), false, (0.0, 0.0))) };
-        let into = ts - a.sent;
+        // Guess only for the part of the wait the next move is overdue for.
+        let into = ts - a.sent - OVERDUE_GAPS * self.usual_gap();
         let k = eased(into);
         if k > 0.0 {
             self.predicted += 1;
         }
         Some(((a.pos.0 as f64 + v.0 * k, a.pos.1 as f64 + v.1 * k), k > 0.0, v))
+    }
+
+    /// The usual time between two moves on the sender's clock: the median of the recent
+    /// gaps, within 2..=30 ms. 8 ms until there is anything to measure.
+    fn usual_gap(&self) -> f64 {
+        let times: Vec<f64> = self.played.iter().chain(self.samples.iter()).map(|s| s.sent).collect();
+        let mut gaps: Vec<f64> = times.windows(2).rev().take(16).map(|w| w[1] - w[0]).filter(|g| *g > 0.0).collect();
+        if gaps.is_empty() {
+            return 8.0;
+        }
+        gaps.sort_by(f64::total_cmp);
+        gaps[gaps.len() / 2].clamp(2.0, 30.0)
     }
 
     /// Speed (px per ms of the sender's time) at the newest position, over at least
@@ -328,6 +346,30 @@ mod tests {
     }
 
     #[test]
+    fn a_clean_link_never_guesses_between_moves_so_the_pointer_cannot_shake() {
+        // A hand slowing down, a move every 8 ms, 0–1 ms of jitter, drawn every 2 ms.
+        let mut p = Playout::new(Mode::Auto { max_ms: 60.0 });
+        let (mut x, mut step, mut last_shown) = (0i64, 20i64, f64::MIN);
+        for i in 0..120u64 {
+            let sent = 8.0 * i as f64;
+            let arrive = sent + 1000.0 + (i % 2) as f64;
+            p.push(i + 1, sent, (x, 0), arrive);
+            for k in 0..4 {
+                let (shown, _) = p.target(arrive + 2.0 * k as f64).unwrap();
+                assert!(shown >= last_shown, "went back from {last_shown} to {shown} at move {i}");
+                // Ahead of the hand is what has to be pulled back later: that is the shake.
+                assert!(shown <= x as f64 + 0.01, "ran ahead of the hand: {shown} > {x} at move {i}");
+                last_shown = shown;
+            }
+            x += step;
+            if i % 10 == 9 {
+                step = (step - 2).max(1);
+            }
+        }
+        assert_eq!(p.predicted, 0, "nothing guessed on a clean link");
+    }
+
+    #[test]
     fn a_clean_link_adds_no_delay() {
         let mut p = Playout::new(Mode::Auto { max_ms: 60.0 });
         let mut t = 0.0;
@@ -358,10 +400,11 @@ mod tests {
     fn late_data_is_predicted_then_corrected() {
         let mut p = Playout::new(Mode::Fixed(0.0));
         feed(&mut p, 0, 20, |_| 0.0); // newest: sent 76 ms, at 76 px
-        let (x, _) = p.target(1076.0 + 30.0).unwrap();
-        assert!((x - 106.0).abs() < 0.5, "30 ms into a gap at 1 px/ms: {x}");
+        // Overdue 6 ms after the newest move (1.5 × the usual 4 ms), so 36 ms in is 30 ms of guessing.
+        let (x, _) = p.target(1076.0 + 36.0).unwrap();
+        assert!((x - 106.0).abs() < 0.5, "30 ms of guessing at 1 px/ms: {x}");
         let (x, _) = p.target(1076.0 + 200.0).unwrap();
-        assert!(x <= 76.0 + PREDICT_MS + 0.5, "never beyond the prediction limit: {x}");
+        assert!(x <= 76.0 + 6.0 + PREDICT_MS + 0.5, "never beyond the prediction limit: {x}");
         // The held-back moves arrive: the real path takes over.
         feed(&mut p, 20, 60, |_| 0.0);
         let (x, _) = p.target(1076.0 + 200.0).unwrap();
@@ -372,18 +415,18 @@ mod tests {
     fn a_guess_is_not_taken_back_while_the_hand_keeps_moving() {
         let mut p = Playout::new(Mode::Fixed(0.0));
         feed(&mut p, 0, 20, |_| 0.0); // at 76 px, 1 px/ms
-        let (x, _) = p.target(1076.0 + 30.0).unwrap(); // guessed on to 106
+        let (x, _) = p.target(1076.0 + 36.0).unwrap(); // guessed on to 106
         assert!((x - 106.0).abs() < 0.5, "{x}");
         // Real data: the hand slowed to 0.5 px/ms, so it is only at 91 at that time.
         for i in 0..8u64 {
             let sent = 80.0 + 4.0 * i as f64;
-            p.push(21 + i, sent, (78 + 2 * i as i64, 0), 1106.0);
+            p.push(21 + i, sent, (78 + 2 * i as i64, 0), 1112.0);
         }
-        let (x, _) = p.target(1106.0).unwrap();
+        let (x, _) = p.target(1112.0).unwrap();
         assert!(x >= 106.0 - 0.01, "waits at the guess, doesn't step back: {x}");
         // The hand stops there: the repeat says so, and the pointer goes to the true spot.
-        p.push(28, 108.0, (92, 0), 1110.0);
-        let (x, _) = p.target(1112.0).unwrap();
+        p.push(28, 108.0, (92, 0), 1114.0);
+        let (x, _) = p.target(1116.0).unwrap();
         assert_eq!(x, 92.0);
     }
 
