@@ -270,13 +270,22 @@ impl Decoder for MessageCodec {
     type Item = Message;
     type Error = CodecError;
 
+    /// A message type this version doesn't know is skipped, not an error: a newer peer may
+    /// send one, and dropping the connection over it locked the two machines in a reconnect
+    /// loop when only one of them had been updated (27 Oct 2026, `MotionReady`). Anything
+    /// else that fails to decode is still an error.
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Message>, CodecError> {
-        match self.inner.decode(src)? {
-            Some(frame) => {
-                let msg = serde_json::from_slice(&frame)?;
-                Ok(Some(msg))
+        loop {
+            let Some(frame) = self.inner.decode(src)? else {
+                return Ok(None);
+            };
+            match serde_json::from_slice(&frame) {
+                Ok(msg) => return Ok(Some(msg)),
+                Err(e) if e.is_data() && e.to_string().starts_with("unknown variant") => {
+                    tracing::debug!("skipped a message this version doesn't know: {e}");
+                }
+                Err(e) => return Err(e.into()),
             }
-            None => Ok(None),
         }
     }
 }
@@ -367,6 +376,24 @@ mod tests {
             out.push(m);
         }
         assert_eq!(out, msgs);
+    }
+
+    #[test]
+    fn a_message_from_a_newer_version_is_skipped() {
+        let mut buf = BytesMut::new();
+        let mut codec = MessageCodec::new();
+        let unknown = br#"{"t":"FromTheFuture","x":1}"#;
+        let mut frame = BytesMut::new();
+        frame.put_slice(unknown);
+        codec.inner.encode(frame.freeze(), &mut buf).unwrap();
+        codec.encode(Message::Ping, &mut buf).unwrap();
+        assert_eq!(codec.decode(&mut buf).unwrap(), Some(Message::Ping));
+        // Malformed JSON is still an error.
+        let mut bad = BytesMut::new();
+        let mut frame = BytesMut::new();
+        frame.put_slice(b"{not json");
+        codec.inner.encode(frame.freeze(), &mut bad).unwrap();
+        assert!(codec.decode(&mut bad).is_err());
     }
 
     #[test]

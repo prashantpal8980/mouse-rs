@@ -193,6 +193,9 @@ pub(crate) struct ServerMotion {
     /// After datagrams were found not to arrive: don't try UDP again before this.
     retry_after: Option<Instant>,
     stats: ServerStats,
+    /// Whether the client has ever reported over TCP, and a hello's address held until it does.
+    stats_readies_ever: u64,
+    pending_hello: Option<SocketAddr>,
     /// When the last move went out, and how many of [`REPEAT_AFTER`] have been sent since.
     last_move: Option<(Instant, SocketAddr)>,
     repeats: usize,
@@ -217,6 +220,8 @@ impl ServerMotion {
             unconfirmed_since: None,
             retry_after: None,
             stats: ServerStats::new(),
+            stats_readies_ever: 0,
+            pending_hello: None,
             last_move: None,
             repeats: 0,
             epoch: Instant::now(),
@@ -248,6 +253,7 @@ impl ServerMotion {
     pub(crate) fn on_ready(&mut self, port: u16, seen: u64) {
         let now = Instant::now();
         self.stats.readies += 1;
+        self.stats_readies_ever += 1;
         if now.duration_since(self.stats.since) >= STATS_EVERY {
             let peer = self.peer.map_or("none".to_string(), |(a, _)| a.to_string());
             tracing::info!(
@@ -269,6 +275,10 @@ impl ServerMotion {
         }
         let mut to = self.tcp_peer;
         to.set_port(port);
+        // A hello that came before the first report: its source is the better address.
+        if let Some(hello) = self.pending_hello.take() {
+            self.use_peer(hello, "hello");
+        }
         // A hello's source wins over the TCP address (it is right behind a NAT too).
         match self.peer {
             Some((_, heard)) if heard.elapsed() < PEER_STALE => self.peer = self.peer.map(|(a, _)| (a, now)),
@@ -278,6 +288,14 @@ impl ServerMotion {
 
     fn use_peer(&mut self, to: SocketAddr, how: &str) {
         if self.retry_after.is_some_and(|t| Instant::now() < t) {
+            return;
+        }
+        // Only a client that reports over TCP (MotionReady) can say whether datagrams arrive
+        // and reads this datagram format. An older one says hello but would drop every move
+        // (the login screen on 27 Oct: motion only came with clicks, seconds apart). It stays
+        // on TCP, which every version reads.
+        if self.stats_readies_ever == 0 {
+            self.pending_hello = Some(to);
             return;
         }
         if self.peer.map(|(a, _)| a) != Some(to) {
@@ -783,6 +801,9 @@ mod tests {
         let mut c = ClientMotion::start(server_sock.local_addr().unwrap(), p, &token, key(4)).await.unwrap();
         let (buf, n, from) = recv(Some(server_sock.clone())).await.unwrap();
         s.on_datagram(&buf[..n], from);
+        assert!(!s.send_move(0, 0), "a hello alone is not enough: an older client says hello too");
+        let Some(Message::MotionReady { port: cport, seen }) = c.ready() else { panic!("ready") };
+        s.on_ready(cport, seen);
 
         assert!(s.send_move(3, 4));
         assert!(s.send_move(-1, 0));
