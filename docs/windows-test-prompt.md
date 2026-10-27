@@ -27,8 +27,8 @@ Invoke-WebRequest -Uri http://192.168.137.2:8000/mouse-rs.exe -OutFile $HOME\mou
 
 Verify the download — it must match exactly:
 
-- size: `12657664` bytes
-- SHA256: `368C5896863A94EEDC128E5CEAA668FF1840998AD5D2A24FF96E759E260F1ADC`
+- size: `12659712` bytes
+- SHA256: `767E76DFFC369C288E47B74D43F72149DF08B583E42DD92BCA6CE470D1B6E2AA`
 
 ```powershell
 Get-FileHash $HOME\mouse-rs\mouse-rs.exe -Algorithm SHA256
