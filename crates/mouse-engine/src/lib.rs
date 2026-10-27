@@ -94,6 +94,10 @@ pub(crate) fn is_clipboard_message(m: &Message) -> bool {
         | Message::AuthChallenge { .. }
         | Message::AuthResponse { .. }
         | Message::AuthOk { .. }
+        | Message::PairStart { .. }
+        | Message::PairReply { .. }
+        | Message::PairConfirm { .. }
+        | Message::PairDone { .. }
         | Message::Enter { .. }
         | Message::Leave
         | Message::LeaveRequest

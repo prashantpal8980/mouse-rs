@@ -25,6 +25,8 @@ rand.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 if-addrs = "0.15.0"
+# Pairing with a short code (SPAKE2, MIT OR Apache-2.0).
+spake2 = "0.4"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [

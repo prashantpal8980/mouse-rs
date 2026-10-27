@@ -910,3 +910,13 @@ end frame, the paste is recorded. Test:
 - Impact: only when someone browses the folder by hand (the B24 test). A Ctrl+V paste names
   the file directly and is unaffected. Possible later fix: offer "Show in folder" from the
   panel, which opens the folder after the entry exists.
+
+### B40 — PIN limits of the first version (27 Oct 2026) — **open, for the owner to decide**
+- The login-screen instance skips the PIN, because nobody can type one at a login screen. A machine that has the
+  shared secret and claims to be at its login screen therefore connects without the PIN. The fix needs a decision:
+  for example, a per-device key handed over at pairing that the login-screen instance uses in place of the PIN.
+- A client's input and transfer connections each send the cached PIN, so one wrong PIN can count as two tries.
+- A headless server (no panel) never makes up a PIN, so it runs without one until a PIN is set in the panel.
+- Changing the PIN on the server restarts sharing. The client's next attempt uses the old PIN, which counts as one
+  wrong try, and then asks.
+

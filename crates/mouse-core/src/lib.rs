@@ -12,6 +12,8 @@ pub mod discover;
 mod motion_udp;
 mod playout;
 pub mod net;
+pub mod pairing;
+pub mod pin;
 pub mod protocol;
 pub mod qos;
 pub mod timing;

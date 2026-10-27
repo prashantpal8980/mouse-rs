@@ -112,9 +112,44 @@ pub enum Message {
         /// version 1 server, which the client refuses.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         proof: Option<String>,
+        /// The server asks for the connection PIN (R35). Absent from an older server.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        pin: bool,
     },
     AuthResponse {
         hmac: String, // hex-encoded
+        /// Proof of the connection PIN (see `pin::proof_hex`), when the server asked for
+        /// one and the user has typed it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pin_proof: Option<String>,
+    },
+
+    // --- pairing with a code (see `pairing`) ---
+    /// Client → server, instead of a Hello: SPAKE2 message, hex.
+    PairStart {
+        name: String,
+        msg: String,
+    },
+    /// Server → client: its SPAKE2 message and its key confirmation.
+    PairReply {
+        msg: String,
+        confirm: String,
+    },
+    /// Client → server: its key confirmation.
+    PairConfirm {
+        confirm: String,
+    },
+    /// Server → client: the shared secret sealed under the pairing key, or why not.
+    PairDone {
+        ok: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        server: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        secret: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tag: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
     },
     AuthOk {
         ok: bool,
@@ -349,7 +384,7 @@ mod tests {
                 login_screen: true,
                 nonce: Some("cd".into()),
             },
-            Message::AuthChallenge { nonce: "ab".into(), proof: Some("ef".into()) },
+            Message::AuthChallenge { nonce: "ab".into(), proof: Some("ef".into()), pin: true },
             Message::MouseMove { dx: 3, dy: -7 },
             Message::MouseButton {
                 button: Button::Left,

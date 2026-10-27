@@ -135,6 +135,10 @@ fn default_stream_wait_secs() -> u32 {
     180
 }
 
+/// The placeholder secret of a fresh install. A server about to pair replaces it with a
+/// random one first, so no two installs end up paired by sharing the placeholder.
+pub const DEFAULT_SECRET: &str = "change-me-to-a-long-random-string";
+
 /// On-disk configuration. Field names match the Python version exactly.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -143,6 +147,14 @@ pub struct Config {
     pub role: Role,
 
     pub shared_secret: String,
+    /// Ask a connecting client for the connection PIN (R35). On by default.
+    #[serde(default = "default_true")]
+    pub pin_enabled: bool,
+    /// The connection PIN, 4 digits, kept on the server. Empty until first set; a server
+    /// with the PIN on and none set makes one up and shows it in Settings → Security. Kept
+    /// in the clear like `shared_secret`, in the same 0600 file: a 4-digit PIN gains nothing
+    /// from hashing, since all 10,000 can be tried offline in a moment.
+    pub connection_pin: String,
     #[serde(default = "default_true")]
     pub tls_enabled: bool,
     #[serde(default = "default_true")]
@@ -402,7 +414,9 @@ impl Default for Config {
         Config {
             name: default_name(),
             role: Role::Server,
-            shared_secret: "change-me-to-a-long-random-string".into(),
+            shared_secret: DEFAULT_SECRET.into(),
+            pin_enabled: true,
+            connection_pin: String::new(),
             tls_enabled: true,
             clipboard_sync: true,
             clipboard_sync_text: true,

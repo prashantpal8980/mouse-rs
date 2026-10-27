@@ -67,8 +67,11 @@ Code for items 1–5 depends on these. A suggested answer is given for each; "ye
 - [ ] Claude: **pairing with a code**. The client lists servers it found on the network. The server shows a
       6-digit code once, and the user types it on the client. The secret is exchanged with a PAKE (SPAKE2), so the code can't
       be guessed by someone listening on the network. The typed shared secret stays under Advanced for existing setups.
+      *Built 27 Oct (R38): SPAKE2 over TLS, key confirmation bound to the TLS session, code works once and dies
+      after 3 wrong tries; the client tries every server it finds when no address is set.*
 - [ ] Claude: **connection PIN**. It is set on the server, typed on the client, and checked on the server, with try limits.
       Settings → Security: Change PIN / Turn off (turning it off needs the current PIN).
+      *Built 27 Oct with the suggested answers to decisions 1–2 (see R35 in UI-REQUIREMENTS). Open points in B40.*
 - [ ] Claude: **Wi-Fi fix** from Monday's numbers. Most likely: merge mouse moves that queue up behind
       a slow Wi-Fi packet into one move, so the pointer jumps to where it should be and doesn't replay old moves late.
 - [ ] Owner, evening: pair the laptop and Kali from scratch (Clear settings → pair with the code), PIN on/off/change,

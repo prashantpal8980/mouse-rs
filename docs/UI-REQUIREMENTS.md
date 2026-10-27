@@ -240,3 +240,20 @@ only while mouse-rs is running (R33).
 A user who can't set a static IP must still be able to connect. Two devices on the same Wi-Fi, hotspot or
 Ethernet find each other on their own, and switching between Wi-Fi and Ethernet needs no settings change.
 Typing an IP address stays available as an Advanced option.
+
+### R35 / R38 — what was built on 27 Oct (awaiting the owner's hardware test)
+The six decisions of 26 Oct were never answered, so the suggested answers were used. Change any of them and the code follows.
+- **When the PIN is asked:** on the client's first connection after mouse-rs starts, and again only if it was wrong. An
+  automatic reconnect after a Wi-Fi drop or sleep reuses the PIN typed this run. The PIN box appears on the client's main
+  window, under "Other computer", only while the server is asking.
+- **Wrong PIN:** 5 tries, then PIN entry is locked for 5 minutes, then 10, 20… A correct PIN resets the count. Counted on
+  the server, for all clients together.
+- **On by default:** a server with no PIN makes one up when sharing starts. It is shown (masked, with Show) in
+  Settings → Security & pairing, where it can be changed (current PIN + new PIN twice) or turned off (current PIN).
+- **The login-screen instance does not ask for the PIN** (nobody can type one at a login screen). It still has to prove
+  the shared secret. See B40.
+- **R38 — pairing with a code.** Server: Settings → Security & pairing (also on the main window) → **Pair a new device**
+  shows a 6-digit code for 5 minutes. Client: type it under "Pair with a code" (main window or Security page) → **Pair**.
+  With no server address set, the client tries every machine on its networks that answers on the server port. The code
+  works once and dies after 3 wrong tries. A fresh server's placeholder secret is replaced by a random one first.
+  The typed shared secret moved to Security → Advanced.

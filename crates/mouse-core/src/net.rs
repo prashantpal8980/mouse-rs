@@ -407,6 +407,10 @@ pub async fn run_server(
                 };
                 let (peer_name, peer_w, peer_h, lane, peer_login_screen) = match shook {
                     Ok(Ok(v)) => v,
+                    Ok(Err(reason)) if reason.starts_with("pairing:") => {
+                        tracing::info!("{reason}");
+                        continue;
+                    }
                     Ok(Err(reason)) => {
                         let _ = events.send(LinkEvent::AuthFailed(reason));
                         continue;
@@ -640,6 +644,8 @@ pub async fn run_client(
         tokio::select! {
             _ = cancel.cancelled() => return,
             _ = epoch.changed() => { backoff = params.reconnect_initial; }
+            // The user just typed the connection PIN: try it now, not after the backoff.
+            _ = crate::pin::entered() => { backoff = params.reconnect_initial; }
             _ = tokio::time::sleep(wait) => {}
         }
         if !no_network {
@@ -926,6 +932,9 @@ async fn server_handshake(
         Some(Ok(Message::Hello { name, width, height, lane, login_screen, version, nonce })) => {
             (name, width, height, lane, login_screen, version, nonce)
         }
+        Some(Ok(Message::PairStart { name, msg })) => {
+            return Err(server_pair(framed, cfg, name, msg).await);
+        }
         Some(Ok(other)) => return Err(format!("expected hello, got {other:?}")),
         Some(Err(e)) => return Err(format!("hello decode: {e}")),
         None => return Err("peer closed before hello".into()),
@@ -946,14 +955,18 @@ async fn server_handshake(
     let nonce = auth::generate_nonce_hex();
     let proof = auth::proof_hex(&cfg.shared_secret, Side::Server, &binding, &client_nonce, &nonce)
         .map_err(|e| format!("bad nonce from {name}: {e}"))?;
+    // The login-screen instance is exempt: nobody can type a PIN on a machine that is at
+    // its login screen, and typing there from this machine is what it is for. It still
+    // has to prove the shared secret. Recorded for the owner in KNOWN-ISSUES (B40).
+    let need_pin = cfg.pin_enabled && !cfg.connection_pin.is_empty() && !login_screen;
     framed
-        .send(Message::AuthChallenge { nonce: nonce.clone(), proof: Some(proof) })
+        .send(Message::AuthChallenge { nonce: nonce.clone(), proof: Some(proof), pin: need_pin })
         .await
         .map_err(|e| format!("send challenge: {e}"))?;
 
     let resp = framed.next().await;
-    let hmac = match resp {
-        Some(Ok(Message::AuthResponse { hmac })) => hmac,
+    let (hmac, pin_proof) = match resp {
+        Some(Ok(Message::AuthResponse { hmac, pin_proof })) => (hmac, pin_proof),
         Some(Ok(other)) => return Err(format!("expected auth response, got {other:?}")),
         Some(Err(e)) => return Err(format!("auth decode: {e}")),
         None => return Err("peer closed before auth response".into()),
@@ -963,6 +976,21 @@ async fn server_handshake(
     {
         let _ = framed.send(refusal("bad_secret")).await;
         return Err(format!("bad secret from {name}"));
+    }
+
+    if need_pin {
+        // No PIN yet is not a wrong guess: the client asks its user and comes back.
+        let Some(pin_proof) = pin_proof else {
+            let _ = framed.send(refusal(crate::pin::REASON_REQUIRED)).await;
+            return Err(format!("{} from {name}", crate::pin::REASON_REQUIRED));
+        };
+        let correct = crate::pin::verify(&cfg.connection_pin, &binding, &client_nonce, &nonce, &pin_proof);
+        let verdict = crate::pin::server_attempt(correct);
+        if verdict != crate::pin::Verdict::Accept {
+            let reason = crate::pin::refusal_reason(&verdict);
+            let _ = framed.send(refusal(&reason)).await;
+            return Err(format!("{reason} from {name}"));
+        }
     }
 
     framed
@@ -977,6 +1005,127 @@ async fn server_handshake(
         .map_err(|e| format!("send auth ok: {e}"))?;
 
     Ok((name, width, height, lane, login_screen))
+}
+
+/// Serve one pairing attempt (see `pairing`). Always ends the connection: the client
+/// reconnects with the secret it was given. Returns the line for the log, starting
+/// with "pairing:" so the accept loop knows this was not a refused connection.
+async fn server_pair(
+    framed: &mut Framed<LinkStream, MessageCodec>,
+    cfg: &Config,
+    client: String,
+    client_msg: String,
+) -> String {
+    let done = |reason: &str| Message::PairDone { ok: false, server: None, secret: None, tag: None, reason: Some(reason.into()) };
+    let Some(code) = crate::pairing::code_for_attempt() else {
+        let _ = framed.send(done("no_code")).await;
+        return format!("pairing: {client} tried to pair, but no code is showing");
+    };
+    let binding = match framed.get_ref().auth_binding() {
+        Ok(b) => b,
+        Err(e) => return format!("pairing: {e}"),
+    };
+    let start = crate::pairing::start_server(&code);
+    let server_msg = start.msg.clone();
+    let session = match start.finish(&client_msg, &binding, &client_msg, &server_msg) {
+        Ok(s) => s,
+        Err(e) => {
+            crate::pairing::note_failure();
+            return format!("pairing: {client}: {e}");
+        }
+    };
+    if framed.send(Message::PairReply { msg: server_msg, confirm: session.server_confirm() }).await.is_err() {
+        return format!("pairing: {client} went away");
+    }
+    let confirmed = match framed.next().await {
+        Some(Ok(Message::PairConfirm { confirm })) => session.check(&session.client_confirm(), &confirm),
+        // A client with the wrong code sees our confirmation fail and hangs up.
+        _ => false,
+    };
+    if !confirmed {
+        crate::pairing::note_failure();
+        let _ = framed.send(done("wrong_code")).await;
+        return format!("pairing: {client} typed a wrong code");
+    }
+    let (secret, tag) = session.seal(&cfg.shared_secret);
+    let _ = framed
+        .send(Message::PairDone { ok: true, server: Some(cfg.name.clone()), secret: Some(secret), tag: Some(tag), reason: None })
+        .await;
+    crate::pairing::note_success(&client);
+    format!("pairing: paired with {client}")
+}
+
+/// Pair with the server at `to` using the code it shows. Returns the server's name and
+/// the shared secret to save.
+pub async fn pair_with_server(cfg: &Config, to: &str, code: &str, wait: Duration) -> Result<(String, String), String> {
+    // "1.2.3.4", "1.2.3.4:24800", "fe80::1%3", "[fe80::1%3]:24800" or "name[:port]".
+    let to = if to.parse::<SocketAddr>().is_ok() {
+        to.to_owned()
+    } else if let Ok(ip) = to.parse::<std::net::IpAddr>() {
+        SocketAddr::new(ip, cfg.server_port).to_string()
+    } else if to.contains(':') {
+        to.to_owned()
+    } else {
+        format!("{to}:{}", cfg.server_port)
+    };
+    let tcp = match timeout(wait, TcpStream::connect(&to)).await {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => return Err(format!("could not reach {to}: {e}")),
+        Err(_) => return Err(format!("could not reach {to}: timed out")),
+    };
+    let stream = if cfg.tls_enabled {
+        let connector = tls::client_connector().map_err(|e| format!("tls setup: {e}"))?;
+        match timeout(wait, connector.connect(tls::dummy_server_name(), tcp)).await {
+            Ok(Ok(s)) => LinkStream::ClientTls(Box::new(s)),
+            Ok(Err(e)) => return Err(format!("tls connect: {e}")),
+            Err(_) => return Err("tls connect timed out".into()),
+        }
+    } else {
+        LinkStream::Plain(tcp)
+    };
+    let mut framed = Framed::new(stream, MessageCodec::new());
+    match timeout(wait, client_pair(&mut framed, cfg, code)).await {
+        Ok(r) => r,
+        Err(_) => Err("the server did not answer in time".into()),
+    }
+}
+
+async fn client_pair(
+    framed: &mut Framed<LinkStream, MessageCodec>,
+    cfg: &Config,
+    code: &str,
+) -> Result<(String, String), String> {
+    let binding = framed.get_ref().auth_binding()?;
+    let start = crate::pairing::start_client(code);
+    let client_msg = start.msg.clone();
+    framed
+        .send(Message::PairStart { name: cfg.name.clone(), msg: client_msg.clone() })
+        .await
+        .map_err(|e| format!("send: {e}"))?;
+    let (server_msg, confirm) = match framed.next().await {
+        Some(Ok(Message::PairReply { msg, confirm })) => (msg, confirm),
+        Some(Ok(Message::PairDone { reason, .. })) => return Err(reason.unwrap_or_else(|| "refused".into())),
+        Some(Ok(Message::AuthOk { ok: false, reason, .. })) => return Err(reason.unwrap_or_else(|| "refused".into())),
+        Some(Ok(_)) | Some(Err(_)) => return Err("old_version".into()),
+        None => return Err("old_version".into()),
+    };
+    let session = start.finish(&server_msg, &binding, &client_msg, &server_msg)?;
+    if !session.check(&session.server_confirm(), &confirm) {
+        // Either the code is wrong or someone is in the middle; nothing is sent either way.
+        return Err("wrong_code".into());
+    }
+    framed
+        .send(Message::PairConfirm { confirm: session.client_confirm() })
+        .await
+        .map_err(|e| format!("send: {e}"))?;
+    match framed.next().await {
+        Some(Ok(Message::PairDone { ok: true, server, secret: Some(secret), tag: Some(tag), .. })) => {
+            let secret = session.open(&secret, &tag)?;
+            Ok((server.unwrap_or_else(|| "server".into()), secret))
+        }
+        Some(Ok(Message::PairDone { reason, .. })) => Err(reason.unwrap_or_else(|| "refused".into())),
+        _ => Err("the server closed the connection".into()),
+    }
 }
 
 fn refusal(reason: &str) -> Message {
@@ -1003,10 +1152,12 @@ async fn client_handshake(
         .await
         .map_err(|e| format!("send hello: {e}"))?;
 
-    let (nonce, proof) = match framed.next().await {
-        Some(Ok(Message::AuthChallenge { nonce, proof })) => (nonce, proof),
+    let (nonce, proof, pin_asked) = match framed.next().await {
+        Some(Ok(Message::AuthChallenge { nonce, proof, pin })) => (nonce, proof, pin),
         Some(Ok(Message::AuthOk { ok: false, reason, .. })) => {
-            return Err(reason.unwrap_or_else(|| "rejected".into()))
+            let reason = reason.unwrap_or_else(|| "rejected".into());
+            crate::pin::note_refusal(&reason);
+            return Err(reason);
         }
         Some(Ok(other)) => return Err(format!("expected challenge, got {other:?}")),
         Some(Err(e)) => return Err(format!("challenge decode: {e}")),
@@ -1025,19 +1176,25 @@ async fn client_handshake(
 
     let hmac = auth::proof_hex(&cfg.shared_secret, Side::Client, &binding, &client_nonce, &nonce)
         .map_err(|e| format!("hmac: {e}"))?;
+    // Sent only once the server has proved the secret above, and only as a proof.
+    let pin_proof = pin_asked
+        .then(crate::pin::cached)
+        .flatten()
+        .map(|pin| crate::pin::proof_hex(&pin, &binding, &client_nonce, &nonce));
     framed
-        .send(Message::AuthResponse { hmac })
+        .send(Message::AuthResponse { hmac, pin_proof })
         .await
         .map_err(|e| format!("send auth response: {e}"))?;
 
     match framed.next().await {
-        Some(Ok(Message::AuthOk { ok: true, server, width, height, .. })) => Ok((
-            server.unwrap_or_else(|| "server".into()),
-            width.unwrap_or(0),
-            height.unwrap_or(0),
-        )),
+        Some(Ok(Message::AuthOk { ok: true, server, width, height, .. })) => {
+            crate::pin::accepted();
+            Ok((server.unwrap_or_else(|| "server".into()), width.unwrap_or(0), height.unwrap_or(0)))
+        }
         Some(Ok(Message::AuthOk { ok: false, reason, .. })) => {
-            Err(reason.unwrap_or_else(|| "rejected".into()))
+            let reason = reason.unwrap_or_else(|| "rejected".into());
+            crate::pin::note_refusal(&reason);
+            Err(reason)
         }
         Some(Ok(other)) => Err(format!("expected auth ok, got {other:?}")),
         Some(Err(e)) => Err(format!("auth ok decode: {e}")),
@@ -1520,11 +1677,97 @@ mod tests {
             other => panic!("expected challenge, got {other:?}"),
         };
         let hmac = auth::proof_hex(secret, Side::Client, &[], &client_nonce, &nonce).unwrap();
-        framed.send(Message::AuthResponse { hmac }).await.unwrap();
+        framed.send(Message::AuthResponse { hmac, pin_proof: None }).await.unwrap();
         let _ = framed.next().await; // consume AuthOk
         // Go silent but keep the socket alive — do not answer pings.
         tokio::time::sleep(Duration::from_secs(5)).await;
         drop(framed);
+    }
+
+    /// The next AuthFailed reason from `events`, within a few seconds.
+    async fn next_refusal(events: &mut mpsc::UnboundedReceiver<LinkEvent>) -> Option<String> {
+        loop {
+            match timeout(Duration::from_secs(3), events.recv()).await {
+                Ok(Some(LinkEvent::AuthFailed(r))) => return Some(r),
+                Ok(Some(LinkEvent::Connected { .. })) => return None,
+                Ok(Some(_)) => continue,
+                Ok(None) | Err(_) => return None,
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_server_with_a_pin_asks_for_it_and_counts_wrong_ones() {
+        let _g = crate::pin::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        crate::pin::accepted();
+        let port = free_port().await;
+        let cancel = CancellationToken::new();
+        let (s_ch, _s_to, _s_from, mut s_events) = channels();
+        let (c_ch, _c_to, _c_from, mut c_events) = channels();
+        let mut server_cfg = test_cfg(Role::Server, port, true);
+        server_cfg.connection_pin = "4321".into();
+        let server = tokio::spawn(run_server(server_cfg, fast_params(), cancel.clone(), s_ch, BulkServer::disabled(), LinkHealth::new()));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let client = tokio::spawn(run_client(test_cfg(Role::Client, port, true), fast_params(), cancel.clone(), c_ch, LinkHealth::new()));
+
+        assert_eq!(next_refusal(&mut c_events).await.as_deref(), Some("pin_required"));
+        assert_eq!(crate::pin::prompt(), crate::pin::Prompt::Needed);
+        assert!(next_refusal(&mut s_events).await.unwrap().starts_with("pin_required from "));
+
+        crate::pin::enter("1111".into());
+        let mut wrong = None;
+        for _ in 0..5 {
+            match next_refusal(&mut c_events).await {
+                Some(r) if r.starts_with("wrong_pin") => {
+                    wrong = Some(r);
+                    break;
+                }
+                Some(_) => continue,
+                None => break,
+            }
+        }
+        assert_eq!(wrong.as_deref(), Some("wrong_pin:4"));
+        assert_eq!(crate::pin::cached(), None, "a wrong PIN is forgotten");
+
+        crate::pin::enter("4321".into());
+        assert!(wait_for_connect(&mut c_events, Duration::from_secs(3)).await, "the right PIN connects");
+        assert_eq!(crate::pin::prompt(), crate::pin::Prompt::None);
+
+        cancel.cancel();
+        let _ = tokio::join!(server, client);
+        crate::pin::accepted();
+        let _ = crate::pin::server_attempt(true); // leave the limiter clean
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn pairing_with_the_code_hands_over_the_secret() {
+        let _g = crate::pin::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let port = free_port().await;
+        let cancel = CancellationToken::new();
+        let (s_ch, _s_to, _s_from, _s_events) = channels();
+        let server = tokio::spawn(run_server(test_cfg(Role::Server, port, true), fast_params(), cancel.clone(), s_ch, BulkServer::disabled(), LinkHealth::new()));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let mut fresh = test_cfg(Role::Client, port, true);
+        fresh.shared_secret = crate::config::DEFAULT_SECRET.into();
+        let to = format!("127.0.0.1:{port}");
+        let wait = Duration::from_secs(3);
+
+        crate::pairing::cancel_code();
+        assert_eq!(pair_with_server(&fresh, &to, "000000", wait).await, Err("no_code".into()));
+
+        let code = crate::pairing::start_code();
+        let wrong = if code == "111111" { "222222" } else { "111111" };
+        assert_eq!(pair_with_server(&fresh, &to, wrong, wait).await, Err("wrong_code".into()));
+
+        let got = pair_with_server(&fresh, "127.0.0.1", &code, wait).await;
+        assert_eq!(got, Ok(("test-server".into(), "test-secret".into())));
+        assert_eq!(crate::pairing::current_code(), None, "a code is used once");
+        assert_eq!(crate::pairing::take_last_paired().as_deref(), Some("test-client"));
+
+        cancel.cancel();
+        let _ = server.await;
     }
 
     #[tokio::test]
@@ -1622,7 +1865,7 @@ mod tests {
             };
             let nonce = auth::generate_nonce_hex();
             let proof = auth::proof_hex("GUESS", Side::Server, &[], &client_nonce, &nonce).unwrap();
-            framed.send(Message::AuthChallenge { nonce, proof: Some(proof) }).await.unwrap();
+            framed.send(Message::AuthChallenge { nonce, proof: Some(proof), pin: false }).await.unwrap();
             // Whatever comes next must not be the client's proof.
             timeout(Duration::from_secs(2), framed.next()).await.ok().flatten()
         });

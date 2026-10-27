@@ -99,7 +99,7 @@ impl Page {
             Page::Startup => "Start at login, connect automatically",
             Page::Keys => "Getting control back",
             Page::Connection => "Name, ports, reconnecting, profiles",
-            Page::Security => "Shared secret, encryption",
+            Page::Security => "Pairing, connection PIN, encryption",
             Page::Appearance => "Theme",
             Page::Diagnostics => "Log file, sending logs for support",
             Page::About => "Version, restore default settings",
@@ -223,6 +223,23 @@ enum Message {
     RelaunchElevatedNow,
     /// "Keep going" on that warning.
     KeepGoing,
+    // --- connection PIN (R35) and pairing with a code ---
+    /// Client: the PIN box on the main window.
+    PinTyped(String),
+    PinSubmit,
+    /// Client: the pairing-code box.
+    PairCodeTyped(String),
+    PairWithCode,
+    /// Server: show a new pairing code / stop showing it.
+    ShowPairCode,
+    CancelPairCode,
+    /// Server: Settings → Security, PIN section.
+    ToggleShowPin,
+    PinCurrentTyped(String),
+    PinNewTyped(String),
+    PinNew2Typed(String),
+    SavePin,
+    PinOff,
 }
 
 /// What the user asked for when a transfer was still running (R33).
@@ -253,6 +270,10 @@ fn pending_restart_changes(live: &Config, now: &Config) -> Vec<&'static str> {
     chk(live.name != now.name, "machine name");
     chk(live.role != now.role, "role");
     chk(live.shared_secret != now.shared_secret, "shared secret");
+    chk(
+        live.pin_enabled != now.pin_enabled || live.connection_pin != now.connection_pin,
+        "connection PIN",
+    );
     chk(live.tls_enabled != now.tls_enabled, "TLS");
     chk(live.clipboard_sync != now.clipboard_sync, "clipboard sync");
     // Everything the clipboard thread and the bulk lane read once, at Start. They were
@@ -376,6 +397,16 @@ struct App {
     scan: Arc<Mutex<ScanState>>,
     /// Addresses found by the last sweep, offered as a pick list.
     found_servers: Vec<String>,
+    /// Client: the connection PIN being typed.
+    pin_input: String,
+    /// Client: the pairing code being typed, and the attempt in flight.
+    pair_code_input: String,
+    pairing: Arc<Mutex<PairState>>,
+    /// Server: Settings → Security PIN fields.
+    show_pin: bool,
+    pin_current: String,
+    pin_new: String,
+    pin_new2: String,
     /// Whether the overflow (⋯) menu is open. Everything rare or destructive lives there,
     /// so the footer can hold only the two actions used constantly — the old footer packed
     /// in eight and pushed Stop and Quit off the edge at normal window width.
@@ -470,6 +501,16 @@ fn human_bytes(bytes: usize) -> String {
     }
 }
 
+/// A pairing attempt running in the background, and its answer.
+#[derive(Default)]
+enum PairState {
+    #[default]
+    Idle,
+    Running,
+    /// The server's name and the shared secret, or why not.
+    Done(Result<(String, String), String>),
+}
+
 #[derive(Default)]
 enum ScanState {
     #[default]
@@ -514,6 +555,13 @@ impl App {
             restart_hint_dismissed: false,
             scan: Arc::new(Mutex::new(ScanState::Idle)),
             found_servers: Vec::new(),
+            pin_input: String::new(),
+            pair_code_input: String::new(),
+            pairing: Arc::new(Mutex::new(PairState::Idle)),
+            show_pin: false,
+            pin_current: String::new(),
+            pin_new: String::new(),
+            pin_new2: String::new(),
             menu_open: false,
             page: None,
             adv_open: Vec::new(),
@@ -612,6 +660,12 @@ impl App {
     }
 
     fn start_engine(&mut self) {
+        // The PIN is on by default (R35). A server that has never had one gets a random one,
+        // shown in Settings → Security, rather than running without.
+        if self.cfg.role == Role::Server && self.cfg.pin_enabled && self.cfg.connection_pin.is_empty() {
+            self.cfg.connection_pin = mouse_core::pin::random_pin();
+            tracing::info!("made up a connection PIN; it is shown in Settings → Security");
+        }
         // Starting persists the current settings, so a later headless or at-login run uses
         // exactly what the panel was showing. That write is logged because the user didn't
         // ask for it: an unannounced rewrite of the file holding `shared_secret` should at
@@ -633,6 +687,15 @@ impl App {
         self.live_cfg = Some(self.cfg.clone());
         self.saved_cfg = self.cfg.clone();
         self.restart_hint_dismissed = false;
+    }
+
+    /// Save the settings and, if sharing is on, restart it so they take effect now.
+    fn save_and_apply(&mut self) -> Task<Message> {
+        if self.running() {
+            return self.leave(Leave::Restart);
+        }
+        let _ = self.update(Message::SaveConfig);
+        Task::none()
     }
 
     /// Settings **saved** but not yet picked up by the running engine. Unsaved edits are
@@ -760,6 +823,29 @@ impl App {
                         return iced::window::latest()
                             .and_then(|id| iced::window::minimize(id, true));
                     }
+                }
+                // A pairing attempt finished.
+                let paired = std::mem::take(&mut *self.pairing.lock().unwrap());
+                match paired {
+                    PairState::Done(Ok((server, secret))) => {
+                        self.cfg.shared_secret = secret;
+                        self.pair_code_input.clear();
+                        tracing::info!("paired with {server}");
+                        let t = self.save_and_apply();
+                        if !self.running() {
+                            self.start_engine();
+                        }
+                        self.feedback = format!("paired with {server}");
+                        return t;
+                    }
+                    PairState::Done(Err(why)) => {
+                        tracing::warn!("pairing failed: {why}");
+                        self.feedback = pair_error_text(&why);
+                    }
+                    other => *self.pairing.lock().unwrap() = other,
+                }
+                if let Some(client) = mouse_core::pairing::take_last_paired() {
+                    self.feedback = format!("paired with {client}");
                 }
                 // Clear a handle whose engine thread has exited on its own.
                 if self.engine.as_ref().is_some_and(|e| !e.is_running()) {
@@ -1372,6 +1458,93 @@ impl App {
                     }
                 };
             }
+            Message::PinTyped(v) => {
+                self.pin_input = v.chars().filter(char::is_ascii_digit).take(mouse_core::pin::PIN_DIGITS).collect();
+            }
+            Message::PinSubmit => {
+                if mouse_core::pin::is_valid(&self.pin_input) {
+                    mouse_core::pin::enter(std::mem::take(&mut self.pin_input));
+                    self.feedback = "connecting with the PIN…".into();
+                } else {
+                    self.feedback = format!("the PIN is {} digits", mouse_core::pin::PIN_DIGITS);
+                }
+            }
+            Message::PairCodeTyped(v) => {
+                self.pair_code_input =
+                    v.chars().filter(char::is_ascii_digit).take(mouse_core::pairing::CODE_DIGITS).collect();
+            }
+            Message::PairWithCode => {
+                if !mouse_core::pairing::is_valid_code(&self.pair_code_input) {
+                    self.feedback = format!("the code is {} digits", mouse_core::pairing::CODE_DIGITS);
+                    return Task::none();
+                }
+                if matches!(*self.pairing.lock().unwrap(), PairState::Running) {
+                    return Task::none();
+                }
+                *self.pairing.lock().unwrap() = PairState::Running;
+                self.feedback = "pairing…".into();
+                let (cfg, code, slot) = (self.cfg.clone(), self.pair_code_input.clone(), self.pairing.clone());
+                std::thread::spawn(move || {
+                    let answer = pair_in_background(&cfg, &code);
+                    *slot.lock().unwrap() = PairState::Done(answer);
+                });
+            }
+            Message::ShowPairCode => {
+                // A fresh install still has the placeholder secret; every other install
+                // has it too, so pairing on it would pair with all of them. Make a real one.
+                let new_secret = self.cfg.shared_secret == mouse_core::config::DEFAULT_SECRET;
+                if new_secret {
+                    self.cfg.shared_secret = generate_secret();
+                    tracing::info!("replaced the placeholder shared secret before pairing");
+                }
+                mouse_core::pairing::start_code();
+                self.feedback = "pairing code shown; type it on the other computer".into();
+                if !self.running() {
+                    self.start_engine();
+                } else if new_secret {
+                    return self.leave(Leave::Restart);
+                }
+            }
+            Message::CancelPairCode => mouse_core::pairing::cancel_code(),
+            Message::ToggleShowPin => self.show_pin = !self.show_pin,
+            Message::PinCurrentTyped(v) => self.pin_current = v.chars().filter(char::is_ascii_digit).take(4).collect(),
+            Message::PinNewTyped(v) => self.pin_new = v.chars().filter(char::is_ascii_digit).take(4).collect(),
+            Message::PinNew2Typed(v) => self.pin_new2 = v.chars().filter(char::is_ascii_digit).take(4).collect(),
+            Message::SavePin => {
+                let has_pin = self.cfg.pin_enabled && !self.cfg.connection_pin.is_empty();
+                if has_pin && self.pin_current != self.cfg.connection_pin {
+                    self.feedback = "the current PIN is not right".into();
+                    return Task::none();
+                }
+                if !mouse_core::pin::is_valid(&self.pin_new) {
+                    self.feedback = format!("the new PIN must be {} digits", mouse_core::pin::PIN_DIGITS);
+                    return Task::none();
+                }
+                if self.pin_new != self.pin_new2 {
+                    self.feedback = "the two new PINs differ".into();
+                    return Task::none();
+                }
+                self.cfg.connection_pin = std::mem::take(&mut self.pin_new);
+                self.cfg.pin_enabled = true;
+                self.pin_new2.clear();
+                self.pin_current.clear();
+                tracing::info!("connection PIN changed");
+                let t = self.save_and_apply();
+                self.feedback = "PIN saved".into();
+                return t;
+            }
+            Message::PinOff => {
+                if self.pin_current != self.cfg.connection_pin {
+                    self.feedback = "type the current PIN to turn it off".into();
+                    return Task::none();
+                }
+                self.cfg.pin_enabled = false;
+                self.pin_current.clear();
+                tracing::info!("connection PIN turned off");
+                let t = self.save_and_apply();
+                self.feedback = "PIN turned off".into();
+                return t;
+            }
             Message::RestartNow => return self.leave(Leave::Restart),
             Message::RestartLater => {
                 self.restart_hint_dismissed = true;
@@ -1775,6 +1948,7 @@ impl App {
                 text("The other computer finds this one by itself on a shared network; type one of these there only if it does not.")
                     .size(11.0)
                     .color(p.txt3),
+                labeled(p, "Pairing", self.pair_server_view(p)),
             ]
             .spacing(6.0)
             .into()
@@ -1827,6 +2001,10 @@ impl App {
                         .text_size(13.0),
                 ));
             }
+            if let Some(pin) = self.pin_prompt_view(p) {
+                col = col.push(pin);
+            }
+            col = col.push(labeled(p, "Pair with a code", self.pair_client_view(p)));
             col.into()
         };
 
@@ -1857,6 +2035,17 @@ impl App {
             .spacing(3.0),
             column![
                 info_row(p, "🔒", "Encryption", if cb.tls_enabled { "on (TLS)".to_string() } else { "off".to_string() }, Page::Security),
+                info_row(
+                    p,
+                    "🔢",
+                    "Connection PIN",
+                    match (server_side, cb.pin_enabled) {
+                        (true, true) => "on".to_string(),
+                        (true, false) => "off".to_string(),
+                        (false, _) => "set on the server".to_string(),
+                    },
+                    Page::Security,
+                ),
                 info_row(p, "📋", "Clipboard", clip, Page::Clipboard),
                 info_row(p, "⌨", "Take control back", key_label(&cb.lock_hotkey), Page::Keys),
             ]
@@ -2148,22 +2337,179 @@ impl App {
         ]
         .spacing(8.0);
 
+        // Pairing with a code replaced typing the secret; the secret stays here for setups
+        // made before pairing existed.
         let adv = column![
+            field_label(p, "Shared secret — identical on both machines (pairing sets it for you)"),
+            secret,
             toggle_row(p, "Encrypt link (TLS)", "rustls, self-signed cert", self.cfg.tls_enabled, Message::TlsToggled),
         ]
         .spacing(14.0);
 
+        let pairing = if self.cfg.role == Role::Server { self.pair_server_view(p) } else { self.pair_client_view(p) };
         column![
-            card(p, column![
-                section(p, "Pairing"),
-                field_label(p, "Shared secret — identical on both machines"),
-                secret,
-            ]
-            .spacing(14.0)),
+            card(p, column![section(p, "Pairing"), pairing].spacing(14.0)),
+            card(p, column![section(p, "Connection PIN"), self.pin_settings_view(p)].spacing(14.0)),
             self.advanced(p, Page::Security, adv),
         ]
         .spacing(12.0)
         .into()
+    }
+
+    /// Server: "Pair a new device", or the code being shown.
+    fn pair_server_view(&self, p: Palette) -> Element<'_, Message> {
+        match mouse_core::pairing::current_code() {
+            Some((code, left)) => {
+                let spaced = format!("{} {}", &code[..3], &code[3..]);
+                column![
+                    text("Type this code on the other computer (its main window, \"Pair with a code\"):")
+                        .size(12.0).color(p.txt2),
+                    text(spaced).size(34.0).color(p.accent),
+                    row![
+                        text(format!(
+                            "valid for {}:{:02} · works once",
+                            left.as_secs() / 60,
+                            left.as_secs() % 60
+                        ))
+                        .size(11.0)
+                        .color(p.txt3)
+                        .width(Length::Fill),
+                        button(text("Cancel").size(13.0))
+                            .style(ui_theme::ghost(p)).padding([7.0, 12.0]).on_press(Message::CancelPairCode),
+                    ]
+                    .align_y(Alignment::Center),
+                ]
+                .spacing(6.0)
+                .into()
+            }
+            None => column![
+                button(text("Pair a new device").size(13.0))
+                    .style(ui_theme::primary(p)).padding([9.0, 14.0]).on_press(Message::ShowPairCode),
+                text("Shows a 6-digit code for a few minutes. Typing it on the other computer pairs the two; nothing secret has to be copied by hand.")
+                    .size(11.0).color(p.txt3),
+            ]
+            .spacing(6.0)
+            .into(),
+        }
+    }
+
+    /// Client: type the code the server shows.
+    fn pair_client_view(&self, p: Palette) -> Element<'_, Message> {
+        let busy = matches!(*self.pairing.lock().unwrap(), PairState::Running);
+        let go = button(text(if busy { "Pairing…" } else { "Pair" }).size(13.0))
+            .style(ui_theme::primary(p))
+            .padding([9.0, 14.0]);
+        let go = if busy { go } else { go.on_press(Message::PairWithCode) };
+        column![
+            row![
+                input(p, "6-digit code", &self.pair_code_input, Message::PairCodeTyped)
+                    .on_submit(Message::PairWithCode),
+                go,
+            ]
+            .spacing(8.0)
+            .align_y(Alignment::Center),
+            text("On the server, press \"Pair a new device\" in Settings → Security & pairing, then type the code it shows here.")
+                .size(11.0).color(p.txt3),
+        ]
+        .spacing(6.0)
+        .into()
+    }
+
+    /// Settings → Security: the PIN on the server, an explanation on the client.
+    fn pin_settings_view(&self, p: Palette) -> Element<'_, Message> {
+        if self.cfg.role != Role::Server {
+            return text(
+                "The server may ask for a 4-digit PIN when this computer connects. It is asked once each time mouse-rs starts, not after a Wi-Fi drop.",
+            )
+            .size(12.0)
+            .color(p.txt2)
+            .into();
+        }
+        let on = self.cfg.pin_enabled && !self.cfg.connection_pin.is_empty();
+        let status: Element<'_, Message> = if on {
+            row![
+                text(format!(
+                    "On. PIN: {}",
+                    if self.show_pin { self.cfg.connection_pin.clone() } else { "••••".into() }
+                ))
+                .size(14.0)
+                .color(p.txt)
+                .width(Length::Fill),
+                button(text(if self.show_pin { "Hide" } else { "Show" }).size(13.0))
+                    .style(ui_theme::ghost(p)).padding([7.0, 12.0]).on_press(Message::ToggleShowPin),
+            ]
+            .align_y(Alignment::Center)
+            .into()
+        } else if self.cfg.pin_enabled {
+            text("On. A PIN is made up when sharing starts; set your own below.").size(14.0).color(p.txt).into()
+        } else {
+            text("Off. Any paired computer connects without a PIN.").size(14.0).color(p.warn).into()
+        };
+        let mut col = column![
+            status,
+            text("Typed on the other computer before it can connect. 5 wrong tries lock PIN entry for 5 minutes, then 10, 20…")
+                .size(11.0).color(p.txt3),
+        ]
+        .spacing(8.0);
+        if on {
+            col = col.push(labeled(
+                p,
+                "Current PIN (needed to change it or turn it off)",
+                input(p, "current PIN", &self.pin_current, Message::PinCurrentTyped).secure(true),
+            ));
+        }
+        col = col.push(
+            row![
+                input(p, if on { "new PIN" } else { "PIN" }, &self.pin_new, Message::PinNewTyped).secure(true),
+                input(p, "again", &self.pin_new2, Message::PinNew2Typed).secure(true).on_submit(Message::SavePin),
+            ]
+            .spacing(8.0),
+        );
+        let mut buttons = row![
+            button(text(if on { "Change PIN" } else { "Turn on with this PIN" }).size(13.0))
+                .style(ui_theme::primary(p)).padding([9.0, 14.0]).on_press(Message::SavePin),
+        ]
+        .spacing(8.0);
+        if on {
+            buttons = buttons.push(
+                button(text("Turn off").size(13.0))
+                    .style(ui_theme::ghost(p)).padding([9.0, 14.0]).on_press(Message::PinOff),
+            );
+        }
+        col.push(buttons).into()
+    }
+
+    /// Client, main window: the PIN box, while the server is asking for one.
+    fn pin_prompt_view(&self, p: Palette) -> Option<Element<'_, Message>> {
+        use mouse_core::pin::Prompt;
+        if self.cfg.role != Role::Client || !self.running() {
+            return None;
+        }
+        let why = match mouse_core::pin::prompt() {
+            Prompt::None => return None,
+            Prompt::Needed => "The server asks for its connection PIN. It is shown on the server in Settings → Security & pairing.".to_string(),
+            Prompt::Wrong(left) => format!("Wrong PIN. {left} tries left before PIN entry is locked."),
+            Prompt::Locked(until) => {
+                let secs = until.saturating_duration_since(std::time::Instant::now()).as_secs();
+                format!("Too many wrong PINs. Try again in {} min.", secs.div_ceil(60).max(1))
+            }
+        };
+        Some(
+            column![
+                text(why).size(12.0).color(p.warn),
+                row![
+                    input(p, "4-digit PIN", &self.pin_input, Message::PinTyped)
+                        .secure(true)
+                        .on_submit(Message::PinSubmit),
+                    button(text("Connect").size(13.0))
+                        .style(ui_theme::primary(p)).padding([9.0, 14.0]).on_press(Message::PinSubmit),
+                ]
+                .spacing(8.0)
+                .align_y(Alignment::Center),
+            ]
+            .spacing(6.0)
+            .into(),
+        )
     }
 
     /// Settings → Keyboard & hotkeys. The lock key is the everyday way back; the return
@@ -3416,6 +3762,51 @@ fn generate_secret() -> String {
     const CH: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
     let mut rng = rand::thread_rng();
     (0..32).map(|_| CH[rng.gen_range(0..CH.len())] as char).collect()
+}
+
+/// Pair with the server using `code`. With no server address set, every machine on this
+/// computer's networks that answers on the server port is tried; only the one showing the
+/// code can pair. Blocking: runs on its own thread.
+fn pair_in_background(cfg: &Config, code: &str) -> Result<(String, String), String> {
+    let hosts: Vec<String> = if cfg.server_host.trim().is_empty() {
+        mouse_core::discover::scan_for_servers(cfg.server_port, std::time::Duration::from_millis(300))
+            .into_iter()
+            .map(|ip| ip.to_string())
+            .collect()
+    } else {
+        vec![cfg.server_host.trim().to_owned()]
+    };
+    if hosts.is_empty() {
+        return Err("no_server".into());
+    }
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("runtime: {e}"))?;
+    let mut last = Err("no_code".to_string());
+    for host in hosts {
+        match rt.block_on(mouse_core::net::pair_with_server(cfg, &host, code, std::time::Duration::from_secs(5))) {
+            Ok(v) => return Ok(v),
+            // The machine showing the code says something other than "no code": keep that.
+            Err(e) if e == "no_code" => {}
+            Err(e) => last = Err(e),
+        }
+    }
+    last
+}
+
+/// Pairing failures in words.
+fn pair_error_text(why: &str) -> String {
+    match why {
+        "no_code" => "no server is showing a pairing code; press \"Pair a new device\" on it first".into(),
+        "wrong_code" => format!(
+            "wrong code; after {} wrong codes the server needs a new one",
+            mouse_core::pairing::MAX_FAILS
+        ),
+        "no_server" => "no server found on this computer's networks; type its address and try again".into(),
+        "old_version" => "the server runs an older mouse-rs; update it".into(),
+        other => format!("pairing failed: {other}"),
+    }
 }
 
 /// Open the control panel, blocking until the window closes.

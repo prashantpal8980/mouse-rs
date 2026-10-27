@@ -124,6 +124,27 @@ pub(crate) fn refusal_text(reason: &str) -> Option<String> {
         r if r.starts_with("bad secret from ") => {
             format!("{} has a different shared secret", &r["bad secret from ".len()..])
         }
+        // Connection PIN (R35). The client sees the bare reason; the server sees it
+        // followed by " from <name>".
+        r if r.starts_with(mouse_core::pin::REASON_REQUIRED) => match r.split_once(" from ") {
+            Some((_, who)) => format!("{who} is waiting for the connection PIN to be typed there"),
+            None => "type the connection PIN shown on the server".to_owned(),
+        },
+        r if r.starts_with(mouse_core::pin::REASON_WRONG) => {
+            let left = r.split(':').nth(1).and_then(|n| n.split(' ').next()).unwrap_or("?");
+            match r.split_once(" from ") {
+                Some((_, who)) => format!("{who} typed a wrong connection PIN ({left} tries left)"),
+                None => format!("wrong connection PIN; {left} tries left"),
+            }
+        }
+        r if r.starts_with(mouse_core::pin::REASON_LOCKED) => {
+            let secs: u64 = r.split(':').nth(1).and_then(|n| n.split(' ').next()?.parse().ok()).unwrap_or(0);
+            let mins = secs.div_ceil(60).max(1);
+            match r.split_once(" from ") {
+                Some((_, who)) => format!("too many wrong PINs from {who}; PIN entry locked for {mins} min"),
+                None => format!("too many wrong PINs; try again in {mins} min"),
+            }
+        }
         r if r.contains("runs an older mouse-rs") => {
             r.split(" (protocol").next().unwrap_or(r).to_owned() + "; update it"
         }
@@ -175,6 +196,13 @@ mod tests {
             Some("MSI runs an older mouse-rs; update it")
         );
         assert!(refusal_text("server_not_verified").is_some());
+        assert_eq!(
+            refusal_text("wrong_pin:3 from kali-desktop").as_deref(),
+            Some("kali-desktop typed a wrong connection PIN (3 tries left)")
+        );
+        assert_eq!(refusal_text("wrong_pin:2").as_deref(), Some("wrong connection PIN; 2 tries left"));
+        assert_eq!(refusal_text("pin_locked:300").as_deref(), Some("too many wrong PINs; try again in 5 min"));
+        assert!(refusal_text("pin_required from kali").unwrap().contains("kali is waiting"));
         assert_eq!(refusal_text("handshake timed out"), None);
 
         let s = StatusHandle::new();
