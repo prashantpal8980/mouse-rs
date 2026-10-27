@@ -147,14 +147,18 @@ pub struct Config {
     pub role: Role,
 
     pub shared_secret: String,
-    /// Ask a connecting client for the connection PIN (R35). On by default.
+    /// This machine, as a client, accepts a server only if the server shows this machine's
+    /// connection PIN (R35). On by default.
     #[serde(default = "default_true")]
     pub pin_enabled: bool,
-    /// The connection PIN, 4 digits, kept on the server. Empty until first set; a server
-    /// with the PIN on and none set makes one up and shows it in Settings → Security. Kept
-    /// in the clear like `shared_secret`, in the same 0600 file: a 4-digit PIN gains nothing
-    /// from hashing, since all 10,000 can be tried offline in a moment.
+    /// The connection PIN, kept on the client and typed on the server. Empty until first
+    /// set; a client with the PIN on and none set makes up 4 digits. Kept in the clear like
+    /// `shared_secret`, in the same 0600 file: a short PIN gains nothing from hashing.
     pub connection_pin: String,
+    /// The PIN was made up rather than chosen. Only then does the client's main window
+    /// show it while a server asks, because the person driving the client from the server
+    /// may have no other way to read it. A chosen PIN is never shown unasked.
+    pub pin_made_up: bool,
     #[serde(default = "default_true")]
     pub tls_enabled: bool,
     #[serde(default = "default_true")]
@@ -417,6 +421,7 @@ impl Default for Config {
             shared_secret: DEFAULT_SECRET.into(),
             pin_enabled: true,
             connection_pin: String::new(),
+            pin_made_up: false,
             tls_enabled: true,
             clipboard_sync: true,
             clipboard_sync_text: true,

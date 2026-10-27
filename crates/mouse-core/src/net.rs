@@ -639,13 +639,19 @@ pub async fn run_client(
 
         // Wait before the next attempt. Wake on cancel, or at once if the network changes. With no
         // network, poll at a steady rate instead of backing off.
-        let wait = if no_network { NO_NETWORK_POLL } else { backoff };
+        // Refused over the PIN: someone is about to type it on the server, so look again
+        // soon instead of backing off.
+        let wait = if no_network {
+            NO_NETWORK_POLL
+        } else if crate::pin::awaiting() {
+            PIN_POLL
+        } else {
+            backoff
+        };
         let mut epoch = epoch_rx.clone();
         tokio::select! {
             _ = cancel.cancelled() => return,
             _ = epoch.changed() => { backoff = params.reconnect_initial; }
-            // The user just typed the connection PIN: try it now, not after the backoff.
-            _ = crate::pin::entered() => { backoff = params.reconnect_initial; }
             _ = tokio::time::sleep(wait) => {}
         }
         if !no_network {
@@ -955,18 +961,26 @@ async fn server_handshake(
     let nonce = auth::generate_nonce_hex();
     let proof = auth::proof_hex(&cfg.shared_secret, Side::Server, &binding, &client_nonce, &nonce)
         .map_err(|e| format!("bad nonce from {name}: {e}"))?;
-    // The login-screen instance is exempt: nobody can type a PIN on a machine that is at
-    // its login screen, and typing there from this machine is what it is for. It still
-    // has to prove the shared secret. Recorded for the owner in KNOWN-ISSUES (B40).
-    let need_pin = cfg.pin_enabled && !cfg.connection_pin.is_empty() && !login_screen;
+    // The client's PIN, if someone has typed it here this run. The client checks it.
+    let pin_proof = crate::pin::typed_for(&name)
+        .map(|pin| crate::pin::proof_hex(&pin, &binding, &client_nonce, &nonce));
     framed
-        .send(Message::AuthChallenge { nonce: nonce.clone(), proof: Some(proof), pin: need_pin })
+        .send(Message::AuthChallenge { nonce: nonce.clone(), proof: Some(proof), pin_proof })
         .await
         .map_err(|e| format!("send challenge: {e}"))?;
 
     let resp = framed.next().await;
-    let (hmac, pin_proof) = match resp {
-        Some(Ok(Message::AuthResponse { hmac, pin_proof })) => (hmac, pin_proof),
+    let hmac = match resp {
+        Some(Ok(Message::AuthResponse { hmac })) => hmac,
+        // The client refused us, most often over its PIN: ask our user for it.
+        Some(Ok(Message::AuthOk { ok: false, reason, .. })) => {
+            let reason = reason.unwrap_or_else(|| "refused".into());
+            return Err(if crate::pin::note_refusal(&name, &reason) {
+                format!("{reason} from {name}")
+            } else {
+                format!("{name} refused: {reason}")
+            });
+        }
         Some(Ok(other)) => return Err(format!("expected auth response, got {other:?}")),
         Some(Err(e)) => return Err(format!("auth decode: {e}")),
         None => return Err("peer closed before auth response".into()),
@@ -977,21 +991,7 @@ async fn server_handshake(
         let _ = framed.send(refusal("bad_secret")).await;
         return Err(format!("bad secret from {name}"));
     }
-
-    if need_pin {
-        // No PIN yet is not a wrong guess: the client asks its user and comes back.
-        let Some(pin_proof) = pin_proof else {
-            let _ = framed.send(refusal(crate::pin::REASON_REQUIRED)).await;
-            return Err(format!("{} from {name}", crate::pin::REASON_REQUIRED));
-        };
-        let correct = crate::pin::verify(&cfg.connection_pin, &binding, &client_nonce, &nonce, &pin_proof);
-        let verdict = crate::pin::server_attempt(correct);
-        if verdict != crate::pin::Verdict::Accept {
-            let reason = crate::pin::refusal_reason(&verdict);
-            let _ = framed.send(refusal(&reason)).await;
-            return Err(format!("{reason} from {name}"));
-        }
-    }
+    crate::pin::accepted(&name);
 
     framed
         .send(Message::AuthOk {
@@ -1152,12 +1152,10 @@ async fn client_handshake(
         .await
         .map_err(|e| format!("send hello: {e}"))?;
 
-    let (nonce, proof, pin_asked) = match framed.next().await {
-        Some(Ok(Message::AuthChallenge { nonce, proof, pin })) => (nonce, proof, pin),
+    let (nonce, proof, pin_proof) = match framed.next().await {
+        Some(Ok(Message::AuthChallenge { nonce, proof, pin_proof })) => (nonce, proof, pin_proof),
         Some(Ok(Message::AuthOk { ok: false, reason, .. })) => {
-            let reason = reason.unwrap_or_else(|| "rejected".into());
-            crate::pin::note_refusal(&reason);
-            return Err(reason);
+            return Err(reason.unwrap_or_else(|| "rejected".into()))
         }
         Some(Ok(other)) => return Err(format!("expected challenge, got {other:?}")),
         Some(Err(e)) => return Err(format!("challenge decode: {e}")),
@@ -1176,25 +1174,43 @@ async fn client_handshake(
 
     let hmac = auth::proof_hex(&cfg.shared_secret, Side::Client, &binding, &client_nonce, &nonce)
         .map_err(|e| format!("hmac: {e}"))?;
-    // Sent only once the server has proved the secret above, and only as a proof.
-    let pin_proof = pin_asked
-        .then(crate::pin::cached)
-        .flatten()
-        .map(|pin| crate::pin::proof_hex(&pin, &binding, &client_nonce, &nonce));
+    // The connection PIN (R35): this machine is the one being driven, so it decides who
+    // may drive it. The server must show the PIN, typed there by its user; the check and
+    // the try limits are here. This applies at the login screen too: the PIN is typed on
+    // the server, which has a keyboard.
+    if cfg.pin_enabled && !cfg.connection_pin.is_empty() {
+        use crate::pin::{check_attempt, locked_for, refusal_reason, verify, Verdict, REASON_REQUIRED};
+        let verdict = match (locked_for(), pin_proof) {
+            (Some(left), _) => Some(Verdict::Locked(left)),
+            // No PIN typed there yet: not a wrong guess, nothing to count.
+            (None, None) => None,
+            (None, Some(p)) => Some(check_attempt(verify(&cfg.connection_pin, &binding, &client_nonce, &nonce, &p))),
+        };
+        let reason = match verdict {
+            Some(Verdict::Accept) => None,
+            Some(v) => Some(refusal_reason(&v)),
+            None => Some(REASON_REQUIRED.to_owned()),
+        };
+        if let Some(reason) = reason {
+            crate::pin::set_awaiting(true);
+            let _ = framed.send(refusal(&reason)).await;
+            return Err(reason);
+        }
+    }
+    crate::pin::set_awaiting(false);
     framed
-        .send(Message::AuthResponse { hmac, pin_proof })
+        .send(Message::AuthResponse { hmac })
         .await
         .map_err(|e| format!("send auth response: {e}"))?;
 
     match framed.next().await {
-        Some(Ok(Message::AuthOk { ok: true, server, width, height, .. })) => {
-            crate::pin::accepted();
-            Ok((server.unwrap_or_else(|| "server".into()), width.unwrap_or(0), height.unwrap_or(0)))
-        }
+        Some(Ok(Message::AuthOk { ok: true, server, width, height, .. })) => Ok((
+            server.unwrap_or_else(|| "server".into()),
+            width.unwrap_or(0),
+            height.unwrap_or(0),
+        )),
         Some(Ok(Message::AuthOk { ok: false, reason, .. })) => {
-            let reason = reason.unwrap_or_else(|| "rejected".into());
-            crate::pin::note_refusal(&reason);
-            Err(reason)
+            Err(reason.unwrap_or_else(|| "rejected".into()))
         }
         Some(Ok(other)) => Err(format!("expected auth ok, got {other:?}")),
         Some(Err(e)) => Err(format!("auth ok decode: {e}")),
@@ -1245,6 +1261,10 @@ const CONNECT_TRY: Duration = Duration::from_secs(3);
 
 /// How often a client with no network re-checks for one.
 const NO_NETWORK_POLL: Duration = Duration::from_secs(2);
+
+/// How often a client that refused a server over the PIN tries again, so it connects
+/// within a couple of seconds of the PIN being typed on the server.
+const PIN_POLL: Duration = Duration::from_secs(2);
 
 /// Connect to every candidate at once and keep the first that accepts. Racing, rather than
 /// trying in turn, means a dead address costs nothing. It also picks the faster path: when the
@@ -1677,7 +1697,7 @@ mod tests {
             other => panic!("expected challenge, got {other:?}"),
         };
         let hmac = auth::proof_hex(secret, Side::Client, &[], &client_nonce, &nonce).unwrap();
-        framed.send(Message::AuthResponse { hmac, pin_proof: None }).await.unwrap();
+        framed.send(Message::AuthResponse { hmac }).await.unwrap();
         let _ = framed.next().await; // consume AuthOk
         // Go silent but keep the socket alive — do not answer pings.
         tokio::time::sleep(Duration::from_secs(5)).await;
@@ -1698,24 +1718,24 @@ mod tests {
 
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
-    async fn a_server_with_a_pin_asks_for_it_and_counts_wrong_ones() {
+    async fn a_client_with_a_pin_refuses_a_server_until_its_user_types_it() {
         let _g = crate::pin::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        crate::pin::accepted();
         let port = free_port().await;
         let cancel = CancellationToken::new();
         let (s_ch, _s_to, _s_from, mut s_events) = channels();
         let (c_ch, _c_to, _c_from, mut c_events) = channels();
-        let mut server_cfg = test_cfg(Role::Server, port, true);
-        server_cfg.connection_pin = "4321".into();
-        let server = tokio::spawn(run_server(server_cfg, fast_params(), cancel.clone(), s_ch, BulkServer::disabled(), LinkHealth::new()));
+        let server = tokio::spawn(run_server(test_cfg(Role::Server, port, true), fast_params(), cancel.clone(), s_ch, BulkServer::disabled(), LinkHealth::new()));
         tokio::time::sleep(Duration::from_millis(100)).await;
-        let client = tokio::spawn(run_client(test_cfg(Role::Client, port, true), fast_params(), cancel.clone(), c_ch, LinkHealth::new()));
+        let mut client_cfg = test_cfg(Role::Client, port, true);
+        client_cfg.connection_pin = "Ab#4321".into();
+        let client = tokio::spawn(run_client(client_cfg, fast_params(), cancel.clone(), c_ch, LinkHealth::new()));
 
+        // Nothing typed on the server yet: the client refuses and the server asks its user.
         assert_eq!(next_refusal(&mut c_events).await.as_deref(), Some("pin_required"));
-        assert_eq!(crate::pin::prompt(), crate::pin::Prompt::Needed);
-        assert!(next_refusal(&mut s_events).await.unwrap().starts_with("pin_required from "));
+        assert_eq!(next_refusal(&mut s_events).await.as_deref(), Some("pin_required from test-client"));
+        assert_eq!(crate::pin::prompt(), Some(("test-client".into(), crate::pin::Prompt::Needed)));
 
-        crate::pin::enter("1111".into());
+        crate::pin::enter("test-client", "1111".into());
         let mut wrong = None;
         for _ in 0..5 {
             match next_refusal(&mut c_events).await {
@@ -1727,17 +1747,22 @@ mod tests {
                 None => break,
             }
         }
-        assert_eq!(wrong.as_deref(), Some("wrong_pin:4"));
-        assert_eq!(crate::pin::cached(), None, "a wrong PIN is forgotten");
+        assert_eq!(wrong.as_deref(), Some("wrong_pin:4"), "counted on the client");
+        while let Some(r) = next_refusal(&mut s_events).await {
+            if r.starts_with("wrong_pin") {
+                break;
+            }
+        }
+        assert_eq!(crate::pin::typed_for("test-client"), None, "the server forgets a wrong PIN");
 
-        crate::pin::enter("4321".into());
-        assert!(wait_for_connect(&mut c_events, Duration::from_secs(3)).await, "the right PIN connects");
-        assert_eq!(crate::pin::prompt(), crate::pin::Prompt::None);
+        crate::pin::enter("test-client", "Ab#4321".into());
+        assert!(wait_for_connect(&mut c_events, Duration::from_secs(5)).await, "the right PIN connects");
+        assert_eq!(crate::pin::prompt(), None);
 
         cancel.cancel();
         let _ = tokio::join!(server, client);
-        crate::pin::accepted();
-        let _ = crate::pin::server_attempt(true); // leave the limiter clean
+        let _ = crate::pin::check_attempt(true); // leave the limiter clean
+        crate::pin::set_awaiting(false);
     }
 
     #[tokio::test]
@@ -1865,7 +1890,7 @@ mod tests {
             };
             let nonce = auth::generate_nonce_hex();
             let proof = auth::proof_hex("GUESS", Side::Server, &[], &client_nonce, &nonce).unwrap();
-            framed.send(Message::AuthChallenge { nonce, proof: Some(proof), pin: false }).await.unwrap();
+            framed.send(Message::AuthChallenge { nonce, proof: Some(proof), pin_proof: None }).await.unwrap();
             // Whatever comes next must not be the client's proof.
             timeout(Duration::from_secs(2), framed.next()).await.ok().flatten()
         });

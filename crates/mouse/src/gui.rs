@@ -660,10 +660,11 @@ impl App {
     }
 
     fn start_engine(&mut self) {
-        // The PIN is on by default (R35). A server that has never had one gets a random one,
-        // shown in Settings → Security, rather than running without.
-        if self.cfg.role == Role::Server && self.cfg.pin_enabled && self.cfg.connection_pin.is_empty() {
+        // The PIN is on by default (R35). A client that has never had one gets a random one
+        // rather than running without; its main window shows it while a server asks.
+        if self.cfg.role == Role::Client && self.cfg.pin_enabled && self.cfg.connection_pin.is_empty() {
             self.cfg.connection_pin = mouse_core::pin::random_pin();
+            self.cfg.pin_made_up = true;
             tracing::info!("made up a connection PIN; it is shown in Settings → Security");
         }
         // Starting persists the current settings, so a later headless or at-login run uses
@@ -1458,17 +1459,17 @@ impl App {
                     }
                 };
             }
-            Message::PinTyped(v) => {
-                self.pin_input = v.chars().filter(char::is_ascii_digit).take(mouse_core::pin::PIN_DIGITS).collect();
-            }
-            Message::PinSubmit => {
-                if mouse_core::pin::is_valid(&self.pin_input) {
-                    mouse_core::pin::enter(std::mem::take(&mut self.pin_input));
-                    self.feedback = "connecting with the PIN…".into();
-                } else {
-                    self.feedback = format!("the PIN is {} digits", mouse_core::pin::PIN_DIGITS);
+            Message::PinTyped(v) => self.pin_input = v.chars().take(mouse_core::pin::MAX_LEN).collect(),
+            Message::PinSubmit => match mouse_core::pin::prompt() {
+                Some((client, _)) if mouse_core::pin::is_valid(&self.pin_input) => {
+                    mouse_core::pin::enter(&client, std::mem::take(&mut self.pin_input));
+                    self.feedback = format!("sent; {client} connects in a moment if the PIN is right");
                 }
-            }
+                Some(_) => {
+                    self.feedback = format!("a PIN has at least {} characters", mouse_core::pin::MIN_LEN);
+                }
+                None => {}
+            },
             Message::PairCodeTyped(v) => {
                 self.pair_code_input =
                     v.chars().filter(char::is_ascii_digit).take(mouse_core::pairing::CODE_DIGITS).collect();
@@ -1507,9 +1508,9 @@ impl App {
             }
             Message::CancelPairCode => mouse_core::pairing::cancel_code(),
             Message::ToggleShowPin => self.show_pin = !self.show_pin,
-            Message::PinCurrentTyped(v) => self.pin_current = v.chars().filter(char::is_ascii_digit).take(4).collect(),
-            Message::PinNewTyped(v) => self.pin_new = v.chars().filter(char::is_ascii_digit).take(4).collect(),
-            Message::PinNew2Typed(v) => self.pin_new2 = v.chars().filter(char::is_ascii_digit).take(4).collect(),
+            Message::PinCurrentTyped(v) => self.pin_current = v.chars().take(mouse_core::pin::MAX_LEN).collect(),
+            Message::PinNewTyped(v) => self.pin_new = v.chars().take(mouse_core::pin::MAX_LEN).collect(),
+            Message::PinNew2Typed(v) => self.pin_new2 = v.chars().take(mouse_core::pin::MAX_LEN).collect(),
             Message::SavePin => {
                 let has_pin = self.cfg.pin_enabled && !self.cfg.connection_pin.is_empty();
                 if has_pin && self.pin_current != self.cfg.connection_pin {
@@ -1517,7 +1518,11 @@ impl App {
                     return Task::none();
                 }
                 if !mouse_core::pin::is_valid(&self.pin_new) {
-                    self.feedback = format!("the new PIN must be {} digits", mouse_core::pin::PIN_DIGITS);
+                    self.feedback = format!(
+                        "the new PIN needs {} to {} characters; letters and symbols are fine",
+                        mouse_core::pin::MIN_LEN,
+                        mouse_core::pin::MAX_LEN
+                    );
                     return Task::none();
                 }
                 if self.pin_new != self.pin_new2 {
@@ -1525,6 +1530,7 @@ impl App {
                     return Task::none();
                 }
                 self.cfg.connection_pin = std::mem::take(&mut self.pin_new);
+                self.cfg.pin_made_up = false;
                 self.cfg.pin_enabled = true;
                 self.pin_new2.clear();
                 self.pin_current.clear();
@@ -1941,17 +1947,19 @@ impl App {
             // The server is found by the client, so what matters here is what to tell it.
             // Choosing which of these addresses to listen on is in Settings → Connection.
             let local = mouse_core::discover::listen_candidates();
-            column![
-                text(if local.is_empty() { "none found".to_string() } else { local.join("  ·  ") })
+            let mut col = column![].spacing(6.0);
+            // First, while a client is waiting for its PIN: it is the one thing to do now.
+            if let Some(pin) = self.pin_prompt_view(p) {
+                col = col.push(pin);
+            }
+            col.push(text(if local.is_empty() { "none found".to_string() } else { local.join("  ·  ") })
                     .size(13.0)
-                    .color(p.txt2),
-                text("The other computer finds this one by itself on a shared network; type one of these there only if it does not.")
+                    .color(p.txt2))
+                .push(text("The other computer finds this one by itself on a shared network; type one of these there only if it does not.")
                     .size(11.0)
-                    .color(p.txt3),
-                labeled(p, "Pairing", self.pair_server_view(p)),
-            ]
-            .spacing(6.0)
-            .into()
+                    .color(p.txt3))
+                .push(labeled(p, "Pairing", self.pair_server_view(p)))
+                .into()
         } else {
             let scanning = matches!(*self.scan.lock().unwrap(), ScanState::Running);
             let detect = button(
@@ -2001,8 +2009,8 @@ impl App {
                         .text_size(13.0),
                 ));
             }
-            if let Some(pin) = self.pin_prompt_view(p) {
-                col = col.push(pin);
+            if let Some(waiting) = self.pin_waiting_view(p) {
+                col = col.push(waiting);
             }
             col = col.push(labeled(p, "Pair with a code", self.pair_client_view(p)));
             col.into()
@@ -2040,9 +2048,9 @@ impl App {
                     "🔢",
                     "Connection PIN",
                     match (server_side, cb.pin_enabled) {
-                        (true, true) => "on".to_string(),
-                        (true, false) => "off".to_string(),
-                        (false, _) => "set on the server".to_string(),
+                        (false, true) => "on".to_string(),
+                        (false, false) => "off".to_string(),
+                        (true, _) => "asked by the computer you drive".to_string(),
                     },
                     Page::Security,
                 ),
@@ -2385,7 +2393,7 @@ impl App {
             None => column![
                 button(text("Pair a new device").size(13.0))
                     .style(ui_theme::primary(p)).padding([9.0, 14.0]).on_press(Message::ShowPairCode),
-                text("Shows a 6-digit code for a few minutes. Typing it on the other computer pairs the two; nothing secret has to be copied by hand.")
+                text("Only for setting up a new computer. Press it, then type the 6-digit code it shows into that computer's mouse-rs window. The two are then linked and find each other by themselves from then on.")
                     .size(11.0).color(p.txt3),
             ]
             .spacing(6.0)
@@ -2408,18 +2416,18 @@ impl App {
             ]
             .spacing(8.0)
             .align_y(Alignment::Center),
-            text("On the server, press \"Pair a new device\" in Settings → Security & pairing, then type the code it shows here.")
+            text("Only for first-time setup: on the computer with the mouse, press \"Pair a new device\" and type the code it shows here.")
                 .size(11.0).color(p.txt3),
         ]
         .spacing(6.0)
         .into()
     }
 
-    /// Settings → Security: the PIN on the server, an explanation on the client.
+    /// Settings → Security: the PIN on the client, an explanation on the server.
     fn pin_settings_view(&self, p: Palette) -> Element<'_, Message> {
-        if self.cfg.role != Role::Server {
+        if self.cfg.role != Role::Client {
             return text(
-                "The server may ask for a 4-digit PIN when this computer connects. It is asked once each time mouse-rs starts, not after a Wi-Fi drop.",
+                "The computer you drive may have a PIN. When it asks, a box appears on this window's main page; type its PIN there. It is asked once each time mouse-rs starts here, not after a Wi-Fi drop.",
             )
             .size(12.0)
             .color(p.txt2)
@@ -2443,11 +2451,11 @@ impl App {
         } else if self.cfg.pin_enabled {
             text("On. A PIN is made up when sharing starts; set your own below.").size(14.0).color(p.txt).into()
         } else {
-            text("Off. Any paired computer connects without a PIN.").size(14.0).color(p.warn).into()
+            text("Off. Any paired computer can drive this one without a PIN.").size(14.0).color(p.warn).into()
         };
         let mut col = column![
             status,
-            text("Typed on the other computer before it can connect. 5 wrong tries lock PIN entry for 5 minutes, then 10, 20…")
+            text("Before a computer can drive this one, its user must type this PIN there. Letters and symbols are fine, at least 4 characters. 5 wrong tries and this computer accepts no PIN for 5 minutes, then 10, 20…")
                 .size(11.0).color(p.txt3),
         ]
         .spacing(8.0);
@@ -2479,26 +2487,28 @@ impl App {
         col.push(buttons).into()
     }
 
-    /// Client, main window: the PIN box, while the server is asking for one.
+    /// Server, main window: the box for the client's PIN, while a client is asking for it.
     fn pin_prompt_view(&self, p: Palette) -> Option<Element<'_, Message>> {
         use mouse_core::pin::Prompt;
-        if self.cfg.role != Role::Client || !self.running() {
+        if self.cfg.role != Role::Server || !self.running() {
             return None;
         }
-        let why = match mouse_core::pin::prompt() {
-            Prompt::None => return None,
-            Prompt::Needed => "The server asks for its connection PIN. It is shown on the server in Settings → Security & pairing.".to_string(),
-            Prompt::Wrong(left) => format!("Wrong PIN. {left} tries left before PIN entry is locked."),
+        let (client, why) = mouse_core::pin::prompt()?;
+        let why = match why {
+            Prompt::Needed => format!(
+                "{client} has a connection PIN. Type it here to drive {client}. It is shown on {client}'s screen, or in Settings → Security & pairing there."
+            ),
+            Prompt::Wrong(left) => format!("Wrong PIN for {client}. {left} tries left before {client} stops accepting PINs for a while."),
             Prompt::Locked(until) => {
                 let secs = until.saturating_duration_since(std::time::Instant::now()).as_secs();
-                format!("Too many wrong PINs. Try again in {} min.", secs.div_ceil(60).max(1))
+                format!("Too many wrong PINs. {client} accepts none for {} min.", secs.div_ceil(60).max(1))
             }
         };
         Some(
             column![
                 text(why).size(12.0).color(p.warn),
                 row![
-                    input(p, "4-digit PIN", &self.pin_input, Message::PinTyped)
+                    input(p, "PIN", &self.pin_input, Message::PinTyped)
                         .secure(true)
                         .on_submit(Message::PinSubmit),
                     button(text("Connect").size(13.0))
@@ -2510,6 +2520,23 @@ impl App {
             .spacing(6.0)
             .into(),
         )
+    }
+
+    /// Client, main window: while a server is being refused over the PIN, say so, and show
+    /// a made-up PIN so whoever sits at the server can read it off this screen.
+    fn pin_waiting_view(&self, p: Palette) -> Option<Element<'_, Message>> {
+        if self.cfg.role != Role::Client || !self.running() || !mouse_core::pin::awaiting() {
+            return None;
+        }
+        let mut col = column![
+            text("A computer is asking to drive this one. Type this computer's PIN on it to allow it.")
+                .size(12.0).color(p.warn),
+        ]
+        .spacing(6.0);
+        if self.cfg.pin_made_up {
+            col = col.push(text(format!("PIN: {}", self.cfg.connection_pin)).size(28.0).color(p.accent));
+        }
+        Some(col.into())
     }
 
     /// Settings → Keyboard & hotkeys. The lock key is the everyday way back; the return

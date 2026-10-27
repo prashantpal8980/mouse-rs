@@ -124,25 +124,25 @@ pub(crate) fn refusal_text(reason: &str) -> Option<String> {
         r if r.starts_with("bad secret from ") => {
             format!("{} has a different shared secret", &r["bad secret from ".len()..])
         }
-        // Connection PIN (R35). The client sees the bare reason; the server sees it
-        // followed by " from <name>".
+        // Connection PIN (R35): set on the client, typed on the server. The client sees the
+        // bare reason; the server sees it followed by " from <client>".
         r if r.starts_with(mouse_core::pin::REASON_REQUIRED) => match r.split_once(" from ") {
-            Some((_, who)) => format!("{who} is waiting for the connection PIN to be typed there"),
-            None => "type the connection PIN shown on the server".to_owned(),
+            Some((_, who)) => format!("type {who}'s connection PIN here to connect"),
+            None => "waiting for this computer's PIN to be typed on the server".to_owned(),
         },
         r if r.starts_with(mouse_core::pin::REASON_WRONG) => {
             let left = r.split(':').nth(1).and_then(|n| n.split(' ').next()).unwrap_or("?");
             match r.split_once(" from ") {
-                Some((_, who)) => format!("{who} typed a wrong connection PIN ({left} tries left)"),
-                None => format!("wrong connection PIN; {left} tries left"),
+                Some((_, who)) => format!("wrong PIN for {who}; {left} tries left"),
+                None => format!("a wrong PIN was typed on the server; {left} tries left"),
             }
         }
         r if r.starts_with(mouse_core::pin::REASON_LOCKED) => {
             let secs: u64 = r.split(':').nth(1).and_then(|n| n.split(' ').next()?.parse().ok()).unwrap_or(0);
             let mins = secs.div_ceil(60).max(1);
             match r.split_once(" from ") {
-                Some((_, who)) => format!("too many wrong PINs from {who}; PIN entry locked for {mins} min"),
-                None => format!("too many wrong PINs; try again in {mins} min"),
+                Some((_, who)) => format!("too many wrong PINs; {who} accepts none for {mins} min"),
+                None => format!("too many wrong PINs typed on the server; locked for {mins} min"),
             }
         }
         r if r.contains("runs an older mouse-rs") => {
@@ -198,11 +198,17 @@ mod tests {
         assert!(refusal_text("server_not_verified").is_some());
         assert_eq!(
             refusal_text("wrong_pin:3 from kali-desktop").as_deref(),
-            Some("kali-desktop typed a wrong connection PIN (3 tries left)")
+            Some("wrong PIN for kali-desktop; 3 tries left")
         );
-        assert_eq!(refusal_text("wrong_pin:2").as_deref(), Some("wrong connection PIN; 2 tries left"));
-        assert_eq!(refusal_text("pin_locked:300").as_deref(), Some("too many wrong PINs; try again in 5 min"));
-        assert!(refusal_text("pin_required from kali").unwrap().contains("kali is waiting"));
+        assert_eq!(refusal_text("wrong_pin:2").as_deref(), Some("a wrong PIN was typed on the server; 2 tries left"));
+        assert_eq!(
+            refusal_text("pin_locked:300").as_deref(),
+            Some("too many wrong PINs typed on the server; locked for 5 min")
+        );
+        assert_eq!(
+            refusal_text("pin_required from kali").as_deref(),
+            Some("type kali's connection PIN here to connect")
+        );
         assert_eq!(refusal_text("handshake timed out"), None);
 
         let s = StatusHandle::new();

@@ -243,15 +243,18 @@ Typing an IP address stays available as an Advanced option.
 
 ### R35 / R38 — what was built on 27 Oct (awaiting the owner's hardware test)
 The six decisions of 26 Oct were never answered, so the suggested answers were used. Change any of them and the code follows.
-- **When the PIN is asked:** on the client's first connection after mouse-rs starts, and again only if it was wrong. An
-  automatic reconnect after a Wi-Fi drop or sleep reuses the PIN typed this run. The PIN box appears on the client's main
-  window, under "Other computer", only while the server is asking.
-- **Wrong PIN:** 5 tries, then PIN entry is locked for 5 minutes, then 10, 20… A correct PIN resets the count. Counted on
-  the server, for all clients together.
-- **On by default:** a server with no PIN makes one up when sharing starts. It is shown (masked, with Show) in
-  Settings → Security & pairing, where it can be changed (current PIN + new PIN twice) or turned off (current PIN).
-- **The login-screen instance does not ask for the PIN** (nobody can type one at a login screen). It still has to prove
-  the shared secret. See B40.
+- **Direction (owner, 27 Oct, correcting the first build):** the PIN protects the **client**, the machine being driven.
+  It is set and checked on the client and typed on the server, which has the keyboard. "The danger is on the client
+  side… anyone can be server and able to connect with the client and able to drive the machine."
+- **Any characters:** at least 4, letters and symbols allowed. A client with none makes up 4 digits; while a server is
+  being refused, the client's main window shows a made-up PIN so the person at the server can read it. A PIN the user
+  chose is never shown unasked. Set, change or turn off in Settings → Security & pairing on the client (current PIN needed).
+- **When it is asked:** the box appears on the server's main window when a client refuses it. What was typed is kept
+  for that client until mouse-rs restarts on the server, so a reconnect after a Wi-Fi drop or sleep doesn't ask again.
+  While waiting, the client retries every 2 s, so it connects within moments of the PIN being typed.
+- **Wrong PIN:** 5 tries, then the client accepts no PIN for 5 minutes, then 10, 20… Counted on the client.
+- **Login screen:** the login-screen instance checks the PIN too, using the PIN in its own config
+  (`/etc/mouse-rs/config.json`, copied by `greeter-install`).
 - **R38 — pairing with a code.** Server: Settings → Security & pairing (also on the main window) → **Pair a new device**
   shows a 6-digit code for 5 minutes. Client: type it under "Pair with a code" (main window or Security page) → **Pair**.
   With no server address set, the client tries every machine on its networks that answers on the server port. The code

@@ -112,16 +112,14 @@ pub enum Message {
         /// version 1 server, which the client refuses.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         proof: Option<String>,
-        /// The server asks for the connection PIN (R35). Absent from an older server.
-        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-        pin: bool,
+        /// Proof of the client's connection PIN (R35, see `pin::proof_hex`), when someone
+        /// has typed it on this server. The client checks it; absent, a client with a PIN
+        /// refuses and the server asks its user for the PIN.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pin_proof: Option<String>,
     },
     AuthResponse {
         hmac: String, // hex-encoded
-        /// Proof of the connection PIN (see `pin::proof_hex`), when the server asked for
-        /// one and the user has typed it.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        pin_proof: Option<String>,
     },
 
     // --- pairing with a code (see `pairing`) ---
@@ -384,7 +382,7 @@ mod tests {
                 login_screen: true,
                 nonce: Some("cd".into()),
             },
-            Message::AuthChallenge { nonce: "ab".into(), proof: Some("ef".into()), pin: true },
+            Message::AuthChallenge { nonce: "ab".into(), proof: Some("ef".into()), pin_proof: Some("01".into()) },
             Message::MouseMove { dx: 3, dy: -7 },
             Message::MouseButton {
                 button: Button::Left,
