@@ -537,7 +537,18 @@ Windows restores its settings, so the network list and auto-connect are normal w
 is at that machine. Linux needs root for the same, so Kali is not covered. Also built: the
 receiving side carries the pointer through a gap of up to ~30 ms at its speed
 (`motion_udp::Conceal`), and the server repeats the final total 25 and 80 ms after motion stops,
-which takes back a guess past where the hand stopped and covers a lost final datagram. Motion datagrams now carry the send time and the
+which takes back a guess past where the hand stopped and covers a lost final datagram.
+
+**Root cause of the 2.4 GHz lag, measured 27 Oct 2026:** Bluetooth earbuds (OPPO Enco Buds2)
+connected to Kali, whose Realtek RTL8821CE is one chip for Wi-Fi and Bluetooth sharing the 2.4 GHz
+radio. With the buds connected and the network idle, Kali → router ping was median 14.8 ms, 90%
+under 70 ms; with them disconnected, 1.5 ms and 2.2 ms. Pointer delay (from the timestamped
+datagrams) went from median 11–12 ms / 99% under 195–494 ms / max 0.8–1.5 s / ~20% of moves over
+50 ms, to median 1 ms / 99% under 21 ms / max 62 ms / 2 of 5003 over 50 ms. Kali's power saving
+made little difference (power save off: still ~18% over 50 ms with the buds on); the rtw88
+latency options (`disable_lps_deep`, `disable_aspm`) were already set. The 5 GHz hotspot was fast
+because Bluetooth doesn't share that band. Not a mouse-rs or router defect. Possible follow-up:
+a tip when Bluetooth audio and 2.4 GHz Wi-Fi are active together on Linux. Motion datagrams now carry the send time and the
 client logs "pointer delay over the last minute", which sees held-back moves, not just gaps.
 
 ### B38 — on a phone hotspot the two machines never found each other — **fixed 2026-10-26, confirmed on hardware**
