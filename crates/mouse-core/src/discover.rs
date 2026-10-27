@@ -66,6 +66,11 @@ fn kind_from_name(iface: &str) -> NetKind {
     }
 }
 
+/// The name of the interface with index `index` (the `%n` of an IPv6 link-local address).
+pub fn iface_name(index: u32) -> Option<String> {
+    if_addrs::get_if_addrs().ok()?.into_iter().find(|i| i.index == Some(index)).map(|i| i.name)
+}
+
 /// The kind of network `target` is reached through directly: the interface whose subnet
 /// contains it. `None` when it is on none of them (reached through a router or a tunnel).
 pub fn on_link_kind(target: Ipv4Addr) -> Option<NetKind> {

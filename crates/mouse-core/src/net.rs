@@ -721,7 +721,7 @@ async fn connect_once(
         local_path(tcp.local_addr().ok()),
         cfg.network_preference
     );
-    let on_cable = local_kind(tcp.local_addr().ok()) == Some(discover::NetKind::Cable);
+    let on_cable = local_kind(tcp.local_addr().ok(), addr) == Some(discover::NetKind::Cable);
     enable_keepalive(&tcp);
     crate::qos::prioritise_input(&tcp);
 
@@ -1248,8 +1248,14 @@ fn local_path(local: Option<SocketAddr>) -> String {
     }
 }
 
-/// The kind of network a connection's local address is on.
-fn local_kind(local: Option<SocketAddr>) -> Option<discover::NetKind> {
+/// The kind of network a connection to `remote` from `local` is on. An IPv6 link-local
+/// peer names its interface itself (the `%n`); IPv4 is matched by the local address.
+fn local_kind(local: Option<SocketAddr>, remote: SocketAddr) -> Option<discover::NetKind> {
+    if let SocketAddr::V6(v6) = remote {
+        if v6.scope_id() != 0 {
+            return discover::iface_name(v6.scope_id()).map(|n| discover::iface_kind(&n));
+        }
+    }
     let local = local?;
     discover::local_ipv4s()
         .into_iter()

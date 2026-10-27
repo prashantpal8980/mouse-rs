@@ -619,7 +619,7 @@ mod tests {
     #[tokio::test]
     async fn on_the_cable_every_move_lands_exactly_and_nothing_is_guessed() {
         let server_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
-        let mut s = ServerMotion::new(server_sock.clone(), key(7), server_sock.local_addr().unwrap());
+        let s = ServerMotion::new(server_sock.clone(), key(7), server_sock.local_addr().unwrap());
         let Some(Message::MotionOffer { port, token }) = s.offer() else { panic!("offer") };
         let mut c = ClientMotion::start(server_sock.local_addr().unwrap(), port, &token, key(7), true).await.unwrap();
         let k = key(7);
