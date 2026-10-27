@@ -241,20 +241,22 @@ A user who can't set a static IP must still be able to connect. Two devices on t
 Ethernet find each other on their own, and switching between Wi-Fi and Ethernet needs no settings change.
 Typing an IP address stays available as an Advanced option.
 
-### R35 / R38 — what was built on 27 Oct (awaiting the owner's hardware test)
-The six decisions of 26 Oct were never answered, so the suggested answers were used. Change any of them and the code follows.
-- **Direction (owner, 27 Oct, correcting the first build):** the PIN protects the **client**, the machine being driven.
-  It is set and checked on the client and typed on the server, which has the keyboard. "The danger is on the client
-  side… anyone can be server and able to connect with the client and able to drive the machine."
-- **Any characters:** at least 4, letters and symbols allowed. A client with none makes up 4 digits; while a server is
-  being refused, the client's main window shows a made-up PIN so the person at the server can read it. A PIN the user
-  chose is never shown unasked. Set, change or turn off in Settings → Security & pairing on the client (current PIN needed).
-- **When it is asked:** the box appears on the server's main window when a client refuses it. What was typed is kept
-  for that client until mouse-rs restarts on the server, so a reconnect after a Wi-Fi drop or sleep doesn't ask again.
-  While waiting, the client retries every 2 s, so it connects within moments of the PIN being typed.
-- **Wrong PIN:** 5 tries, then the client accepts no PIN for 5 minutes, then 10, 20… Counted on the client.
-- **Login screen:** the login-screen instance checks the PIN too, using the PIN in its own config
-  (`/etc/mouse-rs/config.json`, copied by `greeter-install`).
+### R35 / R38 — the password and pairing as agreed on 27 Oct (explained in `docs/security-explained.html`)
+- **Direction:** the password protects the **client**, the machine being driven. It is set and checked on the client
+  and typed on the server, which has the keyboard. "The danger is on the client side… anyone can be server and able to
+  connect with the client and able to drive the machine."
+- **Any characters**, at least 4. One password, two switches on the client:
+  **Ask at the login screen** (on by default; turning on login-screen sharing asks for a password to be set first) and
+  **Ask when someone is logged in here** (off by default).
+- **Reminder:** while the logged-in switch is off, the client's main window shows a reminder at most once a day:
+  Set a password / Not now / Don't show this again.
+- **Typed once per run on the server:** the box appears on the server's main window when the client refuses; what was
+  typed is kept for that client until mouse-rs restarts on the server. The client retries every 2 s while waiting.
+- **Wrong tries:** 3, then the client accepts none for 1 hour; 3 more, 2 hours; then 4, 8… A correct one resets it.
+  (Owner's words: "locked for 1 hour… 3 more tries… increased to 2 hours". Doubling after that is an assumption.)
+- **Change / turn off / forgot:** on the client, with no old password asked: being at the computer is the proof.
+  A change refreshes the login screen's copy through the desktop's own permission prompt (pkexec), not a command.
+- **Pairing on the main window** only until the computer is paired (or while a code shows); always in Settings.
 - **R38 — pairing with a code.** Server: Settings → Security & pairing (also on the main window) → **Pair a new device**
   shows a 6-digit code for 5 minutes. Client: type it under "Pair with a code" (main window or Security page) → **Pair**.
   With no server address set, the client tries every machine on its networks that answers on the server port. The code

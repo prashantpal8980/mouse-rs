@@ -1,0 +1,174 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pairing and Password</title>
+<style>
+:root {
+  --bg: #f6f7f9; --card: #ffffff; --ink: #1b1f24; --ink2: #4a525c; --ink3: #77808b;
+  --line: #e3e6ea; --accent: #3b6fd8; --accent-soft: #e8effc; --good: #2f8a4f; --good-soft: #e6f4ea;
+  --warn: #b86a00; --warn-soft: #fdf1e0; --bad: #c0392b; --bad-soft: #fbe9e7;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #12151a; --card: #1b2028; --ink: #e8ebef; --ink2: #b4bcc6; --ink3: #858e99;
+    --line: #2b323c; --accent: #7aa2ff; --accent-soft: #1f2a40; --good: #5cc584; --good-soft: #17301f;
+    --warn: #f0a640; --warn-soft: #33270f; --bad: #ff7a6b; --bad-soft: #3a1c19;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #12151a; --card: #1b2028; --ink: #e8ebef; --ink2: #b4bcc6; --ink3: #858e99;
+  --line: #2b323c; --accent: #7aa2ff; --accent-soft: #1f2a40; --good: #5cc584; --good-soft: #17301f;
+  --warn: #f0a640; --warn-soft: #33270f; --bad: #ff7a6b; --bad-soft: #3a1c19;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink); font: 16px/1.55 system-ui, -apple-system, "Segoe UI", sans-serif; }
+main { max-width: 860px; margin: 0 auto; padding: 32px 16px 64px; }
+h1 { font-size: 28px; margin: 0 0 6px; }
+h2 { font-size: 21px; margin: 40px 0 12px; }
+h3 { font-size: 16px; margin: 0 0 6px; }
+p { margin: 0 0 12px; color: var(--ink2); }
+.lead { font-size: 17px; color: var(--ink2); }
+.card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 18px 20px; margin: 12px 0; }
+.grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+@media (max-width: 640px) { .grid2 { grid-template-columns: 1fr; } }
+.tag { display: inline-block; font-size: 12px; font-weight: 600; padding: 2px 8px; border-radius: 99px; background: var(--accent-soft); color: var(--accent); margin-bottom: 8px; }
+.note { border-left: 4px solid var(--accent); background: var(--accent-soft); padding: 12px 16px; border-radius: 8px; color: var(--ink); margin: 12px 0; }
+.warn { border-left-color: var(--warn); background: var(--warn-soft); }
+.good { border-left-color: var(--good); background: var(--good-soft); }
+ol.steps { counter-reset: s; list-style: none; padding: 0; margin: 0; }
+ol.steps li { counter-increment: s; position: relative; padding: 10px 0 10px 44px; border-bottom: 1px dashed var(--line); color: var(--ink2); }
+ol.steps li:last-child { border-bottom: 0; }
+ol.steps li::before { content: counter(s); position: absolute; left: 0; top: 9px; width: 28px; height: 28px; border-radius: 50%; background: var(--accent); color: #fff; font-weight: 700; display: grid; place-items: center; font-size: 14px; }
+ol.steps b { color: var(--ink); }
+table { width: 100%; border-collapse: collapse; font-size: 15px; }
+th, td { text-align: left; padding: 9px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { color: var(--ink3); font-weight: 600; font-size: 13px; }
+.timeline { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin: 8px 0; }
+.chip { padding: 6px 10px; border-radius: 8px; font-size: 14px; font-weight: 600; }
+.try { background: var(--bad-soft); color: var(--bad); }
+.lock { background: var(--warn-soft); color: var(--warn); }
+.arrow { color: var(--ink3); }
+svg text { font-family: inherit; }
+.diagram { width: 100%; height: auto; display: block; }
+code { font-size: 14px; background: var(--accent-soft); padding: 1px 6px; border-radius: 5px; }
+</style>
+</head>
+<body>
+<main>
+<h1>Pairing and the password</h1>
+<p class="lead">Two separate things. <b>Pairing</b> happens once, when you set up a new computer.
+The <b>password</b> decides who may drive a computer, every time someone connects.</p>
+
+<h2>First: which computer is which</h2>
+<svg class="diagram" viewBox="0 0 800 210" role="img" aria-label="The laptop with the mouse drives the Kali desktop">
+  <rect x="20" y="30" width="300" height="150" rx="14" fill="var(--card)" stroke="var(--accent)" stroke-width="2"/>
+  <text x="170" y="75" text-anchor="middle" font-size="20" font-weight="700" fill="var(--ink)">Laptop (Windows)</text>
+  <text x="170" y="105" text-anchor="middle" font-size="15" fill="var(--ink2)">has the mouse and keyboard</text>
+  <text x="170" y="150" text-anchor="middle" font-size="15" font-weight="700" fill="var(--accent)">"server"</text>
+  <rect x="480" y="30" width="300" height="150" rx="14" fill="var(--card)" stroke="var(--good)" stroke-width="2"/>
+  <text x="630" y="75" text-anchor="middle" font-size="20" font-weight="700" fill="var(--ink)">Kali desktop</text>
+  <text x="630" y="105" text-anchor="middle" font-size="15" fill="var(--ink2)">is driven by the laptop</text>
+  <text x="630" y="150" text-anchor="middle" font-size="15" font-weight="700" fill="var(--good)">"client"</text>
+  <line x1="330" y1="105" x2="468" y2="105" stroke="var(--ink3)" stroke-width="2.5"/>
+  <polygon points="468,97 482,105 468,113" fill="var(--ink3)"/>
+  <text x="400" y="92" text-anchor="middle" font-size="14" fill="var(--ink2)">mouse, keys,</text>
+  <text x="400" y="130" text-anchor="middle" font-size="14" fill="var(--ink2)">clipboard</text>
+</svg>
+<p>The one at risk is the <b>client</b> (Kali), because it is the one being driven. The person at the laptop already
+owns the laptop. So the client decides who may drive it.</p>
+
+<h2>1 · Pairing — once, for a new computer</h2>
+<div class="card">
+  <span class="tag">What it is</span>
+  <p>Two computers running mouse-rs only trust each other if they share a long hidden key, the <b>shared secret</b>
+  (32 random characters). Without it, a stranger's mouse-rs on the same network can't even start talking to yours.</p>
+  <p>Before pairing existed, you had to copy those 32 characters by hand from one computer to the other.
+  Pairing does that copy for you, safely, using a short 6-digit code instead.</p>
+</div>
+
+<div class="card">
+  <span class="tag">How to do it</span>
+  <ol class="steps">
+    <li>On the <b>laptop</b> (has the mouse): Settings → Security &amp; pairing → <b>Pair a new device</b>.
+      It shows a code like <code>482 913</code> for 5 minutes.</li>
+    <li>On the <b>new computer</b>: type that code into <b>Pair with a code</b> and press <b>Pair</b>.</li>
+    <li>Done. The new computer now has the secret, and the two find each other by themselves from then on.</li>
+  </ol>
+</div>
+
+<div class="note good"><b>You don't need it today.</b> Your laptop and Kali already share the secret. That is why the
+main window no longer shows pairing once a computer is paired. It's for a buyer setting up for the first time,
+or for adding a third computer. It is always in Settings → Security &amp; pairing.</div>
+
+<div class="card">
+  <h3>Why it's safe</h3>
+  <p>The code is never sent over the network. Each side only proves it knows the same code. Someone listening learns
+  nothing. Someone guessing gets 3 tries, then the code is gone and a new one is needed. A code works once.</p>
+</div>
+
+<h2>2 · The password — who may drive this computer</h2>
+<div class="grid2">
+  <div class="card">
+    <span class="tag">Set on</span>
+    <h3>Kali (the client)</h3>
+    <p>Settings → Security &amp; pairing → <b>Set a password</b>. Letters, numbers and symbols are fine, at least
+    4 characters.</p>
+  </div>
+  <div class="card">
+    <span class="tag">Typed on</span>
+    <h3>The laptop (the server)</h3>
+    <p>When Kali asks, a password box appears on the laptop's main window. Type it there and press <b>Connect</b>.
+    You type with the keyboard you are already using.</p>
+  </div>
+</div>
+
+<div class="card">
+  <h3>What a stranger on the same network sees</h3>
+  <p>Say 100 people share an office network and 10 run mouse-rs. If one of them has paired with your Kali, then
+  without a password they could drive it. With a password, their laptop shows the box, they don't know the password,
+  and Kali refuses them.</p>
+</div>
+
+<h3 style="margin-top:22px">Two switches, one password</h3>
+<table>
+  <tr><th>Switch on Kali</th><th>Default</th><th>What it does</th></tr>
+  <tr><td><b>Ask at the login screen</b></td><td>On</td><td>Before anyone has logged in to Kali, the laptop must type the
+  password to type into Kali's login screen. Turning login-screen sharing on asks you to set a password first.</td></tr>
+  <tr><td><b>Ask when someone is logged in here</b></td><td>Off</td><td>The same check during normal use. While it is off,
+  Kali shows a reminder once a day: <b>Set a password</b> · <b>Not now</b> · <b>Don't show this again</b>.</td></tr>
+</table>
+
+<h3 style="margin-top:22px">How often you type it</h3>
+<p>Once each time mouse-rs starts on the laptop. After that the laptop remembers it, so a Wi-Fi drop or sleep
+reconnects without asking.</p>
+
+<h3 style="margin-top:22px">Wrong passwords</h3>
+<div class="timeline">
+  <span class="chip try">✗</span><span class="chip try">✗</span><span class="chip try">✗</span>
+  <span class="arrow">→</span><span class="chip lock">locked 1 hour</span><span class="arrow">→</span>
+  <span class="chip try">✗</span><span class="chip try">✗</span><span class="chip try">✗</span>
+  <span class="arrow">→</span><span class="chip lock">locked 2 hours</span><span class="arrow">→</span>
+  <span class="chip lock">then 4 h, 8 h…</span>
+</div>
+<p>While locked, Kali refuses even the right password. One correct password resets the count. Kali keeps the count,
+so a guesser can't get around it by switching computers.</p>
+
+<h3 style="margin-top:22px">Changing it, turning it off, or forgetting it</h3>
+<div class="card">
+  <ol class="steps">
+    <li><b>Change:</b> on Kali, Settings → Security &amp; pairing → type the new password twice → <b>Change password</b>.</li>
+    <li><b>Turn off:</b> on Kali, switch off <b>Ask when someone is logged in here</b> and/or <b>Ask at the login screen</b>.</li>
+    <li><b>Forgot it:</b> sit at Kali and set a new one. No old password is asked for. Being at the computer is the proof.</li>
+    <li><b>Login screen:</b> after a change, Kali updates its login-screen copy by itself. Kali asks for its own
+      computer password through the usual system prompt. No commands to type.</li>
+  </ol>
+</div>
+
+<div class="note warn"><b>Today's test.</b> Your Kali has no password set yet, so it will connect as before and
+show the daily reminder. To test: set one on Kali, switch on <b>Ask when someone is logged in here</b>, then type it in
+the box on the laptop. Try a wrong one once to see the "tries left" message.</div>
+</main>
+</body>
+</html>

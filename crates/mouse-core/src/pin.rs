@@ -24,10 +24,10 @@ use std::time::{Duration, Instant};
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 
-/// Wrong PINs allowed before the client stops accepting any for a while.
-pub const MAX_TRIES: u32 = 5;
-/// The first wait after [`MAX_TRIES`] wrong PINs; each further lock doubles it.
-pub const FIRST_LOCK: Duration = Duration::from_secs(5 * 60);
+/// Wrong passwords allowed before the client stops accepting any for a while (owner, 27 Oct).
+pub const MAX_TRIES: u32 = 3;
+/// The first wait after [`MAX_TRIES`] wrong passwords: 1 hour, then 2, 4, 8… (owner, 27 Oct).
+pub const FIRST_LOCK: Duration = Duration::from_secs(60 * 60);
 /// Shortest PIN.
 pub const MIN_LEN: usize = 4;
 /// Longest PIN.
@@ -43,12 +43,6 @@ pub const REASON_LOCKED: &str = "pin_locked";
 pub fn is_valid(pin: &str) -> bool {
     let n = pin.chars().count();
     (MIN_LEN..=MAX_LEN).contains(&n) && !pin.chars().any(char::is_control)
-}
-
-/// A fresh random 4-digit PIN, for a client that has none yet (the PIN is on by default).
-pub fn random_pin() -> String {
-    use rand::Rng;
-    format!("{:04}", rand::thread_rng().gen_range(0..10_000u32))
 }
 
 /// The server's proof that it knows `pin`, bound to this TLS session and these nonces.
@@ -249,7 +243,6 @@ mod tests {
         assert!(!is_valid("042"));
         assert!(!is_valid("ab\ncd"));
         assert!(!is_valid(&"x".repeat(MAX_LEN + 1)));
-        assert!(is_valid(&random_pin()));
     }
 
     #[test]

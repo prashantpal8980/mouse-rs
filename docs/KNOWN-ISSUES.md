@@ -911,8 +911,9 @@ end frame, the paste is recorded. Test:
   the file directly and is unaffected. Possible later fix: offer "Show in folder" from the
   panel, which opens the folder after the entry exists.
 
-### B40 — PIN limits of the first version (27 Oct 2026) — **open**
-- The login-screen instance reads the PIN from `/etc/mouse-rs/config.json`, which is copied only by `greeter-install`.
-  Until that copy is refreshed, the login screen runs with the PIN that was in the config when it was installed (none
-  on Kali today). A later build should refresh it without a command.
-- The first build of 27 Oct put the PIN on the server; the owner corrected the direction the same day (see R35).
+### B40 — password limits of the first version (27 Oct 2026) — **open**
+- The login-screen instance and the logged-in instance are separate processes with separate try counters, so a
+  guesser gets 3 tries against each before both lock.
+- The counters live in memory: the login-screen service restarting (it restarts when a session ends) resets its count.
+- The login screen reads the password from `/etc/mouse-rs/config.json`. The panel refreshes it after a change only
+  while login-screen sharing is on, and only if the user accepts the permission prompt.

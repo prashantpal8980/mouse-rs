@@ -235,11 +235,18 @@ enum Message {
     CancelPairCode,
     /// Server: Settings → Security, PIN section.
     ToggleShowPin,
-    PinCurrentTyped(String),
     PinNewTyped(String),
     PinNew2Typed(String),
     SavePin,
-    PinOff,
+    /// Client: ask for the password while logged in / at the login screen.
+    PinSessionToggled(bool),
+    /// Linux only: Windows has no login-screen sharing.
+    #[cfg(target_os = "linux")]
+    PinLoginToggled(bool),
+    /// Client: the daily set-a-password reminder.
+    PinReminderSet,
+    PinReminderLater,
+    PinReminderNever,
 }
 
 /// What the user asked for when a transfer was still running (R33).
@@ -404,7 +411,6 @@ struct App {
     pairing: Arc<Mutex<PairState>>,
     /// Server: Settings → Security PIN fields.
     show_pin: bool,
-    pin_current: String,
     pin_new: String,
     pin_new2: String,
     /// Whether the overflow (⋯) menu is open. Everything rare or destructive lives there,
@@ -559,7 +565,6 @@ impl App {
             pair_code_input: String::new(),
             pairing: Arc::new(Mutex::new(PairState::Idle)),
             show_pin: false,
-            pin_current: String::new(),
             pin_new: String::new(),
             pin_new2: String::new(),
             menu_open: false,
@@ -660,13 +665,6 @@ impl App {
     }
 
     fn start_engine(&mut self) {
-        // The PIN is on by default (R35). A client that has never had one gets a random one
-        // rather than running without; its main window shows it while a server asks.
-        if self.cfg.role == Role::Client && self.cfg.pin_enabled && self.cfg.connection_pin.is_empty() {
-            self.cfg.connection_pin = mouse_core::pin::random_pin();
-            self.cfg.pin_made_up = true;
-            tracing::info!("made up a connection PIN; it is shown in Settings → Security");
-        }
         // Starting persists the current settings, so a later headless or at-login run uses
         // exactly what the panel was showing. That write is logged because the user didn't
         // ask for it: an unannounced rewrite of the file holding `shared_secret` should at
@@ -688,6 +686,19 @@ impl App {
         self.live_cfg = Some(self.cfg.clone());
         self.saved_cfg = self.cfg.clone();
         self.restart_hint_dismissed = false;
+    }
+
+    /// After a password setting changed: save, restart sharing so it applies now, and
+    /// refresh the login screen's own copy of the settings, which it reads from `/etc`
+    /// (that asks for the computer's password through the desktop, not a command).
+    fn apply_pin_change(&mut self) -> Task<Message> {
+        let t = self.save_and_apply();
+        #[cfg(target_os = "linux")]
+        if self.login_screen.on() {
+            let _ = self.cfg.save(&Config::default_path());
+            self.apply_login_screen(true);
+        }
+        t
     }
 
     /// Save the settings and, if sharing is on, restart it so they take effect now.
@@ -1259,6 +1270,13 @@ impl App {
             // toggle acts immediately, because the answer has been given.
             #[cfg(target_os = "linux")]
             Message::LoginScreenToggled(v) => {
+                // The login-screen password is on by default (owner, 27 Oct), and the login
+                // screen has no way to show or ask for one, so it must exist first.
+                if v && self.cfg.login_pin_enabled && self.cfg.connection_pin.is_empty() {
+                    self.feedback = "set a password first: whoever drives the login screen will be asked for it".into();
+                    self.page = Some(Page::Security);
+                    return Task::none();
+                }
                 if v && !self.cfg.login_screen_notice_seen {
                     self.login_screen_asking = true;
                 } else {
@@ -1508,48 +1526,60 @@ impl App {
             }
             Message::CancelPairCode => mouse_core::pairing::cancel_code(),
             Message::ToggleShowPin => self.show_pin = !self.show_pin,
-            Message::PinCurrentTyped(v) => self.pin_current = v.chars().take(mouse_core::pin::MAX_LEN).collect(),
             Message::PinNewTyped(v) => self.pin_new = v.chars().take(mouse_core::pin::MAX_LEN).collect(),
             Message::PinNew2Typed(v) => self.pin_new2 = v.chars().take(mouse_core::pin::MAX_LEN).collect(),
             Message::SavePin => {
-                let has_pin = self.cfg.pin_enabled && !self.cfg.connection_pin.is_empty();
-                if has_pin && self.pin_current != self.cfg.connection_pin {
-                    self.feedback = "the current PIN is not right".into();
-                    return Task::none();
-                }
+                // No old password is asked for: being at this computer is the proof (owner,
+                // 27 Oct). It is also how a forgotten password is replaced.
                 if !mouse_core::pin::is_valid(&self.pin_new) {
                     self.feedback = format!(
-                        "the new PIN needs {} to {} characters; letters and symbols are fine",
+                        "the password needs {} to {} characters; letters, numbers and symbols are all fine",
                         mouse_core::pin::MIN_LEN,
                         mouse_core::pin::MAX_LEN
                     );
                     return Task::none();
                 }
                 if self.pin_new != self.pin_new2 {
-                    self.feedback = "the two new PINs differ".into();
+                    self.feedback = "the two passwords differ".into();
                     return Task::none();
                 }
+                let first = self.cfg.connection_pin.is_empty();
                 self.cfg.connection_pin = std::mem::take(&mut self.pin_new);
-                self.cfg.pin_made_up = false;
-                self.cfg.pin_enabled = true;
                 self.pin_new2.clear();
-                self.pin_current.clear();
-                tracing::info!("connection PIN changed");
-                let t = self.save_and_apply();
-                self.feedback = "PIN saved".into();
+                // Setting a password for the first time is asking for it to be used.
+                if first {
+                    self.cfg.pin_enabled = true;
+                }
+                tracing::info!("connection password changed");
+                let t = self.apply_pin_change();
+                self.feedback = "password saved".into();
                 return t;
             }
-            Message::PinOff => {
-                if self.pin_current != self.cfg.connection_pin {
-                    self.feedback = "type the current PIN to turn it off".into();
+            Message::PinSessionToggled(on) => {
+                if on && self.cfg.connection_pin.is_empty() {
+                    self.feedback = "set a password below first".into();
                     return Task::none();
                 }
-                self.cfg.pin_enabled = false;
-                self.pin_current.clear();
-                tracing::info!("connection PIN turned off");
-                let t = self.save_and_apply();
-                self.feedback = "PIN turned off".into();
-                return t;
+                self.cfg.pin_enabled = on;
+                tracing::info!(on, "password while logged in changed");
+                return self.apply_pin_change();
+            }
+            #[cfg(target_os = "linux")]
+            Message::PinLoginToggled(on) => {
+                self.cfg.login_pin_enabled = on;
+                tracing::info!(on, "password at the login screen changed");
+                return self.apply_pin_change();
+            }
+            Message::PinReminderSet => {
+                self.page = Some(Page::Security);
+            }
+            Message::PinReminderLater => {
+                self.cfg.pin_reminder_day = today();
+                let _ = self.cfg.save(&Config::default_path());
+            }
+            Message::PinReminderNever => {
+                self.cfg.pin_reminder_off = true;
+                let _ = self.cfg.save(&Config::default_path());
             }
             Message::RestartNow => return self.leave(Leave::Restart),
             Message::RestartLater => {
@@ -1661,6 +1691,9 @@ impl App {
             content = content.push(banner);
         }
         if let Some(banner) = self.elevation_notice(p) {
+            content = content.push(banner);
+        }
+        if let Some(banner) = self.pin_reminder(p) {
             content = content.push(banner);
         }
         #[cfg(target_os = "linux")]
@@ -1952,14 +1985,21 @@ impl App {
             if let Some(pin) = self.pin_prompt_view(p) {
                 col = col.push(pin);
             }
-            col.push(text(if local.is_empty() { "none found".to_string() } else { local.join("  ·  ") })
+            col = col
+                .push(text(if local.is_empty() { "none found".to_string() } else { local.join("  ·  ") })
                     .size(13.0)
                     .color(p.txt2))
                 .push(text("The other computer finds this one by itself on a shared network; type one of these there only if it does not.")
                     .size(11.0)
-                    .color(p.txt3))
-                .push(labeled(p, "Pairing", self.pair_server_view(p)))
-                .into()
+                    .color(p.txt3));
+            // Pairing is for setting up a new computer; on the main window only until this
+            // one has been paired, or while a code is showing. It is always in Settings.
+            if self.cfg.shared_secret == mouse_core::config::DEFAULT_SECRET
+                || mouse_core::pairing::current_code().is_some()
+            {
+                col = col.push(labeled(p, "Set up a new computer", self.pair_server_view(p)));
+            }
+            col.into()
         } else {
             let scanning = matches!(*self.scan.lock().unwrap(), ScanState::Running);
             let detect = button(
@@ -2012,7 +2052,9 @@ impl App {
             if let Some(waiting) = self.pin_waiting_view(p) {
                 col = col.push(waiting);
             }
-            col = col.push(labeled(p, "Pair with a code", self.pair_client_view(p)));
+            if self.cfg.shared_secret == mouse_core::config::DEFAULT_SECRET {
+                col = col.push(labeled(p, "First-time setup: pair with a code", self.pair_client_view(p)));
+            }
             col.into()
         };
 
@@ -2046,11 +2088,11 @@ impl App {
                 info_row(
                     p,
                     "🔢",
-                    "Connection PIN",
-                    match (server_side, cb.pin_enabled) {
+                    "Password",
+                    match (server_side, cb.pin_enabled && !cb.connection_pin.is_empty()) {
                         (false, true) => "on".to_string(),
                         (false, false) => "off".to_string(),
-                        (true, _) => "asked by the computer you drive".to_string(),
+                        (true, _) => "set on the computer you drive".to_string(),
                     },
                     Page::Security,
                 ),
@@ -2427,17 +2469,17 @@ impl App {
     fn pin_settings_view(&self, p: Palette) -> Element<'_, Message> {
         if self.cfg.role != Role::Client {
             return text(
-                "The computer you drive may have a PIN. When it asks, a box appears on this window's main page; type its PIN there. It is asked once each time mouse-rs starts here, not after a Wi-Fi drop.",
+                "The password belongs to the computer you drive, and is set there. When it asks, a box appears on this window's main page; type its password there. It is asked once each time mouse-rs starts here, not after a Wi-Fi drop.",
             )
             .size(12.0)
             .color(p.txt2)
             .into();
         }
-        let on = self.cfg.pin_enabled && !self.cfg.connection_pin.is_empty();
-        let status: Element<'_, Message> = if on {
+        let has = !self.cfg.connection_pin.is_empty();
+        let status: Element<'_, Message> = if has {
             row![
                 text(format!(
-                    "On. PIN: {}",
+                    "Password: {}",
                     if self.show_pin { self.cfg.connection_pin.clone() } else { "••••".into() }
                 ))
                 .size(14.0)
@@ -2448,43 +2490,76 @@ impl App {
             ]
             .align_y(Alignment::Center)
             .into()
-        } else if self.cfg.pin_enabled {
-            text("On. A PIN is made up when sharing starts; set your own below.").size(14.0).color(p.txt).into()
         } else {
-            text("Off. Any paired computer can drive this one without a PIN.").size(14.0).color(p.warn).into()
+            text("No password set. Any computer that has been paired with this one can drive it.")
+                .size(14.0).color(p.warn).into()
         };
         let mut col = column![
             status,
-            text("Before a computer can drive this one, its user must type this PIN there. Letters and symbols are fine, at least 4 characters. 5 wrong tries and this computer accepts no PIN for 5 minutes, then 10, 20…")
+            text("Whoever wants to drive this computer types this password on their own computer. 3 wrong tries and this computer accepts none for 1 hour, then 2, 4, 8 hours…")
                 .size(11.0).color(p.txt3),
+            toggle_row(p, "Ask when someone is logged in here", "off by default", self.cfg.pin_enabled, Message::PinSessionToggled),
         ]
         .spacing(8.0);
-        if on {
-            col = col.push(labeled(
+        #[cfg(target_os = "linux")]
+        {
+            col = col.push(toggle_row(
                 p,
-                "Current PIN (needed to change it or turn it off)",
-                input(p, "current PIN", &self.pin_current, Message::PinCurrentTyped).secure(true),
+                "Ask at the login screen",
+                "on by default; only matters when login-screen sharing is on (Settings → Startup)",
+                self.cfg.login_pin_enabled,
+                Message::PinLoginToggled,
             ));
         }
+        col = col.push(field_label(p, if has { "New password (forgot it? just set a new one — being at this computer is enough)" } else { "Set a password" }));
         col = col.push(
             row![
-                input(p, if on { "new PIN" } else { "PIN" }, &self.pin_new, Message::PinNewTyped).secure(true),
+                input(p, "password", &self.pin_new, Message::PinNewTyped).secure(true),
                 input(p, "again", &self.pin_new2, Message::PinNew2Typed).secure(true).on_submit(Message::SavePin),
             ]
             .spacing(8.0),
         );
-        let mut buttons = row![
-            button(text(if on { "Change PIN" } else { "Turn on with this PIN" }).size(13.0))
+        col.push(
+            button(text(if has { "Change password" } else { "Set password" }).size(13.0))
                 .style(ui_theme::primary(p)).padding([9.0, 14.0]).on_press(Message::SavePin),
-        ]
-        .spacing(8.0);
-        if on {
-            buttons = buttons.push(
-                button(text("Turn off").size(13.0))
-                    .style(ui_theme::ghost(p)).padding([9.0, 14.0]).on_press(Message::PinOff),
-            );
+        )
+        .into()
+    }
+
+    /// Client, main window, at most once a day: a nudge to set a password, until one is in
+    /// use or the user says never (owner, 27 Oct).
+    fn pin_reminder(&self, p: Palette) -> Option<Element<'_, Message>> {
+        if self.cfg.role != Role::Client
+            || self.cfg.pin_reminder_off
+            || (self.cfg.pin_enabled && !self.cfg.connection_pin.is_empty())
+            || self.cfg.pin_reminder_day == today()
+            || self.page.is_some()
+        {
+            return None;
         }
-        col.push(buttons).into()
+        Some(
+            container(
+                column![
+                    text("Protect this computer with a password").size(13.5).color(p.txt),
+                    text("Without one, anyone on this network who has paired a computer with this one can drive it. With one, they also need the password, and 3 wrong tries lock them out for an hour.")
+                        .size(11.0).color(p.txt3),
+                    row![
+                        button(text("Set a password").size(12.5))
+                            .style(ui_theme::primary(p)).padding([9.0, 14.0]).on_press(Message::PinReminderSet),
+                        button(text("Not now").size(12.5))
+                            .style(ui_theme::ghost(p)).padding([9.0, 12.0]).on_press(Message::PinReminderLater),
+                        button(text("Don't show this again").size(12.5))
+                            .style(ui_theme::ghost(p)).padding([9.0, 12.0]).on_press(Message::PinReminderNever),
+                    ]
+                    .spacing(8.0),
+                ]
+                .spacing(8.0),
+            )
+            .style(move |_| ui_theme::well(p))
+            .padding([11.0, 14.0])
+            .width(Length::Fill)
+            .into(),
+        )
     }
 
     /// Server, main window: the box for the client's PIN, while a client is asking for it.
@@ -2522,21 +2597,17 @@ impl App {
         )
     }
 
-    /// Client, main window: while a server is being refused over the PIN, say so, and show
-    /// a made-up PIN so whoever sits at the server can read it off this screen.
+    /// Client, main window: while a server is being refused over the password, say so.
     fn pin_waiting_view(&self, p: Palette) -> Option<Element<'_, Message>> {
         if self.cfg.role != Role::Client || !self.running() || !mouse_core::pin::awaiting() {
             return None;
         }
-        let mut col = column![
-            text("A computer is asking to drive this one. Type this computer's PIN on it to allow it.")
-                .size(12.0).color(p.warn),
-        ]
-        .spacing(6.0);
-        if self.cfg.pin_made_up {
-            col = col.push(text(format!("PIN: {}", self.cfg.connection_pin)).size(28.0).color(p.accent));
-        }
-        Some(col.into())
+        Some(
+            text("A computer is asking to drive this one. Type this computer's password on it to allow it.")
+                .size(12.0)
+                .color(p.warn)
+                .into(),
+        )
     }
 
     /// Settings → Keyboard & hotkeys. The lock key is the everyday way back; the return
@@ -3820,6 +3891,14 @@ fn pair_in_background(cfg: &Config, code: &str) -> Result<(String, String), Stri
         }
     }
     last
+}
+
+/// Today, as days since 1970 (UTC): enough to show the reminder at most once a day.
+fn today() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() / 86_400)
+        .unwrap_or(0)
 }
 
 /// Pairing failures in words.

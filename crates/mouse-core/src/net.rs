@@ -1178,7 +1178,8 @@ async fn client_handshake(
     // may drive it. The server must show the PIN, typed there by its user; the check and
     // the try limits are here. This applies at the login screen too: the PIN is typed on
     // the server, which has a keyboard.
-    if cfg.pin_enabled && !cfg.connection_pin.is_empty() {
+    let pin_on = if cfg.at_login_screen { cfg.login_pin_enabled } else { cfg.pin_enabled };
+    if pin_on && !cfg.connection_pin.is_empty() {
         use crate::pin::{check_attempt, locked_for, refusal_reason, verify, Verdict, REASON_REQUIRED};
         let verdict = match (locked_for(), pin_proof) {
             (Some(left), _) => Some(Verdict::Locked(left)),
@@ -1728,6 +1729,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
         let mut client_cfg = test_cfg(Role::Client, port, true);
         client_cfg.connection_pin = "Ab#4321".into();
+        client_cfg.pin_enabled = true;
         let client = tokio::spawn(run_client(client_cfg, fast_params(), cancel.clone(), c_ch, LinkHealth::new()));
 
         // Nothing typed on the server yet: the client refuses and the server asks its user.
@@ -1747,7 +1749,7 @@ mod tests {
                 None => break,
             }
         }
-        assert_eq!(wrong.as_deref(), Some("wrong_pin:4"), "counted on the client");
+        assert_eq!(wrong.as_deref(), Some("wrong_pin:2"), "counted on the client");
         while let Some(r) = next_refusal(&mut s_events).await {
             if r.starts_with("wrong_pin") {
                 break;

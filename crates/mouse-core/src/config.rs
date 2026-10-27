@@ -147,18 +147,22 @@ pub struct Config {
     pub role: Role,
 
     pub shared_secret: String,
-    /// This machine, as a client, accepts a server only if the server shows this machine's
-    /// connection PIN (R35). On by default.
-    #[serde(default = "default_true")]
-    pub pin_enabled: bool,
-    /// The connection PIN, kept on the client and typed on the server. Empty until first
-    /// set; a client with the PIN on and none set makes up 4 digits. Kept in the clear like
-    /// `shared_secret`, in the same 0600 file: a short PIN gains nothing from hashing.
+    /// The connection password (PIN), kept on the client and typed on the server (R35).
+    /// One password for both places below. Empty until the user sets one. Kept in the clear
+    /// like `shared_secret`, in the same 0600 file: a short PIN gains nothing from hashing.
     pub connection_pin: String,
-    /// The PIN was made up rather than chosen. Only then does the client's main window
-    /// show it while a server asks, because the person driving the client from the server
-    /// may have no other way to read it. A chosen PIN is never shown unasked.
-    pub pin_made_up: bool,
+    /// Ask for the password while someone is logged in on this client. Off by default
+    /// (owner, 27 Oct); the panel reminds once a day until it is on or the reminder is
+    /// turned off.
+    pub pin_enabled: bool,
+    /// Ask for the password at this client's login screen. On by default (owner, 27 Oct):
+    /// typing into a login prompt from the network is what most needs guarding.
+    #[serde(default = "default_true")]
+    pub login_pin_enabled: bool,
+    /// "Don't show this again" on the daily set-a-password reminder.
+    pub pin_reminder_off: bool,
+    /// The day (days since 1970, UTC) the reminder was last dismissed with "Not now".
+    pub pin_reminder_day: u64,
     #[serde(default = "default_true")]
     pub tls_enabled: bool,
     #[serde(default = "default_true")]
@@ -419,9 +423,11 @@ impl Default for Config {
             name: default_name(),
             role: Role::Server,
             shared_secret: DEFAULT_SECRET.into(),
-            pin_enabled: true,
             connection_pin: String::new(),
-            pin_made_up: false,
+            pin_enabled: false,
+            login_pin_enabled: true,
+            pin_reminder_off: false,
+            pin_reminder_day: 0,
             tls_enabled: true,
             clipboard_sync: true,
             clipboard_sync_text: true,
