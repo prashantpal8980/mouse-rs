@@ -10,7 +10,7 @@
 //! behind the sender, moving smoothly between the positions already received, and predicting
 //! forward only when data is late. On that same recording, 40–60 ms of delay plus up to 60 ms
 //! of prediction left 2.5–4% of frames frozen. The delay adapts: it follows how late moves
-//! actually arrive (the 90th percentile over the last few seconds, up to a maximum), so on a
+//! actually arrive (the 99th percentile over the last few seconds, up to a maximum), so on a
 //! clean link (cable, 5 GHz, no Bluetooth audio) it stays near zero and nothing is added.
 //!
 //! Every move carries the sender's clock (`sent`, ms) and the running total, so this needs
@@ -22,7 +22,7 @@ use std::collections::VecDeque;
 /// How long the playback delay is chosen.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum Mode {
-    /// Follow the link: the 90th percentile of lateness, never more than `max_ms`.
+    /// Follow the link: the 99th percentile of lateness, never more than `max_ms`.
     Auto { max_ms: f64 },
     /// Always this much (for the owner's feel test).
     Fixed(f64),
@@ -49,15 +49,22 @@ pub(crate) const AUTO_MAX_MS: f64 = 60.0;
 /// the prediction eases off to a stop.
 const PREDICT_MS: f64 = 60.0;
 const PREDICT_FULL_MS: f64 = 40.0;
+/// The longest the pointer waits for real data to catch up with a guess, ms.
+const HOLD_MAX_MS: f64 = 100.0;
 /// The window the automatic delay looks back over.
 const WINDOW_MS: f64 = 3000.0;
 /// How fast the delay may change: ms of delay per ms of time. Playback speeds up or slows
 /// down by at most this fraction, which the eye doesn't notice.
 const SLEW: f64 = 0.1;
+/// How fast the delay comes back down: a tenth of the way up.
+const SLEW_DOWN: f64 = 0.01;
 /// Already-played positions kept for measuring speed.
 const PLAYED_KEPT: usize = 32;
 /// Speed is measured over at least this much of the sender's time.
 const SPEED_SPAN_MS: f64 = 8.0;
+
+/// A position or a velocity, in pixels (or pixels per ms).
+type Point = (f64, f64);
 
 #[derive(Clone, Copy, Debug)]
 struct Sample {
@@ -84,6 +91,10 @@ pub(crate) struct Playout {
     last_tick: Option<f64>,
     /// The sender repeated its newest total: motion has stopped there, predict nothing past it.
     stopped_at: Option<u64>,
+    /// The position last returned, and while it was ahead of real data on a guess, the
+    /// direction of that guess and when guessing began.
+    shown: Option<(f64, f64)>,
+    lead: Option<((f64, f64), f64)>,
     /// Renders that were a prediction, for the per-minute counters.
     pub(crate) predicted: u64,
 }
@@ -103,6 +114,8 @@ impl Playout {
             delay,
             last_tick: None,
             stopped_at: None,
+            shown: None,
+            lead: None,
             predicted: 0,
         }
     }
@@ -153,6 +166,8 @@ impl Playout {
         let here = self.play_time(now).unwrap_or(f64::MIN);
         self.samples.retain(|s| s.seq > seq);
         self.played.clear();
+        self.shown = None;
+        self.lead = None;
         self.samples.push_front(Sample { seq, sent: here, pos });
         if self.samples.len() == 1 {
             self.stopped_at = Some(seq);
@@ -174,7 +189,39 @@ impl Playout {
     }
 
     /// Where the pointer should be at `now`, in the sender's total coordinates.
+    ///
+    /// A prediction is never taken back while the hand is still moving: if real data lands
+    /// behind where a guess already put the pointer, the pointer waits there for the real path
+    /// to catch up, instead of stepping back. Stepping back was the small left-right jitter
+    /// the owner felt in the first feel test (27 Oct): replaying the recording, prediction
+    /// turned 0.2% of frames into back-and-forth wobbles at 3.2%. The pointer does go back when
+    /// the hand really stopped (the sender's repeat), after a click's sync, or after waiting
+    /// [`HOLD_MAX_MS`].
     pub(crate) fn target(&mut self, now: f64) -> Option<(f64, f64)> {
+        let (want, guessed, v) = self.raw_target(now)?;
+        if let (Some(shown), Some((dir, since))) = (self.shown, self.lead) {
+            let stopped = self.samples.back().is_some_and(|n| self.stopped_at == Some(n.seq));
+            let back = (want.0 - shown.0) * dir.0 + (want.1 - shown.1) * dir.1;
+            if back < 0.0 && !stopped && now - since < HOLD_MAX_MS {
+                return Some(shown);
+            }
+            if !guessed {
+                self.lead = None;
+            }
+        }
+        if guessed {
+            let speed = v.0.hypot(v.1);
+            if speed > 0.0 {
+                let since = self.lead.map_or(now, |(_, t)| t);
+                self.lead = Some(((v.0 / speed, v.1 / speed), since));
+            }
+        }
+        self.shown = Some(want);
+        Some(want)
+    }
+
+    /// The playback position at `now`, whether it is a guess, and the speed used for it.
+    fn raw_target(&mut self, now: f64) -> Option<(Point, bool, Point)> {
         self.adjust_delay(now);
         let ts = self.play_time(now)?;
         // Drop what has been fully played, keeping the one being played.
@@ -190,28 +237,29 @@ impl Playout {
         let as_f = |p: (i64, i64)| (p.0 as f64, p.1 as f64);
         if ts < a.sent {
             // Before anything known (the first sample, or right after a sync): hold.
-            return Some(as_f(a.pos));
+            return Some((as_f(a.pos), false, (0.0, 0.0)));
         }
         if let Some(b) = self.samples.get(1) {
             // Between two known positions: move smoothly from one to the other.
             let span = (b.sent - a.sent).max(f64::EPSILON);
             let k = ((ts - a.sent) / span).clamp(0.0, 1.0);
-            return Some((
+            let at = (
                 a.pos.0 as f64 + (b.pos.0 - a.pos.0) as f64 * k,
                 a.pos.1 as f64 + (b.pos.1 - a.pos.1) as f64 * k,
-            ));
+            );
+            return Some((at, false, (0.0, 0.0)));
         }
         // Past the newest known position: predict, unless the hand has stopped there.
         if self.stopped_at == Some(a.seq) {
-            return Some(as_f(a.pos));
+            return Some((as_f(a.pos), false, (0.0, 0.0)));
         }
-        let Some(v) = self.speed() else { return Some(as_f(a.pos)) };
+        let Some(v) = self.speed() else { return Some((as_f(a.pos), false, (0.0, 0.0))) };
         let into = ts - a.sent;
         let k = eased(into);
         if k > 0.0 {
             self.predicted += 1;
         }
-        Some((a.pos.0 as f64 + v.0 * k, a.pos.1 as f64 + v.1 * k))
+        Some(((a.pos.0 as f64 + v.0 * k, a.pos.1 as f64 + v.1 * k), k > 0.0, v))
     }
 
     /// Speed (px per ms of the sender's time) at the newest position, over at least
@@ -244,9 +292,11 @@ impl Playout {
         }
         let mut late: Vec<f64> = self.late.iter().map(|(_, l)| *l).collect();
         late.sort_by(f64::total_cmp);
-        let want = late[(late.len() * 9 / 10).min(late.len() - 1)].clamp(0.0, max_ms);
-        let step = SLEW * dt;
-        self.delay += (want - self.delay).clamp(-step, step);
+        let want = late[(late.len() * 99 / 100).min(late.len() - 1)].clamp(0.0, max_ms);
+        // Rise fast when moves start arriving late; come down slowly once they stop, so a calm
+        // second between pauses doesn't pull playback into guessing just before the next one.
+        let (up, down) = (SLEW * dt, SLEW_DOWN * dt);
+        self.delay += (want - self.delay).clamp(-down, up);
     }
 }
 
@@ -316,6 +366,25 @@ mod tests {
         feed(&mut p, 20, 60, |_| 0.0);
         let (x, _) = p.target(1076.0 + 200.0).unwrap();
         assert!((x - 276.0).abs() < 0.5, "{x}");
+    }
+
+    #[test]
+    fn a_guess_is_not_taken_back_while_the_hand_keeps_moving() {
+        let mut p = Playout::new(Mode::Fixed(0.0));
+        feed(&mut p, 0, 20, |_| 0.0); // at 76 px, 1 px/ms
+        let (x, _) = p.target(1076.0 + 30.0).unwrap(); // guessed on to 106
+        assert!((x - 106.0).abs() < 0.5, "{x}");
+        // Real data: the hand slowed to 0.5 px/ms, so it is only at 91 at that time.
+        for i in 0..8u64 {
+            let sent = 80.0 + 4.0 * i as f64;
+            p.push(21 + i, sent, (78 + 2 * i as i64, 0), 1106.0);
+        }
+        let (x, _) = p.target(1106.0).unwrap();
+        assert!(x >= 106.0 - 0.01, "waits at the guess, doesn't step back: {x}");
+        // The hand stops there: the repeat says so, and the pointer goes to the true spot.
+        p.push(28, 108.0, (92, 0), 1110.0);
+        let (x, _) = p.target(1112.0).unwrap();
+        assert_eq!(x, 92.0);
     }
 
     #[test]

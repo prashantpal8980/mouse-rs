@@ -59,6 +59,8 @@ pub async fn run_client_engine(
     let (mut moves, mut keys) = (0u64, 0u64);
 
     let mut motion_log = mouse_core::timing::MotionLog::default();
+    let mut last_key_at: Option<std::time::Instant> = None;
+    let mut prev_key_gap_ms: u64 = 0;
     loop {
         tokio::select! {
             _ = cancel.cancelled() => {
@@ -130,14 +132,28 @@ pub async fn run_client_engine(
                         if let Some(ev) = InputEvent::from_message(&other) {
                             if let InputEvent::Key { key, pressed } = &ev {
                                 keys += 1;
+                                let now = std::time::Instant::now();
+                                let gap_ms = last_key_at.map_or(0, |t| now.duration_since(t).as_millis() as u64);
+                                last_key_at = Some(now);
                                 // First few only: enough to prove keys arrive and to see
                                 // which ones, without the per-second spam that got the
                                 // old kbd_diag counters deleted.
                                 if keys <= 8 && at_login_screen {
-                                    tracing::info!(pressed, n = keys, "key received from peer (not named: login screen)");
+                                    tracing::info!(pressed, n = keys, gap_ms, "key received from peer (not named: login screen)");
                                 } else if keys <= 8 {
-                                    tracing::info!(?key, pressed, n = keys, "key received from peer");
+                                    tracing::info!(?key, pressed, n = keys, gap_ms, "key received from peer");
+                                } else if !at_login_screen && is_switching_key(key) {
+                                    // Modifiers, Tab and Escape are named after the first 8 too, so
+                                    // a stuck or mistimed shortcut (Alt-Tab, 27 Oct) shows in the log.
+                                    // Letters never are: nothing typed can be read back from here.
+                                    tracing::info!(?key, pressed, n = keys, gap_ms, "shortcut key received from peer");
                                 }
+                                if gap_ms <= 2 && prev_key_gap_ms >= 100 {
+                                    // Keys held back by the network, then delivered at once: their
+                                    // timing is lost, which can upset shortcuts.
+                                    tracing::info!(n = keys, after_ms = prev_key_gap_ms, "keys arrived in a burst after a hold-up");
+                                }
+                                prev_key_gap_ms = gap_ms;
                             }
                             inject.send(InjectCmd::Apply(ev));
                         }
@@ -197,6 +213,19 @@ fn report_crossing(moves: u64, keys: u64) {
     } else {
         tracing::info!(moves, keys, "peer released control");
     }
+}
+
+/// Keys worth naming in the log beyond the first few of a crossing: modifiers and the keys
+/// used with them to switch windows. Never a key that types text.
+fn is_switching_key(key: &mouse_input::keys::Key) -> bool {
+    use mouse_input::keys::{Key, NamedKey as N};
+    matches!(
+        key,
+        Key::Named(
+            N::ShiftL | N::ShiftR | N::CtrlL | N::CtrlR | N::AltL | N::AltR | N::AltGr | N::SuperL
+                | N::SuperR | N::Tab | N::Escape
+        )
+    )
 }
 
 #[cfg(test)]
