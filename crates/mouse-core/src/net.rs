@@ -721,6 +721,7 @@ async fn connect_once(
         local_path(tcp.local_addr().ok()),
         cfg.network_preference
     );
+    let on_cable = local_kind(tcp.local_addr().ok()) == Some(discover::NetKind::Cable);
     enable_keepalive(&tcp);
     crate::qos::prioritise_input(&tcp);
 
@@ -789,7 +790,7 @@ async fn connect_once(
         login_screen: false,
     });
     let motion = match framed.get_ref().motion_key() {
-        Some(key) => Motion::Client { key, server: addr, live: None },
+        Some(key) => Motion::Client { key, server: addr, on_cable, live: None },
         None => Motion::Off,
     };
     let reason = pump(framed, params, cancel, ch, health, net, motion).await;
@@ -1247,6 +1248,15 @@ fn local_path(local: Option<SocketAddr>) -> String {
     }
 }
 
+/// The kind of network a connection's local address is on.
+fn local_kind(local: Option<SocketAddr>) -> Option<discover::NetKind> {
+    let local = local?;
+    discover::local_ipv4s()
+        .into_iter()
+        .find(|a| std::net::IpAddr::V4(a.ip) == local.ip())
+        .map(|a| discover::iface_kind(&a.iface))
+}
+
 async fn network_moved(net: &mut Option<watch::Receiver<u64>>) {
     match net {
         Some(r) => {
@@ -1402,6 +1412,8 @@ enum Motion {
     Client {
         key: crate::motion_udp::Key,
         server: SocketAddr,
+        /// The link goes over the cable: show each move as it arrives, no smoothing.
+        on_cable: bool,
         /// Set once the server's offer arrives.
         live: Option<ClientMotion>,
     },
@@ -1524,8 +1536,8 @@ async fn pump(
                             }
                         }
                         Message::MotionOffer { port, token } => {
-                            if let Motion::Client { key, server, live } = &mut motion {
-                                match ClientMotion::start(*server, port, &token, key.clone()).await {
+                            if let Motion::Client { key, server, on_cable, live } = &mut motion {
+                                match ClientMotion::start(*server, port, &token, key.clone(), *on_cable).await {
                                     Ok(m) => {
                                         tracing::info!("pointer motion will arrive over UDP from {server} (port {port})");
                                         let mut m = m;

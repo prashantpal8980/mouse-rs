@@ -390,6 +390,10 @@ pub(crate) struct ClientMotion {
     epoch: Instant,
     delay: crate::timing::DelayLog,
     playout: crate::playout::Playout,
+    /// Over the cable: every move goes straight to the pointer, nothing smoothed or guessed
+    /// (owner, 27 Oct 2026: "at cable… I don't want it to guess at all"). Smoothing is for
+    /// Wi-Fi, where moves arrive late and bunched.
+    direct: bool,
     stats: ClientStats,
     /// Diagnostic only: one line per datagram, when `MOUSE_RS_MOTION_TRACE` names a file.
     trace: Option<std::io::BufWriter<std::fs::File>>,
@@ -403,6 +407,7 @@ impl ClientMotion {
         port: u16,
         token: &str,
         key: Key,
+        on_cable: bool,
     ) -> std::io::Result<ClientMotion> {
         let token = unhex16(token)
             .ok_or_else(|| std::io::Error::other("malformed motion token"))?;
@@ -423,11 +428,11 @@ impl ClientMotion {
             applied: (0, 0),
             epoch: Instant::now(),
             delay: Default::default(),
-            playout: {
-                let mode = crate::playout::Mode::from_env(std::env::var(SMOOTH_ENV).ok().as_deref());
-                tracing::info!("pointer playback: {mode:?} (set {SMOOTH_ENV} to change)");
-                crate::playout::Playout::new(mode)
-            },
+            playout: crate::playout::Playout::new(crate::playout::Mode::from_env(
+                std::env::var(SMOOTH_ENV).ok().as_deref(),
+            )),
+            // The environment setting is for testing, and overrides the cable rule.
+            direct: on_cable && std::env::var_os(SMOOTH_ENV).is_none(),
             stats: ClientStats::new(),
             trace: std::env::var_os(TRACE_ENV).and_then(|p| {
                 let f = std::fs::OpenOptions::new().create(true).append(true).open(&p).ok()?;
@@ -435,6 +440,11 @@ impl ClientMotion {
                 Some(std::io::BufWriter::new(f))
             }),
         };
+        if me.direct {
+            tracing::info!("pointer playback: direct, every move as it arrives (the link is on the cable)");
+        } else {
+            tracing::info!("pointer playback: {:?} (set {SMOOTH_ENV} to change)", me.playout.mode());
+        }
         me.hello().await;
         Ok(me)
     }
@@ -448,11 +458,11 @@ impl ClientMotion {
         if self.stats.since.elapsed() >= STATS_EVERY {
             tracing::info!(
                 "UDP motion over the last minute: {} datagrams in, {} rejected; {} predicted \
-                 frames; playback {:?}, delay now {:.0} ms; latest seq {}",
+                 frames; playback {}, delay now {:.0} ms; latest seq {}",
                 self.stats.datagrams,
                 self.stats.rejected,
                 self.stats.guesses,
-                self.playout.mode(),
+                if self.direct { "direct (cable)".to_string() } else { format!("{:?}", self.playout.mode()) },
                 self.playout.delay_ms(),
                 self.last_seq
             );
@@ -488,6 +498,14 @@ impl ClientMotion {
         if let Some(line) = self.delay.push(transit, now) {
             tracing::info!("{line}");
         }
+        if self.direct {
+            // Newest wins; one overtaken by a later move is already included in its total.
+            if seq <= self.last_seq {
+                return None;
+            }
+            self.last_seq = seq;
+            return self.move_to((sx, sy));
+        }
         self.last_seq = self.last_seq.max(seq);
         self.playout.push(seq, f64::from(sent_ms), (sx, sy), self.ms(now));
         self.render(now)
@@ -517,13 +535,15 @@ impl ClientMotion {
         // A click or key follows: the pointer goes exactly to the total, now.
         self.last_seq = self.last_seq.max(seq);
         let now = Instant::now();
-        self.playout.sync(seq, (sx, sy), self.ms(now));
+        if !self.direct {
+            self.playout.sync(seq, (sx, sy), self.ms(now));
+        }
         self.move_to((sx, sy))
     }
 
     /// Whether playback may move the pointer without new data (see `playout`).
     pub(crate) fn concealing(&self, now: Instant) -> bool {
-        self.playout.active(self.ms(now))
+        !self.direct && self.playout.active(self.ms(now))
     }
 
     /// Called every few ms while [`concealing`](Self::concealing).
@@ -585,7 +605,7 @@ mod tests {
         let tcp_peer: SocketAddr = "127.0.0.1:40000".parse().unwrap(); // port is replaced
         let mut s = ServerMotion::new(server_sock.clone(), key(5), tcp_peer);
         let Some(Message::MotionOffer { port, token }) = s.offer() else { panic!("offer") };
-        let mut c = ClientMotion::start(server_sock.local_addr().unwrap(), port, &token, key(5)).await.unwrap();
+        let mut c = ClientMotion::start(server_sock.local_addr().unwrap(), port, &token, key(5), false).await.unwrap();
         // The hello is never read: as if dropped. Only the TCP message arrives.
         let Some(Message::MotionReady { port: cport, seen: 0 }) = c.ready() else { panic!("ready") };
         s.on_ready(cport, 0);
@@ -594,6 +614,22 @@ mod tests {
         let (buf, n, _) = recv(Some(c.socket())).await.unwrap();
         assert_eq!(c.on_datagram(&buf[..n]), Some(Message::MouseMove { dx: 7, dy: -2 }));
         let Some(Message::MotionReady { seen: 1, .. }) = c.ready() else { panic!("seen") };
+    }
+
+    #[tokio::test]
+    async fn on_the_cable_every_move_lands_exactly_and_nothing_is_guessed() {
+        let server_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let mut s = ServerMotion::new(server_sock.clone(), key(7), server_sock.local_addr().unwrap());
+        let Some(Message::MotionOffer { port, token }) = s.offer() else { panic!("offer") };
+        let mut c = ClientMotion::start(server_sock.local_addr().unwrap(), port, &token, key(7), true).await.unwrap();
+        let k = key(7);
+        assert_eq!(c.on_datagram(&encode_move(&k, 1, 10, 0, 0)), Some(Message::MouseMove { dx: 10, dy: 0 }));
+        assert_eq!(c.on_datagram(&encode_move(&k, 3, 25, 2, 8)), Some(Message::MouseMove { dx: 15, dy: 2 }));
+        // Move 2 overtaken by move 3: its total is already in 3's, so it changes nothing.
+        assert_eq!(c.on_datagram(&encode_move(&k, 2, 18, 1, 4)), None);
+        // However long nothing arrives, the pointer stays exactly where the hand put it.
+        assert!(!c.concealing(Instant::now() + Duration::from_millis(50)));
+        assert_eq!(c.conceal(Instant::now() + Duration::from_millis(50)), None);
     }
 
     #[tokio::test]
@@ -617,7 +653,7 @@ mod tests {
 
         let Some(Message::MotionOffer { port: p, token }) = s.offer() else { panic!("offer") };
         assert_eq!(p, port);
-        let mut c = ClientMotion::start(server_sock.local_addr().unwrap(), p, &token, key(4)).await.unwrap();
+        let mut c = ClientMotion::start(server_sock.local_addr().unwrap(), p, &token, key(4), false).await.unwrap();
         let (buf, n, from) = recv(Some(server_sock.clone())).await.unwrap();
         s.on_datagram(&buf[..n], from);
         assert!(!s.send_move(0, 0), "a hello alone is not enough: an older client says hello too");

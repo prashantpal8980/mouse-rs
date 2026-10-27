@@ -922,7 +922,8 @@ end frame, the paste is recorded. Test:
 Owner: "even when i was on ethernet… the mouse go front and back… like it is vibrating". Kali's log, 14:24 UTC: delay
 1 ms, round trip 0.5 ms, yet 3,498 guessed frames for 1,235 real moves in a minute. At a 1 ms delay, playback passed the
 newest move between every two moves and guessed ahead; when the hand slowed, the guess was ahead of it and had to come
-back. Fix: guess only once the next move is overdue by 1.5 × the usual gap between moves. A new test drives a slowing
+back. Fix: guess only once the next move is overdue by 1.5 × the usual gap between moves. Then, at the owner's request ("at cable… I don't want it to guess at all"): when the link goes over the cable, playback
+is off entirely, and each move goes to the pointer as it arrives. Smoothing applies only on Wi-Fi and other networks. A new test drives a slowing
 hand over a clean link and fails if the pointer is ever ahead of the hand (it failed on the old code: 21.75 px vs 20).
 
 ### B42 — the link could pick Wi-Fi with the cable plugged in (27 Oct 2026) — **fixed in code**
