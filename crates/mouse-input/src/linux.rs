@@ -272,7 +272,10 @@ impl X11Injector {
         let (conn, screen_num) = x11rb::connect(None)?;
         let root = conn.setup().roots[screen_num].root;
         let kbd = KeyboardMap::fetch(&conn)?;
-        let shift_keycode = kbd.lookup(named_to_keysym(NamedKey::ShiftL)).map(|(kc, _)| kc).unwrap_or(50);
+        let shift_keycode = kbd
+            .lookup(named_to_keysym(NamedKey::ShiftL))
+            .map(|(kc, _)| kc)
+            .unwrap_or(50);
         Ok(X11Injector {
             conn,
             root,
@@ -297,8 +300,7 @@ impl X11Injector {
         // Remap the spare keycode to this keysym (both levels), then use it.
         let spare = self.kbd.spare_keycode;
         let syms = vec![keysym, keysym];
-        self.conn
-            .change_keyboard_mapping(1, spare, 2, &syms)?;
+        self.conn.change_keyboard_mapping(1, spare, 2, &syms)?;
         self.conn.flush()?;
         // Reflect it in our cached map so repeated injections are cheap.
         let row = (spare - self.kbd.min_keycode) as usize * self.kbd.per;
@@ -645,9 +647,7 @@ fn emit_held_modifiers(
 /// a pseudo-Remote state with input still leaking to local apps.
 fn grab(conn: &RustConnection, root: Window) -> Result<bool, InputError> {
     use x11rb::protocol::xproto::EventMask;
-    let mask = EventMask::POINTER_MOTION
-        | EventMask::BUTTON_PRESS
-        | EventMask::BUTTON_RELEASE;
+    let mask = EventMask::POINTER_MOTION | EventMask::BUTTON_PRESS | EventMask::BUTTON_RELEASE;
     let p = conn
         .grab_pointer(
             false,
@@ -742,9 +742,18 @@ fn handle_event(
 fn emit_button(detail: u8, pressed: bool, sink: &UnboundedSender<CaptureSignal>) {
     let send = |ev: InputEvent| drop(sink.send(CaptureSignal::Input(ev)));
     match detail {
-        1 => send(InputEvent::MouseButton { button: Button::Left, pressed }),
-        2 => send(InputEvent::MouseButton { button: Button::Middle, pressed }),
-        3 => send(InputEvent::MouseButton { button: Button::Right, pressed }),
+        1 => send(InputEvent::MouseButton {
+            button: Button::Left,
+            pressed,
+        }),
+        2 => send(InputEvent::MouseButton {
+            button: Button::Middle,
+            pressed,
+        }),
+        3 => send(InputEvent::MouseButton {
+            button: Button::Right,
+            pressed,
+        }),
         // Scroll buttons fire press+release; emit one scroll per press only.
         4 if pressed => send(InputEvent::MouseScroll { dx: 0, dy: 1 }),
         5 if pressed => send(InputEvent::MouseScroll { dx: 0, dy: -1 }),
@@ -805,11 +814,7 @@ mod tests {
 
     #[test]
     fn key_to_keysym_and_back() {
-        for key in [
-            Key::Named(NamedKey::Enter),
-            Key::Char('q'),
-            Key::Char('€'),
-        ] {
+        for key in [Key::Named(NamedKey::Enter), Key::Char('q'), Key::Char('€')] {
             let ks = key_to_keysym(&key);
             assert_eq!(keysym_to_key(ks), Some(key));
         }

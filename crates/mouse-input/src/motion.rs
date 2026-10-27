@@ -73,8 +73,7 @@ impl Motion {
         } else {
             MotionAction::Ignore
         };
-        let near_edge =
-            ex < g.w / 4 || ex > g.w - g.w / 4 || ey < g.h / 4 || ey > g.h - g.h / 4;
+        let near_edge = ex < g.w / 4 || ex > g.w - g.w / 4 || ey < g.h / 4 || ey > g.h - g.h / 4;
         (action, near_edge)
     }
 
@@ -99,7 +98,12 @@ mod tests {
 
     // 1440x900 screen: centre (720,450), edge bands ex<360 / ex>1080 / ey<225 / ey>675.
     fn geom() -> MotionGeom {
-        MotionGeom { cx: 720, cy: 450, w: 1440, h: 900 }
+        MotionGeom {
+            cx: 720,
+            cy: 450,
+            w: 1440,
+            h: 900,
+        }
     }
 
     #[test]
@@ -152,7 +156,10 @@ mod tests {
                 assert_eq!(dy, 0);
                 // No single forwarded delta may exceed a sane per-event magnitude;
                 // the buggy version produced ~-470 here.
-                assert!(dx.abs() <= 200, "spurious large delta {dx} (over-count bug)");
+                assert!(
+                    dx.abs() <= 200,
+                    "spurious large delta {dx} (over-count bug)"
+                );
                 forwarded += dx;
             }
             if warp {
@@ -161,7 +168,11 @@ mod tests {
             }
         }
         // Total forwarded equals the true displacement 720 -> 150 = -570.
-        assert_eq!(forwarded, 150 - 720, "summed delta must equal true displacement");
+        assert_eq!(
+            forwarded,
+            150 - 720,
+            "summed delta must equal true displacement"
+        );
 
         // Now the `warps` synthetic centre echoes arrive: each is absorbed (no
         // forward), leaving pending_warps back at zero.

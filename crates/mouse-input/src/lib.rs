@@ -54,10 +54,7 @@ impl Suppressor {
     /// The shared flag the capture backend reconciles against. Only consumed by a
     /// platform capture backend; dead on targets whose `start_capture` is still the
     /// `Unsupported` stub.
-    #[cfg_attr(
-        not(any(target_os = "linux", target_os = "windows")),
-        allow(dead_code)
-    )]
+    #[cfg_attr(not(any(target_os = "linux", target_os = "windows")), allow(dead_code))]
     fn shared(&self) -> Arc<AtomicBool> {
         self.0.clone()
     }

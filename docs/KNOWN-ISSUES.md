@@ -136,7 +136,7 @@ Found B35 along the way.
 ## Open defects
 
 ### B13 — Alt+Tab sticks: a modifier release is lost and the key stays logically down
-**fixed 2026-10-26, confirmed on hardware the same day** (owner reproduced it at 15:04–15:05 IST before the update: 4 stuck Ctrl crossings; after the update at 15:06, repeated hold-Ctrl-cross-release tests: 0) · reported 2026-10-09
+**reopened 2026-10-27 (second path, fixed in code — see the end of this entry)** · **fixed 2026-10-26, confirmed on hardware the same day** (owner reproduced it at 15:04–15:05 IST before the update: 4 stuck Ctrl crossings; after the update at 15:06, repeated hold-Ctrl-cross-release tests: 0) · reported 2026-10-09
 
 **The trigger (owner, 26 Oct, 14:10–14:15 IST):** back on Windows after a crossing, the wheel
 didn't scroll; on Kali, Alt+Tab didn't work. One tap of Ctrl fixed each.
@@ -311,6 +311,23 @@ now a *lead*, not a known cure — those warnings concern crossing start, and th
 above show the hook was alive during every crossing.
 
 </details>
+
+**Second path, 27 Oct 2026 (17:58–18:05 IST): reopened and fixed in code, not yet confirmed on hardware.**
+Owner: back on Windows, the wheel didn't scroll again until Ctrl was tapped. Laptop log, crossing
+12:32:14–12:33:36 UTC: 479 key presses swallowed (almost all Ctrl auto-repeat from long holds), and
+`raw_keys=1`. Raw Input only sees key events the hook let through, so one press reached Windows while
+control was on Kali. Its release was swallowed, because the B13 fix only passes releases of keys Windows
+saw *before* the crossing. The next crossing (12:34:00) shows no instant Ctrl snapshot, which fits the owner
+tapping Ctrl in between. Earlier `raw_keys=1` crossings today: 06:55, 06:58, 08:04, 08:40 (08:30 had 34).
+*How* the press got past the hook is not yet known: no pump stall was logged, and the re-arm installs the
+new hook before removing the old one.
+Fix (mouse-input `windows.rs`, `held.rs`):
+- Every key that gets past the hook during a crossing is now logged once ("a key press got past the hook…"),
+  with the ms since the last hook re-arm. That is the evidence for the mechanism.
+- Its release is let through to Windows ("let the release of a key that had reached Windows…").
+- 50 ms after control comes back, any modifier Windows still holds down while the hook's last event for that
+  key was a release gets a release sent ("after control came back Windows still had this key down…").
+  This runs only while nothing is suppressed, so it is not the forbidden B14 reconcile.
 
 ### B14 — modifiers were released 8 ms after the press (regression, fixed)
 **fixed 2026-10-09** · shipped and withdrawn the same day

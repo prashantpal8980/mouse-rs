@@ -37,10 +37,6 @@ use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Threading::{
     GetCurrentThread, GetCurrentThreadId, SetThreadPriority, THREAD_PRIORITY_TIME_CRITICAL,
 };
-use windows_sys::Win32::UI::Input::{
-    GetRawInputData, RegisterRawInputDevices, HRAWINPUT, MOUSE_MOVE_ABSOLUTE, RAWINPUT,
-    RAWINPUTDEVICE, RAWINPUTHEADER, RIDEV_INPUTSINK, RID_INPUT, RIM_TYPEKEYBOARD, RIM_TYPEMOUSE,
-};
 use windows_sys::Win32::UI::HiDpi::{
     SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
@@ -51,18 +47,21 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN,
     MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL, MOUSEINPUT,
 };
+use windows_sys::Win32::UI::Input::{
+    GetRawInputData, RegisterRawInputDevices, HRAWINPUT, MOUSE_MOVE_ABSOLUTE, RAWINPUT,
+    RAWINPUTDEVICE, RAWINPUTHEADER, RIDEV_INPUTSINK, RID_INPUT, RIM_TYPEKEYBOARD, RIM_TYPEMOUSE,
+};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClassNameW,
-    GetCursorPos, GetForegroundWindow, GetSystemMetrics, GetWindowTextW, GetWindowThreadProcessId,
-    MsgWaitForMultipleObjectsEx, PeekMessageW, PostThreadMessageW, RegisterClassW,
-    GetDesktopWindow, GetShellWindow, SetForegroundWindow, SetWindowsHookExW, ShowWindow,
-    SW_MINIMIZE, TranslateMessage, UnhookWindowsHookEx,
-    UnregisterClassW, HC_ACTION,
-    HWND_MESSAGE, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, LLKHF_UP, MSG, MSLLHOOKSTRUCT,
-    MWMO_INPUTAVAILABLE, PM_REMOVE, QS_ALLINPUT, SM_CXSCREEN, SM_CXVIRTUALSCREEN, SM_CYSCREEN,
-    SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, WH_KEYBOARD_LL, WH_MOUSE_LL,
-    WHEEL_DELTA, WM_INPUT, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP,
-    WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP, WNDCLASSW,
+    CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
+    GetClassNameW, GetCursorPos, GetDesktopWindow, GetForegroundWindow, GetShellWindow,
+    GetSystemMetrics, GetWindowTextW, GetWindowThreadProcessId, MsgWaitForMultipleObjectsEx,
+    PeekMessageW, PostThreadMessageW, RegisterClassW, SetForegroundWindow, SetWindowsHookExW,
+    ShowWindow, TranslateMessage, UnhookWindowsHookEx, UnregisterClassW, HC_ACTION, HWND_MESSAGE,
+    KBDLLHOOKSTRUCT, LLKHF_EXTENDED, LLKHF_UP, MSG, MSLLHOOKSTRUCT, MWMO_INPUTAVAILABLE, PM_REMOVE,
+    QS_ALLINPUT, SM_CXSCREEN, SM_CXVIRTUALSCREEN, SM_CYSCREEN, SM_CYVIRTUALSCREEN,
+    SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SW_MINIMIZE, WHEEL_DELTA, WH_KEYBOARD_LL, WH_MOUSE_LL,
+    WM_INPUT, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL,
+    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP, WNDCLASSW,
 };
 
 use mouse_core::protocol::Button;
@@ -111,7 +110,7 @@ mod vk {
     pub const RCONTROL: u16 = 0xA3;
     pub const LMENU: u16 = 0xA4; // Left Alt
     pub const RMENU: u16 = 0xA5; // Right Alt / AltGr
-    // Generic (layout-agnostic) modifiers, seen when a hook can't resolve a side.
+                                 // Generic (layout-agnostic) modifiers, seen when a hook can't resolve a side.
     pub const SHIFT: u16 = 0x10;
     pub const CONTROL: u16 = 0x11;
     pub const MENU: u16 = 0x12;
@@ -277,7 +276,9 @@ fn vk_to_named(v: u16, extended: bool) -> Option<NamedKey> {
 /// current layout, if any. `MapVirtualKey(MAPVK_VK_TO_CHAR)` is stateless (unlike
 /// `ToUnicode`), giving exactly the wire's "base char" without dead-key mutation.
 fn vk_to_basechar(v: u16) -> Option<char> {
-    let res = unsafe { MapVirtualKeyW(v as u32, 2 /* MAPVK_VK_TO_CHAR */) };
+    let res = unsafe {
+        MapVirtualKeyW(v as u32, 2 /* MAPVK_VK_TO_CHAR */)
+    };
     // The character is the low word; bit 31 (0x8000_0000) flags a dead key, which we
     // don't filter — a dead key's base char (e.g. '^') is still what we want on the
     // wire. Masking the full low word avoids clearing bit 15 of a real character.
@@ -429,10 +430,20 @@ impl InputInjector for WinInjector {
         let clamp = |v: i32| v.clamp(-32, 32);
         let mut inputs: Vec<INPUT> = Vec::new();
         if dy != 0 {
-            inputs.push(mk_mouse(MOUSEEVENTF_WHEEL, 0, 0, clamp(dy) * WHEEL_DELTA as i32));
+            inputs.push(mk_mouse(
+                MOUSEEVENTF_WHEEL,
+                0,
+                0,
+                clamp(dy) * WHEEL_DELTA as i32,
+            ));
         }
         if dx != 0 {
-            inputs.push(mk_mouse(MOUSEEVENTF_HWHEEL, 0, 0, clamp(dx) * WHEEL_DELTA as i32));
+            inputs.push(mk_mouse(
+                MOUSEEVENTF_HWHEEL,
+                0,
+                0,
+                clamp(dx) * WHEEL_DELTA as i32,
+            ));
         }
         send_inputs(&inputs)
     }
@@ -499,6 +510,16 @@ enum DiagEvent {
     Rearmed {
         ok: bool,
     },
+    /// The release of a key that had slipped past the hook was let through.
+    SlippedReleased {
+        vk: u16,
+    },
+    /// After control came back, Windows still had this modifier down although the
+    /// keyboard had released it, so a release was sent.
+    StuckReleased {
+        vk: u16,
+        ok: bool,
+    },
     FocusHandedOff {
         ok: bool,
         to: String,
@@ -539,6 +560,8 @@ struct HookState {
     /// Keys Windows saw go down while input was local, so their release is let
     /// through even if it happens on the peer side (B13).
     locally_held: crate::held::LocallyHeld,
+    /// The last event the hook saw for each key; see [`release_stuck_modifiers`].
+    last_seen: crate::held::LastSeen,
 }
 
 thread_local! {
@@ -645,8 +668,14 @@ impl HookState {
         let pressed = info.flags & LLKHF_UP == 0;
         let extended = info.flags & LLKHF_EXTENDED != 0;
         let vk = info.vkCode as u16;
+        self.last_seen.note(vk, pressed);
         if !self.suppress.load(Ordering::SeqCst) {
             self.locally_held.note(vk, pressed);
+            if !pressed {
+                if let Some(f) = REACHED_WINDOWS.get(vk as usize) {
+                    f.store(false, Ordering::SeqCst);
+                }
+            }
             return false; // keys flow to local apps while not suppressing
         }
         // Snapshot held modifiers before forwarding anything, if we got here first.
@@ -673,9 +702,18 @@ impl HookState {
                 n: self.kbd_leaked,
             });
         }
+        // A press Windows got by slipping past this hook (see `REACHED_WINDOWS`) needs
+        // its release just as much as one it saw before the crossing.
+        let slipped = !pressed
+            && REACHED_WINDOWS
+                .get(vk as usize)
+                .is_some_and(|f| f.swap(false, Ordering::SeqCst));
+        if slipped {
+            let _ = self.diag.send(DiagEvent::SlippedReleased { vk });
+        }
         if pressed {
             self.kbd_swallowed += 1;
-        } else if self.locally_held.take_release(vk) {
+        } else if self.locally_held.take_release(vk) || slipped {
             // Windows saw this key go down before the crossing. Swallowing its release
             // would leave it held here: Ctrl stuck, the wheel zooming, and the stuck
             // Ctrl forwarded again on the next crossing (B13). The peer got the press
@@ -689,7 +727,10 @@ impl HookState {
     fn send_button(&self, button: Button, pressed: bool) {
         let _ = self
             .sink
-            .send(CaptureSignal::Input(InputEvent::MouseButton { button, pressed }));
+            .send(CaptureSignal::Input(InputEvent::MouseButton {
+                button,
+                pressed,
+            }));
     }
 
     fn send_scroll(&self, dx: i32, dy: i32) {
@@ -715,8 +756,18 @@ fn wheel_delta(mouse_data: u32) -> i32 {
 
 /// UTF-16, null-terminated class name for our hidden Raw Input message window.
 const RAW_CLASS: &[u16] = &[
-    b'm' as u16, b'o' as u16, b'u' as u16, b's' as u16, b'e' as u16, b'r' as u16, b's' as u16,
-    b'_' as u16, b'r' as u16, b'a' as u16, b'w' as u16, 0,
+    b'm' as u16,
+    b'o' as u16,
+    b'u' as u16,
+    b's' as u16,
+    b'e' as u16,
+    b'r' as u16,
+    b's' as u16,
+    b'_' as u16,
+    b'r' as u16,
+    b'a' as u16,
+    b'w' as u16,
+    0,
 ];
 
 /// Create a hidden message-only window and register for raw **mouse** input targeted
@@ -834,7 +885,12 @@ impl RawState {
 }
 
 /// Window proc for the hidden raw-input window: reads mouse deltas from `WM_INPUT`.
-unsafe extern "system" fn raw_wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+unsafe extern "system" fn raw_wnd_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
     if msg == WM_INPUT {
         handle_raw_input(lparam as HRAWINPUT);
     }
@@ -864,9 +920,34 @@ unsafe fn handle_raw_input(hri: HRAWINPUT) {
         // so a crossing can distinguish "the hook was dead" from "nothing was typed".
         const WM_KEYDOWN_MSG: u32 = 0x0100;
         const WM_SYSKEYDOWN_MSG: u32 = 0x0104;
-        let msg = raw.data.keyboard.Message;
+        const RI_KEY_E0: u16 = 0x02;
+        let kb = &raw.data.keyboard;
+        let msg = kb.Message;
         if msg == WM_KEYDOWN_MSG || msg == WM_SYSKEYDOWN_MSG {
             RAW_KEY_DOWNS.fetch_add(1, Ordering::Relaxed);
+            let suppressing = RAW_STATE.with(|cell| {
+                cell.try_borrow()
+                    .ok()
+                    .and_then(|g| g.as_ref().map(|s| s.suppress.load(Ordering::SeqCst)))
+                    .unwrap_or(false)
+            });
+            if suppressing {
+                let v = crate::held::sided_vk(kb.VKey, kb.MakeCode, kb.Flags & RI_KEY_E0 != 0);
+                // Logged once per key, not once per auto-repeat. Rare, and this thread
+                // only carries motion, never the hook, so writing here is safe.
+                if REACHED_WINDOWS
+                    .get(v as usize)
+                    .is_some_and(|f| !f.swap(true, Ordering::SeqCst))
+                {
+                    tracing::warn!(
+                        key = %vk_label(v),
+                        ms_since_rearm = clock_ms().saturating_sub(LAST_REARM_MS.load(Ordering::Relaxed)),
+                        "a key press got past the hook and reached Windows while control was \
+                         on the peer; its release will be let through so the key cannot stay \
+                         down here"
+                    );
+                }
+            }
         }
         return;
     }
@@ -980,6 +1061,34 @@ static KBD_HOOK_BAILS: AtomicU64 = AtomicU64::new(0);
 /// This is the control variable: `RAW_KEY_DOWNS` rising while `KBD_HOOK_CALLS` stays at
 /// zero is proof the hook is dead, and only that combination justifies calling it a leak.
 static RAW_KEY_DOWNS: AtomicU64 = AtomicU64::new(0);
+
+/// Keys Raw Input saw go down while control was on the peer. Raw Input only sees what
+/// the hook let through, so each of these is a press Windows got that it was never meant
+/// to have, and its release must reach Windows too. 27 Oct 2026: one press out of a long
+/// Ctrl hold on the peer got through (`raw_keys=1`), the release was swallowed, and Ctrl
+/// stayed down here — the wheel stopped scrolling until Ctrl was tapped (B13 again).
+static REACHED_WINDOWS: [AtomicBool; 256] = [const { AtomicBool::new(false) }; 256];
+
+/// When the hooks were last re-armed, in ms on [`clock_ms`], so a key that slips past
+/// the hook can be lined up with the re-arm.
+static LAST_REARM_MS: AtomicU64 = AtomicU64::new(0);
+
+fn clock_ms() -> u64 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_millis() as u64
+}
+
+/// Readable name of a virtual key for the log: the modifier's name, or its code.
+fn vk_label(v: u16) -> String {
+    TRACKED_MODIFIERS
+        .iter()
+        .find(|(m, _)| *m == v)
+        .map(|(_, named)| format!("{named:?}"))
+        .unwrap_or_else(|| format!("vk {v:#04x}"))
+}
 
 /// OS invocations of the *mouse* low-level hook. Both hooks live on the same thread and
 /// are installed and re-armed together, so this is the field that separates the last two
@@ -1098,6 +1207,7 @@ fn capture_loop(
             mouse_calls_at_grab: 0,
             diag: diag.clone(),
             locally_held: Default::default(),
+            last_seen: Default::default(),
         });
     });
 
@@ -1178,6 +1288,8 @@ fn capture_loop(
     // `hook_calls=0` as proof: an instrument that cannot see its own failure. Re-check a
     // moment later and say plainly which of the two happened.
     let mut verify_at: Option<std::time::Instant> = None;
+    // When to check, after control comes back, that Windows has no modifier stuck down.
+    let mut unstick_at: Option<std::time::Instant> = None;
     /// How often to re-arm while control is on the peer. Short enough that a mid-crossing
     /// removal costs a couple of keystrokes rather than the whole session.
     const REARM_INTERVAL: Duration = Duration::from_millis(1000);
@@ -1311,13 +1423,23 @@ fn capture_loop(
         if verify_at.is_some_and(|due| due <= std::time::Instant::now()) {
             verify_at = None;
             if want && fg_is_ours {
-                let retried =
-                    !last_foreign_fg.is_null() && unsafe { SetForegroundWindow(last_foreign_fg) } != 0;
+                let retried = !last_foreign_fg.is_null()
+                    && unsafe { SetForegroundWindow(last_foreign_fg) } != 0;
                 let _ = diag.send(DiagEvent::FocusHandoffIneffective { retried });
             }
         }
         // Control came back: return foreground to whatever of ours had it, so the hand-off
         // is invisible to the user rather than silently rearranging their windows.
+        if !want && prev_suppress {
+            // 50 ms: lets Windows finish applying the last events of the crossing first.
+            unstick_at = Some(std::time::Instant::now() + Duration::from_millis(50));
+        }
+        if unstick_at.is_some_and(|due| due <= std::time::Instant::now()) {
+            unstick_at = None;
+            if !want {
+                release_stuck_modifiers(&diag);
+            }
+        }
         if !want && prev_suppress && !yielded_from.is_null() {
             unsafe { SetForegroundWindow(yielded_from) };
             yielded_from = std::ptr::null_mut();
@@ -1500,6 +1622,36 @@ fn watchdog(
 /// failed re-install leaves the existing hook in place rather than leaving us with none.
 /// The brief overlap is harmless: the new hook sits at the front of the chain and
 /// swallows without calling on, so the old one simply never sees an event.
+/// Release any modifier Windows still holds down after control came back although the
+/// keyboard has let go of it.
+///
+/// This is not the reconcile that `stuck_modifiers_cannot_be_detected_here` forbids.
+/// That one ran while the hook was suppressing, when Windows' key state cannot say
+/// whether a key is physically down. Here nothing is suppressed, and the physical answer
+/// comes from the hook itself: it sees every key event, so a modifier whose last event
+/// was a release is up on the keyboard. Windows still saying "down" then can only be a
+/// press that reached it with a release that did not — Ctrl stuck, the wheel zooming.
+fn release_stuck_modifiers(diag: &std::sync::mpsc::Sender<DiagEvent>) {
+    let stuck: Vec<(u16, NamedKey)> = HOOK_STATE.with(|cell| {
+        let Ok(guard) = cell.try_borrow() else {
+            return Vec::new();
+        };
+        let Some(state) = guard.as_ref() else {
+            return Vec::new();
+        };
+        TRACKED_MODIFIERS
+            .into_iter()
+            .filter(|(v, _)| vk_physically_down(*v) && !state.last_seen.is_down(*v))
+            .collect()
+    });
+    for (vk, named) in stuck {
+        let mut buf = Vec::new();
+        push_key_inputs(&mut buf, &Key::Named(named), false);
+        let ok = send_inputs(&buf).is_ok();
+        let _ = diag.send(DiagEvent::StuckReleased { vk, ok });
+    }
+}
+
 fn rearm_hooks(
     hinstance: windows_sys::Win32::Foundation::HINSTANCE,
     h_mouse: &mut windows_sys::Win32::UI::WindowsAndMessaging::HHOOK,
@@ -1507,6 +1659,7 @@ fn rearm_hooks(
     diag: &std::sync::mpsc::Sender<DiagEvent>,
     report: bool,
 ) {
+    LAST_REARM_MS.store(clock_ms(), Ordering::Relaxed);
     let mut ok = true;
     let fresh_kbd = unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_proc), hinstance, 0) };
     if is_null_hhook(fresh_kbd) {
@@ -1641,6 +1794,20 @@ fn diag_loop(rx: std::sync::mpsc::Receiver<DiagEvent>) {
                     );
                 }
             }
+            DiagEvent::SlippedReleased { vk } => {
+                tracing::info!(
+                    key = %vk_label(vk),
+                    "let the release of a key that had reached Windows through to Windows"
+                );
+            }
+            DiagEvent::StuckReleased { vk, ok } => {
+                tracing::warn!(
+                    key = %vk_label(vk),
+                    released = ok,
+                    "after control came back Windows still had this key down although the \
+                     keyboard had let go of it; sent its release"
+                );
+            }
             DiagEvent::Stalled { ms, rearmed } => {
                 tracing::warn!(
                     stalled_ms = ms,
@@ -1703,7 +1870,9 @@ impl WinCapture {
         // named_to_vk yields one side, so the hook-independent failsafe only recognizes
         // that side (the engine's L/R-collapsing path still handles either) — a non-issue
         // for sane lock keys (ScrollLock/Pause/F-keys), which a modifier is not.
-        let return_vk = return_hotkey.map(|n| named_to_vk(n).0).unwrap_or(vk::SCROLL);
+        let return_vk = return_hotkey
+            .map(|n| named_to_vk(n).0)
+            .unwrap_or(vk::SCROLL);
 
         let wd_sink = sink.clone();
         let (s2, st2, hb2, tid2) = (
@@ -1829,7 +1998,13 @@ fn integrity_of(pid: u32) -> Option<u32> {
         }
         // Two calls: the first learns the size, the second fills the buffer.
         let mut needed = 0u32;
-        GetTokenInformation(token, TokenIntegrityLevel, std::ptr::null_mut(), 0, &mut needed);
+        GetTokenInformation(
+            token,
+            TokenIntegrityLevel,
+            std::ptr::null_mut(),
+            0,
+            &mut needed,
+        );
         let mut buf = vec![0u8; needed.max(1) as usize];
         let ok = GetTokenInformation(
             token,
@@ -1931,14 +2106,20 @@ mod tests {
     fn extended_key_flags_are_correct() {
         // Right Shift is NOT extended (it has a separate scancode); right Ctrl/Alt
         // and the navigation cluster ARE — getting this wrong injects malformed keys.
-        assert!(!named_to_vk(NamedKey::ShiftR).1, "RShift must not be extended");
+        assert!(
+            !named_to_vk(NamedKey::ShiftR).1,
+            "RShift must not be extended"
+        );
         assert!(!named_to_vk(NamedKey::ShiftL).1);
         assert!(named_to_vk(NamedKey::CtrlR).1, "RCtrl is extended");
         assert!(named_to_vk(NamedKey::AltGr).1, "RAlt/AltGr is extended");
         assert!(named_to_vk(NamedKey::Up).1, "arrows are extended");
         assert!(named_to_vk(NamedKey::Delete).1);
         assert!(named_to_vk(NamedKey::Home).1);
-        assert!(!named_to_vk(NamedKey::Enter).1, "main Enter is not extended");
+        assert!(
+            !named_to_vk(NamedKey::Enter).1,
+            "main Enter is not extended"
+        );
         assert!(!named_to_vk(NamedKey::F(5)).1);
     }
 
@@ -1960,7 +2141,10 @@ mod tests {
     #[test]
     fn wheel_delta_decoding() {
         assert_eq!(wheel_delta(WHEEL_DELTA << 16), 1);
-        assert_eq!(wheel_delta(((-(WHEEL_DELTA as i32)) as u32) << 16 & 0xFFFF_0000), -1);
+        assert_eq!(
+            wheel_delta(((-(WHEEL_DELTA as i32)) as u32) << 16 & 0xFFFF_0000),
+            -1
+        );
         // High-resolution sub-notch still yields a 1-step floor.
         assert_eq!(wheel_delta(40u32 << 16), 1);
         assert_eq!(wheel_delta(0), 0);

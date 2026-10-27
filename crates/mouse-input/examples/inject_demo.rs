@@ -16,7 +16,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::thread::sleep(std::time::Duration::from_millis(50));
     let at = inj.cursor_pos()?;
     println!("after move_abs(400,300): {at:?}");
-    assert!((at.0 - 400).abs() <= 1 && (at.1 - 300).abs() <= 1, "absolute move failed");
+    assert!(
+        (at.0 - 400).abs() <= 1 && (at.1 - 300).abs() <= 1,
+        "absolute move failed"
+    );
 
     // Relative move by (+120, +80).
     inj.mouse_move_rel(120, 80)?;

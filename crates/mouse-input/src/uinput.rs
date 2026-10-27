@@ -79,10 +79,7 @@ const fn io(ty: u8, nr: u8) -> libc::c_ulong {
 /// Encoded rather than hardcoded so the numbers are checkable against the header
 /// instead of being four magic constants nobody can verify.
 const fn iow(ty: u8, nr: u8, size: usize) -> libc::c_ulong {
-    (1 << 30)
-        | ((size as libc::c_ulong) << 16)
-        | ((ty as libc::c_ulong) << 8)
-        | nr as libc::c_ulong
+    (1 << 30) | ((size as libc::c_ulong) << 16) | ((ty as libc::c_ulong) << 8) | nr as libc::c_ulong
 }
 
 const UI_DEV_CREATE: libc::c_ulong = io(b'U', 1);
@@ -233,14 +230,36 @@ fn char_code(c: char) -> Option<u16> {
 /// them rather than by repeating the list, so the two cannot drift apart.
 fn all_key_codes() -> Vec<u16> {
     let named = [
-        NamedKey::Enter, NamedKey::Escape, NamedKey::Backspace, NamedKey::Tab,
-        NamedKey::Space, NamedKey::Insert, NamedKey::Delete, NamedKey::Up,
-        NamedKey::Down, NamedKey::Left, NamedKey::Right, NamedKey::Home,
-        NamedKey::End, NamedKey::PageUp, NamedKey::PageDown, NamedKey::CapsLock,
-        NamedKey::NumLock, NamedKey::ScrollLock, NamedKey::PrintScreen,
-        NamedKey::Pause, NamedKey::Menu, NamedKey::ShiftL, NamedKey::ShiftR,
-        NamedKey::CtrlL, NamedKey::CtrlR, NamedKey::AltL, NamedKey::AltR,
-        NamedKey::AltGr, NamedKey::SuperL, NamedKey::SuperR,
+        NamedKey::Enter,
+        NamedKey::Escape,
+        NamedKey::Backspace,
+        NamedKey::Tab,
+        NamedKey::Space,
+        NamedKey::Insert,
+        NamedKey::Delete,
+        NamedKey::Up,
+        NamedKey::Down,
+        NamedKey::Left,
+        NamedKey::Right,
+        NamedKey::Home,
+        NamedKey::End,
+        NamedKey::PageUp,
+        NamedKey::PageDown,
+        NamedKey::CapsLock,
+        NamedKey::NumLock,
+        NamedKey::ScrollLock,
+        NamedKey::PrintScreen,
+        NamedKey::Pause,
+        NamedKey::Menu,
+        NamedKey::ShiftL,
+        NamedKey::ShiftR,
+        NamedKey::CtrlL,
+        NamedKey::CtrlR,
+        NamedKey::AltL,
+        NamedKey::AltR,
+        NamedKey::AltGr,
+        NamedKey::SuperL,
+        NamedKey::SuperR,
     ];
     let mut codes: Vec<u16> = named.iter().filter_map(|k| named_code(*k)).collect();
     codes.extend((1u8..=24).filter_map(|n| named_code(NamedKey::F(n))));
@@ -292,7 +311,12 @@ impl Device {
 
         let mut dev = UinputUserDev {
             name: [0; UINPUT_MAX_NAME_SIZE],
-            id: InputId { bustype: BUS_VIRTUAL, vendor: 0x1d6b, product: 0x0001, version: 1 },
+            id: InputId {
+                bustype: BUS_VIRTUAL,
+                vendor: 0x1d6b,
+                product: 0x0001,
+                version: 1,
+            },
             ff_effects_max: 0,
             absmax: [0; ABS_CNT],
             absmin: [0; ABS_CNT],
@@ -330,7 +354,10 @@ impl Device {
     /// Queue one event. Nothing is delivered until [`Device::sync`].
     fn emit(&mut self, type_: u16, code: u16, value: i32) -> io::Result<()> {
         let ev = InputEventRaw {
-            time: libc::timeval { tv_sec: 0, tv_usec: 0 },
+            time: libc::timeval {
+                tv_sec: 0,
+                tv_usec: 0,
+            },
             type_,
             code,
             value,
@@ -420,7 +447,14 @@ impl UinputInjector {
 
         std::thread::sleep(SETTLE);
         tracing::info!(w, h, keys = keys.len(), "uinput devices created");
-        Ok(UinputInjector { kbd, ptr, w, h, x: w / 2, y: h / 2 })
+        Ok(UinputInjector {
+            kbd,
+            ptr,
+            w,
+            h,
+            x: w / 2,
+            y: h / 2,
+        })
     }
 
     /// Turn an open/ioctl failure into something that names the actual remedy.
@@ -506,7 +540,9 @@ impl InputInjector for UinputInjector {
             tracing::debug!("no Linux keycode for a received key; dropped");
             return Ok(());
         };
-        self.kbd.emit(EV_KEY, code, i32::from(pressed)).map_err(io_err)?;
+        self.kbd
+            .emit(EV_KEY, code, i32::from(pressed))
+            .map_err(io_err)?;
         self.kbd.sync().map_err(io_err)
     }
 
@@ -536,7 +572,10 @@ mod tests {
     #[test]
     fn the_abi_structs_are_the_sizes_the_kernel_expects() {
         // 80 name + 8 id + 4 ff + 4 arrays of 64 i32.
-        assert_eq!(std::mem::size_of::<UinputUserDev>(), 80 + 8 + 4 + 4 * ABS_CNT * 4);
+        assert_eq!(
+            std::mem::size_of::<UinputUserDev>(),
+            80 + 8 + 4 + 4 * ABS_CNT * 4
+        );
         // 16-byte timeval + u16 + u16 + i32 on a 64-bit target.
         assert_eq!(std::mem::size_of::<InputEventRaw>(), 24);
     }
@@ -555,8 +594,14 @@ mod tests {
             assert!(declared.contains(&code), "F{n} -> {code} not declared");
         }
         for k in [
-            NamedKey::Enter, NamedKey::ShiftL, NamedKey::CtrlR, NamedKey::AltGr,
-            NamedKey::SuperL, NamedKey::Delete, NamedKey::PageDown, NamedKey::Menu,
+            NamedKey::Enter,
+            NamedKey::ShiftL,
+            NamedKey::CtrlR,
+            NamedKey::AltGr,
+            NamedKey::SuperL,
+            NamedKey::Delete,
+            NamedKey::PageDown,
+            NamedKey::Menu,
         ] {
             let code = named_code(k).unwrap();
             assert!(declared.contains(&code), "{k:?} -> {code} not declared");
