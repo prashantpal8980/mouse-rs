@@ -269,3 +269,45 @@ Connection on the client: **Preferred network** = Cable (Ethernet) first (defaul
 first. Owner: "cable should be priority for me… choose from the drop down". If the preferred network stops working the
 other takes over, and the network watch switches back when it returns.
 
+
+### R40 — full app redesign from the owner's Claude Design file (agreed 2026-10-28)
+The owner designed every screen in Claude Design ("mouse-rs App Screens", 20 screens: M1–M6 main window, S0–S10
+settings, B1 banners, D1–D2 dialogs) and asked for it to be implemented as shown. Owner: "I liked the very idea how it
+is looking right now… there are six colour implementations… implement that UI".
+- **Six new themes** replace the old six: Graphite (dark, cyan), **Amber (dark, default)**, Plum & Cream, Forest &
+  Mint, Slate & Sand (these three are *mixed*: a dark header and status card over a light body), Porcelain (light).
+  The theme is now saved in the config. Appearance shows them as preview cards, plus **Match system light / dark**
+  (dark → Graphite, light → Porcelain).
+- **Changes save automatically.** No Save button; the footer says "Changes save automatically" and holds one action,
+  Start/Stop sharing. Settings the running session read at start still raise the **Restart needed** banner.
+- **Main window:** status card with a title sentence ("Connected to laptop"), both computers as tiles (the one with the
+  mouse outlined, "● Has the mouse") and a ⇄ swap-roles button. Underlined tabs Connection · Clipboard (with count).
+  Connection is a grouped list: This computer (Shares mouse | Is controlled), Connection details (expands in place:
+  addresses, pairing, server address), Connection PIN (client), Take control back, then Recent clipboard + See all.
+- **Before pairing** the Connection tab is a 3-step setup: what does this computer do → find the other computer → pair
+  with its code. After pairing it folds into the list above.
+- **Server PIN prompt** sits in the main window ("laptop wants its PIN"), not a pop-up.
+- **Banners above the tabs:** at most one shown in full, the rest one line each. Order: restart needed, file waiting,
+  permissions, PIN reminder, a computer asking to control this one.
+- **Settings index** groups: Everyday (Clipboard, Screens & edges, Keyboard & hotkeys), This computer (Startup,
+  Connection, Security & pairing), App (Appearance, Diagnostics, About). Each row shows its current value.
+- **Screens & edges:** a picture of the two screens and one choice "laptop sits Left/Right/Above/Below"; the matching
+  entry edge is set for you, overriding it is under Advanced ("Arrives on laptop at: Auto…").
+- **Hotkeys are recorded**: press Change, then press the key (Esc cancels).
+- **Profiles** are a list with the active one marked and Switch/× on the others; also listed in the ⋯ menu.
+- **Diagnostics:** Copy path and Open folder. **About:** Restore defaults asks for confirmation first.
+- **Dialogs:** quit/stop during a transfer (D1) and the one-time login-screen explanation (D2) are centred dialogs
+  over a dimmed window.
+
+### R41 — turning on pre-login / elevated access asks properly (agreed 2026-10-28)
+Owner: when someone enables something that runs before the password, "it should ask… you allow the elevated
+permissions… then set the password and only then" can the login screen be typed into.
+- **Linux, Share input at the login screen:** switching it on *always* opens the explanation (not only the first
+  time). If no PIN is set, the PIN is set in that same dialog ("Save PIN and turn on"); "Ask at the login screen" is
+  forced on. Then the system's own password prompt (pkexec) installs the service with that PIN in its copy of the
+  settings. The PIN comes before the system prompt so the installed copy is never PIN-less.
+- **Windows, Start at login as administrator:** from a normal window it now shows Windows' own Yes/No prompt; on Yes a
+  short elevated `mouse-rs autostart-elevated-on|off` makes the change. It no longer refuses with "restart as
+  administrator first".
+- Not built: typing into the **Windows** sign-in/lock screen. Windows shows it on a separate secure desktop that a
+  normal or elevated program cannot reach; it needs a SYSTEM service. Owner decision pending.

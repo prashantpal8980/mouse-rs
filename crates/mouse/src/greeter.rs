@@ -389,13 +389,19 @@ pub fn install(source: Option<PathBuf>) -> anyhow::Result<()> {
 
     run_systemctl(&["daemon-reload"])?;
     run_systemctl(&["enable", UNIT_NAME])?;
+    // A copy already running keeps the old binary in memory: it sits waiting for the login
+    // screen to come back and then serves it with the old code, so a reinstall changed
+    // nothing until the next reboot. Restart it if it is running; the new copy sees the
+    // open session and waits the same way.
+    run_systemctl(&["try-restart", UNIT_NAME])?;
 
     println!("Installed.");
     println!("  config  {}  (root-only; holds a copy of the shared secret)", dest.display());
     println!("  service {UNIT_PATH}");
     println!("  binary  {}  (copied from {})", exe.display(), running.display());
     println!();
-    println!("It starts at the next boot. To start it now without rebooting:");
+    println!("It starts at the next boot; a copy that was already running now runs this one.");
+    println!("To start it now without rebooting:");
     println!("  sudo systemctl start mouse-rs-greeter");
     println!();
     println!("Re-run this after changing the shared secret or the peer address — the");

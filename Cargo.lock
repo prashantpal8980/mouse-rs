@@ -2255,6 +2255,7 @@ dependencies = [
  "mouse-engine",
  "mouse-input",
  "rand",
+ "serde_json",
  "tokio",
  "tokio-util",
  "tracing",

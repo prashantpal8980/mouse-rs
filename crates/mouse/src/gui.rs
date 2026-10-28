@@ -1,23 +1,23 @@
 //! iced control panel (the product UI). A bare `mouse-rs` launch opens this window:
-//! edit config, Save it, and Start/Stop the engine — the same lifecycle the headless
+//! edit config (saved as it changes), and Start/Stop the engine — the same lifecycle the headless
 //! CLI uses, so the GUI is just a front-end over [`crate::run`]. Closing the window
-//! quits the app. The look (6 themes, status hero, animated toggles) lives in
+//! quits the app. The look (R40: six themes, status card, grouped rows) lives in
 //! [`crate::ui_theme`]; the system tray in [`crate::tray`].
 
 use std::sync::{Arc, Mutex};
 
 use iced::widget::{
-    button, column, container, mouse_area, pick_list, progress_bar, row, scrollable, stack, text,
-    text_input, toggler, Space,
+    button, column, container, mouse_area, progress_bar, row, scrollable, stack, text, text_input,
+    toggler, Space,
 };
-use iced::{Alignment, Element, Length, Subscription, Task};
+use iced::{Alignment, Element, Length, Padding, Subscription, Task};
 
 use mouse_core::{sanitize_profile_name, Config, Edge, Role};
 use mouse_engine::StatusSnapshot;
 use mouse_input::screen_size;
 
 use crate::run::EngineHandle;
-use crate::ui_theme::{self, Palette, Theme6};
+use crate::ui_theme::{self, Palette, Theme6, BOLD, MONO};
 
 /// The main window's tabs: only what is used every day (R28). Everything else is a
 /// setting, and settings live in ⋯ → Settings.
@@ -57,11 +57,11 @@ enum Page {
 }
 
 impl Page {
-    /// (group heading, its pages), in the order shown (R30).
+    /// (group heading, its pages), in the order shown (R40, from the owner's design).
     const CATEGORIES: [(&'static str, &'static [Page]); 3] = [
-        ("EVERYDAY", &[Page::Clipboard, Page::Screens, Page::Startup, Page::Keys]),
-        ("SETUP", &[Page::Connection, Page::Security, Page::Appearance]),
-        ("HELP & ADVANCED", &[Page::Diagnostics, Page::About]),
+        ("EVERYDAY", &[Page::Clipboard, Page::Screens, Page::Keys]),
+        ("THIS COMPUTER", &[Page::Startup, Page::Connection, Page::Security]),
+        ("APP", &[Page::Appearance, Page::Diagnostics, Page::About]),
     ];
     fn title(self) -> &'static str {
         match self {
@@ -77,40 +77,55 @@ impl Page {
             Page::About => "About",
         }
     }
-    fn icon(self) -> &'static str {
-        match self {
-            Page::Index => "⚙",
-            Page::Clipboard => "📋",
-            Page::Screens => "🖥",
-            Page::Startup => "⏻",
-            Page::Keys => "⌨",
-            Page::Connection => "🔗",
-            Page::Security => "🔒",
-            Page::Appearance => "🎨",
-            Page::Diagnostics => "🩺",
-            Page::About => "ℹ",
-        }
-    }
     fn summary(self) -> &'static str {
         match self {
             Page::Index => "",
-            Page::Clipboard => "What to share, history, files, transfers",
-            Page::Screens => "Which side the other computer is on",
-            Page::Startup => "Start at login, connect automatically",
+            Page::Clipboard => "What to share, large files, history",
+            Page::Screens => "Where the other computer sits",
+            Page::Startup => "Start at login, minimized, auto-connect",
             Page::Keys => "Getting control back",
-            Page::Connection => "Name, ports, reconnecting, profiles",
-            Page::Security => "Pairing, connection PIN, encryption",
+            Page::Connection => "Name, profiles, ports",
+            Page::Security => "PIN, pairing, encryption",
             Page::Appearance => "Theme",
-            Page::Diagnostics => "Log file, sending logs for support",
-            Page::About => "Version, restore default settings",
+            Page::Diagnostics => "Log file, support logs",
+            Page::About => "Version, restore defaults",
         }
     }
+}
+
+/// Which hotkey is being recorded (Settings → Keyboard & hotkeys).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HotkeyField {
+    Lock,
+    Return,
 }
 
 #[derive(Debug, Clone)]
 enum Message {
     Tick,
     ThemePicked(Theme6),
+    /// Appearance → "Match system light / dark".
+    ThemeFollowSystem(bool),
+    /// The system's light/dark setting, at launch and whenever it changes.
+    SystemTheme(iced::theme::Mode),
+    /// Main window: open or fold the Connection details row.
+    ToggleDetails,
+    /// The ⇄ button between the two computers: swap this computer's role.
+    SwapRoles,
+    /// Screens & edges: the side the other computer sits on.
+    PeerSidePicked(Edge),
+    /// Screens & edges → Advanced: "Arrives on … at: Auto".
+    EntryEdgeAuto,
+    /// Keyboard & hotkeys: start recording, a key arriving, stop.
+    RecordHotkey(HotkeyField),
+    KeyEvent(iced::keyboard::Event),
+    ClearReturnHotkey,
+    /// Diagnostics.
+    CopyLogPath,
+    OpenLogFolder,
+    /// About → Restore…: ask first, then do it.
+    AskRestoreDefaults,
+    CancelRestoreDefaults,
     TabPicked(Tab),
     NameChanged(String),
     RolePicked(Role),
@@ -187,21 +202,18 @@ enum Message {
     CancelLoginScreen,
     AutoconnectToggled(bool),
     StartMinimizedToggled(bool),
-    LockHotkeyChanged(String),
-    ReturnHotkeyChanged(String),
     ServerHostChanged(String),
     NetworkPreferencePicked(mouse_core::NetworkPreference),
     ServerPortChanged(String),
     ListenHostChanged(String),
     ListenPortChanged(String),
-    ExitEdgePicked(Edge),
     EntryEdgePicked(Edge),
     ScreenWChanged(String),
     ScreenHChanged(String),
     DetectScreen,
-    ProfilePicked(String),
-    LoadProfile,
-    DeleteProfile,
+    /// Load a saved profile and make it the current setup.
+    SwitchProfile(String),
+    DeleteProfile(String),
     ProfileNameChanged(String),
     SaveProfileAs,
     Start,
@@ -337,14 +349,32 @@ fn pending_restart_changes(live: &Config, now: &Config) -> Vec<&'static str> {
 
 struct App {
     cfg: Config,
-    theme: Theme6,
+    /// The system's light/dark setting, once known; used when the theme follows it.
+    system_dark: Option<bool>,
     tab: Tab,
     engine: Option<EngineHandle>,
     show_secret: bool,
     feedback: String,
-    profiles: Vec<String>,
-    profile_pick: Option<String>,
+    /// Saved profiles with their settings, so the list can mark the one in use.
+    profiles: Vec<(String, Config)>,
     profile_name_input: String,
+    /// Main window: the Connection details row is open.
+    details_open: bool,
+    /// Keyboard & hotkeys: the hotkey waiting for a key press.
+    recording: Option<HotkeyField>,
+    /// About: the "Restore default settings?" question is showing.
+    confirm_restore: bool,
+    /// When the settings were last edited. They are written once editing pauses, so a
+    /// half-typed number is not saved one keystroke at a time (R40: no Save button).
+    last_edit: Option<std::time::Instant>,
+    /// When the footer message was set; it fades back to "Changes save automatically".
+    feedback_at: Option<std::time::Instant>,
+    /// The other computer's name and screen from the last connection, for the status card
+    /// while sharing is off.
+    last_peer: Option<(String, i32, i32)>,
+    /// When the clipboard history was last checked for saving, and what it held then (a
+    /// fingerprint of ids and pins), so it is written only when it has changed.
+    history_mark: (std::time::Instant, u64),
     // String buffers for numeric fields (so partial edits don't fight the parse).
     server_port_s: String,
     listen_port_s: String,
@@ -378,6 +408,9 @@ struct App {
     /// system is not actually in.
     #[cfg(target_os = "linux")]
     login_screen_asking: bool,
+    /// Why "Allow and turn on" did not go ahead (a PIN too short, two that differ).
+    #[cfg(target_os = "linux")]
+    login_dialog_error: String,
     /// Set while the "a transfer is still running" warning is on screen (R33).
     confirm_leave: Option<Leave>,
     /// One-shot latch for the `autoconnect` / `start_minimized` launch actions, so they
@@ -464,7 +497,7 @@ fn hint<'a>(
     iced::widget::tooltip(
         control,
         container(text(text_).size(11.5).color(p.txt2))
-            .style(move |_| ui_theme::well(p))
+            .style(move |_| ui_theme::floating(p))
             .padding([6.0, 9.0])
             .max_width(260.0),
         iced::widget::tooltip::Position::Top,
@@ -530,14 +563,20 @@ enum ScanState {
 impl App {
     fn new(cfg: Config) -> Self {
         let mut app = App {
-            theme: Theme6::Midnight,
+            system_dark: None,
             tab: Tab::Connection,
             engine: None,
             show_secret: false,
             feedback: String::new(),
-            profiles: Config::list_profiles(),
-            profile_pick: None,
+            profiles: load_profiles(),
             profile_name_input: String::new(),
+            details_open: false,
+            recording: None,
+            confirm_restore: false,
+            last_edit: None,
+            feedback_at: None,
+            last_peer: None,
+            history_mark: (std::time::Instant::now(), 0),
             server_port_s: cfg.server_port.to_string(),
             listen_port_s: cfg.listen_port.to_string(),
             screen_w_s: cfg.screen_width.to_string(),
@@ -556,6 +595,8 @@ impl App {
             login_screen_stale: crate::greeter::installed_copy_is_current() == Some(false),
             #[cfg(target_os = "linux")]
             login_screen_asking: false,
+            #[cfg(target_os = "linux")]
+            login_dialog_error: String::new(),
             confirm_leave: None,
             launch_done: false,
             log_path: crate::logging::log_path().display().to_string(),
@@ -606,6 +647,16 @@ impl App {
             }
             if want == "quit-prompt" {
                 app.confirm_leave = Some(Leave::Quit);
+            }
+            if want == "menu" {
+                app.menu_open = true;
+            }
+            if want == "restore-prompt" {
+                app.confirm_restore = true;
+            }
+            #[cfg(target_os = "linux")]
+            if want == "login-prompt" {
+                app.login_screen_asking = true;
             }
             if let Some(pg) = all.into_iter().find(|p| p.title().to_lowercase().starts_with(&want) || (want == "index" && *p == Page::Index)) {
                 app.page = Some(pg);
@@ -806,7 +857,11 @@ impl App {
             }
             Leave::Elevate => self.update(Message::RelaunchElevatedNow),
             Leave::Quit => {
+                // An edit made a moment ago has not been written yet.
+                self.autosave();
                 if let Some(e) = &self.engine {
+                    // Not left to the engine's drop: the hard exit below can beat it.
+                    e.save_history();
                     e.request_stop();
                 }
                 // Hard backstop so the process always dies even if teardown wedges.
@@ -821,9 +876,70 @@ impl App {
         }
     }
 
+    /// Every message goes through here. Anything but the clock counts as an edit, and the
+    /// settings are written once editing has paused (R40: changes save automatically).
     fn update(&mut self, message: Message) -> Task<Message> {
+        let quiet = matches!(message, Message::Tick | Message::KeyEvent(_) | Message::SystemTheme(_));
+        let said = self.feedback.clone();
+        let task = self.handle(message);
+        if !quiet {
+            self.last_edit = Some(std::time::Instant::now());
+        }
+        if self.feedback != said {
+            self.feedback_at = Some(std::time::Instant::now());
+        }
+        task
+    }
+
+    /// Write the settings if they differ from what is on disk.
+    fn autosave(&mut self) {
+        self.last_edit = None;
+        let same = serde_json::to_value(&self.cfg).ok() == serde_json::to_value(&self.saved_cfg).ok();
+        if !same {
+            let _ = self.handle(Message::SaveConfig);
+        }
+    }
+
+    fn handle(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::Tick => {
+                // Save once the last edit is a moment old.
+                if self.last_edit.is_some_and(|t| t.elapsed() >= std::time::Duration::from_millis(600)) {
+                    self.autosave();
+                }
+                // A footer message is news for a few seconds, then the footer goes back to
+                // saying what is always true.
+                if self.feedback_at.is_some_and(|t| t.elapsed() >= std::time::Duration::from_secs(8)) {
+                    self.feedback.clear();
+                    self.feedback_at = None;
+                }
+                // The history file is kept current while running, because the app is
+                // rarely stopped in a way that runs the save on quit (B45).
+                if self.history_mark.0.elapsed() >= std::time::Duration::from_secs(30) {
+                    if let Some(e) = &self.engine {
+                        use std::hash::{Hash, Hasher};
+                        let mut h = std::collections::hash_map::DefaultHasher::new();
+                        for m in e.clipboard_meta() {
+                            (m.id, m.pinned).hash(&mut h);
+                        }
+                        let fp = h.finish();
+                        if fp != self.history_mark.1 {
+                            e.save_history();
+                        }
+                        self.history_mark = (std::time::Instant::now(), fp);
+                    } else {
+                        self.history_mark.0 = std::time::Instant::now();
+                    }
+                }
+                if let Some(s) = self.engine.as_ref().map(|e| e.status()).filter(|s| s.connected) {
+                    let name = s.peer.trim_end_matches(" (login screen)").to_string();
+                    // Remembered, so the status card can name it while sharing is off.
+                    if self.cfg.peer_name != name {
+                        self.cfg.peer_name = name.clone();
+                        self.last_edit = Some(std::time::Instant::now());
+                    }
+                    self.last_peer = Some((name, s.peer_w, s.peer_h));
+                }
                 // Launch behaviour, once. Done on the first tick rather than in `new()`
                 // because the window doesn't exist yet at construction time, so there is
                 // nothing to minimize; and starting the engine here keeps the Start path
@@ -995,7 +1111,93 @@ impl App {
                     });
                 }
             }
-            Message::ThemePicked(t) => self.theme = t,
+            Message::ThemePicked(t) => {
+                self.cfg.theme = t.key().to_string();
+                self.cfg.theme_follow_system = false;
+            }
+            Message::ThemeFollowSystem(on) => {
+                self.cfg.theme_follow_system = on;
+                if on {
+                    return iced::system::theme().map(Message::SystemTheme);
+                }
+            }
+            Message::SystemTheme(mode) => {
+                self.system_dark = match mode {
+                    iced::theme::Mode::Dark => Some(true),
+                    iced::theme::Mode::Light => Some(false),
+                    iced::theme::Mode::None => None,
+                };
+            }
+            Message::ToggleDetails => self.details_open = !self.details_open,
+            Message::SwapRoles => {
+                self.cfg.role = match self.cfg.role {
+                    Role::Server => Role::Client,
+                    Role::Client => Role::Server,
+                };
+            }
+            Message::PeerSidePicked(side) => match self.cfg.role {
+                // The server leaves through the side the other computer is on, and the
+                // pointer arrives on the facing edge over there.
+                Role::Server => {
+                    self.cfg.exit_edge = side;
+                    self.cfg.entry_edge = side.opposite();
+                }
+                // The client only sees where the pointer arrives: the side facing the server.
+                Role::Client => self.cfg.entry_edge = side,
+            },
+            Message::EntryEdgeAuto => self.cfg.entry_edge = self.cfg.exit_edge.opposite(),
+            Message::RecordHotkey(which) => {
+                self.recording = if self.recording == Some(which) { None } else { Some(which) };
+            }
+            Message::KeyEvent(ev) => {
+                if let (Some(which), iced::keyboard::Event::KeyPressed { key, modifiers, .. }) = (self.recording, ev) {
+                    let plain = !(modifiers.control() || modifiers.alt() || modifiers.shift() || modifiers.logo());
+                    if plain && key == iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape) {
+                        self.recording = None;
+                        self.feedback = "kept the old key".into();
+                    } else if let Some(tok) = key_token(&key) {
+                        let combo = match which {
+                            // One key: modifiers held with it are not part of it.
+                            HotkeyField::Lock => tok,
+                            HotkeyField::Return => {
+                                let mut parts: Vec<&str> = Vec::new();
+                                if modifiers.control() { parts.push("ctrl"); }
+                                if modifiers.shift() { parts.push("shift"); }
+                                if modifiers.logo() { parts.push("win"); }
+                                if modifiers.alt() { parts.push("alt"); }
+                                parts.push(&tok);
+                                parts.join("+")
+                            }
+                        };
+                        match which {
+                            HotkeyField::Lock => self.cfg.lock_hotkey = combo.clone(),
+                            HotkeyField::Return => self.cfg.return_hotkey = combo.clone(),
+                        }
+                        self.recording = None;
+                        self.last_edit = Some(std::time::Instant::now());
+                        self.feedback = format!("set to {}", key_label(&combo));
+                        self.feedback_at = Some(std::time::Instant::now());
+                    }
+                }
+            }
+            Message::ClearReturnHotkey => self.cfg.return_hotkey.clear(),
+            Message::CopyLogPath => {
+                self.feedback = "log path copied".into();
+                return iced::clipboard::write(self.log_path.clone());
+            }
+            Message::OpenLogFolder => {
+                let dir = std::path::Path::new(&self.log_path)
+                    .parent()
+                    .map(|d| d.to_path_buf())
+                    .unwrap_or_default();
+                let opener = if cfg!(windows) { "explorer" } else { "xdg-open" };
+                self.feedback = match std::process::Command::new(opener).arg(&dir).spawn() {
+                    Ok(_) => format!("opened {}", dir.display()),
+                    Err(e) => format!("could not open {}: {e}", dir.display()),
+                };
+            }
+            Message::AskRestoreDefaults => self.confirm_restore = true,
+            Message::CancelRestoreDefaults => self.confirm_restore = false,
             Message::TabPicked(t) => {
                 self.tab = t;
                 self.menu_open = false;
@@ -1233,14 +1435,7 @@ impl App {
                 if let Ok(v) = s.trim().parse::<u64>() {
                     self.cfg.clipboard_cache_budget = v.max(1) * 1024 * 1024 * 1024;
                 }
-                self.clip_inline_kb_s = (self.cfg.clipboard_inline_image_max / 1024).max(1).to_string();
-        self.clip_max_files_s = self.cfg.clipboard_max_files_per_copy.to_string();
-        self.clip_quick_s = self.cfg.clipboard_quick_send_secs.to_string();
-        self.clip_stream_mb_s = self.cfg.clipboard_stream_min_mb.to_string();
-        self.clip_stream_wait_s = self.cfg.clipboard_stream_wait_secs.to_string();
-        self.bulk_rate_s = self.cfg.bulk_rate_limit_mbps.to_string();
-        self.bulk_buf_s = self.cfg.bulk_send_buffer_mb.to_string();
-        self.clip_cache_gb_s = s;
+                self.clip_cache_gb_s = s;
             }
             Message::BulkPortChanged(s) => {
                 // 0 (or an empty box) means "share the input link's port".
@@ -1272,27 +1467,49 @@ impl App {
             // toggle acts immediately, because the answer has been given.
             #[cfg(target_os = "linux")]
             Message::LoginScreenToggled(v) => {
-                // The login-screen password is on by default (owner, 27 Oct), and the login
-                // screen has no way to show or ask for one, so it must exist first.
-                if v && self.cfg.login_pin_enabled && self.cfg.connection_pin.is_empty() {
-                    self.feedback = "set a password first: whoever drives the login screen will be asked for it".into();
-                    self.page = Some(Page::Security);
-                    return Task::none();
-                }
-                if v && !self.cfg.login_screen_notice_seen {
+                // Turning it on always asks (owner, 28 Oct): what it costs, the PIN that will
+                // guard the login screen, and then the system's own password prompt. Turning
+                // it off needs no explanation.
+                if v {
+                    self.pin_new.clear();
+                    self.pin_new2.clear();
+                    self.login_dialog_error.clear();
                     self.login_screen_asking = true;
                 } else {
-                    self.apply_login_screen(v);
+                    self.apply_login_screen(false);
                 }
             }
             #[cfg(target_os = "linux")]
             Message::ConfirmLoginScreen => {
-                // Recorded before the attempt: they have been told, whether or not the
-                // install then succeeds or the password prompt is dismissed.
+                // A PIN first: the service copies the settings when it is installed, so the
+                // PIN has to exist before the system prompt, or the login screen would be
+                // open to anyone paired until the next reinstall.
+                let has = !self.cfg.connection_pin.is_empty();
+                if !has || !self.pin_new.is_empty() {
+                    if !mouse_core::pin::is_valid(&self.pin_new) {
+                        self.login_dialog_error = format!(
+                            "The PIN needs {} to {} characters.",
+                            mouse_core::pin::MIN_LEN,
+                            mouse_core::pin::MAX_LEN
+                        );
+                        return Task::none();
+                    }
+                    if self.pin_new != self.pin_new2 {
+                        self.login_dialog_error = "The two PINs differ.".into();
+                        return Task::none();
+                    }
+                    self.cfg.connection_pin = std::mem::take(&mut self.pin_new);
+                    self.pin_new2.clear();
+                    tracing::info!("connection PIN set while turning on login-screen sharing");
+                }
+                self.cfg.login_pin_enabled = true;
                 self.cfg.login_screen_notice_seen = true;
-                let _ = self.cfg.save(&Config::default_path());
+                self.login_dialog_error.clear();
                 self.login_screen_asking = false;
+                // Written before the install, which copies this file.
+                let t = self.save_and_apply();
                 self.apply_login_screen(true);
+                return t;
             }
             #[cfg(target_os = "linux")]
             Message::CancelLoginScreen => {
@@ -1324,10 +1541,18 @@ impl App {
                 }
             }
             Message::AutostartElevatedToggled(v) => {
-                let res = if v {
-                    crate::autostart::enable_elevated()
+                // From a normal window this goes through Windows' own Yes/No prompt: the
+                // owner asked for elevation to be granted the way other software asks for
+                // it, not refused with "restart as administrator first".
+                let res = if !mouse_input::elevation().is_limited() {
+                    if v { crate::autostart::enable_elevated() } else { crate::autostart::disable_elevated() }
                 } else {
-                    crate::autostart::disable_elevated()
+                    self.feedback = "approve the Windows prompt to continue…".into();
+                    match crate::autostart::set_elevated_via_prompt(v) {
+                        Ok(true) => Ok(()),
+                        Ok(false) => Err(anyhow::anyhow!("Windows prompt declined — nothing was changed")),
+                        Err(e) => Err(e),
+                    }
                 };
                 match res {
                     Ok(()) => {
@@ -1373,8 +1598,6 @@ impl App {
             }
             Message::AutoconnectToggled(v) => self.cfg.autoconnect = v,
             Message::StartMinimizedToggled(v) => self.cfg.start_minimized = v,
-            Message::LockHotkeyChanged(s) => self.cfg.lock_hotkey = s,
-            Message::ReturnHotkeyChanged(s) => self.cfg.return_hotkey = s,
             Message::ServerHostChanged(s) => self.cfg.server_host = s,
             Message::ServerPortChanged(s) => {
                 if let Ok(v) = s.parse() {
@@ -1389,7 +1612,6 @@ impl App {
                 }
                 self.listen_port_s = s;
             }
-            Message::ExitEdgePicked(e) => self.cfg.exit_edge = e,
             Message::EntryEdgePicked(e) => self.cfg.entry_edge = e,
             Message::ScreenWChanged(s) => {
                 if let Ok(v) = s.parse() {
@@ -1414,28 +1636,23 @@ impl App {
                     Err(e) => format!("detect failed: {e}"),
                 };
             }
-            Message::ProfilePicked(p) => self.profile_pick = Some(p),
-            Message::LoadProfile => {
-                if let Some(name) = self.profile_pick.clone() {
-                    self.feedback = match Config::load_profile(&name) {
-                        Ok(c) => {
-                            self.cfg = c;
-                            self.sync_buffers();
-                            format!("loaded '{name}'")
-                        }
-                        Err(e) => format!("load failed: {e}"),
-                    };
-                }
+            Message::SwitchProfile(name) => {
+                self.menu_open = false;
+                self.feedback = match Config::load_profile(&name) {
+                    Ok(c) => {
+                        self.cfg = c;
+                        self.sync_buffers();
+                        format!("switched to '{name}'")
+                    }
+                    Err(e) => format!("could not switch: {e}"),
+                };
             }
-            Message::DeleteProfile => {
-                if let Some(name) = self.profile_pick.clone() {
-                    self.feedback = match Config::delete_profile(&name) {
-                        Ok(()) => format!("deleted '{name}'"),
-                        Err(e) => format!("delete failed: {e}"),
-                    };
-                    self.profile_pick = None;
-                    self.profiles = Config::list_profiles();
-                }
+            Message::DeleteProfile(name) => {
+                self.feedback = match Config::delete_profile(&name) {
+                    Ok(()) => format!("deleted '{name}'"),
+                    Err(e) => format!("delete failed: {e}"),
+                };
+                self.profiles = load_profiles();
             }
             Message::ProfileNameChanged(s) => self.profile_name_input = s,
             Message::SaveProfileAs => {
@@ -1446,8 +1663,7 @@ impl App {
                         // raw pick would leave the dropdown pointing at no real profile.
                         let saved = sanitize_profile_name(&self.profile_name_input)
                             .unwrap_or_else(|| self.profile_name_input.trim().to_string());
-                        self.profiles = Config::list_profiles();
-                        self.profile_pick = Some(saved.clone());
+                        self.profiles = load_profiles();
                         self.profile_name_input.clear();
                         format!("saved profile '{saved}'")
                     }
@@ -1618,6 +1834,7 @@ impl App {
             }
             Message::RestoreDefaults => {
                 self.menu_open = false;
+                self.confirm_restore = false;
                 self.adv_open.clear();
                 // Resets *preferences*, never facts about this machine. Wiping the name,
                 // the screen size or the secret is not "restoring defaults", it is losing
@@ -1629,22 +1846,21 @@ impl App {
                 //     silently corrupts edge geometry, so re-detect it instead.
                 //   * machine name — an identity the peer displays, not a setting.
                 //
-                // Applied to the form only; the file is untouched until Save, so this stays
-                // reviewable and abandonable.
-                let (secret, name) = (self.cfg.shared_secret.clone(), self.cfg.name.clone());
+                // Asked for first (About → Restore…), then saved like any other change.
+                let (secret, name, peer) =
+                    (self.cfg.shared_secret.clone(), self.cfg.name.clone(), self.cfg.peer_name.clone());
                 let (w, h) = screen_size()
                     .unwrap_or((self.cfg.screen_width, self.cfg.screen_height));
                 self.cfg = Config {
                     shared_secret: secret,
                     name,
+                    peer_name: peer,
                     screen_width: w,
                     screen_height: h,
                     ..Config::default()
                 };
                 self.sync_buffers();
-                self.feedback = format!(
-                    "defaults restored — kept your name, secret and screen ({w}×{h}); press Save to apply"
-                );
+                self.feedback = format!("defaults restored — kept your name, secret and screen ({w}×{h})");
             }
             Message::Quit | Message::CloseRequested => return self.leave(Leave::Quit),
             Message::LeaveAnyway => {
@@ -1659,15 +1875,31 @@ impl App {
     }
 
     fn subscription(&self) -> Subscription<Message> {
-        Subscription::batch([
+        let mut subs = vec![
             iced::time::every(std::time::Duration::from_millis(150)).map(|_| Message::Tick),
             // The close button asks first, like Quit, so it can warn about a transfer.
             iced::window::close_requests().map(|_| Message::CloseRequested),
-        ])
+        ];
+        if self.cfg.theme_follow_system {
+            subs.push(iced::system::theme_changes().map(Message::SystemTheme));
+        }
+        if self.recording.is_some() {
+            subs.push(iced::keyboard::listen().map(Message::KeyEvent));
+        }
+        Subscription::batch(subs)
+    }
+
+    /// The theme in use: the saved one, or the system's light/dark pick (R40).
+    fn theme6(&self) -> Theme6 {
+        match (self.cfg.theme_follow_system, self.system_dark) {
+            (true, Some(true)) => Theme6::Graphite,
+            (true, Some(false)) => Theme6::Porcelain,
+            _ => Theme6::from_key(&self.cfg.theme),
+        }
     }
 
     fn theme(&self) -> iced::Theme {
-        if self.theme.is_dark() {
+        if self.theme6().is_dark() {
             iced::Theme::Dark
         } else {
             iced::Theme::Light
@@ -1675,54 +1907,72 @@ impl App {
     }
 
     fn view(&self) -> Element<'_, Message> {
-        let p = self.theme.palette();
+        let th = self.theme6();
+        let p = th.palette();
+        let h = th.hero();
         let running = self.running();
         let snap = self.engine.as_ref().map(|e| e.status());
 
-        let mut content = column![self.header(p, running, snap.as_ref())]
-            .spacing(12.0)
-            .padding(16.0);
-        // The hero answers "who has the mouse right now", which is what the main window
-        // is for. A settings page is a different task and gets the room instead.
+        // The top band: header, and on the main window the status card. On a mixed theme it
+        // is painted in the dark top palette.
+        let mut top = column![self.header(h, running, snap.as_ref())].spacing(14.0);
         if self.page.is_none() {
-            content = content.push(self.hero(p, running, snap.as_ref()));
+            top = top.push(self.hero(h, running, snap.as_ref()));
         }
-        if let Some(banner) = self.restart_banner(p) {
-            content = content.push(banner);
-        }
-        if let Some(banner) = self.pending_files_banner(p) {
-            content = content.push(banner);
-        }
-        if let Some(banner) = self.elevation_notice(p) {
-            content = content.push(banner);
-        }
-        if let Some(banner) = self.pin_reminder(p) {
-            content = content.push(banner);
-        }
-        #[cfg(target_os = "linux")]
-        if let Some(banner) = self.login_screen_notice(p) {
-            content = content.push(banner);
-        }
-        let content = match self.page {
-            None => content.push(self.tab_bar(p)).push(
-                scrollable(container(self.tab_body(p, running)).padding([4.0, 2.0]))
-                    .height(Length::Fill),
-            ),
-            Some(pg) => content.push(self.settings_bar(p, pg)).push(
-                scrollable(container(self.settings_body(p, pg)).padding([4.0, 2.0]))
-                    .height(Length::Fill),
-            ),
-        }
-        .push(self.footer(p, running));
-
-        let page: Element<'_, Message> = container(content)
-            .style(move |_| ui_theme::root(p))
+        let top = container(top)
+            .padding(Padding { top: 14.0, right: 20.0, bottom: 16.0, left: 20.0 })
             .width(Length::Fill)
-            .height(Length::Fill)
-            .into();
+            .style(move |_| ui_theme::root(h));
+
+        let body: Element<'_, Message> = match self.page {
+            None => {
+                let mut col = column![].spacing(10.0);
+                let banners = self.banners(p);
+                if !banners.is_empty() {
+                    let mut stack_col = column![].spacing(8.0);
+                    for (i, (full, compact)) in banners.into_iter().enumerate() {
+                        stack_col = stack_col.push(if i == 0 { full } else { compact });
+                    }
+                    col = col.push(container(stack_col).padding([0.0, 20.0]));
+                }
+                col.push(self.tab_bar(p))
+                    .push(scroll(container(self.tab_body(p, running)).padding(Padding {
+                        top: 14.0,
+                        right: 20.0,
+                        bottom: 16.0,
+                        left: 20.0,
+                    })))
+                    .into()
+            }
+            Some(pg) => column![
+                container(self.settings_bar(p, pg)).padding(Padding { top: 14.0, right: 20.0, bottom: 4.0, left: 20.0 }),
+                scroll(container(self.settings_body(p, pg)).padding(Padding {
+                    top: 4.0,
+                    right: 20.0,
+                    bottom: 16.0,
+                    left: 20.0,
+                })),
+            ]
+            .into(),
+        };
+
+        let page: Element<'_, Message> = container(
+            column![top, container(body).height(Length::Fill), self.footer(p, running)],
+        )
+        .style(move |_| ui_theme::root(p))
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into();
 
         if let Some(how) = self.confirm_leave {
             return stack![page, self.leave_prompt(p, how)].into();
+        }
+        if self.confirm_restore {
+            return stack![page, self.restore_prompt(p)].into();
+        }
+        #[cfg(target_os = "linux")]
+        if self.login_screen_asking {
+            return stack![page, self.login_screen_prompt(p)].into();
         }
         if !self.menu_open {
             return page;
@@ -1731,25 +1981,20 @@ impl App {
         // `mouse_area` beneath it closes the menu on any click elsewhere, which is what
         // makes it behave like a menu rather than a panel that has to be dismissed by
         // pressing the same button again.
-        let dismiss = mouse_area(
-            container(Space::new())
-                .width(Length::Fill)
-                .height(Length::Fill),
-        )
-        .on_press(Message::CloseMenu);
-
-        let floating = container(
-            column![
-                Space::new().height(52.0),
-                container(self.overflow_menu(p)).align_right(Length::Fill),
-            ]
-        )
-        .padding([0.0, 16.0])
+        let dismiss = mouse_area(container(Space::new()).width(Length::Fill).height(Length::Fill))
+            .on_press(Message::CloseMenu);
+        let floating = container(column![
+            Space::new().height(50.0),
+            container(self.overflow_menu(p)).align_right(Length::Fill),
+        ])
+        .padding([0.0, 20.0])
         .width(Length::Fill)
         .height(Length::Fill);
 
         stack![page, dismiss, floating].into()
     }
+
+    // ---------- dialogs ----------
 
     /// R33: quitting or stopping during a transfer asks once. Either answer is final:
     /// "Quit anyway" quits at once, wherever the transfer is; "Keep going" changes nothing.
@@ -1757,131 +2002,338 @@ impl App {
         let what = self
             .transfer_running()
             .unwrap_or_else(|| "The transfer has just finished.".into());
-        let (title, go) = match how {
-            Leave::Quit => ("Quit while a transfer is running?", "Quit anyway"),
-            Leave::Stop => ("Stop sharing while a transfer is running?", "Stop anyway"),
-            Leave::Restart => ("Restart sharing while a transfer is running?", "Restart anyway"),
-            Leave::Elevate => ("Restart as administrator while a transfer is running?", "Restart anyway"),
+        let (title, go, verb) = match how {
+            Leave::Quit => ("Quit while a transfer is running?", "Quit anyway", "Quitting"),
+            Leave::Stop => ("Stop sharing while a transfer is running?", "Stop anyway", "Stopping"),
+            Leave::Restart => ("Restart sharing while a transfer is running?", "Restart anyway", "Restarting"),
+            Leave::Elevate => ("Restart as administrator while a transfer is running?", "Restart anyway", "Restarting"),
         };
-        let card = container(
+        dialog(
+            p,
             column![
-                text(title).size(15.0).color(p.txt),
-                text(what).size(12.5).color(p.txt2),
-                text("Stopping now ends it where it is; a half-pasted file stays incomplete.")
-                    .size(11.5)
-                    .color(p.warn),
+                text(title).size(16.0).font(BOLD).color(p.txt),
+                text(format!("{what} {verb} stops it, and a half-pasted file stays incomplete."))
+                    .size(13.0)
+                    .color(p.txt2),
                 row![
                     Space::new().width(Length::Fill),
-                    button(text("Keep going").size(12.5))
-                        .style(ui_theme::ghost(p))
-                        .padding([9.0, 14.0])
-                        .on_press(Message::KeepGoing),
-                    button(text(go).size(12.5))
-                        .style(ui_theme::danger(p))
-                        .padding([9.0, 14.0])
-                        .on_press(Message::LeaveAnyway),
+                    btn_secondary(p, "Keep going", Some(Message::KeepGoing)),
+                    btn_danger(p, go, Some(Message::LeaveAnyway)),
                 ]
                 .spacing(8.0),
             ]
-            .spacing(10.0),
+            .spacing(12.0),
         )
-        .style(move |_| ui_theme::card(p))
-        .padding(18.0)
-        .max_width(420.0);
-
-        // A dimmed full-window layer under the card, which also swallows clicks so the
-        // page behind cannot be used while the question is open.
-        mouse_area(
-            container(card)
-                .center(Length::Fill)
-                .padding(16.0)
-                .style(move |_| container::Style {
-                    background: Some(iced::Color { a: 0.55, ..iced::Color::BLACK }.into()),
-                    ..Default::default()
-                }),
-        )
-        .on_press(Message::Tick)
-        .into()
     }
 
-    /// "Restart needed" prompt: the panel's only honest answer to "did my change take
-    /// effect?". Saving a setting the engine already read does nothing to the live
-    /// session, and the previous behaviour — reporting "saved" and changing nothing —
-    /// gave no way to tell the two states apart.
+    /// About → Restore…: say what is kept before doing it.
+    fn restore_prompt(&self, p: Palette) -> Element<'_, Message> {
+        dialog(
+            p,
+            column![
+                text("Restore default settings?").size(16.0).font(BOLD).color(p.txt),
+                text("Every preference goes back to how it was on install. This computer's name, shared secret and screen size are kept.")
+                    .size(13.0)
+                    .color(p.txt2),
+                row![
+                    Space::new().width(Length::Fill),
+                    btn_secondary(p, "Cancel", Some(Message::CancelRestoreDefaults)),
+                    btn_danger(p, "Restore", Some(Message::RestoreDefaults)),
+                ]
+                .spacing(8.0),
+            ]
+            .spacing(12.0),
+        )
+    }
+
+    /// The one-time explanation, shown only when turning the login-screen service on for
+    /// the first time (D2). It appears at the moment the decision is being made, which is
+    /// when the information is worth something; a permanent warning about a thing nobody
+    /// asked for would be noise.
+    #[cfg(target_os = "linux")]
+    fn login_screen_prompt(&self, p: Palette) -> Element<'_, Message> {
+        let peer = self.peer_name();
+        let has = !self.cfg.connection_pin.is_empty();
+        let pin: Element<'_, Message> = if has {
+            note(p, p.good, "This computer's PIN is set. Whoever drives the login screen types it first.")
+        } else {
+            column![
+                text("Set this computer's PIN").size(13.5).font(BOLD).color(p.txt),
+                row![
+                    input(p, "New PIN", &self.pin_new, Message::PinNewTyped).secure(true),
+                    input(p, "Again", &self.pin_new2, Message::PinNew2Typed)
+                        .secure(true)
+                        .on_submit(Message::ConfirmLoginScreen),
+                ]
+                .spacing(8.0),
+                text(format!(
+                    "{peer} must type it before its keyboard reaches the login screen. 3 wrong tries lock it out for an hour."
+                ))
+                .size(11.5)
+                .color(p.txt3),
+            ]
+            .spacing(8.0)
+            .into()
+        };
+        let mut body = column![
+            text("Share the keyboard before anyone logs in?").size(16.0).font(BOLD).color(p.txt),
+            text(format!(
+                "This installs a small system service that starts at boot, so {peer}'s keyboard \
+                 works at the password screen and you no longer need a second one plugged in here."
+            ))
+            .size(13.0)
+            .color(p.txt2),
+            note(
+                p,
+                p.warn,
+                "This computer will accept keystrokes over the network before anyone signs in. \
+                 The shared secret and the PIN are what protect this login.",
+            ),
+            pin,
+        ]
+        .spacing(12.0);
+        if !self.login_dialog_error.is_empty() {
+            body = body.push(text(self.login_dialog_error.clone()).size(12.0).color(p.danger));
+        }
+        body = body
+            .push(text("Next, your computer asks for your password to install it.").size(11.5).color(p.txt3))
+            .push(
+                row![
+                    Space::new().width(Length::Fill),
+                    btn_secondary(p, "Leave it off", Some(Message::CancelLoginScreen)),
+                    btn_primary(p, if has { "Allow and turn on" } else { "Save PIN and turn on" }, Some(Message::ConfirmLoginScreen)),
+                ]
+                .spacing(8.0),
+            );
+        dialog(p, body)
+    }
+
+    // ---------- banners ----------
+
+    /// The messages above the tabs (B1), in the agreed order. Each comes as a full banner
+    /// and a one-line form: only the first is shown in full, so a pile of them never pushes
+    /// the tabs off the window.
+    fn banners(&self, p: Palette) -> Vec<(Element<'_, Message>, Element<'_, Message>)> {
+        let mut v = Vec::new();
+        if let Some(b) = self.restart_banner(p) {
+            v.push(b);
+        }
+        if let Some(b) = self.pending_files_banner(p) {
+            v.push(b);
+        }
+        if let Some(b) = self.elevation_notice(p) {
+            v.push(b);
+        }
+        if let Some(b) = self.pin_reminder(p) {
+            v.push(b);
+        }
+        if let Some(b) = self.pin_waiting_banner(p) {
+            v.push(b);
+        }
+        v
+    }
+
+    /// "Restart needed": the panel's only honest answer to "did my change take effect?".
+    /// Saving a setting the engine already read does nothing to the live session.
     ///
-    /// Dismissing with "Later" collapses it to a one-line marker rather than hiding it,
-    /// because the mismatch is still real after dismissal.
-    fn restart_banner(&self, p: Palette) -> Option<Element<'_, Message>> {
+    /// "Later" collapses it to the one-line form rather than hiding it, because the
+    /// mismatch is still real after dismissal.
+    fn restart_banner(&self, p: Palette) -> Option<(Element<'_, Message>, Element<'_, Message>)> {
         let pending = self.pending_changes();
         if pending.is_empty() {
             return None;
         }
         let n = pending.len();
-        let list = pending.join(", ");
-        let summary = format!(
-            "{n} change{} saved but not yet active: {list}.",
-            if n == 1 { "" } else { "s" }
+        let plural = if n == 1 { "" } else { "s" };
+        let compact = banner_line(
+            p,
+            p.warn,
+            format!("{n} change{plural} wait for a restart"),
+            Some(("Restart", Message::RestartNow)),
         );
-
         if self.restart_hint_dismissed {
-            // Compact persistent marker.
-            return Some(
-                container(
-                    text(format!("⚠ {summary}  (restart to apply)"))
-                        .size(12.0)
-                        .style(move |_| iced::widget::text::Style { color: Some(p.warn) }),
-                )
-                .padding([6.0, 10.0])
-                .style(move |_| ui_theme::card(p))
-                .width(Length::Fill)
-                .into(),
+            let again = banner_line(
+                p,
+                p.warn,
+                format!("{n} change{plural} wait for a restart"),
+                Some(("Restart", Message::RestartNow)),
             );
+            return Some((again, compact));
         }
-
-        Some(
-            container(
-                column![
-                    text("⚠ Restart needed")
-                        .size(14.0)
-                        .style(move |_| iced::widget::text::Style { color: Some(p.warn) }),
-                    text(summary).size(12.0),
-                    row![
-                        button(text("Restart sharing now").size(12.0))
-                            .style(ui_theme::primary(p))
-                            .padding([8.0, 12.0])
-                            .on_press(Message::RestartNow),
-                        button(text("Later").size(12.0))
-                            .style(ui_theme::ghost(p))
-                            .padding([8.0, 12.0])
-                            .on_press(Message::RestartLater),
-                    ]
-                    .spacing(8.0),
-                ]
-                .spacing(8.0),
-            )
-            .padding([10.0, 12.0])
-            .style(move |_| ui_theme::card(p))
-            .width(Length::Fill)
+        let full = banner(
+            p,
+            p.warn,
+            "Restart needed",
+            format!("{n} saved change{plural} apply after a restart: {}.", pending.join(", ")),
+            row![
+                btn_primary(p, "Restart sharing now", Some(Message::RestartNow)),
+                btn_secondary(p, "Later", Some(Message::RestartLater)),
+            ]
+            .spacing(8.0)
             .into(),
-        )
+        );
+        Some((full, compact))
     }
 
-    // ---------- header ----------
+    /// "The other machine copied something big — want it?"
+    ///
+    /// A banner rather than a dialog, and that is not a style preference. Windows
+    /// withholds `WH_KEYBOARD_LL` callbacks from a process while that process owns the
+    /// foreground window — the exact root cause of the keyboard leak fixed on
+    /// 2026‑07‑31. A pop-up that grabbed focus the moment a large file was copied would
+    /// bring it straight back, mid-work, quite possibly mid-crossing. So this never calls
+    /// `SetForegroundWindow` and never steals focus.
+    fn pending_files_banner(&self, p: Palette) -> Option<(Element<'_, Message>, Element<'_, Message>)> {
+        // Only while it is *waiting*. Once fetching — "Bring it over" pressed, or a paste
+        // started it — its job is done; the history row carries the progress.
+        let waiting: Vec<_> = self
+            .engine
+            .as_ref()?
+            .clipboard_meta()
+            .into_iter()
+            .filter(|m| m.status == mouse_clipboard::ClipStatus::NeedsConsent)
+            .collect();
+        let first = waiting.first()?;
+        let more = waiting.len().saturating_sub(1);
+        let title = match more {
+            0 => format!("{} is ready to paste", first.preview),
+            n => format!("{} (and {n} more) are ready to paste", first.preview),
+        };
+        let body = format!(
+            "{}, over your {} limit, so it only comes over when you paste it. {}",
+            human_bytes(first.disk_bytes as usize),
+            human_bytes(self.cfg.clipboard_auto_transfer_max as usize),
+            // Linux offers it from the streaming folder, so a paste of any size starts at
+            // once. Elsewhere the paste waits for the whole transfer.
+            if cfg!(target_os = "linux") {
+                "Pasting works now; this is only a heads-up."
+            } else {
+                "If it is large, bring it over first: a paste waits for the whole file."
+            }
+        );
+        let compact = banner_line(p, p.accent, title.clone(), Some(("Bring it over", Message::ClipReuse(first.id))));
+        // Three answers, because "yes" and "no" are not the only ones: the third says "stop
+        // asking me about files this size", which is the real request behind repeatedly
+        // pressing the first.
+        let full = banner(
+            p,
+            p.accent,
+            title,
+            body,
+            row![
+                btn_primary(p, "Bring it over", Some(Message::ClipReuse(first.id))),
+                btn_secondary(p, "Not now", Some(Message::ClipDecline(first.id))),
+                btn_link(p, format!("Always allow up to {}", mb_ceil_label(first.disk_bytes)), Message::ClipAlwaysAllow(first.id)),
+            ]
+            .spacing(8.0)
+            .align_y(Alignment::Center)
+            .into(),
+        );
+        Some((full, compact))
+    }
 
-    fn header(&self, p: Palette, running: bool, snap: Option<&StatusSnapshot>) -> Element<'_, Message> {
-        let (pill_fill, pill_txt, label) = status_pill(p, running, snap);
-        let status = container(text(label).size(12.0).color(pill_txt))
-            .style(move |_| ui_theme::pill(pill_fill, pill_txt))
-            .padding([4.0, 10.0]);
+    /// Told once, then never again. Running without administrator rights is a perfectly
+    /// reasonable way to use this, so it says the limitation plainly, offers the two ways
+    /// to act on it, and goes away for good.
+    fn elevation_notice(&self, p: Palette) -> Option<(Element<'_, Message>, Element<'_, Message>)> {
+        if self.cfg.elevation_notice_seen || !mouse_input::elevation().is_limited() {
+            return None;
+        }
+        let full = banner(
+            p,
+            p.txt3,
+            "Running with normal permissions",
+            "Fine for everyday use. While an administrator window is in front (an installer or a \
+             permission prompt), Windows hides the mouse from mouse-rs, so the pointer can't cross \
+             until you click away."
+                .to_string(),
+            row![
+                btn_secondary(p, "Restart as administrator", Some(Message::RelaunchElevated)),
+                btn_link(p, "Keep normal", Message::DismissElevationNotice),
+            ]
+            .spacing(8.0)
+            .align_y(Alignment::Center)
+            .into(),
+        );
+        let compact = banner_line(
+            p,
+            p.txt3,
+            "Running with normal permissions".to_string(),
+            Some(("Restart as administrator", Message::RelaunchElevated)),
+        );
+        Some((full, compact))
+    }
 
-        // Theme swatches used to sit here — six colour dots directly beside the one line
-        // of status a user actually reads. They live in the ⋯ menu now.
+    /// Client, main window, at most once a day: a nudge to set a PIN, until one is in use
+    /// or the user says never (owner, 27 Oct).
+    fn pin_reminder(&self, p: Palette) -> Option<(Element<'_, Message>, Element<'_, Message>)> {
+        if self.cfg.role != Role::Client
+            || self.cfg.pin_reminder_off
+            || (self.cfg.pin_enabled && !self.cfg.connection_pin.is_empty())
+            || self.cfg.pin_reminder_day == today()
+            || self.page.is_some()
+        {
+            return None;
+        }
+        let full = banner(
+            p,
+            p.accent,
+            "Protect this computer with a PIN",
+            "Anyone on this network who has paired with this computer can control it. With a PIN, \
+             they also need the PIN, and 3 wrong tries lock them out for an hour."
+                .to_string(),
+            row![
+                btn_primary(p, "Set a PIN", Some(Message::PinReminderSet)),
+                btn_secondary(p, "Not now", Some(Message::PinReminderLater)),
+                btn_link(p, "Don't ask again", Message::PinReminderNever),
+            ]
+            .spacing(8.0)
+            .align_y(Alignment::Center)
+            .into(),
+        );
+        let compact = banner_line(
+            p,
+            p.accent,
+            "Protect this computer with a PIN".to_string(),
+            Some(("Set a PIN", Message::PinReminderSet)),
+        );
+        Some((full, compact))
+    }
+
+    /// Client: while a server is being refused over the PIN, say so.
+    fn pin_waiting_banner(&self, p: Palette) -> Option<(Element<'_, Message>, Element<'_, Message>)> {
+        if self.cfg.role != Role::Client || !self.running() || !mouse_core::pin::awaiting() {
+            return None;
+        }
+        let full = banner(
+            p,
+            p.warn,
+            "A computer is asking to control this one",
+            "Type this computer's PIN on it to allow it.".to_string(),
+            Space::new().height(0.0).into(),
+        );
+        let compact = banner_line(p, p.warn, "A computer is asking to control this one".to_string(), None);
+        Some((full, compact))
+    }
+
+    // ---------- header and status card ----------
+
+    fn header(&self, h: Palette, running: bool, snap: Option<&StatusSnapshot>) -> Element<'_, Message> {
+        let (colour, label) = self.status_label(h, running, snap);
+        let status = container(
+            row![dot(colour, 7.0), text(label).size(12.0).color(h.txt2)]
+                .spacing(7.0)
+                .align_y(Alignment::Center),
+        )
+        .style(move |_| ui_theme::pill(h))
+        .padding([4.0, 11.0]);
+
         row![
-            text("mouse-rs").size(22.0).color(p.txt).width(Length::Fill),
+            text("mouse-rs").size(15.0).font(BOLD).color(h.txt).width(Length::Fill),
             status,
-            button(text("⋯").size(16.0).color(p.txt2))
-                .style(ui_theme::ghost(p))
-                .padding([6.0, 12.0])
+            button(text("⋯").size(16.0).color(h.txt2))
+                .style(ui_theme::icon_button(h, self.menu_open))
+                .padding([3.0, 10.0])
                 .on_press(Message::ToggleMenu),
         ]
         .spacing(10.0)
@@ -1889,324 +2341,1330 @@ impl App {
         .into()
     }
 
-    // ---------- status hero ----------
+    /// The pill in the header: one word or two for the state of the link.
+    fn status_label(&self, h: Palette, running: bool, snap: Option<&StatusSnapshot>) -> (iced::Color, String) {
+        if !running {
+            return if self.paired() { (h.txt3, "Stopped".into()) } else { (h.txt3, "Not set up".into()) };
+        }
+        if self.server_pin_prompt().is_some() {
+            return (h.warn, "PIN needed".into());
+        }
+        match snap {
+            Some(s) if s.connected => (h.good, "Connected".into()),
+            Some(StatusSnapshot { refused: Some(_), .. }) => (h.danger, "Refused".into()),
+            _ => (h.warn, format!("Waiting for {}…", self.peer_name())),
+        }
+    }
 
-    /// One row of two machine chips plus the live control line.
-    ///
-    /// The previous hero was two large boxes and took roughly a third of the window to say
-    /// what this says in ~70px. It answers the only question that changes moment to moment —
-    /// which machine currently has the mouse and keyboard — so it stays on every tab.
-    fn hero(&self, p: Palette, running: bool, snap: Option<&StatusSnapshot>) -> Element<'_, Message> {
-        let connected = snap.map(|s| s.connected).unwrap_or(false);
-        // Exactly one chip is lit, and it is always the machine that currently has the
+    /// Has this computer been paired? A fresh install still has the placeholder secret.
+    fn paired(&self) -> bool {
+        self.cfg.shared_secret != mouse_core::config::DEFAULT_SECRET
+    }
+
+    /// The client asking this server for its PIN, if any.
+    fn server_pin_prompt(&self) -> Option<(String, mouse_core::pin::Prompt)> {
+        if self.cfg.role != Role::Server || !self.running() {
+            return None;
+        }
+        mouse_core::pin::prompt()
+    }
+
+    /// The other computer's name as best known: live, else from the last connection, else
+    /// the address typed for it, else a plain description.
+    fn peer_name(&self) -> String {
+        if let Some(s) = self.engine.as_ref().map(|e| e.status()).filter(|s| s.connected) {
+            return s.peer.trim_end_matches(" (login screen)").to_string();
+        }
+        if let Some((name, _, _)) = &self.last_peer {
+            return name.clone();
+        }
+        if !self.cfg.peer_name.trim().is_empty() {
+            return self.cfg.peer_name.trim().to_string();
+        }
+        if self.cfg.role == Role::Client && !self.cfg.server_host.trim().is_empty() {
+            return self.cfg.server_host.trim().to_string();
+        }
+        "the other computer".into()
+    }
+
+    /// The status card's sentence: a title and one line under it.
+    fn hero_text(&self, running: bool, snap: Option<&StatusSnapshot>) -> (String, String) {
+        let enc = if self.cfg.tls_enabled { "encrypted" } else { "not encrypted" };
+        if !self.paired() && !running {
+            return ("Let's connect a second computer".into(), "Takes about a minute, once".into());
+        }
+        if !running {
+            let peer = self.peer_name();
+            return ("Sharing is off".into(), format!("Start sharing to connect to {peer} again"));
+        }
+        if let Some((client, _)) = self.server_pin_prompt() {
+            return (format!("{client} wants its PIN"), format!("Type it below to start controlling {client}"));
+        }
+        match snap {
+            Some(s) if s.connected => {
+                let peer = s.peer.trim_end_matches(" (login screen)").to_string();
+                let login = if s.peer_at_login_screen { " · at its login screen" } else { "" };
+                match (self.cfg.role, s.engaged) {
+                    (Role::Server, true) => (
+                        format!("Controlling {peer}"),
+                        format!("You're on {peer} now · {} brings you back · {enc}{login}", key_label(&self.cfg.lock_hotkey)),
+                    ),
+                    (Role::Server, false) => (
+                        format!("Controlling {peer}"),
+                        format!("Push past the {} edge to use {peer} · {enc}{login}", self.cfg.exit_edge.label()),
+                    ),
+                    (Role::Client, true) => {
+                        (format!("Connected to {peer}"), format!("{peer} is controlling this computer · {enc}"))
+                    }
+                    (Role::Client, false) => (
+                        format!("Connected to {peer}"),
+                        format!("{peer} takes over when its pointer crosses · {enc}"),
+                    ),
+                }
+            }
+            Some(StatusSnapshot { refused: Some(why), .. }) => ("Couldn't connect".into(), why.clone()),
+            _ => {
+                let peer = self.peer_name();
+                (format!("Waiting for {peer}"), format!("It will connect as soon as {peer} is reachable"))
+            }
+        }
+    }
+
+    /// The two computers, the one with the mouse outlined (R31, R40). It answers the only
+    /// question that changes moment to moment — which machine has the mouse and keyboard.
+    fn hero(&self, h: Palette, running: bool, snap: Option<&StatusSnapshot>) -> Element<'_, Message> {
+        // Exactly one tile is lit, and it is always the machine that currently has the
         // mouse and keyboard. See `control_is_local` for why the role has to be folded in.
         let local_has_control = control_is_local(self.cfg.role, snap);
+        let (title, sub) = self.hero_text(running, snap);
 
-        let local = machine_chip(
-            p,
-            "🖥",
+        let local = machine_tile(
+            h,
             &self.cfg.name,
-            &format!("{}×{} · this computer", self.cfg.screen_width, self.cfg.screen_height),
+            &format!("This computer · {}×{}", self.cfg.screen_width, self.cfg.screen_height),
             local_has_control,
+            true,
         );
-        let (peer_name, peer_res) = match snap {
-            Some(s) if s.connected => (s.peer.clone(), format!("{}×{}", s.peer_w, s.peer_h)),
-            _ => ("waiting…".to_string(), "not connected".to_string()),
+        let peer = match (snap, self.server_pin_prompt()) {
+            (Some(s), _) if s.connected => machine_tile(
+                h,
+                s.peer.trim_end_matches(" (login screen)"),
+                &format!("{}×{}", s.peer_w, s.peer_h),
+                !local_has_control,
+                true,
+            ),
+            (_, Some((client, _))) => machine_tile(h, &client, "Asking for PIN", false, false),
+            _ if !self.paired() => machine_tile(h, "Waiting…", "Not connected", false, false),
+            _ => machine_tile(h, &self.peer_label(), "Not connected", false, false),
         };
-        let peer = machine_chip(p, "💻", &peer_name, &peer_res, connected && !local_has_control);
+        let swap = hint(
+            h,
+            button(container(text("⇄").size(14.0).color(h.txt2)).center(Length::Fixed(18.0)))
+                .style(ui_theme::round_button(h))
+                .padding(6.0)
+                .on_press(Message::SwapRoles),
+            "Swap roles: this computer shares its mouse, or is controlled. The other computer needs the opposite.",
+        );
 
-        let link = column![
-            text(if connected { "⇄" } else { "—" })
-                .size(20.0)
-                .color(if connected { p.accent } else { p.txt3 }),
-        ]
-        .align_x(Alignment::Center)
-        .width(Length::Shrink);
-
-        let body = column![
-            row![local, link, peer].spacing(10.0).align_y(Alignment::Center),
-            text(hero_line(running, self.cfg.role, snap))
-                .size(12.0)
-                .color(if running { p.accent } else { p.txt3 }),
-        ]
-        .spacing(10.0);
-
-        container(body)
-            .style(move |_| ui_theme::hero(p))
-            .padding(12.0)
-            .width(Length::Fill)
-            .into()
+        container(
+            column![
+                column![
+                    text(title).size(21.0).font(BOLD).color(h.txt),
+                    text(sub).size(12.5).color(h.txt2),
+                ]
+                .spacing(3.0),
+                row![local, swap, peer].spacing(10.0).align_y(Alignment::Center),
+            ]
+            .spacing(14.0),
+        )
+        .style(move |_| ui_theme::hero(h))
+        .padding(16.0)
+        .width(Length::Fill)
+        .into()
     }
 
-    // ---------- tab bar ----------
+    // ---------- tabs ----------
 
     fn tab_bar(&self, p: Palette) -> Element<'_, Message> {
-        let mut r = row![].spacing(6.0);
-        for t in Tab::ALL {
-            r = r.push(
-                button(
-                    container(text(t.label()).size(13.5).color(if t == self.tab { p.accent_ink } else { p.txt2 }))
-                        .center_x(Length::Fill),
-                )
-                .style(ui_theme::segment(p, t == self.tab))
-                .padding([9.0, 16.0])
-                .width(Length::Fill)
-                .on_press(Message::TabPicked(t)),
-            );
-        }
-        container(r).padding(4.0).width(Length::Fill).style(move |_| ui_theme::well(p)).into()
+        let count = self
+            .engine
+            .as_ref()
+            .map(|e| e.clipboard_usage().0)
+            .filter(|n| *n > 0);
+        let tab = |t: Tab, count: Option<usize>| -> Element<'_, Message> {
+            let active = t == self.tab;
+            let mut label = row![text(t.label()).size(13.5).font(if active { BOLD } else { iced::Font::DEFAULT })]
+                .spacing(6.0)
+                .align_y(Alignment::Center);
+            // Wide enough for the label: a Fill underline inside a Shrink column would take
+            // the whole row.
+            let mut w = t.label().len() as f32 * 7.6;
+            if let Some(n) = count {
+                label = label.push(text(n.to_string()).size(11.5).color(p.txt3).font(BOLD));
+                w += 8.0 + n.to_string().len() as f32 * 7.0;
+            }
+            column![
+                button(label).style(ui_theme::tab(p, active)).padding([10.0, 0.0]).on_press(Message::TabPicked(t)),
+                container(Space::new().height(2.0))
+                    .width(w)
+                    .height(2.0)
+                    .style(move |_| ui_theme::rule(if active { p.accent } else { iced::Color::TRANSPARENT })),
+            ]
+            .into()
+        };
+        column![
+            container(
+                Tab::ALL
+                    .into_iter()
+                    .fold(row![].spacing(22.0), |r, t| r.push(tab(t, if t == Tab::Clipboard { count } else { None }))),
+            )
+            .padding([0.0, 20.0]),
+            hairline(p),
+        ]
+        .into()
     }
-
-    // ---------- tab bodies ----------
 
     fn tab_body(&self, p: Palette, running: bool) -> Element<'_, Message> {
         match self.tab {
+            Tab::Connection if !self.paired() => self.first_run(p, running),
             Tab::Connection => self.tab_connection(p, running),
             Tab::Clipboard => self.tab_clipboard(p),
         }
     }
 
-    /// The main window's Connection tab: who this computer is, and how it finds the other
-    /// one (R30). Ports, auto-reconnect, the machine name and profiles are in
-    /// ⋯ → Settings → Connection.
+    /// The main window's Connection tab once paired (M1–M3): who this computer is, how the
+    /// two find each other, and the way back. Everything else is in ⋯ → Settings.
     fn tab_connection(&self, p: Palette, _running: bool) -> Element<'_, Message> {
         let server_side = self.cfg.role == Role::Server;
+        let connected_peer = self
+            .engine
+            .as_ref()
+            .map(|e| e.status())
+            .filter(|s| s.connected)
+            .map(|s| s.peer.trim_end_matches(" (login screen)").to_string());
 
-        // Role segmented control.
-        let role = row![
-            seg_button(p, "Server · has mouse", self.cfg.role == Role::Server, Message::RolePicked(Role::Server)),
-            seg_button(p, "Client · receives", self.cfg.role == Role::Client, Message::RolePicked(Role::Client)),
-        ]
-        .spacing(6.0);
+        let mut col = column![].spacing(12.0);
+        // First, while a client is waiting for its PIN: it is the one thing to do now.
+        if let Some(pin) = self.pin_prompt_view(p) {
+            col = col.push(pin);
+        }
 
-        let net: Element<'_, Message> = if server_side {
-            // The server is found by the client, so what matters here is what to tell it.
-            // Choosing which of these addresses to listen on is in Settings → Connection.
-            let local = mouse_core::discover::listen_candidates();
-            let mut col = column![].spacing(6.0);
-            // First, while a client is waiting for its PIN: it is the one thing to do now.
-            if let Some(pin) = self.pin_prompt_view(p) {
-                col = col.push(pin);
-            }
-            col = col
-                .push(text(if local.is_empty() { "none found".to_string() } else { local.join("  ·  ") })
-                    .size(13.0)
-                    .color(p.txt2))
-                .push(text("The other computer finds this one by itself on a shared network; type one of these there only if it does not.")
-                    .size(11.0)
-                    .color(p.txt3));
-            // Pairing is for setting up a new computer; on the main window only until this
-            // one has been paired, or while a code is showing. It is always in Settings.
-            if self.cfg.shared_secret == mouse_core::config::DEFAULT_SECRET
-                || mouse_core::pairing::current_code().is_some()
-            {
-                col = col.push(labeled(p, "Set up a new computer", self.pair_server_view(p)));
-            }
-            col.into()
+        let role_sub = match (server_side, &connected_peer) {
+            (true, Some(peer)) => format!("Server · its mouse drives {peer}"),
+            (true, None) => "Server".to_string(),
+            (false, Some(peer)) => format!("Client · driven by {peer}"),
+            (false, None) => "Client".to_string(),
+        };
+        let mut rows: Vec<Element<'_, Message>> = vec![srow(p, "This computer", role_sub, self.role_switch(p))];
+
+        // Connection details: folded to one line, opened in place.
+        let (summary_value, summary_sub): (Element<'_, Message>, String) = if server_side {
+            let local = own_addresses();
+            let v = match local.len() {
+                0 => text("no address").size(12.5).color(p.txt3).into(),
+                1 => mono(p, local[0].clone()),
+                n => row![mono(p, local[0].clone()), text(format!("+{}", n - 1)).size(11.5).color(p.txt3)]
+                    .spacing(6.0)
+                    .align_y(Alignment::Center)
+                    .into(),
+            };
+            (v, "Addresses and pairing".into())
         } else {
-            let scanning = matches!(*self.scan.lock().unwrap(), ScanState::Running);
-            let detect = button(
-                text(if scanning { "Scanning…" } else { "Detect" }).size(13.0),
+            let v = if self.cfg.server_host.trim().is_empty() {
+                text("found automatically").size(12.5).color(p.txt2).into()
+            } else {
+                mono(p, self.cfg.server_host.trim().to_string())
+            };
+            (v, format!("Address and pairing · paired with {}", self.peer_name()))
+        };
+        rows.push(
+            button(
+                row![
+                    labels(p, "Connection details", if self.details_open { "Open".to_string() } else { summary_sub }),
+                    if self.details_open { Space::new().width(0.0).into() } else { summary_value },
+                    text(if self.details_open { "⌄" } else { "›" }).size(15.0).color(p.txt3),
+                ]
+                .spacing(10.0)
+                .align_y(Alignment::Center),
             )
-            .style(ui_theme::ghost(p))
-            .padding([9.0, 14.0]);
-            let detect = if scanning { detect } else { detect.on_press(Message::DetectServers) };
-            let detect = hint(
-                p,
-                detect,
-                "Searches the networks this computer is on for the other computer running \
-                 mouse-rs as the server, and fills in its address. Takes a few seconds.",
+            .style(ui_theme::row_button(p))
+            .padding([12.0, 14.0])
+            .width(Length::Fill)
+            .on_press(Message::ToggleDetails)
+            .into(),
+        );
+        if self.details_open {
+            if server_side {
+                rows.push(self.addresses_row(p));
+                rows.push(self.pair_server_row(p));
+            } else {
+                rows.push(self.server_address_row(p));
+                rows.push(self.network_preference_row(p));
+                rows.push(stacked(p, "Pair with a new code", self.pair_client_view(p), ""));
+            }
+        }
+        if !server_side {
+            let has = !self.cfg.connection_pin.is_empty();
+            let value = match (has, self.cfg.pin_enabled, self.cfg.login_pin_enabled && cfg!(target_os = "linux")) {
+                (false, _, _) => "Not set",
+                (true, true, _) => "On · asked when connecting",
+                (true, false, true) => "At the login screen only",
+                (true, false, false) => "Off",
+            };
+            rows.push(nav(p, "Connection PIN", "", value_text(p, value), Message::OpenSettings(Page::Security)));
+        }
+        rows.push(nav(p, "Take control back", "", keycaps(p, &self.cfg.lock_hotkey), Message::OpenSettings(Page::Keys)));
+        col = col.push(group(p, rows));
+
+        // The last few clipboard entries, so the main window shows the other half of what
+        // the app does without a tab switch.
+        if let Some(entries) = self.engine.as_ref().map(|e| e.clipboard_meta()).filter(|e| !e.is_empty()) {
+            col = col.push(
+                row![
+                    text("Recent clipboard").size(12.5).font(BOLD).color(p.txt2).width(Length::Fill),
+                    btn_link(p, "See all", Message::TabPicked(Tab::Clipboard)),
+                ]
+                .align_y(Alignment::Center),
             );
-
-            let mut col = column![
-                labeled(
-                    p,
-                    "Server host / IP",
-                    row![
-                        input(p, "press Detect, or type the other machine's IP", &self.cfg.server_host, Message::ServerHostChanged),
-                        detect,
-                    ]
-                    .spacing(8.0)
-                    .align_y(Alignment::Center),
-                ),
-                text("The address of the computer that has the mouse (the server). Press Detect to find it on your network, or type its IP address.")
-                    .size(11.0)
-                    .color(p.txt3),
-            ]
-            .spacing(8.0);
-
-            // Only offered once a sweep has actually found something — an empty picker
-            // would imply the feature is broken rather than that nothing answered.
-            if !self.found_servers.is_empty() {
-                let picked = self
-                    .found_servers
-                    .iter()
-                    .find(|c| **c == self.cfg.server_host)
-                    .cloned();
-                col = col.push(labeled(
-                    p,
-                    "Found on your network",
-                    pick_list(self.found_servers.clone(), picked, Message::ServerPicked)
-                        .width(Length::Fill)
-                        .padding([10.0, 12.0])
-                        .text_size(13.0),
-                ));
+            let mut list = column![].spacing(8.0);
+            for m in entries.iter().take(3) {
+                let what = if m.incoming { "Received" } else { "Sent" };
+                let size = if m.is_files { human_bytes(m.disk_bytes as usize) } else { human_bytes(m.bytes) };
+                list = list.push(
+                    button(
+                        row![
+                            kind_badge(p, m),
+                            text(m.preview.clone())
+                                .size(13.0)
+                                .font(if m.is_files || m.is_image { iced::Font::DEFAULT } else { MONO })
+                                .color(p.txt)
+                                .width(Length::Fill)
+                                .wrapping(iced::widget::text::Wrapping::WordOrGlyph),
+                            text(format!("{what} · {size}")).size(11.5).color(p.txt3),
+                        ]
+                        .spacing(10.0)
+                        .align_y(Alignment::Center),
+                    )
+                    .style(ui_theme::choice(p, false))
+                    .padding([10.0, 14.0])
+                    .width(Length::Fill)
+                    .on_press(Message::ClipReuse(m.id)),
+                );
             }
-            if let Some(waiting) = self.pin_waiting_view(p) {
-                col = col.push(waiting);
-            }
-            if self.cfg.shared_secret == mouse_core::config::DEFAULT_SECRET {
-                col = col.push(labeled(p, "First-time setup: pair with a code", self.pair_client_view(p)));
-            }
-            col.into()
-        };
+            col = col.push(list);
+        }
+        col.into()
+    }
 
-        // At a glance: the settings that decide how this session behaves, read-only, so the
-        // main window answers "is this set up the way I think?" without becoming a second
-        // settings page (R28).
-        let cb = &self.cfg;
-        let shared: Vec<&str> = [
-            (cb.clipboard_sync_text, "text"),
-            (cb.clipboard_sync_images, "images"),
-            (cb.clipboard_sync_files, "files"),
-        ]
-        .into_iter()
-        .filter_map(|(on, what)| on.then_some(what))
-        .collect();
-        let clip = if !cb.clipboard_sync || shared.is_empty() {
-            "not shared".to_string()
+    /// "Shares mouse | Is controlled".
+    fn role_switch(&self, p: Palette) -> Element<'_, Message> {
+        segmented(
+            p,
+            vec![
+                ("Shares mouse".into(), self.cfg.role == Role::Server, Message::RolePicked(Role::Server)),
+                ("Is controlled".into(), self.cfg.role == Role::Client, Message::RolePicked(Role::Client)),
+            ],
+        )
+    }
+
+    /// Server: the addresses the other computer can use.
+    fn addresses_row(&self, p: Palette) -> Element<'_, Message> {
+        let local = own_addresses();
+        let chips: Element<'_, Message> = if local.is_empty() {
+            text("none found").size(12.5).color(p.txt3).into()
         } else {
-            format!("shares {}", shared.join(", "))
+            let mut r = row![].spacing(6.0);
+            for a in local {
+                r = r.push(container(text(a).size(12.5).font(MONO).color(p.txt)).padding([4.0, 9.0]).style(move |_| ui_theme::chip(p)));
+            }
+            r.wrap().vertical_spacing(6.0).into()
         };
-        let glance = column![
-            column![
-                section(p, "At a glance"),
-                text("A summary of how sharing is set up. Nothing changes here; click a line to change it in Settings.")
-                    .size(11.0)
-                    .color(p.txt3),
+        stacked(
+            p,
+            "This computer's addresses",
+            chips,
+            "The other computer finds this one by itself. Type one of these there only if it doesn't.",
+        )
+    }
+
+    /// Client: the address of the computer with the mouse, Detect, and what Detect found.
+    fn server_address_row(&self, p: Palette) -> Element<'_, Message> {
+        let scanning = matches!(*self.scan.lock().unwrap(), ScanState::Running);
+        let detect = hint(
+            p,
+            btn_secondary(p, if scanning { "Scanning…" } else { "Detect" }, (!scanning).then_some(Message::DetectServers)),
+            "Searches the networks this computer is on for the other computer running \
+             mouse-rs as the server, and fills in its address. Takes a few seconds.",
+        );
+        let mut col = column![
+            row![
+                input(p, "Press Detect, or type its IP", &self.cfg.server_host, Message::ServerHostChanged).font(MONO),
+                detect,
             ]
-            .spacing(3.0),
-            column![
-                info_row(p, "🔒", "Encryption", if cb.tls_enabled { "on (TLS)".to_string() } else { "off".to_string() }, Page::Security),
-                info_row(
-                    p,
-                    "🔢",
-                    "Password",
-                    match (server_side, cb.pin_enabled && !cb.connection_pin.is_empty()) {
-                        (false, true) => "on".to_string(),
-                        (false, false) => "off".to_string(),
-                        (true, _) => "set on the computer you drive".to_string(),
-                    },
-                    Page::Security,
-                ),
-                info_row(p, "📋", "Clipboard", clip, Page::Clipboard),
-                info_row(p, "⌨", "Take control back", key_label(&cb.lock_hotkey), Page::Keys),
-            ]
-            .spacing(2.0),
+            .spacing(8.0)
+            .align_y(Alignment::Center),
         ]
         .spacing(8.0);
+        // Only offered once a sweep has actually found something — an empty list would imply
+        // the feature is broken rather than that nothing answered.
+        for found in &self.found_servers {
+            let used = *found == self.cfg.server_host;
+            col = col.push(
+                container(
+                    row![
+                        dot(p.good, 7.0),
+                        text(found.clone()).size(12.5).font(MONO).color(p.txt).width(Length::Fill),
+                        if used {
+                            Element::from(text("In use").size(12.0).color(p.txt3))
+                        } else {
+                            btn_link(p, "Use", Message::ServerPicked(found.clone()))
+                        },
+                    ]
+                    .spacing(10.0)
+                    .align_y(Alignment::Center),
+                )
+                .padding([6.0, 12.0])
+                .style(move |_| ui_theme::note(p))
+                .width(Length::Fill),
+            );
+        }
+        stacked(
+            p,
+            "The computer with the mouse",
+            col.into(),
+            "Usually found by itself. Press Detect to search your network, or type its IP address.",
+        )
+    }
+
+    /// Client: which network to use when the server answers on both (R39).
+    fn network_preference_row(&self, p: Palette) -> Element<'_, Message> {
+        use mouse_core::NetworkPreference as N;
+        let pick = self.cfg.network_preference;
+        srow(
+            p,
+            "Preferred network",
+            "When both work, use this one; the other takes over if it fails",
+            segmented(
+                p,
+                vec![
+                    ("Cable".into(), pick == N::Cable, Message::NetworkPreferencePicked(N::Cable)),
+                    ("Wi-Fi".into(), pick == N::Wifi, Message::NetworkPreferencePicked(N::Wifi)),
+                    ("Fastest".into(), pick == N::Fastest, Message::NetworkPreferencePicked(N::Fastest)),
+                ],
+            ),
+        )
+    }
+
+    /// Server: "Pair a new device", or the code being shown.
+    fn pair_server_row(&self, p: Palette) -> Element<'_, Message> {
+        match mouse_core::pairing::current_code() {
+            Some(_) => container(self.pair_server_view(p)).padding([12.0, 14.0]).into(),
+            None => srow(
+                p,
+                "Pair a new device",
+                "Shows a 6-digit code to type on the new computer",
+                btn_secondary(p, "Pair a new device", Some(Message::ShowPairCode)),
+            ),
+        }
+    }
+
+    /// The code itself, big, with how long it lasts.
+    fn pair_server_view(&self, p: Palette) -> Element<'_, Message> {
+        match mouse_core::pairing::current_code() {
+            Some((code, left)) => column![
+                text("Type this code on the new computer, in its main window:").size(12.5).color(p.txt2),
+                text(format!("{}  {}", &code[..3], &code[3..])).size(38.0).font(MONO).color(p.accent),
+                row![
+                    text(format!("Valid for {}:{:02} · works once", left.as_secs() / 60, left.as_secs() % 60))
+                        .size(11.5)
+                        .color(p.txt3)
+                        .width(Length::Fill),
+                    btn_secondary(p, "Cancel", Some(Message::CancelPairCode)),
+                ]
+                .align_y(Alignment::Center),
+            ]
+            .spacing(8.0)
+            .into(),
+            None => row![
+                text("Only for setting up a new computer. Press it, then type the 6-digit code into that computer's mouse-rs window.")
+                    .size(12.0)
+                    .color(p.txt3)
+                    .width(Length::Fill),
+                btn_primary(p, "Pair a new device", Some(Message::ShowPairCode)),
+            ]
+            .spacing(12.0)
+            .align_y(Alignment::Center)
+            .into(),
+        }
+    }
+
+    /// Client: the six code boxes and Pair.
+    fn pair_client_view(&self, p: Palette) -> Element<'_, Message> {
+        let busy = matches!(*self.pairing.lock().unwrap(), PairState::Running);
+        row![
+            code_boxes(p, &self.pair_code_input, mouse_core::pairing::CODE_DIGITS, Message::PairCodeTyped, Message::PairWithCode),
+            Space::new().width(Length::Fill),
+            btn_primary(p, if busy { "Pairing…" } else { "Pair" }, (!busy).then_some(Message::PairWithCode)),
+        ]
+        .spacing(10.0)
+        .align_y(Alignment::Center)
+        .into()
+    }
+
+    /// Before pairing, the Connection tab is a 3-step setup (M4). After pairing it folds
+    /// into the compact list.
+    fn first_run(&self, p: Palette, _running: bool) -> Element<'_, Message> {
+        let server_side = self.cfg.role == Role::Server;
+        let choice = |title: &'static str, desc: &'static str, role: Role| -> Element<'_, Message> {
+            button(
+                column![
+                    text(title).size(13.5).font(BOLD).color(p.txt),
+                    text(desc).size(11.5).color(p.txt3),
+                ]
+                .spacing(4.0),
+            )
+            .style(ui_theme::choice(p, self.cfg.role == role))
+            .padding([12.0, 14.0])
+            .width(Length::Fill)
+            .on_press(Message::RolePicked(role))
+            .into()
+        };
+        let one = step(
+            p,
+            1,
+            "What does this computer do?",
+            row![
+                choice("Shares its mouse", "Server. Its mouse and keyboard drive the other one.", Role::Server),
+                choice("Is controlled", "Client. Uses the other computer's mouse.", Role::Client),
+            ]
+            .spacing(10.0)
+            .into(),
+        );
+        let (two, three) = if server_side {
+            (
+                step(
+                    p,
+                    2,
+                    "Show a pairing code",
+                    column![self.pair_server_view(p)].spacing(8.0).into(),
+                ),
+                step(
+                    p,
+                    3,
+                    "Type it on the other computer",
+                    text("In mouse-rs on the other computer, choose \"Is controlled\" and type the code under \"Pair with its code\". The two then find each other by themselves.")
+                        .size(12.0)
+                        .color(p.txt3)
+                        .into(),
+                ),
+            )
+        } else {
+            let mut find = column![self.server_address_inline(p)].spacing(8.0);
+            for found in &self.found_servers {
+                find = find.push(
+                    container(
+                        row![
+                            dot(p.good, 7.0),
+                            text(found.clone()).size(12.5).font(MONO).color(p.txt).width(Length::Fill),
+                            btn_link(p, "Use", Message::ServerPicked(found.clone())),
+                        ]
+                        .spacing(10.0)
+                        .align_y(Alignment::Center),
+                    )
+                    .padding([6.0, 12.0])
+                    .style(move |_| ui_theme::note(p))
+                    .width(Length::Fill),
+                );
+            }
+            (
+                step(p, 2, "Find the computer with the mouse", find.into()),
+                step(
+                    p,
+                    3,
+                    "Pair with its code",
+                    column![
+                        self.pair_client_view(p),
+                        text("On the other computer, open Settings › Security & pairing › Pair a new device, then type the code it shows.")
+                            .size(11.5)
+                            .color(p.txt3),
+                    ]
+                    .spacing(8.0)
+                    .into(),
+                ),
+            )
+        };
+        column![one, two, three].spacing(18.0).into()
+    }
+
+    /// The address box and Detect, without a row around them (first run).
+    fn server_address_inline(&self, p: Palette) -> Element<'_, Message> {
+        let scanning = matches!(*self.scan.lock().unwrap(), ScanState::Running);
+        row![
+            input(p, "Press Detect, or type its IP", &self.cfg.server_host, Message::ServerHostChanged).font(MONO),
+            btn_secondary(p, if scanning { "Scanning…" } else { "Detect" }, (!scanning).then_some(Message::DetectServers)),
+        ]
+        .spacing(8.0)
+        .align_y(Alignment::Center)
+        .into()
+    }
+
+    /// Server, main window: the box for the client's PIN, while a client is asking for it (M3).
+    fn pin_prompt_view(&self, p: Palette) -> Option<Element<'_, Message>> {
+        use mouse_core::pin::Prompt;
+        let (client, why) = self.server_pin_prompt()?;
+        let (line, colour) = match why {
+            Prompt::Needed => (
+                format!("It's shown on {client} under Settings › Security & pairing."),
+                p.txt2,
+            ),
+            Prompt::Wrong(left) => (format!("Wrong PIN. {left} tries left before {client} stops accepting PINs for a while."), p.danger),
+            Prompt::Locked(until) => {
+                let secs = until.saturating_duration_since(std::time::Instant::now()).as_secs();
+                (format!("Too many wrong PINs. {client} accepts none for {} min.", secs.div_ceil(60).max(1)), p.danger)
+            }
+        };
+        Some(
+            container(
+                column![
+                    text(format!("{client} is protected with a PIN")).size(15.0).font(BOLD).color(p.txt),
+                    text(line).size(12.0).color(colour),
+                    row![
+                        input(p, "PIN", &self.pin_input, Message::PinTyped)
+                            .secure(true)
+                            .on_submit(Message::PinSubmit),
+                        btn_primary(p, "Connect", Some(Message::PinSubmit)),
+                    ]
+                    .spacing(10.0)
+                    .align_y(Alignment::Center),
+                ]
+                .spacing(8.0),
+            )
+            .padding(16.0)
+            .style(move |_| ui_theme::group_accent(p))
+            .width(Length::Fill)
+            .into(),
+        )
+    }
+
+    // ---------- clipboard tab ----------
+
+    /// The clipboard manager: a list you can act on, not a log you can only read (M5).
+    ///
+    /// Every row is a button that puts that item back on the clipboard (and sends it to
+    /// the peer, exactly as a fresh copy would).
+    fn tab_clipboard(&self, p: Palette) -> Element<'_, Message> {
+        let entries = self.engine.as_ref().map(|e| e.clipboard_meta()).unwrap_or_default();
+        if entries.is_empty() {
+            return container(
+                column![
+                    text("No clipboard history yet").size(14.0).font(BOLD).color(p.txt),
+                    text(if self.running() {
+                        "Copy something on either computer."
+                    } else {
+                        "Copy something on either computer once sharing is on."
+                    })
+                    .size(12.0)
+                    .color(p.txt3),
+                ]
+                .spacing(6.0)
+                .align_x(Alignment::Center),
+            )
+            .center_x(Length::Fill)
+            .padding([90.0, 0.0])
+            .into();
+        }
+
+        // What the user's own limits are costing right now — shown rather than left to be
+        // discovered later.
+        let usage = match self.engine.as_ref().map(|e| e.clipboard_usage()) {
+            Some((_, bytes)) => format!(
+                "Click an item to copy it again · {} of {}",
+                human_bytes(bytes),
+                human_bytes(self.cfg.clipboard_memory_budget)
+            ),
+            None => "Click an item to copy it again".into(),
+        };
+        let header = row![
+            column![text("History").size(14.0).font(BOLD).color(p.txt), text(usage).size(11.5).color(p.txt3)]
+                .spacing(2.0)
+                .width(Length::Fill),
+            hint(
+                p,
+                btn_secondary(p, "Clear", Some(Message::ClipClear)),
+                "Clear the history and delete mouse-rs's own copies of received files. \
+                 Pinned entries and transfers still running are kept; files you have \
+                 pasted somewhere are never touched.",
+            ),
+        ]
+        .align_y(Alignment::Center);
+
+        let mut list = column![].spacing(8.0);
+        for m in &entries {
+            list = list.push(self.clip_row(p, m));
+        }
+
+        // What the transferred files are costing on disk, so "is this program eating my
+        // drive?" has an answer.
+        let disk: Element<'_, Message> = match self.engine.as_ref().and_then(|e| e.cache_usage()) {
+            Some((bytes, count)) if count > 0 => text(format!(
+                "Received files kept by mouse-rs: {} in {count} file{}",
+                human_bytes(bytes as usize),
+                if count == 1 { "" } else { "s" }
+            ))
+            .size(11.5)
+            .color(if bytes > self.cfg.clipboard_cache_budget { p.warn } else { p.txt3 })
+            .into(),
+            _ => Space::new().height(0.0).into(),
+        };
 
         column![
-            card(p, column![section(p, "This computer is the…"), role].spacing(12.0)),
-            card(p, column![
-                section(p, if server_side { "How the other computer finds this one" } else { "Other computer" }),
-                net,
-            ]
-            .spacing(12.0)),
-            card(p, glance),
-            nav_row(
-                p,
-                "🔗",
-                "More connection settings",
-                "Ports, auto-reconnect, this computer's name, profiles",
-                Message::OpenSettings(Page::Connection),
-            ),
+            header,
+            list,
+            disk,
+            btn_link(p, "Clipboard settings ›", Message::OpenSettings(Page::Clipboard)),
         ]
         .spacing(12.0)
         .into()
     }
 
-    /// Settings → Startup: how the app behaves at login. Split out of Connection because it
-    /// is a different question — how this machine starts the app, not how it reaches the
-    /// peer. Every setting here is everyday, so the page has no Advanced section.
-    fn page_startup(&self, p: Palette) -> Element<'_, Message> {
-        // The three are deliberately independent: the OS launches the panel (Start at
-        // login), the panel brings the link up by itself (Auto-connect), and it stays out
-        // of the way while doing so (Start minimized).
-        let mut startup = column![
-            toggle_row(p, "Start at login", self.autostart_hint(), self.autostart_on, Message::AutostartToggled),
-            toggle_row(p, "Auto-connect on launch", "begin sharing as soon as the panel opens", self.cfg.autoconnect, Message::AutoconnectToggled),
-            toggle_row(p, "Start minimized", "open out of the way, into the tray/taskbar", self.cfg.start_minimized, Message::StartMinimizedToggled),
+    /// One history entry: kind, name, its state in the user's words, and Stop/Pin/×.
+    fn clip_row(&self, p: Palette, m: &mouse_clipboard::ClipMeta) -> Element<'_, Message> {
+        let what = if m.incoming { "Received" } else { "Sent" };
+        // The status line is the entry's state in the user's words. Every one of these is a
+        // situation they can really be in, and the alternative is leaving them to guess.
+        let (note_text, note_col) = match &m.status {
+            mouse_clipboard::ClipStatus::Ready if m.is_files => {
+                (format!("{what} · {} · ready", human_bytes(m.disk_bytes as usize)), p.txt3)
+            }
+            mouse_clipboard::ClipStatus::Ready => (format!("{what} · {}", human_bytes(m.bytes)), p.txt3),
+            // A small file being prefetched, or a large one that streams in when pasted.
+            // Either way, pasting works now.
+            mouse_clipboard::ClipStatus::Remote => (
+                format!("{} · on the other computer · paste any time", human_bytes(m.disk_bytes as usize)),
+                p.accent,
+            ),
+            mouse_clipboard::ClipStatus::NeedsConsent | mouse_clipboard::ClipStatus::Declined => (
+                format!("{} · paste it anywhere", human_bytes(m.disk_bytes as usize)),
+                p.txt3,
+            ),
+            mouse_clipboard::ClipStatus::Fetching { done, total } => {
+                let pct = if *total > 0 { done * 100 / total } else { 0 };
+                // Speed and time left, measured from this entry's own progress between
+                // ticks: "22% of 6.8 GB" answers neither question being asked while
+                // watching a transfer — how fast, and how much longer.
+                let tail = match self.clip_rates.get(&m.id).copied() {
+                    Some(bps) if bps > 0 => format!(
+                        " · {}/s · {} left",
+                        human_bytes(bps as usize),
+                        human_duration(total.saturating_sub(*done) / bps.max(1))
+                    ),
+                    _ => String::new(),
+                };
+                (format!("{pct}% of {}{tail}", human_bytes(*total as usize)), p.accent)
+            }
+            mouse_clipboard::ClipStatus::Unavailable(why) => (why.clone(), p.danger),
+        };
+        let mut info = column![
+            text(m.preview.clone())
+                .size(13.5)
+                .font(if m.is_files || m.is_image { iced::Font::DEFAULT } else { MONO })
+                .color(p.txt)
+                .width(Length::Fill)
+                // A file name has no spaces to break at, so it may break anywhere.
+                .wrapping(iced::widget::text::Wrapping::WordOrGlyph),
+            text(note_text)
+                .size(11.5)
+                .color(note_col)
+                .width(Length::Fill)
+                .wrapping(iced::widget::text::Wrapping::WordOrGlyph),
         ]
-        .spacing(12.0);
+        .spacing(3.0)
+        .width(Length::Fill);
+        let fetching = matches!(m.status, mouse_clipboard::ClipStatus::Fetching { .. });
+        if let mouse_clipboard::ClipStatus::Fetching { done, total } = &m.status {
+            let frac = if *total > 0 { *done as f32 / *total as f32 } else { 0.0 };
+            info = info.push(progress_bar(0.0..=1.0, frac).girth(3.0).style(ui_theme::progress(p)));
+        }
+        // The row itself is the re-use action — the thing wanted nine times out of ten.
+        let reuse = button(row![kind_badge(p, m), info].spacing(12.0).align_y(Alignment::Center))
+            .style(ui_theme::row_button(p))
+            .padding(0.0)
+            .width(Length::Fill)
+            .on_press(Message::ClipReuse(m.id));
 
-        // Windows only. Which privilege level we are at is a *fact* worth stating
-        // permanently — it is one line and answers a real question — but the
-        // explanation of what it costs is a one-time notice, dismissed for good once
-        // read. Running with normal privileges is a legitimate choice most people never
-        // notice, so nagging about a decision already made would be worse than useless.
-        if mouse_input::elevation() != mouse_input::Elevation::NotApplicable {
-            let limited = mouse_input::elevation().is_limited();
-            startup = startup.push(
-                row![
-                    text(if limited {
-                        "Permissions: normal"
-                    } else {
-                        "Permissions: administrator"
-                    })
-                    .size(12.0)
-                    .color(if limited { p.txt2 } else { p.good })
-                    .width(Length::Fill),
-                    button(text(if limited { "Restart as administrator" } else { "Restart as normal user" }).size(11.5))
-                        .style(ui_theme::ghost(p))
-                        .padding([7.0, 12.0])
-                        .on_press(Message::RelaunchElevated),
-                ]
-                .align_y(Alignment::Center),
-            );
-            startup = startup.push(toggle_row(
+        let mut controls = row![reuse].spacing(8.0).align_y(Alignment::Center);
+        // Stop only exists while there is something to stop. What has already arrived is
+        // kept, so pressing it is cheap to undo.
+        if fetching {
+            controls = controls.push(hint(
                 p,
-                "Start at login as administrator",
-                "keeps administrator rights after a reboot — a normal login entry always starts without them. Setting this up needs mouse-rs to be running as administrator now.",
-                self.autostart_elevated_on,
-                Message::AutostartElevatedToggled,
+                button(text("Stop").size(11.5)).style(ui_theme::secondary(p)).padding([4.0, 9.0]).on_press(Message::ClipCancel(m.id)),
+                "Stop this transfer. What has arrived is kept, so clicking the entry resumes it.",
             ));
         }
+        controls = controls.push(hint(
+            p,
+            button(text(if m.pinned { "Pinned" } else { "Pin" }).size(11.5).font(BOLD).color(if m.pinned { p.accent } else { p.txt3 }))
+                .style(ui_theme::row_button(p))
+                .padding([4.0, 6.0])
+                .on_press(Message::ClipTogglePin(m.id)),
+            if m.pinned {
+                "Pinned — kept when the history fills up or is cleared. Click to unpin."
+            } else {
+                "Pin this, so it is kept when the history fills up or is cleared."
+            },
+        ));
+        controls = controls.push(hint(
+            p,
+            button(text("×").size(14.0).color(p.txt3)).style(ui_theme::row_button(p)).padding([2.0, 6.0]).on_press(Message::ClipRemove(m.id)),
+            "Remove this entry. Files already transferred stay on your disk.",
+        ));
+        let pinned = m.pinned;
+        container(controls)
+            .padding([10.0, 14.0])
+            .style(move |_| if pinned { ui_theme::group_accent(p) } else { ui_theme::group(p) })
+            .width(Length::Fill)
+            .into()
+    }
 
-        // Linux only, and the counterpart to the Windows block above: the same shape of
-        // question — what this machine does before anyone has signed in — answered by a
-        // different mechanism. There is no Windows equivalent built yet.
-        #[cfg(target_os = "linux")]
-        {
-            startup = startup.push(toggle_row(
-                p,
-                "Share input at the login screen",
-                "starts before the password prompt, as a system service, so the other \
-                 machine's keyboard can type it. Needs your password to set up, and \
-                 accepts keystrokes over the network before anyone has signed in.",
-                self.login_screen.on(),
-                Message::LoginScreenToggled,
-            ));
-            // Only worth a line when it says something the toggle does not. Installed
-            // but not enabled is the state a stray `systemctl disable` leaves behind,
-            // and it would otherwise look identical to off.
-            if self.login_screen.installed && !self.login_screen.enabled {
-                startup = startup.push(
-                    text("installed but disabled in systemd — turn it off and on to fix")
-                        .size(11.0)
-                        .color(p.warn),
-                );
-            } else if self.login_screen.on() && self.login_screen_stale {
-                startup = startup.push(
-                    text("the login screen runs an older version than this one — turn it off \
-                          and on to update it")
-                        .size(11.0)
-                        .color(p.warn),
+    // ---------- footer and menu ----------
+
+    /// One line of news and one action. Settings save themselves, so there is no Save
+    /// (R40); Start and Stop are one button because they are mutually exclusive.
+    fn footer(&self, p: Palette, running: bool) -> Element<'_, Message> {
+        let left = if !self.feedback.is_empty() {
+            self.feedback.clone()
+        } else if !running && !self.paired() {
+            "Not connected yet".to_string()
+        } else {
+            "Changes save automatically".to_string()
+        };
+        let run = if running {
+            btn_danger(p, "Stop sharing", Some(Message::Stop))
+        } else {
+            btn_primary(p, "Start sharing", Some(Message::Start))
+        };
+        column![
+            hairline(p),
+            container(
+                row![text(left).size(12.0).color(p.txt3).width(Length::Fill), run]
+                    .spacing(10.0)
+                    .align_y(Alignment::Center),
+            )
+            .padding([12.0, 20.0]),
+        ]
+        .into()
+    }
+
+    /// The ⋯ menu: Settings, the profiles to switch between, and Quit (M6).
+    fn overflow_menu(&self, p: Palette) -> Element<'_, Message> {
+        let item = |label: String, colour: iced::Color, msg: Message| -> Element<'_, Message> {
+            button(text(label).size(13.0).color(colour))
+                .style(ui_theme::row_button(p))
+                .padding([8.0, 12.0])
+                .width(Length::Fill)
+                .on_press(msg)
+                .into()
+        };
+        let mut col = column![item("Settings".into(), p.txt, Message::OpenSettings(Page::Index)), hairline(p)].spacing(2.0);
+        if !self.profiles.is_empty() {
+            col = col.push(container(text("PROFILE").size(10.5).font(BOLD).color(p.txt3)).padding([6.0, 12.0]));
+            for (name, saved) in &self.profiles {
+                let active = same_settings(saved, &self.cfg);
+                col = col.push(
+                    button(
+                        row![
+                            text(name.clone()).size(13.0).color(p.txt).width(Length::Fill),
+                            text(if active { "✓" } else { "" }).size(13.0).color(p.accent),
+                        ]
+                        .align_y(Alignment::Center),
+                    )
+                    .style(ui_theme::segment(p, active))
+                    .padding([8.0, 12.0])
+                    .width(Length::Fill)
+                    .on_press(Message::SwitchProfile(name.clone())),
                 );
             }
         }
+        col = col
+            .push(item(
+                if self.profiles.is_empty() { "Profiles…".into() } else { "Manage profiles…".into() },
+                p.txt2,
+                Message::OpenSettings(Page::Connection),
+            ))
+            .push(hairline(p))
+            .push(item("Quit mouse-rs".into(), p.danger, Message::Quit));
 
-        card(p, column![section(p, "When I log in"), startup].spacing(14.0))
+        container(col)
+            .style(move |_| ui_theme::floating(p))
+            .padding(6.0)
+            .width(234.0)
+            .into()
+    }
+
+    // ---------- ⋯ → Settings ----------
+
+    /// The back button and the page's title. Back from a category goes to the list; back
+    /// from the list goes to the main window.
+    fn settings_bar(&self, p: Palette, pg: Page) -> Element<'_, Message> {
+        let back = if pg == Page::Index { Message::CloseSettings } else { Message::OpenSettings(Page::Index) };
+        row![
+            button(text("←").size(14.0).color(p.txt2))
+                .style(ui_theme::icon_button(p, true))
+                .padding([4.0, 10.0])
+                .on_press(back),
+            text(pg.title()).size(20.0).font(BOLD).color(p.txt).width(Length::Fill),
+        ]
+        .spacing(12.0)
+        .align_y(Alignment::Center)
+        .into()
+    }
+
+    fn settings_body(&self, p: Palette, pg: Page) -> Element<'_, Message> {
+        match pg {
+            Page::Index => self.settings_index(p),
+            Page::Clipboard => self.page_clipboard(p),
+            Page::Screens => self.page_screens(p),
+            Page::Startup => self.page_startup(p),
+            Page::Keys => self.page_keys(p),
+            Page::Connection => self.page_connection(p),
+            Page::Security => self.page_security(p),
+            Page::Appearance => self.page_appearance(p),
+            Page::Diagnostics => self.page_diagnostics(p),
+            Page::About => self.page_about(p),
+        }
+    }
+
+    /// The list of categories (S0). Each row shows its current value, so a setting can be
+    /// checked without opening it.
+    fn settings_index(&self, p: Palette) -> Element<'_, Message> {
+        let mut col = column![].spacing(0.0);
+        for (heading, pages) in Page::CATEGORIES {
+            col = col.push(section(p, heading));
+            let rows = pages
+                .iter()
+                .map(|&pg| nav(p, pg.title(), pg.summary(), self.page_value(p, pg), Message::OpenSettings(pg)))
+                .collect();
+            col = col.push(group(p, rows));
+        }
+        col.into()
+    }
+
+    /// What a settings row shows on the right of the index.
+    fn page_value(&self, p: Palette, pg: Page) -> Element<'_, Message> {
+        let c = &self.cfg;
+        let v = match pg {
+            Page::Clipboard => {
+                let on: Vec<&str> = [
+                    (c.clipboard_sync_text, "text"),
+                    (c.clipboard_sync_images, "images"),
+                    (c.clipboard_sync_files, "files"),
+                ]
+                .into_iter()
+                .filter_map(|(on, what)| on.then_some(what))
+                .collect();
+                if !c.clipboard_sync || on.is_empty() {
+                    "Off".to_string()
+                } else {
+                    let s = on.join(", ");
+                    s[..1].to_uppercase() + &s[1..]
+                }
+            }
+            Page::Screens => format!("{} {}", self.peer_label(), side_phrase(self.peer_side())),
+            Page::Keys => return keycaps(p, &c.lock_hotkey),
+            Page::Startup => if self.autostart_on { "At login" } else { "Manual" }.to_string(),
+            Page::Connection => c.name.clone(),
+            Page::Security => match c.role {
+                Role::Client if !c.connection_pin.is_empty() && (c.pin_enabled || c.login_pin_enabled) => "PIN on".into(),
+                Role::Client => "PIN off".into(),
+                Role::Server if self.paired() => "Paired".into(),
+                Role::Server => "Not paired".into(),
+            },
+            Page::Appearance => {
+                if c.theme_follow_system { "Match system".to_string() } else { Theme6::from_key(&c.theme).label().to_string() }
+            }
+            Page::About => format!("Version {}", env!("CARGO_PKG_VERSION")),
+            Page::Index | Page::Diagnostics => String::new(),
+        };
+        value_text(p, v)
+    }
+
+    /// The other computer's name for sentences, capitalised when it is the generic one.
+    fn peer_label(&self) -> String {
+        let n = self.peer_name();
+        if n == "the other computer" { "Other computer".into() } else { n }
+    }
+
+    /// The side the other computer sits on, as this role stores it: the server leaves
+    /// through it, the client's pointer arrives through it.
+    fn peer_side(&self) -> Edge {
+        match self.cfg.role {
+            Role::Server => self.cfg.exit_edge,
+            Role::Client => self.cfg.entry_edge,
+        }
+    }
+
+    /// A page's Advanced section: at the bottom, closed until opened (R25, R30).
+    fn advanced<'a>(&'a self, p: Palette, pg: Page, body: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
+        let open = self.adv_open.contains(&pg);
+        let head = button(
+            row![
+                text(if open { "▾" } else { "▸" }).size(12.0).color(p.txt2),
+                text("Advanced").size(13.0).color(p.txt2),
+                container(Space::new().height(1.0)).width(Length::Fill).height(1.0).style(move |_| ui_theme::rule(p.line)),
+            ]
+            .spacing(10.0)
+            .align_y(Alignment::Center),
+        )
+        .style(ui_theme::tab(p, false))
+        .padding([14.0, 0.0])
+        .width(Length::Fill)
+        .on_press(Message::AdvancedToggled(pg));
+        if open {
+            column![head, body.into()].into()
+        } else {
+            head.into()
+        }
+    }
+
+    /// Settings → Clipboard (S1): the everyday options at the top, the technical transfer
+    /// and memory options under Advanced. Every control the page had is still here.
+    fn page_clipboard(&self, p: Palette) -> Element<'_, Message> {
+        let c = &self.cfg;
+        let what = row![
+            chip_toggle(p, "Text", c.clipboard_sync_text, Message::ClipSyncTextToggled(!c.clipboard_sync_text)),
+            chip_toggle(p, "Images", c.clipboard_sync_images, Message::ClipSyncImagesToggled(!c.clipboard_sync_images)),
+            chip_toggle(p, "Files", c.clipboard_sync_files, Message::ClipSyncFilesToggled(!c.clipboard_sync_files)),
+        ]
+        .spacing(6.0);
+        let ask_sub = if c.clipboard_auto_transfer_max == u64::MAX {
+            "Never asks: anything you copy just comes over".to_string()
+        } else if c.clipboard_auto_transfer_max == 0 {
+            "0 — always ask, whatever the size".to_string()
+        } else {
+            "Smaller ones arrive straight away".to_string()
+        };
+        let deliver_hint = if c.clipboard_deliver_dir.trim().is_empty() {
+            "Leave as default to paste wherever you like. Pick a folder only if files should arrive automatically.".to_string()
+        } else {
+            format!(
+                "Files land in {} as they arrive — nothing to paste. They are linked, not copied, so a 40 GB file uses 40 GB and not 80.",
+                c.clipboard_deliver_dir.trim()
+            )
+        };
+
+        // The worst case this configuration allows. Stating the cost is the job; refusing
+        // the value is not.
+        let worst = c.clipboard_history_size.saturating_mul(c.clipboard_max_item_bytes).min(c.clipboard_memory_budget);
+        let px = c.clipboard_max_image_px;
+        // 4 bytes a pixel of RGBA, allocated while an image is encoded or decoded.
+        let img_cost = px.saturating_mul(px).saturating_mul(4);
+        let quick_sub = if c.clipboard_quick_send_secs == 0 {
+            "0 — the size limit alone decides".to_string()
+        } else {
+            match self.engine.as_ref().and_then(|e| e.measured_throughput()) {
+                Some(bps) => format!("Measured from real transfers · now ~{}/s", human_bytes(bps as usize)),
+                None => "Measured from real transfers · nothing measured yet, so it asks".to_string(),
+            }
+        };
+
+        let adv = column![
+            section(p, "Files"),
+            group(p, vec![
+                num(p, "Most files in one copy", "Guards against a stray copy of a huge folder", &self.clip_max_files_s, "", Message::ClipMaxFilesChanged),
+                tog(p, "Also copy images as a .png file", "So images paste into file managers too", c.clipboard_images_also_as_file, Message::ClipImagesAsFileToggled),
+                tog(p, "Follow shortcuts inside copied folders", "Off: avoids copying files you never picked", c.clipboard_follow_symlinks, Message::ClipFollowSymlinksToggled),
+                tog(p, "Pasting a received file moves it", "Off: copies it, briefly using twice the space", c.clipboard_move_on_paste, Message::ClipMoveOnPasteToggled),
+            ]),
+            section(p, "Transfers"),
+            group(p, vec![
+                num(p, "Don't ask if it takes under", quick_sub, &self.clip_quick_s, "s", Message::ClipQuickSecsChanged),
+                num(
+                    p,
+                    "Stream files bigger than",
+                    if c.clipboard_keep_resumable_copy {
+                        "Off while a resumable copy is kept".to_string()
+                    } else {
+                        "Straight from the network to your folder".to_string()
+                    },
+                    &self.clip_stream_mb_s,
+                    "MB",
+                    Message::ClipStreamMbChanged,
+                ),
+                num(p, "Wait for a dropped connection", "Then resume from the same byte", &self.clip_stream_wait_s, "s", Message::ClipStreamWaitChanged),
+                tog(p, "Keep a resumable copy while pasting", "Uses the file's size again on disk", c.clipboard_keep_resumable_copy, Message::ClipKeepResumableToggled),
+                tog(p, "Slow transfers while I'm on the other computer", "Only if the pointer starts to lag", c.bulk_pause_while_crossed, Message::BulkPauseToggled),
+                num(p, "Speed limit", "0 = automatic", &self.bulk_rate_s, "MB/s", Message::BulkRateChanged),
+                num(p, "Send buffer", "Max file data held in memory", &self.bulk_buf_s, "MB", Message::BulkBufferChanged),
+                tog(p, "Separate lane for large transfers", "Keeps big items from delaying the mouse", c.bulk_enabled, Message::BulkEnabledToggled),
+                num(
+                    p,
+                    "Port for that lane",
+                    if c.bulk_port == 0 { "Blank = share the main port".to_string() } else { format!("Port {} must be reachable both ways", c.bulk_port) },
+                    &self.bulk_port_s,
+                    "",
+                    Message::BulkPortChanged,
+                ),
+                num(p, "Fingerprint files up to", "Bigger files are matched by size", &self.hash_limit_mb_s, "MB", Message::HashLimitMbChanged),
+            ]),
+            section(p, "Storage & memory"),
+            group(p, vec![
+                num(p, "Disk for received files", "Oldest go first; pinned never", &self.clip_cache_gb_s, "GB", Message::ClipCacheGbChanged),
+                stacked(
+                    p,
+                    "Cache folder",
+                    input(p, "~/.mouse_share/cache", &self.cfg.cache_dir, Message::CacheDirChanged).font(MONO).into(),
+                    "",
+                ),
+                num(p, "Biggest item to keep", "", &self.clip_item_mb_s, "MB", Message::ClipItemMbChanged),
+                num(p, "Memory budget", format!("Can hold up to {}; pinned entries are never evicted", human_bytes(worst)), &self.clip_mem_mb_s, "MB", Message::ClipMemMbChanged),
+                num(p, "Largest image edge", format!("About {} of memory while one is compressed", human_bytes(img_cost)), &self.clip_img_px_s, "px", Message::ClipImagePxChanged),
+                num(p, "Send images inline up to", "Bigger ones take the separate lane", &self.clip_inline_kb_s, "KB", Message::ClipInlineKbChanged),
+            ]),
+        ];
+
+        column![
+            section(p, "Sharing"),
+            group(p, vec![
+                tog(p, "Sync clipboard", "Copy here, paste there", c.clipboard_sync, Message::ClipboardToggled),
+                srow(p, "What to share", "", what),
+                tog(p, "Tell me when a file is waiting", "A desktop notification, never a pop-up", c.clipboard_notify, Message::ClipNotifyToggled),
+            ]),
+            section(p, "Large files"),
+            group(p, vec![
+                num(p, "Ask before bringing over files larger than", ask_sub, &self.clip_auto_mb_s, "MB", Message::ClipAutoMbChanged),
+                stacked(
+                    p,
+                    "Save received files to",
+                    input(p, "Wherever I paste (default)", &self.cfg.clipboard_deliver_dir, Message::ClipDeliverDirChanged).into(),
+                    deliver_hint,
+                ),
+            ]),
+            section(p, "History"),
+            group(p, vec![
+                num(p, "Keep", "", &self.clip_items_s, "items", Message::ClipItemsChanged),
+                tog(p, "Keep history after restart", "Writes clipboard contents, including private ones, to disk", c.clipboard_persist_history, Message::ClipPersistToggled),
+            ]),
+            self.advanced(p, Page::Clipboard, adv),
+        ]
+        .into()
+    }
+
+    /// Settings → Screens & edges (S2): a picture and one choice. The matching entry edge
+    /// is set for you; overriding it is under Advanced.
+    ///
+    /// The client engine reads `entry_edge` and nothing else, so a client is only asked
+    /// where the pointer arrives; deciding where to leave from is the server's business.
+    fn page_screens(&self, p: Palette) -> Element<'_, Message> {
+        let peer = self.peer_label();
+        let peer_in_text = self.peer_name();
+        let side = self.peer_side();
+        let pick = |e: Edge, label: &str| (label.to_string(), side == e, Message::PeerSidePicked(e));
+
+        let mut body = column![
+            self.screens_picture(p),
+        ]
+        .spacing(0.0);
+        body = body.push(container(
+            row![
+                labels(p, format!("{peer} sits"), "Pick the side it is on".to_string()),
+                segmented(p, vec![pick(Edge::Left, "Left"), pick(Edge::Right, "Right"), pick(Edge::Top, "Above"), pick(Edge::Bottom, "Below")]),
+            ]
+            .spacing(12.0)
+            .align_y(Alignment::Center),
+        )
+        .padding([12.0, 14.0]));
+
+        let explain = match self.cfg.role {
+            Role::Server => format!(
+                "The pointer leaves this screen at the {} edge and arrives at {}'s {} edge.",
+                self.cfg.exit_edge.label(),
+                peer_in_text,
+                self.cfg.entry_edge.label()
+            ),
+            Role::Client => format!(
+                "The pointer arrives at this screen's {} edge; push back through it to return to {peer_in_text}.",
+                self.cfg.entry_edge.label()
+            ),
+        };
+        let mut col = column![
+            container(body).style(move |_| ui_theme::group(p)).width(Length::Fill),
+            Space::new().height(10.0),
+            note(p, p.good, explain),
+        ];
+        // Leaving through one edge means arriving through the facing one; anything else
+        // puts the two screens on top of each other, so say so. Only the server reads both
+        // edges, so only it can be inconsistent.
+        if shows_exit_edge(self.cfg.role) && self.cfg.entry_edge != self.cfg.exit_edge.opposite() {
+            col = col.push(Space::new().height(8.0)).push(note(
+                p,
+                p.warn,
+                format!(
+                    "Leaving at the {} edge should bring the pointer in at the {} edge of the other screen — {} will feel like the screens overlap.",
+                    self.cfg.exit_edge.label(),
+                    self.cfg.exit_edge.opposite().label(),
+                    self.cfg.entry_edge.label()
+                ),
+            ));
+        }
+
+        let mut adv_rows: Vec<Element<'_, Message>> = Vec::new();
+        if shows_exit_edge(self.cfg.role) {
+            let auto = self.cfg.entry_edge == self.cfg.exit_edge.opposite();
+            let e = |edge: Edge, label: &str| (label.to_string(), !auto && self.cfg.entry_edge == edge, Message::EntryEdgePicked(edge));
+            adv_rows.push(srow(
+                p,
+                format!("Arrives on {peer} at"),
+                "Auto matches the side you picked",
+                segmented(p, vec![
+                    ("Auto".into(), auto, Message::EntryEdgeAuto),
+                    e(Edge::Left, "Left"),
+                    e(Edge::Right, "Right"),
+                    e(Edge::Top, "Top"),
+                    e(Edge::Bottom, "Bottom"),
+                ]),
+            ));
+        }
+        adv_rows.push(srow(
+            p,
+            "This screen",
+            "Detected each time sharing starts",
+            row![
+                small_input(p, "1920", &self.screen_w_s, Message::ScreenWChanged),
+                text("×").size(13.0).color(p.txt3),
+                small_input(p, "1080", &self.screen_h_s, Message::ScreenHChanged),
+                btn_secondary(p, "Detect", Some(Message::DetectScreen)),
+            ]
+            .spacing(6.0)
+            .align_y(Alignment::Center),
+        ));
+        adv_rows.push(num(
+            p,
+            "Edge sensitivity",
+            "How close to the edge before it crosses · 0 = last pixel",
+            &self.edge_threshold_s,
+            "px",
+            Message::EdgeThresholdChanged,
+        ));
+
+        col.push(self.advanced(p, Page::Screens, group(p, adv_rows))).into()
+    }
+
+    /// The two screens drawn side by side, in proportion, joined at the crossing edge.
+    fn screens_picture(&self, p: Palette) -> Element<'_, Message> {
+        let side = self.peer_side();
+        let (lw, lh) = (self.cfg.screen_width.max(1) as f32, self.cfg.screen_height.max(1) as f32);
+        let (pw, ph, peer_res) = match &self.last_peer {
+            Some((_, w, h)) if *w > 0 && *h > 0 => (*w as f32, *h as f32, format!("{w}×{h}")),
+            _ => (1920.0, 1080.0, String::new()),
+        };
+        // Both at one scale, the larger screen 170 px wide.
+        let scale = 170.0 / lw.max(pw);
+        let screen = |name: String, detail: String, w: f32, h: f32, me: bool| -> Element<'_, Message> {
+            container(
+                column![
+                    Space::new().height(Length::Fill),
+                    text(name).size(12.0).font(BOLD).color(p.txt),
+                    text(detail).size(10.0).font(MONO).color(p.txt3),
+                ]
+                .spacing(1.0),
+            )
+            .padding([6.0, 8.0])
+            .width(w * scale)
+            .height((h * scale).max(48.0))
+            .style(move |_| ui_theme::tile(p, me, true))
+            .into()
+        };
+        let me = screen(
+            self.cfg.name.clone(),
+            format!("this · {}×{}", self.cfg.screen_width, self.cfg.screen_height),
+            lw,
+            lh,
+            true,
+        );
+        let other = screen(self.peer_label(), peer_res, pw, ph, false);
+        let vertical = matches!(side, Edge::Top | Edge::Bottom);
+        let bar: Element<'_, Message> = if vertical {
+            container(Space::new()).width(60.0).height(3.0).style(move |_| ui_theme::fill(p.accent, 2.0)).into()
+        } else {
+            container(Space::new()).width(3.0).height(44.0).style(move |_| ui_theme::fill(p.accent, 2.0)).into()
+        };
+        let arrangement: Element<'_, Message> = match side {
+            Edge::Left => row![other, bar, me].spacing(5.0).align_y(Alignment::Center).into(),
+            Edge::Right => row![me, bar, other].spacing(5.0).align_y(Alignment::Center).into(),
+            Edge::Top => column![other, bar, me].spacing(5.0).align_x(Alignment::Center).into(),
+            Edge::Bottom => column![me, bar, other].spacing(5.0).align_x(Alignment::Center).into(),
+        };
+        container(container(arrangement).center(Length::Fill))
+            .height(if vertical { 230.0 } else { 170.0 })
+            .width(Length::Fill)
+            .padding(10.0)
+            .style(move |_| ui_theme::stage(p))
+            .into()
+    }
+
+    /// Settings → Startup (S3). Start minimized is near the top, since many people never
+    /// open the window; each OS shows only its own group.
+    fn page_startup(&self, p: Palette) -> Element<'_, Message> {
+        // The three are deliberately independent: the OS launches the panel (Start at
+        // login), the panel brings the link up by itself (Start sharing automatically), and
+        // it stays out of the way while doing so (Start minimized).
+        let mut col = column![
+            section(p, "When I log in"),
+            group(p, vec![
+                tog(p, "Start at login", self.autostart_hint(), self.autostart_on, Message::AutostartToggled),
+                tog(p, "Start minimized", "Opens in the tray; click the tray icon to show it", self.cfg.start_minimized, Message::StartMinimizedToggled),
+                tog(p, "Start sharing automatically", "Connects as soon as mouse-rs opens", self.cfg.autoconnect, Message::AutoconnectToggled),
+            ]),
+        ];
+
+        // Linux: what this machine does before anyone has signed in.
+        #[cfg(target_os = "linux")]
+        {
+            let mut rows = vec![tog(
+                p,
+                "Share input at the login screen",
+                "The other keyboard can type your login password. Installs a system service.",
+                self.login_screen.on(),
+                Message::LoginScreenToggled,
+            )];
+            // Only worth a line when it says something the toggle does not. Installed but not
+            // enabled is the state a stray `systemctl disable` leaves behind, and it would
+            // otherwise look identical to off.
+            let warn = if self.login_screen.installed && !self.login_screen.enabled {
+                Some("Installed but disabled in systemd. Turn this off and on to fix it.")
+            } else if self.login_screen.on() && self.login_screen_stale {
+                Some("The login screen runs an older version. Turn this off and on to update it.")
+            } else {
+                None
+            };
+            if let Some(w) = warn {
+                rows.push(container(note(p, p.warn, w)).padding([10.0, 14.0]).into());
+            }
+            col = col.push(section(p, "Linux only")).push(group(p, rows));
+        }
+
+        // Windows: which privilege level this runs at is a fact worth stating permanently;
+        // the explanation of what it costs is a one-time banner.
+        if mouse_input::elevation() != mouse_input::Elevation::NotApplicable {
+            let limited = mouse_input::elevation().is_limited();
+            col = col.push(section(p, "Windows only")).push(group(p, vec![
+                srow(
+                    p,
+                    "Permissions",
+                    if limited { "Normal · some admin windows block crossing" } else { "Administrator" },
+                    btn_secondary(p, if limited { "Restart as administrator" } else { "Restart as normal user" }, Some(Message::RelaunchElevated)),
+                ),
+                tog(
+                    p,
+                    "Start at login as administrator",
+                    "Keeps administrator rights after a reboot. Needs mouse-rs running as administrator now.",
+                    self.autostart_elevated_on,
+                    Message::AutostartElevatedToggled,
+                ),
+            ]));
+        }
+        col.into()
     }
 
     /// Install or remove the login-screen service, then re-read what systemd actually
@@ -2246,1316 +3704,406 @@ impl App {
         };
     }
 
-    /// The one-time explanation, shown only when turning the login-screen service on for
-    /// the first time.
-    ///
-    /// Not a permanent banner and not shown while it is off: off is the safe default and
-    /// warning about a thing nobody has asked for is noise. It appears once, at the
-    /// moment the decision is actually being made, which is when the information is
-    /// worth something.
-    #[cfg(target_os = "linux")]
-    fn login_screen_notice(&self, p: Palette) -> Option<Element<'_, Message>> {
-        if !self.login_screen_asking {
-            return None;
-        }
-        Some(
-            container(
-                column![
-                    text("Share the keyboard before anyone logs in?").size(13.5).color(p.txt),
-                    text(
-                        "This installs a small system service that starts at boot, like \
-                         NetworkManager does, so the other machine's keyboard works at the \
-                         password screen and you no longer need a second one plugged in here."
-                    )
-                    .size(11.0)
-                    .color(p.txt3),
-                    text(
-                        "What it costs: this machine will accept keystrokes over the network \
-                         before anyone has signed in. Anything holding your shared secret \
-                         could type at the password prompt, so that secret becomes what \
-                         stands between your network and this login. The service needs \
-                         administrator rights to install, and asks for your password now."
-                    )
-                    .size(11.0)
-                    .color(p.warn),
-                    row![
-                        button(text("Turn it on").size(12.5))
-                            .style(ui_theme::primary(p))
-                            .padding([9.0, 14.0])
-                            .on_press(Message::ConfirmLoginScreen),
-                        button(text("Leave it off").size(12.5))
-                            .style(ui_theme::ghost(p))
-                            .padding([9.0, 12.0])
-                            .on_press(Message::CancelLoginScreen),
-                    ]
-                    .spacing(8.0),
-                ]
-                .spacing(8.0),
-            )
-            .style(move |_| ui_theme::well(p))
-            .padding([11.0, 14.0])
-            .width(Length::Fill)
-            .into(),
-        )
-    }
-
     /// Sub-label for the Start-at-login toggle: says where the entry actually lives, so
     /// the setting is auditable rather than magic.
     fn autostart_hint(&self) -> &'static str {
         if cfg!(windows) {
-            "adds a per-user entry under the Windows Run key"
+            "Adds a per-user entry under the Windows Run key"
         } else {
-            "adds ~/.config/autostart/mouse-rs.desktop"
+            "Adds ~/.config/autostart/mouse-rs.desktop"
         }
     }
 
-    /// Settings → Screens & edges, showing only what this machine's role actually uses.
-    ///
-    /// The client engine reads `entry_edge` and nothing else — it never looks at
-    /// `exit_edge` (`client.rs:37`). So on a client the Exit-edge picker was a dial
-    /// wired to nothing: it wrote a config value no code would ever read. Worse, the
-    /// overlap warning compared that dead value against the live one, so it could
-    /// contradict a pair that was configured perfectly.
-    ///
-    /// Deciding where to *leave* from is the server's business, because the server is
-    /// what watches its own edges and hands control over. The client's only edge
-    /// question is where control comes back.
-    fn page_screens(&self, p: Palette) -> Element<'_, Message> {
-        let mut body = column![section(p, "Arrangement")].spacing(14.0);
-
-        if shows_exit_edge(self.cfg.role) {
-            // Leaving through one edge means arriving through the facing one; anything
-            // else puts the two screens on top of each other, so say so instead of
-            // saving it silently. Only meaningful here: the server is the only role that
-            // reads both, and so the only one that can be inconsistent.
-            let want = self.cfg.exit_edge.opposite();
-            body = body
-                .push(field_label(p, "Exit edge — the pointer leaves this screen here"))
-                .push(edge_picker(p, self.cfg.exit_edge, Message::ExitEdgePicked));
-            if self.cfg.entry_edge != want {
-                body = body.push(
-                    text(format!(
-                        "⚠ Leaving at the {} edge should bring the cursor in at the {} edge of the other screen — {} will feel like the screens overlap.",
-                        self.cfg.exit_edge.label(),
-                        want.label(),
-                        self.cfg.entry_edge.label(),
-                    ))
-                    .size(11.0)
-                    .color(p.warn),
-                );
+    /// Settings → Keyboard & hotkeys (S4). Hotkeys are recorded, not typed: press Change,
+    /// then press the key.
+    fn page_keys(&self, p: Palette) -> Element<'_, Message> {
+        let cap = |field: HotkeyField, value: &str| -> Element<'_, Message> {
+            if self.recording == Some(field) {
+                container(text("Press a key…").size(12.0).color(p.accent))
+                    .padding([3.0, 8.0])
+                    .style(move |_| ui_theme::keycap(p))
+                    .into()
+            } else {
+                keycaps(p, value)
             }
-        }
-
-        body = body
-            .push(field_label(p, entry_edge_label(self.cfg.role)))
-            .push(edge_picker(p, self.cfg.entry_edge, Message::EntryEdgePicked))
-            .push(
-                text(entry_edge_hint(self.cfg.role))
-                    .size(11.0)
-                    .color(p.txt3)
-                    .width(Length::Fill),
-            );
-
-        let adv = column![
-            section(p, "This screen"),
-            field_label(p, "Screen size (px)"),
-            row![
-                input(p, "1920", &self.screen_w_s, Message::ScreenWChanged),
-                text("×").size(16.0).color(p.txt3),
-                input(p, "1080", &self.screen_h_s, Message::ScreenHChanged),
-                button(text("Detect").size(13.0)).style(ui_theme::ghost(p)).padding([9.0, 14.0]).on_press(Message::DetectScreen),
-            ]
-            .spacing(10.0)
-            .align_y(Alignment::Center),
-            text("The engine re-detects this on Start; edit only to override.").size(11.0).color(p.txt3),
-            section(p, "Crossing feel"),
-            labeled(p, "Edge sensitivity (px from the edge)", input(p, "2", &self.edge_threshold_s, Message::EdgeThresholdChanged)),
-            text("How close to the edge the pointer must get before it crosses. Raise it if crossing is hard to hit; 0 means the very last pixel.")
-                .size(11.0)
-                .color(p.txt3),
-        ]
-        .spacing(14.0);
-
-        column![card(p, body), self.advanced(p, Page::Screens, adv)].spacing(12.0).into()
-    }
-
-    fn page_security(&self, p: Palette) -> Element<'_, Message> {
-        let secret = row![
-            input(p, "shared secret", &self.cfg.shared_secret, Message::SecretChanged)
-                .secure(!self.show_secret),
-            button(text(if self.show_secret { "Hide" } else { "Show" }).size(13.0))
-                .style(ui_theme::ghost(p)).padding([9.0, 12.0]).on_press(Message::ToggleShowSecret),
-            button(text("Generate").size(13.0))
-                .style(ui_theme::ghost(p)).padding([9.0, 12.0]).on_press(Message::GenerateSecret),
-        ]
-        .spacing(8.0);
-
-        // Pairing with a code replaced typing the secret; the secret stays here for setups
-        // made before pairing existed.
-        let adv = column![
-            field_label(p, "Shared secret — identical on both machines (pairing sets it for you)"),
-            secret,
-            toggle_row(p, "Encrypt link (TLS)", "rustls, self-signed cert", self.cfg.tls_enabled, Message::TlsToggled),
-        ]
-        .spacing(14.0);
-
-        let pairing = if self.cfg.role == Role::Server { self.pair_server_view(p) } else { self.pair_client_view(p) };
-        column![
-            card(p, column![section(p, "Pairing"), pairing].spacing(14.0)),
-            card(p, column![section(p, "Connection PIN"), self.pin_settings_view(p)].spacing(14.0)),
-            self.advanced(p, Page::Security, adv),
-        ]
-        .spacing(12.0)
-        .into()
-    }
-
-    /// Server: "Pair a new device", or the code being shown.
-    fn pair_server_view(&self, p: Palette) -> Element<'_, Message> {
-        match mouse_core::pairing::current_code() {
-            Some((code, left)) => {
-                let spaced = format!("{} {}", &code[..3], &code[3..]);
-                column![
-                    text("Type this code on the other computer (its main window, \"Pair with a code\"):")
-                        .size(12.0).color(p.txt2),
-                    text(spaced).size(34.0).color(p.accent),
-                    row![
-                        text(format!(
-                            "valid for {}:{:02} · works once",
-                            left.as_secs() / 60,
-                            left.as_secs() % 60
-                        ))
-                        .size(11.0)
-                        .color(p.txt3)
-                        .width(Length::Fill),
-                        button(text("Cancel").size(13.0))
-                            .style(ui_theme::ghost(p)).padding([7.0, 12.0]).on_press(Message::CancelPairCode),
-                    ]
-                    .align_y(Alignment::Center),
-                ]
-                .spacing(6.0)
-                .into()
-            }
-            None => column![
-                button(text("Pair a new device").size(13.0))
-                    .style(ui_theme::primary(p)).padding([9.0, 14.0]).on_press(Message::ShowPairCode),
-                text("Only for setting up a new computer. Press it, then type the 6-digit code it shows into that computer's mouse-rs window. The two are then linked and find each other by themselves from then on.")
-                    .size(11.0).color(p.txt3),
-            ]
-            .spacing(6.0)
-            .into(),
-        }
-    }
-
-    /// Client: type the code the server shows.
-    fn pair_client_view(&self, p: Palette) -> Element<'_, Message> {
-        let busy = matches!(*self.pairing.lock().unwrap(), PairState::Running);
-        let go = button(text(if busy { "Pairing…" } else { "Pair" }).size(13.0))
-            .style(ui_theme::primary(p))
-            .padding([9.0, 14.0]);
-        let go = if busy { go } else { go.on_press(Message::PairWithCode) };
-        column![
-            row![
-                input(p, "6-digit code", &self.pair_code_input, Message::PairCodeTyped)
-                    .on_submit(Message::PairWithCode),
-                go,
-            ]
-            .spacing(8.0)
-            .align_y(Alignment::Center),
-            text("Only for first-time setup: on the computer with the mouse, press \"Pair a new device\" and type the code it shows here.")
-                .size(11.0).color(p.txt3),
-        ]
-        .spacing(6.0)
-        .into()
-    }
-
-    /// Settings → Security: the PIN on the client, an explanation on the server.
-    fn pin_settings_view(&self, p: Palette) -> Element<'_, Message> {
-        if self.cfg.role != Role::Client {
-            return text(
-                "The password belongs to the computer you drive, and is set there. When it asks, a box appears on this window's main page; type its password there. It is asked once each time mouse-rs starts here, not after a Wi-Fi drop.",
-            )
-            .size(12.0)
-            .color(p.txt2)
-            .into();
-        }
-        let has = !self.cfg.connection_pin.is_empty();
-        let status: Element<'_, Message> = if has {
-            row![
-                text(format!(
-                    "Password: {}",
-                    if self.show_pin { self.cfg.connection_pin.clone() } else { "••••".into() }
-                ))
-                .size(14.0)
-                .color(p.txt)
-                .width(Length::Fill),
-                button(text(if self.show_pin { "Hide" } else { "Show" }).size(13.0))
-                    .style(ui_theme::ghost(p)).padding([7.0, 12.0]).on_press(Message::ToggleShowPin),
-            ]
-            .align_y(Alignment::Center)
-            .into()
-        } else {
-            text("No password set. Any computer that has been paired with this one can drive it.")
-                .size(14.0).color(p.warn).into()
+        };
+        let change = |field: HotkeyField| {
+            btn_secondary(p, if self.recording == Some(field) { "Cancel" } else { "Change" }, Some(Message::RecordHotkey(field)))
         };
         let mut col = column![
-            status,
-            text("Whoever wants to drive this computer types this password on their own computer. 3 wrong tries and this computer accepts none for 1 hour, then 2, 4, 8 hours…")
-                .size(11.0).color(p.txt3),
-            toggle_row(p, "Ask when someone is logged in here", "off by default", self.cfg.pin_enabled, Message::PinSessionToggled),
-        ]
-        .spacing(8.0);
-        #[cfg(target_os = "linux")]
-        {
-            col = col.push(toggle_row(
+            section(p, "Getting control back"),
+            group(p, vec![srow(
                 p,
-                "Ask at the login screen",
-                "on by default; only matters when login-screen sharing is on (Settings → Startup)",
-                self.cfg.login_pin_enabled,
-                Message::PinLoginToggled,
+                "Take control back",
+                "One key. Always works, even if the network drops.",
+                row![cap(HotkeyField::Lock, &self.cfg.lock_hotkey), change(HotkeyField::Lock)]
+                    .spacing(10.0)
+                    .align_y(Alignment::Center),
+            )]),
+        ];
+        if self.recording.is_some() {
+            col = col.push(Space::new().height(8.0)).push(note(
+                p,
+                p.accent,
+                "Press the key now, holding any modifiers for the return combo. Esc keeps the old one.",
             ));
         }
-        col = col.push(field_label(p, if has { "New password (forgot it? just set a new one — being at this computer is enough)" } else { "Set a password" }));
-        col = col.push(
-            row![
-                input(p, "password", &self.pin_new, Message::PinNewTyped).secure(true),
-                input(p, "again", &self.pin_new2, Message::PinNew2Typed).secure(true).on_submit(Message::SavePin),
-            ]
-            .spacing(8.0),
-        );
-        col.push(
-            button(text(if has { "Change password" } else { "Set password" }).size(13.0))
-                .style(ui_theme::primary(p)).padding([9.0, 14.0]).on_press(Message::SavePin),
-        )
-        .into()
-    }
-
-    /// Client, main window, at most once a day: a nudge to set a password, until one is in
-    /// use or the user says never (owner, 27 Oct).
-    fn pin_reminder(&self, p: Palette) -> Option<Element<'_, Message>> {
-        if self.cfg.role != Role::Client
-            || self.cfg.pin_reminder_off
-            || (self.cfg.pin_enabled && !self.cfg.connection_pin.is_empty())
-            || self.cfg.pin_reminder_day == today()
-            || self.page.is_some()
-        {
-            return None;
+        let mut ret = row![cap(HotkeyField::Return, &self.cfg.return_hotkey), change(HotkeyField::Return)]
+            .spacing(10.0)
+            .align_y(Alignment::Center);
+        if !self.cfg.return_hotkey.trim().is_empty() && self.recording != Some(HotkeyField::Return) {
+            ret = ret.push(btn_link(p, "Clear", Message::ClearReturnHotkey));
         }
-        Some(
-            container(
-                column![
-                    text("Protect this computer with a password").size(13.5).color(p.txt),
-                    text("Without one, anyone on this network who has paired a computer with this one can drive it. With one, they also need the password, and 3 wrong tries lock them out for an hour.")
-                        .size(11.0).color(p.txt3),
-                    row![
-                        button(text("Set a password").size(12.5))
-                            .style(ui_theme::primary(p)).padding([9.0, 14.0]).on_press(Message::PinReminderSet),
-                        button(text("Not now").size(12.5))
-                            .style(ui_theme::ghost(p)).padding([9.0, 12.0]).on_press(Message::PinReminderLater),
-                        button(text("Don't show this again").size(12.5))
-                            .style(ui_theme::ghost(p)).padding([9.0, 12.0]).on_press(Message::PinReminderNever),
-                    ]
-                    .spacing(8.0),
-                ]
-                .spacing(8.0),
-            )
-            .style(move |_| ui_theme::well(p))
-            .padding([11.0, 14.0])
-            .width(Length::Fill)
-            .into(),
-        )
+        let adv = group(p, vec![srow(p, "Return combo", "Optional · works on the computer with the mouse", ret)]);
+        col.push(self.advanced(p, Page::Keys, adv)).into()
     }
 
-    /// Server, main window: the box for the client's PIN, while a client is asking for it.
-    fn pin_prompt_view(&self, p: Palette) -> Option<Element<'_, Message>> {
-        use mouse_core::pin::Prompt;
-        if self.cfg.role != Role::Server || !self.running() {
-            return None;
-        }
-        let (client, why) = mouse_core::pin::prompt()?;
-        let why = match why {
-            Prompt::Needed => format!(
-                "{client} has a connection PIN. Type it here to drive {client}. It is shown on {client}'s screen, or in Settings → Security & pairing there."
-            ),
-            Prompt::Wrong(left) => format!("Wrong PIN for {client}. {left} tries left before {client} stops accepting PINs for a while."),
-            Prompt::Locked(until) => {
-                let secs = until.saturating_duration_since(std::time::Instant::now()).as_secs();
-                format!("Too many wrong PINs. {client} accepts none for {} min.", secs.div_ceil(60).max(1))
-            }
-        };
-        Some(
-            column![
-                text(why).size(12.0).color(p.warn),
-                row![
-                    input(p, "PIN", &self.pin_input, Message::PinTyped)
-                        .secure(true)
-                        .on_submit(Message::PinSubmit),
-                    button(text("Connect").size(13.0))
-                        .style(ui_theme::primary(p)).padding([9.0, 14.0]).on_press(Message::PinSubmit),
-                ]
-                .spacing(8.0)
-                .align_y(Alignment::Center),
-            ]
-            .spacing(6.0)
-            .into(),
-        )
-    }
-
-    /// Client, main window: while a server is being refused over the password, say so.
-    fn pin_waiting_view(&self, p: Palette) -> Option<Element<'_, Message>> {
-        if self.cfg.role != Role::Client || !self.running() || !mouse_core::pin::awaiting() {
-            return None;
-        }
-        Some(
-            text("A computer is asking to drive this one. Type this computer's password on it to allow it.")
-                .size(12.0)
-                .color(p.warn)
-                .into(),
-        )
-    }
-
-    /// Settings → Keyboard & hotkeys. The lock key is the everyday way back; the return
-    /// combo is optional, so it is Advanced.
-    fn page_keys(&self, p: Palette) -> Element<'_, Message> {
-        let adv = column![
-            labeled(p, "Return hotkey (server)", input(p, "ctrl+win+alt+esc", &self.cfg.return_hotkey, Message::ReturnHotkeyChanged)),
-            text("Optional combo, matched on whichever machine is the server. Empty = none.")
-                .size(11.0).color(p.txt3),
-        ]
-        .spacing(14.0);
-
-        column![
-            card(p, column![
-                section(p, "Getting control back"),
-                labeled(p, "Lock / cross hotkey", input(p, "scroll_lock", &self.cfg.lock_hotkey, Message::LockHotkeyChanged)),
-                text("Single key. Always returns control, even if the network or engine has wedged.")
-                    .size(11.0).color(p.txt3),
-            ]
-            .spacing(14.0)),
-            self.advanced(p, Page::Keys, adv),
-        ]
-        .spacing(12.0)
-        .into()
-    }
-
-    /// "The other machine copied something big — want it?"
-    ///
-    /// A banner rather than a dialog, and that is not a style preference. Windows
-    /// withholds `WH_KEYBOARD_LL` callbacks from a process while that process owns the
-    /// foreground window — the exact root cause of the keyboard leak fixed on
-    /// 2026‑07‑31. A pop-up that grabbed focus the moment a large file was copied would
-    /// bring it straight back, and it would do so mid-work, quite possibly mid-crossing.
-    /// So this never calls `SetForegroundWindow` and never steals focus.
-    /// Told once, then never again.
-    ///
-    /// Running without administrator rights is a perfectly reasonable way to use this —
-    /// most people never focus an elevated window from one week to the next. So this
-    /// says the limitation plainly, offers the two ways to act on it, and then goes away
-    /// for good. A permanent banner about a choice already made is nagging, and gets
-    /// ignored exactly when it matters.
-    fn elevation_notice(&self, p: Palette) -> Option<Element<'_, Message>> {
-        if self.cfg.elevation_notice_seen || !mouse_input::elevation().is_limited() {
-            return None;
-        }
-        Some(
-            container(
-                column![
-                    text("mouse-rs is running with normal permissions").size(13.5).color(p.txt),
-                    text(
-                        "That is fine for everyday use. The one limitation: Windows will not let \
-                         us see the mouse while a window running as administrator is in front — a \
-                         game launcher, an installer, or a Windows permission prompt — so the \
-                         pointer cannot cross to the other machine until you click away from it. \
-                         No setting inside this program can change that; only running as \
-                         administrator can."
-                    )
-                    .size(11.0)
-                    .color(p.txt3),
-                    row![
-                        button(text("Restart as administrator").size(12.5))
-                            .style(ui_theme::primary(p))
-                            .padding([9.0, 14.0])
-                            .on_press(Message::RelaunchElevated),
-                        button(text("Keep normal permissions").size(12.5))
-                            .style(ui_theme::ghost(p))
-                            .padding([9.0, 12.0])
-                            .on_press(Message::DismissElevationNotice),
-                    ]
-                    .spacing(8.0),
-                ]
-                .spacing(8.0),
-            )
-            .style(move |_| ui_theme::well(p))
-            .padding([11.0, 14.0])
-            .width(Length::Fill)
-            .into(),
-        )
-    }
-
-    fn pending_files_banner(&self, p: Palette) -> Option<Element<'_, Message>> {
-        // Fetching counts too, and that is the point. The banner used to show only
-        // while an entry was waiting for consent — a state a paste ends within
-        // milliseconds — so "Always allow this size" flashed past before it could be
-        // read, let alone clicked. A transfer that has just started is exactly when
-        // someone wants to say "don't ask me about this size again", and the answer is
-        // still useful: it applies to every file after this one.
-        let waiting: Vec<_> = self
-            .engine
-            .as_ref()?
-            .clipboard_meta()
-            .into_iter()
-            // Only while it is *waiting*. Once fetching — "Allow" pressed, or a paste
-            // started it — its job is done; the history row carries the progress. Keeping
-            // it up showed a stale "Fetching…" prompt over a transfer already running below.
-            .filter(|m| m.status == mouse_clipboard::ClipStatus::NeedsConsent)
-            .collect();
-        let first = waiting.first()?;
-        let fetching = matches!(first.status, mouse_clipboard::ClipStatus::Fetching { .. });
-        let more = waiting.len().saturating_sub(1);
-        let title = match (fetching, more) {
-            (true, 0) => format!("{} is coming over", first.preview),
-            (true, n) => format!("{} (and {n} more) is coming over", first.preview),
-            (false, 0) => format!("{} is ready to paste", first.preview),
-            (false, n) => format!("{} (and {n} more) are ready to paste", first.preview),
-        };
-        Some(
-            container(
-                row![
-                    column![
-                        text(title).size(13.5).color(p.txt),
-                        text(format!(
-                            "{} — over your {} limit, so it is not fetched until you paste it. {}",
-                            human_bytes(first.disk_bytes as usize),
-                            human_bytes(self.cfg.clipboard_auto_transfer_max as usize),
-                            // Linux offers it from the streaming folder, so a paste of any size
-                            // starts at once. Elsewhere the paste waits for the whole transfer.
-                            if cfg!(target_os = "linux") {
-                                "Paste works now; this is only a heads-up."
-                            } else {
-                                "Press Bring it over first if it is large: a paste waits for the whole file."
-                            }
-                        ))
-                        .size(11.0)
-                        .color(p.txt3),
-                    ]
-                    .spacing(3.0)
-                    .width(Length::Fill),
-                    // Three answers, because "yes" and "no" are not the only ones: the
-                    // third says "stop asking me about files this size", which is the
-                    // real request behind repeatedly pressing the first.
-                    button(text(if fetching { "Fetching…" } else { "Bring it over" }).size(12.5))
-                        .style(ui_theme::primary(p))
-                        .padding([9.0, 14.0])
-                        .on_press_maybe((!fetching).then_some(Message::ClipReuse(first.id))),
-                    button(text(if fetching { "Dismiss" } else { "Not now" }).size(12.5))
-                        .style(ui_theme::ghost(p))
-                        .padding([9.0, 12.0])
-                        .on_press(Message::ClipDecline(first.id)),
-                    button(text(format!("Always allow {}", mb_ceil_label(first.disk_bytes))).size(12.5))
-                        .style(ui_theme::ghost(p))
-                        .padding([9.0, 12.0])
-                        .on_press(Message::ClipAlwaysAllow(first.id)),
-                ]
-                .spacing(8.0)
-                .align_y(Alignment::Center),
-            )
-            .style(move |_| ui_theme::well(p))
-            .padding([11.0, 14.0])
-            .width(Length::Fill)
-            .into(),
-        )
-    }
-
-    /// The clipboard manager: a list you can act on, not a log you can only read.
-    ///
-    /// Every row is a button that puts that item back on the clipboard (and sends it to
-    /// the peer, exactly as a fresh copy would). Settings split Basic / Advanced so the
-    /// four most people touch stay visible while the rest are one click away — nothing
-    /// is hidden, it just isn't all shouting at once.
-    fn tab_clipboard(&self, p: Palette) -> Element<'_, Message> {
-        let entries = self.engine.as_ref().map(|e| e.clipboard_meta());
-        let mut list = column![].spacing(10.0);
-        match &entries {
-            None => {
-                list = list.push(
-                    text("Start sharing to build up clipboard history.").size(12.0).color(p.txt3),
-                )
-            }
-            Some(e) if e.is_empty() => {
-                list = list.push(text("Nothing copied yet.").size(12.0).color(p.txt3))
-            }
-            Some(e) => {
-                for m in e {
-                    let (arrow, col) = if m.incoming { ("↓ in", p.accent) } else { ("↑ out", p.good) };
-                    let kind = if m.is_files {
-                        "🗎"
-                    } else if m.is_image {
-                        "🖼"
-                    } else {
-                        "¶"
-                    };
-                    // The right-hand label is the entry's state in the user's words.
-                    // Every one of these is a situation they can really be in, and the
-                    // alternative to saying so is leaving them to guess.
-                    let (note, note_col) = match &m.status {
-                        mouse_clipboard::ClipStatus::Ready if m.is_files => {
-                            (format!("{} · ready", human_bytes(m.disk_bytes as usize)), p.good)
-                        }
-                        mouse_clipboard::ClipStatus::Ready => (human_bytes(m.bytes), p.txt3),
-                        // True of both kinds: a small file being prefetched, and a large one
-                        // that streams in when pasted. Either way, pasting works now.
-                        mouse_clipboard::ClipStatus::Remote => (
-                            format!("{} · on the other computer · paste any time", human_bytes(m.disk_bytes as usize)),
-                            p.accent,
-                        ),
-                        // No longer an instruction. The paths are already on the
-                        // clipboard and pasting is what starts the transfer, so telling
-                        // the user to click first was describing an older design and
-                        // making a working feature look like a chore.
-                        mouse_clipboard::ClipStatus::NeedsConsent => (
-                            format!("{} · paste it anywhere", human_bytes(m.disk_bytes as usize)),
-                            p.txt3,
-                        ),
-                        // "Not now" is not an error and not a dead end — say what it is
-                        // and what to do about it.
-                        mouse_clipboard::ClipStatus::Declined => (
-                            format!("{} · paste it anywhere", human_bytes(m.disk_bytes as usize)),
-                            p.txt3,
-                        ),
-                        mouse_clipboard::ClipStatus::Fetching { done, total } => {
-                            let pct = if *total > 0 { done * 100 / total } else { 0 };
-                            // Speed and time left, because "22% of 6.8 GB" answers
-                            // neither of the two questions actually being asked while
-                            // watching a transfer: how fast, and how much longer.
-                            // Measured from this entry's own progress between ticks.
-                            // The lane's own throughput figure is reset by every Begin
-                            // frame, and a folder sends 23 of them interleaved, so it
-                            // measures a fragment of one file rather than the transfer.
-                            let rate = self.clip_rates.get(&m.id).copied();
-                            let tail = match rate {
-                                Some(bps) if bps > 0 => {
-                                    let left = total.saturating_sub(*done);
-                                    format!(
-                                        " · {}/s · {} left",
-                                        human_bytes(bps as usize),
-                                        human_duration(left / bps.max(1))
-                                    )
-                                }
-                                _ => String::new(),
-                            };
-                            (
-                                format!("{pct}% of {}{tail}", human_bytes(*total as usize)),
-                                p.accent,
-                            )
-                        }
-                        mouse_clipboard::ClipStatus::Unavailable(why) => (why.clone(), p.danger),
-                    };
-                    let fetching = matches!(m.status, mouse_clipboard::ClipStatus::Fetching { .. });
-                    // The row itself is the re-use action — the thing the user wants
-                    // nine times out of ten needs no menu and no second click.
-                    // Stacked, not side by side. Sharing one line means the two texts
-                    // compete for width at every window size, and one of them always
-                    // loses — either the status is crushed into a one-word-per-line
-                    // column, or a long status ("no longer at the recorded path on the
-                    // other machine") runs straight over the file name. On its own line
-                    // each can simply use the width available, at any size down to a
-                    // phone.
-                    let head = column![
-                        row![
-                            text(kind).size(12.0).color(p.txt3),
-                            text(arrow).size(11.0).color(col),
-                            // A file name has no spaces to break at, so it has to be allowed
-                            // to break anywhere, or it runs out over the pin and ✕ buttons.
-                            text(m.preview.clone())
-                                .size(13.0)
-                                .color(p.txt2)
-                                .width(Length::Fill)
-                                .wrapping(iced::widget::text::Wrapping::WordOrGlyph),
-                        ]
-                        .spacing(8.0)
-                        .align_y(Alignment::Center),
-                        text(note)
-                            .size(11.0)
-                            .color(note_col)
-                            .width(Length::Fill)
-                            .wrapping(iced::widget::text::Wrapping::WordOrGlyph),
-                    ]
-                    .spacing(4.0);
-                    // A bar while it is moving: a percentage answers "how far", a bar
-                    // answers "is it still going", which is the one being asked while
-                    // watching a long transfer.
-                    let body: Element<'_, Message> = if let mouse_clipboard::ClipStatus::Fetching {
-                        done,
-                        total,
-                    } = &m.status
-                    {
-                        let frac = if *total > 0 { *done as f32 / *total as f32 } else { 0.0 };
-                        column![head, progress_bar(0.0..=1.0, frac).girth(3.0)]
-                            .spacing(6.0)
-                            .into()
-                    } else {
-                        head.into()
-                    };
-                    let reuse = button(body)
-                        .style(ui_theme::ghost(p))
-                        .padding([12.0, 14.0])
-                        .width(Length::Fill)
-                        .on_press(Message::ClipReuse(m.id));
-
-                    // Icons with real hover text. Renaming them to words was the wrong
-                    // fix for "hovering tells me nothing" — it cost the compactness and
-                    // still explained less than a sentence can.
-                    let pin = hint(
-                        p,
-                        button(text(if m.pinned { "📌" } else { "📍" }).size(12.0))
-                            .style(ui_theme::ghost(p))
-                            .padding([9.0, 10.0])
-                            .on_press(Message::ClipTogglePin(m.id)),
-                        if m.pinned {
-                            "Pinned — kept when the history fills up or is cleared. Click to unpin."
-                        } else {
-                            "Pin this, so it is kept when the history fills up or is cleared."
-                        },
-                    );
-                    let del = hint(
-                        p,
-                        button(text("✕").size(12.0))
-                            .style(ui_theme::ghost(p))
-                            .padding([9.0, 10.0])
-                            .on_press(Message::ClipRemove(m.id)),
-                        "Remove this entry. Files already transferred stay on your disk.",
-                    );
-
-                    let mut controls = row![reuse].spacing(6.0).align_y(Alignment::Center);
-                    // Stop only exists while there is something to stop. What has already
-                    // arrived is kept, so pressing it is cheap to undo.
-                    if fetching {
-                        controls = controls.push(hint(
-                            p,
-                            button(text("Stop").size(11.5))
-                                .style(ui_theme::ghost(p))
-                                .padding([9.0, 10.0])
-                                .on_press(Message::ClipCancel(m.id)),
-                            "Stop this transfer. What has arrived is kept, so clicking the entry resumes it.",
-                        ));
-                    }
-                    list = list.push(controls.push(pin).push(del));
-                }
-            }
-        }
-
-        // What the user's own limits are costing right now — shown rather than left to
-        // be discovered later.
-        let usage: Element<'_, Message> = match self.engine.as_ref().map(|e| e.clipboard_usage()) {
-            Some((count, bytes)) if count > 0 => text(format!(
-                "{count} of {} entries · {} of {}",
-                self.cfg.clipboard_history_size,
-                human_bytes(bytes),
-                human_bytes(self.cfg.clipboard_memory_budget),
-            ))
-            .size(11.0)
-            .color(p.txt3)
-            .into(),
-            _ => Space::new().height(0.0).into(),
-        };
-
-        let header = row![
-            column![
-                section(p, "History"),
-                text("Newest first · click an entry to copy it again").size(11.0).color(p.txt3),
-            ]
-            .spacing(3.0)
-            .width(Length::Fill),
-            hint(
-                p,
-                button(text("Clear").size(12.0))
-                    .style(ui_theme::ghost(p))
-                    .padding([7.0, 12.0])
-                    .on_press(Message::ClipClear),
-                "Clear the history and delete mouse-rs's own copies of received files. \
-                 Pinned entries and transfers still running are kept; files you have \
-                 pasted somewhere are never touched.",
-            ),
-        ]
-        .align_y(Alignment::Center);
-
-        // What the transferred files are actually costing on disk. Absent before, so
-        // there was no way to answer "is this program eating my drive?" short of finding
-        // the cache folder by hand — and no way to do anything about it if it was.
-        let disk: Element<'_, Message> = match self.engine.as_ref().and_then(|e| e.cache_usage()) {
-            Some((bytes, count)) if count > 0 => row![
-                text(format!(
-                    "received files kept by mouse-rs: {} in {count} file{}",
-                    human_bytes(bytes as usize),
-                    if count == 1 { "" } else { "s" }
-                ))
-                .size(11.0)
-                .color(if bytes > self.cfg.clipboard_cache_budget { p.warn } else { p.txt3 })
-                .width(Length::Fill),
-            ]
-            .align_y(Alignment::Center)
-            .into(),
-            _ => Space::new().height(0.0).into(),
-        };
-
-        // The history only: what you copied, and the one action per row. Its settings
-        // are in ⋯ → Settings → Clipboard, which the last line says.
-        column![
-            card(p, column![header, list, usage, disk].spacing(12.0)),
-            nav_row(
-                p,
-                "📋",
-                "Clipboard settings",
-                "What to share, big files, how much history to keep",
-                Message::OpenSettings(Page::Clipboard),
-            ),
-        ]
-        .spacing(12.0)
-        .into()
-    }
-
-    /// Settings → Clipboard. The everyday settings first, the rest under Advanced, in
-    /// three groups (R30). Every control is the one the Clipboard tab used to hold.
-    fn page_clipboard(&self, p: Palette) -> Element<'_, Message> {
-        let basic = column![
-            section(p, "Sharing"),
-            toggle_row(
-                p,
-                "Sync clipboard",
-                "copy here, paste there — text and images",
-                self.cfg.clipboard_sync,
-                Message::ClipboardToggled
-            ),
-            toggle_row(
-                p,
-                "Notify me when a file is waiting",
-                "a desktop notification, never a pop-up — a window stealing focus is what caused the keyboard bug",
-                self.cfg.clipboard_notify,
-                Message::ClipNotifyToggled
-            ),
-            section(p, "Big files"),
-            labeled(
-                p,
-                "Ask before bringing over anything larger than (MB)",
-                input(p, "1", &self.clip_auto_mb_s, Message::ClipAutoMbChanged)
-            ),
-            text(if self.cfg.clipboard_auto_transfer_max == u64::MAX {
-                "Never asks — copying is the decision, so anything you copy just comes over. \
-                 Set a size here if you are on a slow or metered link.".to_string()
-            } else if self.cfg.clipboard_auto_transfer_max == 0 {
-                "0 — always ask, whatever the size.".to_string()
-            } else {
-                format!(
-                    "Under {} it just arrives; over it, the entry waits for you.",
-                    human_bytes(self.cfg.clipboard_auto_transfer_max as usize)
-                )
-            })
-            .size(11.0)
-            .color(p.txt3),
-            labeled(
-                p,
-                "Or put received files straight into this folder",
-                input(p, "/home/you/Desktop — blank to keep them on the clipboard only", &self.cfg.clipboard_deliver_dir, Message::ClipDeliverDirChanged)
-            ),
-            text(if self.cfg.clipboard_deliver_dir.trim().is_empty() {
-                "Blank is normal — paste wherever you want it and that is where it goes. Set a folder only if you would rather files arrived automatically, with no paste at all.".to_string()
-            } else {
-                format!(
-                    "Files land in {} as they arrive — nothing to paste. They are linked, not copied, so a 40 GB file uses 40 GB and not 80.",
-                    self.cfg.clipboard_deliver_dir.trim()
-                )
-            })
-            .size(11.0)
-            .color(p.txt3),
-            section(p, "History"),
-            labeled(p, "Keep this many entries", input(p, "25", &self.clip_items_s, Message::ClipItemsChanged)),
-            toggle_row(
-                p,
-                "Keep history after restart",
-                "convenient — but clipboard contents, including anything you copied that was private, are written to your disk",
-                self.cfg.clipboard_persist_history,
-                Message::ClipPersistToggled
-            ),
-        ]
-        .spacing(12.0);
-
-        // The worst case this configuration allows. Stating the cost is the job;
-        // refusing the value is not — a slow setting chosen deliberately is the
-        // owner's trade to make.
-        let worst = self
-            .cfg
-            .clipboard_history_size
-            .saturating_mul(self.cfg.clipboard_max_item_bytes)
-            .min(self.cfg.clipboard_memory_budget);
-        let px = self.cfg.clipboard_max_image_px;
-        // 4 bytes a pixel of RGBA, allocated while an image is encoded or decoded.
-        let img_cost = px.saturating_mul(px).saturating_mul(4);
-
-        let adv = column![
-            section(p, "What crosses"),
-            toggle_row(p, "Sync text", "copied text crosses machines", self.cfg.clipboard_sync_text, Message::ClipSyncTextToggled),
-            toggle_row(p, "Sync images", "copied images cross machines", self.cfg.clipboard_sync_images, Message::ClipSyncImagesToggled),
-            toggle_row(p, "Sync files", "any file or folder, any extension — no allow-list", self.cfg.clipboard_sync_files, Message::ClipSyncFilesToggled),
-            labeled(p, "Most files in one copy", input(p, "10000", &self.clip_max_files_s, Message::ClipMaxFilesChanged)),
-            text("Bounds a stray click on an enormous folder. The rest is left behind, and the log says so.")
-                .size(11.0)
-                .color(p.txt3),
-            toggle_row(
-                p,
-                "Also copy images as a .png file",
-                "on: a copied image pastes into a browser AND into a file manager. Off: pixels only, and pasting into Explorer or Thunar does nothing.",
-                self.cfg.clipboard_images_also_as_file,
-                Message::ClipImagesAsFileToggled
-            ),
-            toggle_row(
-                p,
-                "Follow shortcuts inside copied folders",
-                "off by default: one pointing outside the folder quietly copies files you never picked",
-                self.cfg.clipboard_follow_symlinks,
-                Message::ClipFollowSymlinksToggled
-            ),
-            toggle_row(
-                p,
-                "Pasting a received file moves it there",
-                "on: the folder you paste into IS the destination, and a big file costs nothing to paste. Off: it is copied out of the cache, so a 40 GB file briefly uses 80 GB.",
-                self.cfg.clipboard_move_on_paste,
-                Message::ClipMoveOnPasteToggled
-            ),
-            section(p, "Transfers"),
-            labeled(
-                p,
-                "Don't ask if it'll take under (seconds)",
-                input(p, "3", &self.clip_quick_s, Message::ClipQuickSecsChanged)
-            ),
-            text(if self.cfg.clipboard_quick_send_secs == 0 {
-                "0 — the size limit alone decides.".to_string()
-            } else {
-                format!(
-                    "On a fast link a big file lands in a moment, so asking is noise. Measured from real transfers, so it still asks on a slow one. Currently {}.",
-                    match self.engine.as_ref().and_then(|e| e.measured_throughput()) {
-                        Some(bps) => format!("measuring ~{}/s", human_bytes(bps as usize)),
-                        None => "no measurement yet, so it always asks".to_string(),
-                    }
-                )
-            })
-            .size(11.0)
-            .color(p.txt3),
-            labeled(
-                p,
-                "Paste files bigger than (MB) straight from the network",
-                input(p, "64", &self.clip_stream_mb_s, Message::ClipStreamMbChanged)
-            ),
-            text(if self.cfg.clipboard_keep_resumable_copy {
-                "Off while \"keep a resumable copy\" is on: every paste goes through the cache.".to_string()
-            } else {
-                format!(
-                    "Files from {} MB up go network → memory → your folder: they use their own size on disk, once. Smaller ones pass through mouse-rs's cache first.",
-                    self.cfg.clipboard_stream_min_mb
-                )
-            })
-            .size(11.0)
-            .color(p.txt3),
-            labeled(
-                p,
-                "Wait for a dropped connection (seconds)",
-                input(p, "180", &self.clip_stream_wait_s, Message::ClipStreamWaitChanged)
-            ),
-            text("A paste whose transfer stops (cable pulled, Wi-Fi drop) pauses and continues from the same byte if the connection is back within this time; after that it fails.")
-                .size(11.0)
-                .color(p.txt3),
-            toggle_row(
-                p,
-                "Keep a resumable copy while pasting",
-                "uses the file's size again in disk while a paste runs, but a paste cut short — even by a restart — continues where it stopped when you copy and paste the same file again",
-                self.cfg.clipboard_keep_resumable_copy,
-                Message::ClipKeepResumableToggled
-            ),
-            toggle_row(
-                p,
-                "Slow transfers while I'm on the other machine",
-                "only if the pointer starts to lag; otherwise transfers run at the network's full speed",
-                self.cfg.bulk_pause_while_crossed,
-                Message::BulkPauseToggled
-            ),
-            labeled(
-                p,
-                "Transfer speed limit (MB/s, 0 = automatic)",
-                input(p, "0", &self.bulk_rate_s, Message::BulkRateChanged)
-            ),
-            text("Automatic watches your mouse latency and backs off by itself. Pin a number if you'd rather decide.")
-                .size(11.0)
-                .color(p.txt3),
-            labeled(
-                p,
-                "Send buffer (MB)",
-                input(p, "8", &self.bulk_buf_s, Message::BulkBufferChanged)
-            ),
-            text(format!(
-                "How much of a file may sit in memory waiting to go out. This is what keeps a 4 GB copy costing the same as a 4 MB one — right now, at most {}.",
-                human_bytes((self.cfg.bulk_send_buffer_mb.max(1) as usize) * 1024 * 1024)
-            ))
-            .size(11.0)
-            .color(p.txt3),
-            toggle_row(
-                p,
-                "Separate lane for large transfers",
-                "stops big items queueing in front of the mouse",
-                self.cfg.bulk_enabled,
-                Message::BulkEnabledToggled
-            ),
-            labeled(
-                p,
-                "Port for that lane (blank = share the main one)",
-                input(p, "same port", &self.bulk_port_s, Message::BulkPortChanged)
-            ),
-            text(if self.cfg.bulk_port == 0 {
-                "Sharing one port — nothing extra to open in a firewall.".to_string()
-            } else {
-                format!("Port {} must be reachable between both machines.", self.cfg.bulk_port)
-            })
-            .size(11.0)
-            .color(p.txt3),
-            labeled(
-                p,
-                "Don't fingerprint files bigger than (MB)",
-                input(p, "64", &self.hash_limit_mb_s, Message::HashLimitMbChanged)
-            ),
-            text("Files up to this size are checked by their content when they arrive; bigger ones by their size, so copying a film is announced at once instead of after reading it all.")
-                .size(11.0)
-                .color(p.txt3),
-            section(p, "Storage & memory"),
-            labeled(p, "Disk for transferred files (GB)", input(p, "2", &self.clip_cache_gb_s, Message::ClipCacheGbChanged)),
-            text("Oldest go first when it fills. Pinned entries are never removed.")
-                .size(11.0)
-                .color(p.txt3),
-            labeled(
-                p,
-                "Folder for transferred files",
-                input(p, "blank = ~/.mouse_share/cache", &self.cfg.cache_dir, Message::CacheDirChanged)
-            ),
-            labeled(p, "Biggest item to keep (MB)", input(p, "5", &self.clip_item_mb_s, Message::ClipItemMbChanged)),
-            labeled(p, "Memory budget (MB)", input(p, "64", &self.clip_mem_mb_s, Message::ClipMemMbChanged)),
-            text(format!(
-                "This configuration can hold up to {}. Pinned entries are never evicted.",
-                human_bytes(worst)
-            ))
-            .size(11.0)
-            .color(p.txt3),
-            labeled(p, "Largest image edge (px)", input(p, "4096", &self.clip_img_px_s, Message::ClipImagePxChanged)),
-            text(format!(
-                "An image this size costs about {} of memory for a moment while it is compressed.",
-                human_bytes(img_cost)
-            ))
-            .size(11.0)
-            .color(if img_cost > 128 * 1024 * 1024 { p.warn } else { p.txt3 }),
-            labeled(
-                p,
-                "Send images inline up to (KB)",
-                input(p, "256", &self.clip_inline_kb_s, Message::ClipInlineKbChanged)
-            ),
-            text("Bigger images take the separate lane instead, so they can't stall the mouse. Lower this on a slow link; raise it to skip the extra round trip on a fast one.")
-                .size(11.0)
-                .color(p.txt3),
-        ]
-        .spacing(12.0);
-
-        column![card(p, basic), self.advanced(p, Page::Clipboard, adv)].spacing(12.0).into()
-    }
-
-
-    // ---------- profiles + footer ----------
-
-    /// Two controls, and only two. The old footer carried eight — profile picker, Load,
-    /// Delete, save-as box, Save as, Restore defaults, Save, Start, Stop and Quit — which
-    /// overflowed at normal window width and silently pushed Stop and Quit off the edge.
-    /// Everything rare or destructive is in the ⋯ menu; Start and Stop are one toggle
-    /// because they are mutually exclusive and one was always greyed out.
-    fn footer(&self, p: Palette, running: bool) -> Element<'_, Message> {
-        let run = if running {
-            button(text("Stop sharing").size(14.0))
-                .style(ui_theme::danger(p))
-                .padding([12.0, 20.0])
-                .on_press(Message::Stop)
-        } else {
-            button(text("Start sharing").size(14.0))
-                .style(ui_theme::primary(p))
-                .padding([12.0, 20.0])
-                .on_press(Message::Start)
-        };
-
-        row![
-            text(&self.feedback).size(12.0).color(p.txt3).width(Length::Fill),
-            button(text("Save").size(13.0))
-                .style(ui_theme::ghost(p))
-                .padding([11.0, 16.0])
-                .on_press(Message::SaveConfig),
-            run,
-        ]
-        .spacing(8.0)
-        .align_y(Alignment::Center)
-        .into()
-    }
-
-    /// The ⋯ menu: the way into Settings, and Quit. The theme moved to Settings →
-    /// Appearance and Restore defaults to Settings → About (R30).
-    fn overflow_menu(&self, p: Palette) -> Element<'_, Message> {
-        let item = |label: &'static str, msg: Message, danger: bool| {
-            button(text(label).size(12.5).color(if danger { p.danger } else { p.txt2 }))
-                .style(ui_theme::ghost(p))
-                .padding([9.0, 11.0])
-                .width(Length::Fill)
-                .on_press(msg)
-        };
-
-        container(
-            column![
-                item("⚙  Settings", Message::OpenSettings(Page::Index), false),
-                item("Profiles…", Message::OpenSettings(Page::Connection), false),
-                item("Quit mouse-rs", Message::Quit, true),
-            ]
-            .spacing(4.0),
-        )
-        .style(move |_| ui_theme::card(p))
-        .padding(10.0)
-        .width(210.0)
-        .into()
-    }
-
-    // ---------- ⋯ → Settings ----------
-
-    /// The back button and the page's title. Back from a category goes to the list; back
-    /// from the list goes to the main window.
-    fn settings_bar(&self, p: Palette, pg: Page) -> Element<'_, Message> {
-        let back = if pg == Page::Index { Message::CloseSettings } else { Message::OpenSettings(Page::Index) };
-        row![
-            button(text("←").size(15.0).color(p.txt2))
-                .style(ui_theme::ghost(p))
-                .padding([6.0, 12.0])
-                .on_press(back),
-            text(pg.title()).size(18.0).color(p.txt).width(Length::Fill),
-        ]
-        .spacing(10.0)
-        .align_y(Alignment::Center)
-        .into()
-    }
-
-    fn settings_body(&self, p: Palette, pg: Page) -> Element<'_, Message> {
-        match pg {
-            Page::Index => self.settings_index(p),
-            Page::Clipboard => self.page_clipboard(p),
-            Page::Screens => self.page_screens(p),
-            Page::Startup => self.page_startup(p),
-            Page::Keys => self.page_keys(p),
-            Page::Connection => self.page_connection(p),
-            Page::Security => self.page_security(p),
-            Page::Appearance => self.page_appearance(p),
-            Page::Diagnostics => self.page_diagnostics(p),
-            Page::About => self.page_about(p),
-        }
-    }
-
-    /// The list of categories, grouped and ordered by how often people use them (R29).
-    fn settings_index(&self, p: Palette) -> Element<'_, Message> {
-        let mut col = column![].spacing(6.0);
-        for (group, pages) in Page::CATEGORIES {
-            col = col.push(Space::new().height(4.0)).push(text(group).size(10.5).color(p.txt3));
-            for &pg in pages {
-                col = col.push(nav_row(p, pg.icon(), pg.title(), pg.summary(), Message::OpenSettings(pg)));
-            }
-        }
-        col.into()
-    }
-
-    /// A page's Advanced section: at the bottom, closed until opened (R25, R30).
-    fn advanced<'a>(&'a self, p: Palette, pg: Page, body: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
-        let open = self.adv_open.contains(&pg);
-        let head = button(text(if open { "▾  Advanced" } else { "▸  Advanced" }).size(13.0).color(p.txt2))
-            .style(ui_theme::ghost(p))
-            .padding([10.0, 14.0])
-            .width(Length::Fill)
-            .on_press(Message::AdvancedToggled(pg));
-        if open {
-            column![head, card(p, body)].spacing(8.0).into()
-        } else {
-            head.into()
-        }
-    }
-
-    /// Settings → Connection: this computer's name, staying connected and profiles; the
-    /// ports and the discovery port under Advanced. Role and the other computer's address
-    /// are on the main window (R30).
+    /// Settings → Connection (S5): this computer's name, staying connected and profiles;
+    /// the ports under Advanced. Role and the other computer's address are on the main
+    /// window.
     fn page_connection(&self, p: Palette) -> Element<'_, Message> {
         let server_side = self.cfg.role == Role::Server;
-        let mut basic = column![
-            section(p, "This computer"),
-            labeled(p, "Machine name", input(p, "this-machine", &self.cfg.name, Message::NameChanged)),
-        ]
-        .spacing(14.0);
+        let mut basic = vec![stacked(
+            p,
+            "Name",
+            input(p, "this-computer", &self.cfg.name, Message::NameChanged).into(),
+            "How it appears on the other computer",
+        )];
         if !server_side {
-            basic = basic.push(toggle_row(p, "Auto-reconnect", "retry with backoff until the server appears", self.cfg.reconnect, Message::ReconnectToggled));
-            basic = basic.push(labeled(
+            basic.push(tog(
                 p,
-                "Preferred network",
-                pick_list(
-                    mouse_core::NetworkPreference::ALL,
-                    Some(self.cfg.network_preference),
-                    Message::NetworkPreferencePicked,
-                )
-                .width(Length::Fill)
-                .padding([10.0, 12.0])
-                .text_size(13.0),
+                "Reconnect automatically",
+                format!("Keep retrying until {} is back", self.peer_name()),
+                self.cfg.reconnect,
+                Message::ReconnectToggled,
             ));
-            basic = basic.push(
-                text("When the other computer can be reached over both the cable and Wi-Fi, use this one. If it stops working, the other takes over by itself; plugging the cable back in switches back.")
-                    .size(11.0)
-                    .color(p.txt3),
-            );
+            basic.push(self.network_preference_row(p));
         }
 
-        let mut adv = column![section(p, "Ports")].spacing(14.0);
+        // Profiles: listed by name, the one in use marked (R40).
+        let mut prof: Vec<Element<'_, Message>> = Vec::new();
+        for (name, saved) in &self.profiles {
+            let active = same_settings(saved, &self.cfg);
+            let right: Element<'_, Message> = if active {
+                container(text("Active").size(11.5).font(BOLD).color(p.accent))
+                    .padding([3.0, 8.0])
+                    .style(move |_| ui_theme::chip(p))
+                    .into()
+            } else {
+                row![
+                    btn_secondary(p, "Switch", Some(Message::SwitchProfile(name.clone()))),
+                    button(text("×").size(15.0).color(p.txt3))
+                        .style(ui_theme::row_button(p))
+                        .padding([2.0, 8.0])
+                        .on_press(Message::DeleteProfile(name.clone())),
+                ]
+                .spacing(6.0)
+                .align_y(Alignment::Center)
+                .into()
+            };
+            prof.push(srow(p, name.clone(), profile_summary(saved), right));
+        }
+        prof.push(stacked(
+            p,
+            "Save current setup as",
+            row![
+                input(p, "Name, e.g. home", &self.profile_name_input, Message::ProfileNameChanged)
+                    .on_submit(Message::SaveProfileAs),
+                btn_secondary(p, "Save", Some(Message::SaveProfileAs)),
+            ]
+            .spacing(8.0)
+            .align_y(Alignment::Center)
+            .into(),
+            // Said plainly because a profile is as sensitive as the config file itself.
+            "A named copy of all your settings, to switch between setups like \"desk\" and \"travel\". Profiles include the shared secret · stored in ~/.mouse_share/profiles/",
+        ));
+
+        let mut ports: Vec<Element<'_, Message>> = Vec::new();
         if server_side {
             // Real addresses of this machine, so the bind address is chosen rather than
             // typed from memory.
-            let local = mouse_core::discover::listen_candidates();
-            let picked = local
-                .iter()
-                .find(|c| **c == self.cfg.listen_host)
-                .cloned();
-            adv = adv
-                .push(labeled(p, "Listen host", input(p, "0.0.0.0", &self.cfg.listen_host, Message::ListenHostChanged)))
-                .push(labeled(
-                    p,
-                    "This machine's addresses",
-                    pick_list(local, picked, Message::ListenHostPicked)
-                        .width(Length::Fill)
-                        .padding([10.0, 12.0])
-                        .text_size(13.0),
-                ))
-                .push(labeled(p, "Listen port", input(p, "24800", &self.listen_port_s, Message::ListenPortChanged)));
+            let mut chips = row![].spacing(6.0);
+            for a in mouse_core::discover::listen_candidates() {
+                let on = a == self.cfg.listen_host;
+                chips = chips.push(
+                    button(text(a.clone()).size(12.0).font(MONO))
+                        .style(ui_theme::chip_toggle(p, on))
+                        .padding([3.0, 9.0])
+                        .on_press(Message::ListenHostPicked(a)),
+                );
+            }
+            ports.push(stacked(
+                p,
+                "Listen host",
+                column![
+                    input(p, "0.0.0.0", &self.cfg.listen_host, Message::ListenHostChanged).font(MONO),
+                    chips.wrap().vertical_spacing(6.0),
+                ]
+                .spacing(8.0)
+                .into(),
+                "0.0.0.0 accepts on every address; pick one to accept only there",
+            ));
+            ports.push(num(p, "Listen port", "", &self.listen_port_s, "", Message::ListenPortChanged));
         } else {
-            adv = adv.push(labeled(p, "Server port", input(p, "24800", &self.server_port_s, Message::ServerPortChanged)));
+            ports.push(num(p, "Server port", "", &self.server_port_s, "", Message::ServerPortChanged));
         }
-        adv = adv
-            .push(labeled(p, "Discovery port (finding the other computer)", input(p, "24801", &self.discovery_port_s, Message::DiscoveryPortChanged)))
-            .push(
-                text("The two computers find each other on this UDP port. Same number on both; 0 turns finding off, and the address on the main window is used instead.")
-                    .size(11.0)
-                    .color(p.txt3),
-            );
+        ports.push(num(
+            p,
+            "Discovery port",
+            "UDP · same on both computers · 0 = off",
+            &self.discovery_port_s,
+            "",
+            Message::DiscoveryPortChanged,
+        ));
 
         column![
-            card(p, basic),
-            card(p, self.profiles_section(p)),
-            self.advanced(p, Page::Connection, adv),
+            section(p, "This computer"),
+            group(p, basic),
+            section(p, "Profiles"),
+            group(p, prof),
+            self.advanced(p, Page::Connection, column![section(p, "Ports"), group(p, ports)]),
         ]
-        .spacing(12.0)
         .into()
     }
 
-    /// Settings → Appearance: the six themes, moved here from the ⋯ menu.
-    fn page_appearance(&self, p: Palette) -> Element<'_, Message> {
-        let mut themes = column![section(p, "Theme")].spacing(8.0);
-        for t in Theme6::ALL {
-            let base = t.palette();
-            themes = themes.push(
-                button(
-                    row![
-                        container(Space::new().width(18.0).height(18.0))
-                            .style(move |_| ui_theme::swatch_fill(base)),
-                        text(t.label()).size(13.5).color(if t == self.theme { p.accent_ink } else { p.txt2 }),
-                    ]
-                    .spacing(10.0)
-                    .align_y(Alignment::Center),
-                )
-                .style(ui_theme::segment(p, t == self.theme))
-                .padding([9.0, 12.0])
-                .width(Length::Fill)
-                .on_press(Message::ThemePicked(t)),
-            );
+    /// Settings → Security & pairing (S6 on the controlled computer, S7 on the one with
+    /// the mouse). The PIN is set on the computer being controlled, so it lives there.
+    fn page_security(&self, p: Palette) -> Element<'_, Message> {
+        let mut col = column![];
+        if self.cfg.role == Role::Client {
+            col = col
+                .push(section(p, "Connection PIN"))
+                .push(group(p, self.pin_settings_rows(p)))
+                .push(section(p, "Pairing"));
+            let mut pairing = Vec::new();
+            if self.paired() {
+                pairing.push(srow(p, format!("Paired with {}", self.peer_name()), "", dot(p.good, 8.0)));
+            }
+            pairing.push(stacked(p, if self.paired() { "Pair with a new code" } else { "Pair with a code" }, self.pair_client_view(p), ""));
+            col = col.push(group(p, pairing));
+        } else {
+            col = col
+                .push(section(p, "Pairing"))
+                .push(group(p, vec![self.pair_server_row(p)]))
+                .push(section(p, "Connection PIN"))
+                .push(group(p, vec![srow(
+                    p,
+                    "Set on the computer you control",
+                    format!(
+                        "When {} asks for its PIN, a box appears on this computer's main window. It's asked once each time mouse-rs starts, not after a Wi-Fi drop.",
+                        self.peer_name()
+                    ),
+                    Space::new().width(0.0),
+                )]));
         }
-        card(p, themes)
+
+        // Pairing with a code replaced typing the secret; the secret stays here for setups
+        // made before pairing existed.
+        let adv = group(p, vec![
+            stacked(
+                p,
+                "Shared secret",
+                row![
+                    input(p, "shared secret", &self.cfg.shared_secret, Message::SecretChanged).secure(!self.show_secret),
+                    btn_secondary(p, if self.show_secret { "Hide" } else { "Show" }, Some(Message::ToggleShowSecret)),
+                    btn_secondary(p, "Generate", Some(Message::GenerateSecret)),
+                ]
+                .spacing(8.0)
+                .align_y(Alignment::Center)
+                .into(),
+                "Identical on both computers. Pairing sets it for you.",
+            ),
+            tog(p, "Encrypt the connection (TLS)", "rustls, self-signed certificate", self.cfg.tls_enabled, Message::TlsToggled),
+        ]);
+        col.push(self.advanced(p, Page::Security, adv)).into()
     }
 
-    /// Settings → Diagnostics: where the log is, and (Advanced) sending it for support.
+    /// Client: the PIN rows of Security & pairing.
+    fn pin_settings_rows(&self, p: Palette) -> Vec<Element<'_, Message>> {
+        let has = !self.cfg.connection_pin.is_empty();
+        let status: Element<'_, Message> = if has {
+            let mut r = row![].spacing(10.0).align_y(Alignment::Center);
+            if self.show_pin {
+                r = r.push(mono(p, self.cfg.connection_pin.clone()));
+            }
+            r.push(btn_secondary(p, if self.show_pin { "Hide" } else { "Show" }, Some(Message::ToggleShowPin))).into()
+        } else {
+            Space::new().width(0.0).into()
+        };
+        let mut rows = vec![
+            srow(
+                p,
+                if has { "PIN is set" } else { "No PIN set" },
+                if has {
+                    "The other computer must type it before it's allowed in"
+                } else {
+                    "Any computer paired with this one can control it"
+                },
+                status,
+            ),
+            tog(p, "Ask when someone is logged in here", "", self.cfg.pin_enabled, Message::PinSessionToggled),
+        ];
+        #[cfg(target_os = "linux")]
+        rows.push(tog(
+            p,
+            "Ask at the login screen",
+            "Only if login-screen sharing is on",
+            self.cfg.login_pin_enabled,
+            Message::PinLoginToggled,
+        ));
+        rows.push(stacked(
+            p,
+            if has { "New PIN" } else { "Set a PIN" },
+            row![
+                input(p, "New PIN", &self.pin_new, Message::PinNewTyped).secure(true),
+                input(p, "Again", &self.pin_new2, Message::PinNew2Typed).secure(true).on_submit(Message::SavePin),
+                btn_primary(p, "Save", Some(Message::SavePin)),
+            ]
+            .spacing(8.0)
+            .align_y(Alignment::Center)
+            .into(),
+            "3 wrong tries lock others out for 1 hour, then 2, 4, 8… Forgot it? Set a new one; being at this computer is enough.",
+        ));
+        rows
+    }
+
+    /// Settings → Appearance (S8): click a card to switch the theme for the whole window.
+    fn page_appearance(&self, p: Palette) -> Element<'_, Message> {
+        let current = self.theme6();
+        let card = |t: Theme6| -> Element<'_, Message> {
+            let (top, body) = (t.hero(), t.palette());
+            let on = t == current && !self.cfg.theme_follow_system;
+            let preview = column![
+                container(
+                    row![
+                        container(Space::new()).width(40.0).height(5.0).style(move |_| ui_theme::fill(ui_theme::alpha(top.txt, 0.7), 3.0)),
+                        Space::new().width(Length::Fill),
+                        container(Space::new()).width(6.0).height(6.0).style(move |_| ui_theme::dot(top.good)),
+                    ]
+                    .align_y(Alignment::Center),
+                )
+                .padding([0.0, 10.0])
+                .height(28.0)
+                .center_y(28.0)
+                .width(Length::Fill)
+                .style(move |_| ui_theme::fill(top.bg, 0.0)),
+                container(
+                    column![
+                        container(Space::new()).width(Length::FillPortion(4)).height(8.0).style(move |_| container::Style {
+                            background: Some(body.surf.into()),
+                            border: iced::Border { color: body.line, width: 1.0, radius: 3.0.into() },
+                            ..container::Style::default()
+                        }),
+                        container(Space::new()).width(38.0).height(9.0).style(move |_| ui_theme::fill(body.accent, 3.0)),
+                    ]
+                    .spacing(6.0),
+                )
+                .padding([8.0, 10.0])
+                .height(44.0)
+                .width(Length::Fill)
+                .style(move |_| ui_theme::fill(body.bg, 0.0)),
+            ];
+            let foot = row![
+                container(Space::new()).width(12.0).height(12.0).style(move |_| ui_theme::radio(p, on)),
+                column![
+                    text(t.label()).size(13.0).font(BOLD).color(p.txt),
+                    text(t.desc()).size(11.0).color(p.txt3),
+                ]
+                .spacing(1.0),
+            ]
+            .spacing(9.0)
+            .align_y(Alignment::Center);
+            button(column![preview, container(foot).padding([9.0, 11.0])])
+                .style(ui_theme::choice(p, on))
+                .padding(1.0)
+                .width(Length::Fill)
+                .on_press(Message::ThemePicked(t))
+                .into()
+        };
+        let mut grid = column![].spacing(10.0);
+        for pair in Theme6::ALL.chunks(2) {
+            grid = grid.push(row![card(pair[0]), card(pair[1])].spacing(10.0));
+        }
+        column![
+            Space::new().height(8.0),
+            grid,
+            Space::new().height(12.0),
+            group(p, vec![tog(
+                p,
+                "Match system light / dark",
+                "Dark: Graphite · Light: Porcelain",
+                self.cfg.theme_follow_system,
+                Message::ThemeFollowSystem,
+            )]),
+        ]
+        .into()
+    }
+
+    /// Settings → Diagnostics (S9): where the log is, and (Advanced) sending it for support.
     fn page_diagnostics(&self, p: Palette) -> Element<'_, Message> {
         // The panel has no console behind it, so name the log file here — otherwise a user
         // hitting a problem has nothing to look at and nothing to send.
-        let logs = column![
-            section(p, "Log file"),
-            text(&self.log_path).size(11.0).color(p.txt3),
-        ]
-        .spacing(6.0);
+        let log = container(
+            column![
+                container(text(self.log_path.clone()).size(12.0).font(MONO).color(p.txt))
+                    .padding([7.0, 10.0])
+                    .width(Length::Fill)
+                    .style(move |_| ui_theme::keycap(p)),
+                row![
+                    Space::new().width(Length::Fill),
+                    btn_secondary(p, "Copy path", Some(Message::CopyLogPath)),
+                    btn_secondary(p, "Open folder", Some(Message::OpenLogFolder)),
+                ]
+                .spacing(8.0),
+            ]
+            .spacing(12.0),
+        )
+        .padding(14.0);
 
         let adv = column![
             section(p, "Send logs for support"),
-            labeled(p, "Log upload address", input(p, "blank = never sent", &self.cfg.log_upload_url, Message::LogUploadUrlChanged)),
-            labeled(p, "Send every (seconds)", input(p, "30", &self.log_upload_secs_s, Message::LogUploadSecsChanged)),
-            text("Nothing leaves this computer unless an address is set. Takes effect the next time mouse-rs starts.")
-                .size(11.0)
-                .color(p.txt3),
-        ]
-        .spacing(14.0);
+            group(p, vec![
+                stacked(
+                    p,
+                    "Upload address",
+                    input(p, "Blank = never sent", &self.cfg.log_upload_url, Message::LogUploadUrlChanged).font(MONO).into(),
+                    "",
+                ),
+                num(p, "Send every", "", &self.log_upload_secs_s, "s", Message::LogUploadSecsChanged),
+            ]),
+            Space::new().height(10.0),
+            note(p, p.txt3, "Nothing leaves this computer unless an address is set. Takes effect next time mouse-rs starts."),
+        ];
 
-        column![card(p, logs), self.advanced(p, Page::Diagnostics, adv)].spacing(12.0).into()
+        column![section(p, "Log file"), group(p, vec![log.into()]), self.advanced(p, Page::Diagnostics, adv)].into()
     }
 
-    /// Settings → About: the version, and Restore defaults, moved here from the ⋯ menu.
+    /// Settings → About (S10): the version, and Restore defaults, which asks first.
     fn page_about(&self, p: Palette) -> Element<'_, Message> {
-        card(p, column![
-            section(p, "mouse-rs"),
-            text(format!("Version {}", env!("CARGO_PKG_VERSION"))).size(12.5).color(p.txt2),
-            button(text("Restore default settings").size(12.5).color(p.danger))
-                .style(ui_theme::ghost(p))
-                .padding([9.0, 12.0])
-                .on_press(Message::RestoreDefaults),
-            text("Resets preferences only — keeps this computer's name, shared secret and screen size. Applied to the form; press Save to keep it.")
-                .size(11.0)
-                .color(p.txt3),
-        ]
-        .spacing(12.0))
-    }
-
-    /// Profiles, with the sentence that was missing. The feature shipped as an unlabelled
-    /// dropdown and three buttons in the footer, and the owner had never worked out what it
-    /// was for — so the explanation is part of the control, not a docs problem.
-    fn profiles_section(&self, p: Palette) -> Element<'_, Message> {
-        let picker = pick_list(self.profiles.clone(), self.profile_pick.clone(), Message::ProfilePicked)
-            .placeholder(if self.profiles.is_empty() { "no profiles saved yet" } else { "choose a profile" })
-            .padding(8.0)
-            .width(Length::Fill);
-
         column![
-            field_label(p, "Profiles"),
-            text(
-                "A named snapshot of all your settings — peer address, edges, screen size, \
-                 hotkeys, secret. Save one per setup (say \"desk\" and \"travel\") and switch \
-                 without retyping. Loading one fills the form; press Save to keep it."
-            )
-            .size(11.0)
-            .color(p.txt3),
-            row![
-                picker,
-                button(text("Load").size(12.0)).style(ui_theme::ghost(p)).padding([8.0, 12.0]).on_press(Message::LoadProfile),
-                button(text("Delete").size(12.0)).style(ui_theme::ghost(p)).padding([8.0, 12.0]).on_press(Message::DeleteProfile),
-            ]
-            .spacing(8.0)
-            .align_y(Alignment::Center),
-            row![
-                input(p, "name this setup…", &self.profile_name_input, Message::ProfileNameChanged),
-                button(text("Save as").size(12.0)).style(ui_theme::ghost(p)).padding([8.0, 12.0]).on_press(Message::SaveProfileAs),
-            ]
-            .spacing(8.0)
-            .align_y(Alignment::Center),
-            // Said plainly because a profile is as sensitive as the config file itself.
-            text("Stored in ~/.mouse_share/profiles/. They include the shared secret.")
-                .size(10.5)
-                .color(p.txt3),
+            Space::new().height(8.0),
+            group(p, vec![
+                srow(p, "mouse-rs", format!("Version {}", env!("CARGO_PKG_VERSION")), Space::new().width(0.0)),
+                srow(
+                    p,
+                    "Restore default settings",
+                    "Keeps this computer's name, shared secret and screen size",
+                    btn_danger(p, "Restore…", Some(Message::AskRestoreDefaults)),
+                ),
+            ]),
         ]
-        .spacing(8.0)
         .into()
     }
 }
 
 // ---------- free helper widgets ----------
+
+fn scroll<'a>(content: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
+    scrollable(content)
+        .direction(scrollable::Direction::Vertical(scrollable::Scrollbar::new().width(4.0).scroller_width(4.0)))
+        .height(Length::Fill)
+        .into()
+}
 
 fn input<'a>(
     p: Palette,
@@ -3566,57 +4114,486 @@ fn input<'a>(
     text_input(placeholder, value)
         .on_input(on_change)
         .style(ui_theme::input(p))
-        .padding(11.0)
-        .size(14.0)
+        .padding([8.0, 11.0])
+        .size(13.5)
         .width(Length::Fill)
 }
 
-fn field_label(p: Palette, label: &str) -> Element<'_, Message> {
-    text(label.to_string()).size(12.0).color(p.txt2).into()
+/// A short number box (sizes, ports, screen width).
+fn small_input<'a>(
+    p: Palette,
+    placeholder: &'a str,
+    value: &'a str,
+    on_change: impl Fn(String) -> Message + 'a,
+) -> Element<'a, Message> {
+    text_input(placeholder, value)
+        .on_input(on_change)
+        .style(ui_theme::input(p))
+        .padding([7.0, 10.0])
+        .size(13.0)
+        .font(MONO)
+        .align_x(iced::alignment::Horizontal::Right)
+        .width(72.0)
+        .into()
 }
 
-/// A row that opens another page: icon, title, one line of what is there, and ›. The
-/// settings list is made of these, and the main window uses one under each tab.
-fn nav_row(p: Palette, icon: &'static str, title: &'static str, summary: &'static str, msg: Message) -> Element<'static, Message> {
-    button(
-        row![
-            text(icon).size(18.0),
-            column![
-                text(title).size(14.0).color(p.txt),
-                text(summary).size(11.0).color(p.txt3),
-            ]
-            .spacing(2.0)
-            .width(Length::Fill),
-            text("›").size(16.0).color(p.txt3),
-        ]
-        .spacing(12.0)
-        .align_y(Alignment::Center),
+/// A row's title and the grey line under it.
+fn labels<'a>(p: Palette, title: impl Into<String>, sub: impl Into<String>) -> Element<'a, Message> {
+    let sub = sub.into();
+    let mut c = column![text(title.into()).size(13.5).font(BOLD).color(p.txt)]
+        .spacing(2.0)
+        .width(Length::Fill);
+    if !sub.is_empty() {
+        c = c.push(text(sub).size(11.5).color(p.txt3));
+    }
+    c.into()
+}
+
+/// A settings row: title and sub-line on the left, a control on the right.
+fn srow<'a>(
+    p: Palette,
+    title: impl Into<String>,
+    sub: impl Into<String>,
+    right: impl Into<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    container(row![labels(p, title, sub), right.into()].spacing(12.0).align_y(Alignment::Center))
+        .padding([12.0, 14.0])
+        .width(Length::Fill)
+        .into()
+}
+
+/// A settings row with a switch.
+fn tog<'a>(
+    p: Palette,
+    title: impl Into<String>,
+    sub: impl Into<String>,
+    on: bool,
+    f: impl Fn(bool) -> Message + 'a,
+) -> Element<'a, Message> {
+    srow(p, title, sub, toggler(on).on_toggle(f).style(ui_theme::switch(p)).size(22.0))
+}
+
+/// A settings row with a number box and its unit.
+fn num<'a>(
+    p: Palette,
+    title: impl Into<String>,
+    sub: impl Into<String>,
+    buf: &'a str,
+    unit: &'static str,
+    f: impl Fn(String) -> Message + 'a,
+) -> Element<'a, Message> {
+    srow(
+        p,
+        title,
+        sub,
+        row![small_input(p, "", buf, f), text(unit).size(11.5).color(p.txt3).width(34.0)]
+            .spacing(8.0)
+            .align_y(Alignment::Center),
     )
-    .style(ui_theme::ghost(p))
+}
+
+/// A row whose control needs the full width: title above, the control, a hint below.
+fn stacked<'a>(
+    p: Palette,
+    title: impl Into<String>,
+    body: Element<'a, Message>,
+    hint_text: impl Into<String>,
+) -> Element<'a, Message> {
+    let hint_text = hint_text.into();
+    let mut c = column![text(title.into()).size(13.5).font(BOLD).color(p.txt), body].spacing(8.0);
+    if !hint_text.is_empty() {
+        c = c.push(text(hint_text).size(11.5).color(p.txt3));
+    }
+    container(c).padding([12.0, 14.0]).width(Length::Fill).into()
+}
+
+/// A row that opens another page: title, sub-line, its current value, and ›.
+fn nav<'a>(
+    p: Palette,
+    title: impl Into<String>,
+    sub: impl Into<String>,
+    value: Element<'a, Message>,
+    msg: Message,
+) -> Element<'a, Message> {
+    button(
+        row![labels(p, title, sub), value, text("›").size(15.0).color(p.txt3)]
+            .spacing(10.0)
+            .align_y(Alignment::Center),
+    )
+    .style(ui_theme::row_button(p))
     .padding([12.0, 14.0])
     .width(Length::Fill)
     .on_press(msg)
     .into()
 }
 
-/// One line of "At a glance": icon, what it is, and its value. Read-only; clicking it
-/// opens the settings page where it is changed.
-fn info_row(p: Palette, icon: &'static str, label: &'static str, value: String, page: Page) -> Element<'static, Message> {
-    button(
-        row![
-            text(icon).size(14.0).width(Length::Fixed(22.0)),
-            text(label).size(13.0).color(p.txt2).width(Length::Fill),
-            text(value).size(13.0).color(p.txt),
-            text("›").size(14.0).color(p.txt3),
-        ]
-        .spacing(8.0)
-        .align_y(Alignment::Center),
+fn value_text<'a>(p: Palette, s: impl Into<String>) -> Element<'a, Message> {
+    text(s.into()).size(12.5).color(p.txt2).into()
+}
+
+fn mono<'a>(p: Palette, s: String) -> Element<'a, Message> {
+    text(s).size(12.5).font(MONO).color(p.txt).into()
+}
+
+/// Rows in one card, divided by hairlines.
+fn group<'a>(p: Palette, rows: Vec<Element<'a, Message>>) -> Element<'a, Message> {
+    let n = rows.len();
+    let mut col = column![];
+    for (i, r) in rows.into_iter().enumerate() {
+        col = col.push(r);
+        if i + 1 < n {
+            col = col.push(hairline(p));
+        }
+    }
+    container(col).style(move |_| ui_theme::group(p)).width(Length::Fill).into()
+}
+
+fn hairline<'a>(p: Palette) -> Element<'a, Message> {
+    container(Space::new().height(1.0))
+        .width(Length::Fill)
+        .height(1.0)
+        .style(move |_| ui_theme::rule(p.line))
+        .into()
+}
+
+/// A heading over a group ("SHARING").
+fn section(p: Palette, title: &str) -> Element<'static, Message> {
+    container(text(title.to_uppercase()).size(11.0).font(BOLD).color(p.txt3))
+        .padding(Padding { top: 16.0, right: 2.0, bottom: 7.0, left: 2.0 })
+        .into()
+}
+
+fn dot<'a>(c: iced::Color, size: f32) -> Element<'a, Message> {
+    container(Space::new()).width(size).height(size).style(move |_| ui_theme::dot(c)).into()
+}
+
+/// A quiet line with a coloured dot in front.
+fn note<'a>(p: Palette, c: iced::Color, s: impl Into<String>) -> Element<'a, Message> {
+    container(
+        row![dot(c, 7.0), text(s.into()).size(12.0).color(p.txt2).width(Length::Fill)]
+            .spacing(9.0)
+            .align_y(Alignment::Center),
     )
-    .style(ui_theme::ghost(p))
-    .padding([7.0, 8.0])
+    .padding([10.0, 14.0])
     .width(Length::Fill)
-    .on_press(Message::OpenSettings(page))
+    .style(move |_| ui_theme::note(p))
     .into()
+}
+
+/// A full banner above the tabs (B1).
+fn banner<'a>(
+    p: Palette,
+    c: iced::Color,
+    title: impl Into<String>,
+    body: String,
+    actions: Element<'a, Message>,
+) -> Element<'a, Message> {
+    container(
+        column![
+            row![dot(c, 7.0), text(title.into()).size(13.5).font(BOLD).color(p.txt)]
+                .spacing(9.0)
+                .align_y(Alignment::Center),
+            text(body).size(12.0).color(p.txt2),
+            actions,
+        ]
+        .spacing(8.0),
+    )
+    .padding([13.0, 15.0])
+    .width(Length::Fill)
+    .style(move |_| ui_theme::group(p))
+    .into()
+}
+
+/// The one-line form of a banner.
+fn banner_line<'a>(p: Palette, c: iced::Color, title: String, action: Option<(&'static str, Message)>) -> Element<'a, Message> {
+    let mut r = row![dot(c, 7.0), text(title).size(12.0).color(p.txt2).width(Length::Fill)]
+        .spacing(9.0)
+        .align_y(Alignment::Center);
+    if let Some((label, msg)) = action {
+        r = r.push(btn_link(p, label, msg));
+    }
+    container(r).padding([4.0, 14.0]).width(Length::Fill).style(move |_| ui_theme::group(p)).into()
+}
+
+/// A centred dialog over a dimmed window. The dim layer swallows clicks, so the page
+/// behind cannot be used while the question is open.
+fn dialog<'a>(p: Palette, body: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
+    mouse_area(
+        container(container(body).style(move |_| ui_theme::floating(p)).padding(20.0).max_width(440.0))
+            .center(Length::Fill)
+            .padding(20.0)
+            .style(|_| ui_theme::scrim()),
+    )
+    .on_press(Message::Tick)
+    .into()
+}
+
+/// A numbered step of the first-run setup.
+fn step<'a>(p: Palette, n: u8, title: &'static str, body: Element<'a, Message>) -> Element<'a, Message> {
+    row![
+        container(text(n.to_string()).size(11.5).font(BOLD).color(p.txt2))
+            .center(Length::Fixed(22.0))
+            .style(move |_| ui_theme::fill(p.surf2, 999.0)),
+        column![text(title).size(13.5).font(BOLD).color(p.txt), body].spacing(10.0).width(Length::Fill),
+    ]
+    .spacing(12.0)
+    .into()
+}
+
+/// One computer in the status card: its screen, name, size, and — on the one with the
+/// mouse right now — "● Has the mouse".
+fn machine_tile(p: Palette, name: &str, detail: &str, active: bool, present: bool) -> Element<'static, Message> {
+    let name_colour = if present { p.txt } else { p.txt2 };
+    container(
+        column![
+            row![
+                container(Space::new()).width(16.0).height(11.0).style(move |_| ui_theme::screen_glyph(name_colour)),
+                text(name.to_string()).size(14.0).font(BOLD).color(name_colour).width(Length::Fill),
+            ]
+            .spacing(9.0)
+            .align_y(Alignment::Center),
+            text(detail.to_string()).size(11.5).color(p.txt3),
+            // Both tiles get the line, blank on the other one, so they stay the same height
+            // as control moves back and forth.
+            text(if active { "• Has the mouse" } else { "\u{a0}" }).size(11.5).font(BOLD).color(p.accent),
+        ]
+        .spacing(4.0),
+    )
+    .style(move |_| ui_theme::tile(p, active, present))
+    .padding([11.0, 13.0])
+    .width(Length::Fill)
+    .into()
+}
+
+/// The kind of a history entry as a small badge.
+fn kind_badge<'a>(p: Palette, m: &mouse_clipboard::ClipMeta) -> Element<'a, Message> {
+    let kind = if m.is_files {
+        "FILE"
+    } else if m.is_image {
+        "IMG"
+    } else {
+        "TXT"
+    };
+    container(text(kind).size(10.0).font(MONO).color(p.txt2))
+        .padding([4.0, 6.0])
+        .style(move |_| ui_theme::chip(p))
+        .into()
+}
+
+/// A hotkey as key caps: "ctrl+win+alt+esc" → [Ctrl] [Win] [Alt] [Esc].
+fn keycaps<'a>(p: Palette, combo: &str) -> Element<'a, Message> {
+    if combo.trim().is_empty() {
+        return text("None").size(12.5).color(p.txt3).into();
+    }
+    let mut r = row![].spacing(5.0);
+    for part in combo.split('+').filter(|s| !s.trim().is_empty()) {
+        r = r.push(
+            container(text(key_label(part)).size(12.0).font(MONO).color(p.txt2))
+                .padding([3.0, 8.0])
+                .style(move |_| ui_theme::keycap(p)),
+        );
+    }
+    r.into()
+}
+
+/// A segmented choice: (label, picked, message) for each option.
+fn segmented<'a>(p: Palette, opts: Vec<(String, bool, Message)>) -> Element<'a, Message> {
+    let mut r = row![].spacing(2.0);
+    for (label, active, msg) in opts {
+        r = r.push(
+            button(text(label).size(12.0).font(if active { BOLD } else { iced::Font::DEFAULT }))
+                .style(ui_theme::segment(p, active))
+                .padding([5.0, 10.0])
+                .on_press(msg),
+        );
+    }
+    container(r).padding(3.0).style(move |_| ui_theme::seg_track(p)).into()
+}
+
+fn chip_toggle<'a>(p: Palette, label: &'static str, on: bool, msg: Message) -> Element<'a, Message> {
+    button(text(if on { format!("✓ {label}") } else { label.to_string() }).size(12.0).font(BOLD))
+        .style(ui_theme::chip_toggle(p, on))
+        .padding([4.0, 10.0])
+        .on_press(msg)
+        .into()
+}
+
+/// The code being typed, drawn as one box per digit. An invisible input on top takes the
+/// typing, so the boxes behave like one field (paste works too).
+fn code_boxes<'a>(
+    p: Palette,
+    value: &'a str,
+    n: usize,
+    on_input: impl Fn(String) -> Message + 'a,
+    on_submit: Message,
+) -> Element<'a, Message> {
+    let typed: Vec<char> = value.chars().collect();
+    let mut boxes = row![].spacing(7.0);
+    for i in 0..n {
+        let ch = typed.get(i).map(|c| c.to_string()).unwrap_or_default();
+        let next = i == typed.len().min(n - 1) && typed.len() < n;
+        boxes = boxes.push(
+            container(text(ch).size(18.0).font(MONO).color(p.txt))
+                .width(36.0)
+                .height(42.0)
+                .align_x(Alignment::Center)
+                .align_y(Alignment::Center)
+                .style(move |_| ui_theme::code_box(p, next)),
+        );
+    }
+    let width = n as f32 * 36.0 + (n.saturating_sub(1)) as f32 * 7.0;
+    stack![
+        boxes,
+        text_input("", value)
+            .on_input(on_input)
+            .on_submit(on_submit)
+            .style(ui_theme::input_invisible())
+            .padding([11.0, 4.0])
+            .size(18.0)
+            .width(width),
+    ]
+    .into()
+}
+
+fn btn_primary<'a>(p: Palette, label: impl Into<String>, msg: Option<Message>) -> Element<'a, Message> {
+    button(text(label.into()).size(13.0).font(BOLD))
+        .style(ui_theme::primary(p))
+        .padding([8.0, 15.0])
+        .on_press_maybe(msg)
+        .into()
+}
+
+fn btn_secondary<'a>(p: Palette, label: impl Into<String>, msg: Option<Message>) -> Element<'a, Message> {
+    button(text(label.into()).size(13.0).font(BOLD))
+        .style(ui_theme::secondary(p))
+        .padding([8.0, 14.0])
+        .on_press_maybe(msg)
+        .into()
+}
+
+fn btn_danger<'a>(p: Palette, label: impl Into<String>, msg: Option<Message>) -> Element<'a, Message> {
+    button(text(label.into()).size(13.0).font(BOLD))
+        .style(ui_theme::danger(p))
+        .padding([8.0, 15.0])
+        .on_press_maybe(msg)
+        .into()
+}
+
+fn btn_link<'a>(p: Palette, label: impl Into<String>, msg: Message) -> Element<'a, Message> {
+    button(text(label.into()).size(12.5).font(BOLD))
+        .style(ui_theme::link(p))
+        .padding([6.0, 4.0])
+        .on_press(msg)
+        .into()
+}
+
+/// This computer's addresses another computer could type, without the 0.0.0.0 wildcard
+/// the listen-host list starts with.
+fn own_addresses() -> Vec<String> {
+    mouse_core::discover::listen_candidates().into_iter().filter(|a| a != "0.0.0.0").collect()
+}
+
+/// "on the left", "above": where the other computer sits, as a phrase.
+fn side_phrase(e: Edge) -> &'static str {
+    match e {
+        Edge::Left => "on the left",
+        Edge::Right => "on the right",
+        Edge::Top => "above",
+        Edge::Bottom => "below",
+    }
+}
+
+/// The saved profiles with their settings.
+fn load_profiles() -> Vec<(String, Config)> {
+    Config::list_profiles()
+        .into_iter()
+        .filter_map(|n| Config::load_profile(&n).ok().map(|c| (n, c)))
+        .collect()
+}
+
+/// Whether two configs hold the same settings — how a profile is known to be the one in use.
+fn same_settings(a: &Config, b: &Config) -> bool {
+    serde_json::to_value(a).ok() == serde_json::to_value(b).ok()
+}
+
+/// A profile in one line: who it talks to, the side, the way back.
+fn profile_summary(c: &Config) -> String {
+    let who = match c.role {
+        Role::Server => "shares its mouse".to_string(),
+        Role::Client if !c.server_host.trim().is_empty() => c.server_host.trim().to_string(),
+        Role::Client => "is controlled".to_string(),
+    };
+    let side = match c.role {
+        Role::Server => c.exit_edge,
+        Role::Client => c.entry_edge,
+    };
+    format!("{who} · {} edge · {}", side.label(), key_label(&c.lock_hotkey))
+}
+
+/// A key the recorder heard, as the hotkey parser spells it. `None` for a modifier on its
+/// own — the recorder waits for the key that goes with it.
+fn key_token(key: &iced::keyboard::Key) -> Option<String> {
+    use iced::keyboard::key::Named as N;
+    use iced::keyboard::Key;
+    match key {
+        Key::Named(n) => {
+            let s = match n {
+                N::ScrollLock => "scroll_lock",
+                N::Pause => "pause",
+                N::PrintScreen => "print_screen",
+                N::Insert => "insert",
+                N::Delete => "delete",
+                N::Home => "home",
+                N::End => "end",
+                N::PageUp => "page_up",
+                N::PageDown => "page_down",
+                N::CapsLock => "caps_lock",
+                N::NumLock => "num_lock",
+                N::Escape => "esc",
+                N::Enter => "enter",
+                N::Tab => "tab",
+                N::Space => "space",
+                N::Backspace => "backspace",
+                N::ArrowUp => "up",
+                N::ArrowDown => "down",
+                N::ArrowLeft => "left",
+                N::ArrowRight => "right",
+                N::ContextMenu => "menu",
+                N::F1 => "f1",
+                N::F2 => "f2",
+                N::F3 => "f3",
+                N::F4 => "f4",
+                N::F5 => "f5",
+                N::F6 => "f6",
+                N::F7 => "f7",
+                N::F8 => "f8",
+                N::F9 => "f9",
+                N::F10 => "f10",
+                N::F11 => "f11",
+                N::F12 => "f12",
+                N::F13 => "f13",
+                N::F14 => "f14",
+                N::F15 => "f15",
+                N::F16 => "f16",
+                N::F17 => "f17",
+                N::F18 => "f18",
+                N::F19 => "f19",
+                N::F20 => "f20",
+                N::F21 => "f21",
+                N::F22 => "f22",
+                N::F23 => "f23",
+                N::F24 => "f24",
+                _ => return None,
+            };
+            Some(s.to_string())
+        }
+        Key::Character(c) => {
+            let mut it = c.chars();
+            let ch = it.next()?;
+            it.next().is_none().then(|| ch.to_lowercase().to_string())
+        }
+        Key::Unidentified => None,
+    }
 }
 
 /// A hotkey as people say it: "scroll_lock" reads as "Scroll Lock", "ctrl+alt+f12" as
@@ -3641,117 +4618,6 @@ fn key_label(key: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join(" + ")
-}
-
-/// A sub-heading inside a settings page ("Sharing", "Ports", …).
-fn section(p: Palette, title: &str) -> Element<'_, Message> {
-    text(title.to_string()).size(12.5).color(p.accent).into()
-}
-
-fn labeled<'a>(p: Palette, label: &'a str, field: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
-    column![field_label(p, label), field.into()].spacing(6.0).into()
-}
-
-fn card<'a>(p: Palette, body: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
-    container(body)
-        .style(move |_| ui_theme::card(p))
-        .padding(18.0)
-        .width(Length::Fill)
-        .into()
-}
-
-fn seg_button(p: Palette, label: &str, active: bool, msg: Message) -> Element<'_, Message> {
-    button(text(label.to_string()).size(13.0).color(if active { p.accent_ink } else { p.txt2 }))
-        .style(ui_theme::segment(p, active))
-        .padding([9.0, 16.0])
-        .width(Length::Fill)
-        .on_press(msg)
-        .into()
-}
-
-fn toggle_row<'a>(
-    p: Palette,
-    title: &'a str,
-    desc: &'a str,
-    value: bool,
-    on_toggle: impl Fn(bool) -> Message + 'a,
-) -> Element<'a, Message> {
-    // The label column takes the free space and the switch keeps its own, so a long
-    // description wraps inside its column instead of growing the row until it runs over
-    // the control beside it. A spacer cannot do this: it only pushes, and what is needed
-    // is for the text to be *allowed to be narrow*.
-    let labels = column![
-        text(title.to_string()).size(14.0).color(p.txt),
-        text(desc.to_string()).size(11.0).color(p.txt3),
-    ]
-    .spacing(2.0)
-    .width(Length::Fill);
-    container(
-        row![
-            labels,
-            toggler(value).on_toggle(on_toggle).style(ui_theme::switch(p)).size(24.0),
-        ]
-        .spacing(12.0)
-        .align_y(Alignment::Center),
-    )
-    .style(move |_| ui_theme::well(p))
-    .padding([13.0, 15.0])
-    .width(Length::Fill)
-    .into()
-}
-
-/// A small +-shaped edge picker: click the edge that faces the other machine.
-fn edge_picker(p: Palette, current: Edge, on_pick: impl Fn(Edge) -> Message + Copy + 'static) -> Element<'static, Message> {
-    let seg = |edge: Edge, w: f32, h: f32| {
-        button(Space::new().width(w).height(h))
-            .style(ui_theme::edge_seg(p, current == edge))
-            .padding(0.0)
-            .on_press(on_pick(edge))
-    };
-    let spacer = || Space::new().width(Length::Fill).height(Length::Fill);
-    let stage = column![
-        row![spacer(), seg(Edge::Top, 60.0, 8.0), spacer()].align_y(Alignment::Center),
-        row![
-            seg(Edge::Left, 8.0, 40.0),
-            container(text("screen").size(11.0).color(p.txt3)).center_x(Length::Fill),
-            seg(Edge::Right, 8.0, 40.0),
-        ]
-        .align_y(Alignment::Center)
-        .spacing(6.0),
-        row![spacer(), seg(Edge::Bottom, 60.0, 8.0), spacer()].align_y(Alignment::Center),
-    ]
-    .spacing(6.0);
-
-    container(stage)
-        .style(move |_| ui_theme::well(p))
-        .padding(14.0)
-        .width(Length::Fill)
-        .into()
-}
-
-/// One machine in the hero: name on the left, resolution on the right, highlighted when
-/// that machine currently owns the input.
-/// One computer in the top card: an icon, its name, its screen, and — on the one that
-/// has the mouse and keyboard right now — a "has the mouse" mark.
-fn machine_chip(p: Palette, icon: &str, name: &str, detail: &str, active: bool) -> Element<'static, Message> {
-    let col = column![
-        row![
-            text(icon.to_string()).size(16.0),
-            text(name.to_string()).size(14.0).color(p.txt).width(Length::Fill),
-        ]
-        .spacing(8.0)
-        .align_y(Alignment::Center),
-        text(detail.to_string()).size(11.0).color(p.txt3),
-    ]
-    .spacing(4.0)
-    // Both tiles get the line, blank on the other one, so they stay the same height as
-    // control moves back and forth.
-    .push(text(if active { "● has the mouse" } else { "\u{a0}" }).size(11.0).color(p.accent));
-    container(col)
-        .style(move |_| if active { ui_theme::well_active(p) } else { ui_theme::well(p) })
-        .padding([11.0, 13.0])
-        .width(Length::Fill)
-        .into()
 }
 
 /// Which machine currently holds the mouse and keyboard — `true` for this one.
@@ -3780,21 +4646,6 @@ fn control_is_local(role: Role, snap: Option<&StatusSnapshot>) -> bool {
 
 // ---------- status text helpers ----------
 
-fn status_pill(p: Palette, running: bool, snap: Option<&StatusSnapshot>) -> (iced::Color, iced::Color, String) {
-    match (running, snap) {
-        (false, _) => (ui_theme::alpha(p.txt3, 0.18), p.txt3, "stopped".into()),
-        (true, Some(s)) if s.connected => (
-            ui_theme::alpha(p.good, 0.16),
-            p.good,
-            format!("connected — {} ({}×{})", s.peer, s.peer_w, s.peer_h),
-        ),
-        (true, Some(StatusSnapshot { refused: Some(why), .. })) => {
-            (ui_theme::alpha(p.danger, 0.16), p.danger, format!("refused — {why}"))
-        }
-        (true, _) => (ui_theme::alpha(p.warn, 0.16), p.warn, "waiting for peer…".into()),
-    }
-}
-
 /// Does this role decide where the pointer *leaves* from?
 ///
 /// Only the server. It watches its own edges and hands control over when the pointer
@@ -3804,33 +4655,6 @@ fn status_pill(p: Palette, running: bool, snap: Option<&StatusSnapshot>) -> (ice
 /// which is how it could contradict a pair that was set up correctly.
 fn shows_exit_edge(role: Role) -> bool {
     role == Role::Server
-}
-
-/// What `entry_edge` means to this role, in the terms that role experiences.
-///
-/// The same setting, honestly, does two different jobs. On the server it is where the
-/// *other* screen picks the pointer up. On the client it is both where the pointer
-/// arrives and the edge to push back against to send control home — which is the only
-/// thing about it the person at the client keyboard actually does.
-fn entry_edge_label(role: Role) -> &'static str {
-    match role {
-        Role::Server => "Entry edge — the pointer appears here on the other screen",
-        Role::Client => "Entry edge — where the pointer arrives, and where to push back",
-    }
-}
-
-fn entry_edge_hint(role: Role) -> &'static str {
-    match role {
-        Role::Server => {
-            "Set this to the edge facing this machine, so the two screens sit side by \
-             side rather than overlapping."
-        }
-        Role::Client => {
-            "Push the pointer back into this edge to hand control home. Where it leaves \
-             from is decided on the other machine, which is why there is no exit edge \
-             here."
-        }
-    }
 }
 
 /// Compact hover text for the tray icon: a mirror of the header status.
@@ -3858,19 +4682,6 @@ fn tray_tooltip(running: bool, snap: Option<&StatusSnapshot>, waiting: usize) ->
         }
         (true, Some(StatusSnapshot { refused: Some(why), .. })) => format!("mouse-rs — refused: {why}"),
         (true, _) => "mouse-rs — waiting for peer".to_owned(),
-    }
-}
-
-fn hero_line(running: bool, role: Role, snap: Option<&StatusSnapshot>) -> String {
-    match snap {
-        Some(s) if s.connected && s.engaged => match role {
-            Role::Server => format!("→ controlling {}", s.peer),
-            Role::Client => format!("← controlled by {}", s.peer),
-        },
-        Some(s) if s.connected => format!("connected to {}", s.peer),
-        Some(StatusSnapshot { refused: Some(why), .. }) if running => format!("refused: {why}"),
-        _ if running => "waiting for peer…".into(),
-        _ => "stopped".into(),
     }
 }
 
@@ -3937,7 +4748,11 @@ fn pair_error_text(why: &str) -> String {
 
 /// Open the control panel, blocking until the window closes.
 pub fn launch(cfg: Config) -> anyhow::Result<()> {
-    iced::application(move || App::new(cfg.clone()), App::update, App::view)
+    iced::application(
+        move || (App::new(cfg.clone()), iced::system::theme().map(Message::SystemTheme)),
+        App::update,
+        App::view,
+    )
         .title("mouse-rs")
         .subscription(App::subscription)
         .theme(App::theme)
@@ -3961,8 +4776,8 @@ pub fn launch(cfg: Config) -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
-    /// R30, as the owner confirmed it on 2026-10-14: the categories, their order and
-    /// their groups. Every page is listed exactly once.
+    /// R40, from the owner's design (28 Oct; R30 had Startup under Everyday): the
+    /// categories, their order and their groups. Every page is listed exactly once.
     #[test]
     fn settings_categories_are_in_the_agreed_order() {
         let order: Vec<&str> = Page::CATEGORIES.iter().flat_map(|(_, pages)| pages.iter().map(|p| p.title())).collect();
@@ -3971,8 +4786,8 @@ mod tests {
             [
                 "Clipboard",
                 "Screens & edges",
-                "Startup",
                 "Keyboard & hotkeys",
+                "Startup",
                 "Connection",
                 "Security & pairing",
                 "Appearance",
@@ -3981,7 +4796,7 @@ mod tests {
             ]
         );
         let groups: Vec<&str> = Page::CATEGORIES.iter().map(|(g, _)| *g).collect();
-        assert_eq!(groups, ["EVERYDAY", "SETUP", "HELP & ADVANCED"]);
+        assert_eq!(groups, ["EVERYDAY", "THIS COMPUTER", "APP"]);
         assert!(order.iter().all(|t| !Page::Index.title().eq(*t)), "the index is not a category");
     }
 
@@ -4165,22 +4980,45 @@ mod layout_role_tests {
 
     /// Each role is told what the setting does *for it*. The client's job is pushing
     /// back to go home, which is the wording agreed for R16.
+    /// R40: the six themes, saved by key; anything unknown opens as Amber.
     #[test]
-    fn each_role_gets_wording_that_describes_its_own_job() {
-        assert!(
-            entry_edge_hint(Role::Client).contains("push the pointer back")
-                || entry_edge_hint(Role::Client).contains("Push the pointer back"),
-            "the client's entry edge is the one it pushes back into: {}",
-            entry_edge_hint(Role::Client)
-        );
-        assert!(
-            entry_edge_hint(Role::Client).contains("no exit edge"),
-            "and it should say why the other control is absent, not just omit it"
-        );
-        assert_ne!(
-            entry_edge_label(Role::Server),
-            entry_edge_label(Role::Client),
-            "the same setting does two different jobs and should not claim otherwise"
-        );
+    fn themes_round_trip_through_their_config_key() {
+        for t in Theme6::ALL {
+            assert_eq!(Theme6::from_key(t.key()), t);
+        }
+        assert_eq!(Theme6::from_key("midnight"), Theme6::Ember, "an old build's theme falls back");
+        assert_eq!(Theme6::from_key(&Config::default().theme), Theme6::Ember, "Amber is the default");
+        // The mixed themes have a dark top over a light body; the rest are one tone.
+        for t in [Theme6::Plum, Theme6::Forest, Theme6::Slate] {
+            assert!(t.hero().dark && !t.palette().dark, "{t:?}");
+        }
+        for t in [Theme6::Graphite, Theme6::Ember, Theme6::Porcelain] {
+            assert_eq!(t.hero().bg, t.palette().bg, "{t:?}");
+        }
+    }
+
+    /// Recorded hotkeys are spelled the way the hotkey parser reads them.
+    #[test]
+    fn recorded_keys_use_the_parsers_spelling() {
+        use iced::keyboard::{key::Named, Key};
+        assert_eq!(key_token(&Key::Named(Named::ScrollLock)).as_deref(), Some("scroll_lock"));
+        assert_eq!(key_token(&Key::Named(Named::Escape)).as_deref(), Some("esc"));
+        assert_eq!(key_token(&Key::Named(Named::F12)).as_deref(), Some("f12"));
+        assert_eq!(key_token(&Key::Character("K".into())).as_deref(), Some("k"));
+        assert_eq!(key_token(&Key::Named(Named::Control)), None, "a modifier alone waits for its key");
+        for tok in ["scroll_lock", "esc", "f12", "page_up", "print_screen"] {
+            assert!(mouse_input::NamedKey::from_name(tok).is_some(), "{tok} must parse");
+        }
+    }
+
+    /// A profile is "Active" when it holds exactly the settings in use.
+    #[test]
+    fn the_active_profile_is_the_one_with_the_same_settings() {
+        let a = Config::default();
+        let mut b = a.clone();
+        assert!(same_settings(&a, &b));
+        b.exit_edge = b.exit_edge.opposite();
+        assert!(!same_settings(&a, &b));
+        assert!(profile_summary(&a).contains("Scroll Lock"));
     }
 }

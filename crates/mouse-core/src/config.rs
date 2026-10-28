@@ -159,6 +159,10 @@ fn default_stream_min_mb() -> u32 {
     64
 }
 
+fn default_theme() -> String {
+    "ember".into()
+}
+
 fn default_stream_wait_secs() -> u32 {
     180
 }
@@ -442,6 +446,17 @@ pub struct Config {
 
     #[serde(default = "default_edge_threshold")]
     pub edge_threshold_px: i32,
+
+    /// The panel's colour theme, by key (`ember`, `graphite`, `plum`, `forest`, `slate`,
+    /// `porcelain`). An unknown key falls back to the default, so a file from a build
+    /// with other themes still opens.
+    #[serde(default = "default_theme")]
+    pub theme: String,
+    /// Follow the system's light/dark setting instead of `theme` (R40).
+    pub theme_follow_system: bool,
+    /// The other computer's name from the last connection, so the panel can name it
+    /// while sharing is off. Display only.
+    pub peer_name: String,
     // `warp_threshold_px` (the Python app's "return distance") was dropped on 2026-10-14
     // by the owner's decision: the Rust engine never read it. Old config files that still
     // carry the key load fine, because unknown keys are ignored.
@@ -513,6 +528,9 @@ impl Default for Config {
             screen_width: 1920,
             screen_height: 1080,
             edge_threshold_px: default_edge_threshold(),
+            theme: default_theme(),
+            theme_follow_system: false,
+            peer_name: String::new(),
         }
     }
 }

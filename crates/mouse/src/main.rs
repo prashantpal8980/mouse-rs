@@ -114,6 +114,13 @@ fn main() -> anyhow::Result<()> {
         ),
         Some("gui") | None => launch_gui(cfg),
 
+        // --- the elevated helper behind "Start at login as administrator" (Windows) ---
+        // Started by the panel through Windows' consent prompt; makes the change and exits.
+        #[cfg(windows)]
+        Some("autostart-elevated-on") => autostart::enable_elevated(),
+        #[cfg(windows)]
+        Some("autostart-elevated-off") => autostart::disable_elevated(),
+
         // --- the login-screen instance and its setup (Linux only) ---
         #[cfg(target_os = "linux")]
         Some("greeter") => greeter::run(),

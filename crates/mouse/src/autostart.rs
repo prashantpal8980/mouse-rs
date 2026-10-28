@@ -99,6 +99,11 @@ pub fn relaunch_elevated() -> Result<bool> {
     anyhow::bail!("running as administrator is a Windows-only concept")
 }
 
+#[cfg(unix)]
+pub fn set_elevated_via_prompt(_on: bool) -> Result<bool> {
+    anyhow::bail!("elevated autostart is a Windows-only setting")
+}
+
 // --------------------------------------------------------------------- Windows
 
 #[cfg(windows)]
@@ -222,6 +227,58 @@ mod win {
         }
     }
 
+    /// Turn the elevated login task on or off from a normal-privilege window: Windows shows
+    /// its own "Do you want to allow this app to make changes?" prompt, and on Yes a short
+    /// elevated copy of mouse-rs (`autostart-elevated-on` / `-off`) makes the change and
+    /// exits. This window keeps running as it was.
+    ///
+    /// Returns `Ok(false)` when the prompt was declined.
+    pub fn set_elevated_via_prompt(on: bool) -> Result<bool> {
+        use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_CANCELLED};
+        use windows_sys::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject};
+        use windows_sys::Win32::UI::Shell::{
+            ShellExecuteExW, SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW,
+        };
+        use windows_sys::Win32::UI::WindowsAndMessaging::SW_HIDE;
+
+        let exe = super::exe_path()?;
+        let verb = wide("runas");
+        let file = wide(&exe.to_string_lossy());
+        let params = wide(if on { "autostart-elevated-on" } else { "autostart-elevated-off" });
+        // SAFETY: a zeroed SHELLEXECUTEINFOW is valid (all pointers null); the strings are
+        // NUL-terminated wide buffers that outlive the call, and the process handle is
+        // closed below.
+        let mut info: SHELLEXECUTEINFOW = unsafe { std::mem::zeroed() };
+        info.cbSize = std::mem::size_of::<SHELLEXECUTEINFOW>() as u32;
+        info.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC;
+        info.lpVerb = verb.as_ptr();
+        info.lpFile = file.as_ptr();
+        info.lpParameters = params.as_ptr();
+        info.nShow = SW_HIDE;
+        let ok = unsafe { ShellExecuteExW(&mut info) };
+        if ok == 0 {
+            let err = unsafe { GetLastError() };
+            if err == ERROR_CANCELLED {
+                return Ok(false);
+            }
+            anyhow::bail!("could not ask Windows for administrator rights (code {err})");
+        }
+        if info.hProcess.is_null() {
+            return Ok(true);
+        }
+        // The helper only runs schtasks; a minute is far more than it needs.
+        let mut code: u32 = 1;
+        unsafe {
+            WaitForSingleObject(info.hProcess, 60_000);
+            GetExitCodeProcess(info.hProcess, &mut code);
+            CloseHandle(info.hProcess);
+        }
+        if code != 0 {
+            anyhow::bail!("the administrator step did not finish (exit code {code})");
+        }
+        Ok(true)
+    }
+
     /// Name of the scheduled task used for the elevated variant.
     const TASK: &str = "mouse-rs (elevated)";
 
@@ -303,7 +360,7 @@ mod win {
 #[cfg(windows)]
 pub use win::{
     disable, disable_elevated, elevated_is_enabled, enable, enable_elevated, is_enabled,
-    relaunch_elevated,
+    relaunch_elevated, set_elevated_via_prompt,
 };
 
 #[cfg(test)]

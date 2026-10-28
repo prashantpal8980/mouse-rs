@@ -2928,6 +2928,34 @@ fn restrict_permissions(path: &std::path::Path) {
 mod persist_tests {
     use super::*;
 
+    /// B45: Clear has to reach the saved file. A cleared history that is written and read
+    /// back holds only what was pinned.
+    #[test]
+    fn a_cleared_history_stays_cleared_after_a_restart() {
+        let dir = std::env::temp_dir().join(format!("mouse-rs-persist-clear-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("history.json");
+        let cache = cache::BlobCache::new(dir.join("cache")).unwrap();
+
+        let h = ClipboardHistory::new();
+        h.record_text(Arc::new("old one".into()), false);
+        let keep = h.record_text(Arc::new("pinned one".into()), false).unwrap();
+        h.toggle_pin(keep);
+        h.record_text(Arc::new("old two".into()), true);
+        h.save(&path, Some(&cache), true).unwrap();
+
+        h.clear();
+        h.save(&path, Some(&cache), true).unwrap();
+
+        let restored = ClipboardHistory::new();
+        restored.load(&path, Some(&cache));
+        let metas = restored.meta();
+        assert_eq!(metas.len(), 1, "only the pinned entry survives Clear");
+        assert!(metas[0].pinned);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A restart used to lose an in-progress file transfer entirely — the entry went,
     /// and the partly-downloaded files stayed on disk with nothing referencing them.
     /// Unrecoverable *and* still taking the space. File entries are therefore written

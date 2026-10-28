@@ -413,11 +413,14 @@ impl EngineHandle {
 
     /// Pin or unpin an entry. Returns the new state.
     pub fn clipboard_toggle_pin(&self, id: u64) -> Option<bool> {
-        self.clip_history.toggle_pin(id)
+        let r = self.clip_history.toggle_pin(id);
+        self.save_history();
+        r
     }
 
     pub fn clipboard_remove(&self, id: u64) {
         self.clip_history.remove(id);
+        self.save_history();
     }
 
     /// Measured bulk throughput, so the panel can say what the quick-send rule is
@@ -426,9 +429,23 @@ impl EngineHandle {
         self.health.throughput_bps()
     }
 
-    /// Drop every entry the user has not pinned.
+    /// Drop every entry the user has not pinned, and write that to disk at once.
     pub fn clipboard_clear(&self) {
         self.clip_history.clear();
+        self.save_history();
+    }
+
+    /// Write the clipboard history file now.
+    ///
+    /// It used to be written only when the engine was dropped on a clean quit. In practice
+    /// the app is stopped by reboots, the Windows updater and restarts, none of which run
+    /// that, so the file froze: a cleared history came back at every launch (28 Oct, B45).
+    /// Now Clear, Remove, Pin and a periodic check all write it.
+    pub fn save_history(&self) {
+        let cache = mouse_clipboard::cache::BlobCache::new(self.cache_root()).ok();
+        if let Err(e) = self.clip_history.save(&history_path(), cache.as_ref(), self.persist) {
+            tracing::warn!("could not save clipboard history: {e}");
+        }
     }
 }
 
@@ -438,19 +455,7 @@ impl Drop for EngineHandle {
         // Written on the way out rather than on every copy: this is clipboard content,
         // and rewriting it per keystroke would both cost I/O and widen the window in
         // which a copied password sits in a file.
-        {
-            let cache = mouse_clipboard::cache::BlobCache::new(if self.cache_dir.trim().is_empty() {
-                mouse_clipboard::cache::BlobCache::default_root()
-            } else {
-                std::path::PathBuf::from(&self.cache_dir)
-            })
-            .ok();
-            if let Err(e) =
-                self.clip_history.save(&history_path(), cache.as_ref(), self.persist)
-            {
-                tracing::warn!("could not save clipboard history: {e}");
-            }
-        }
+        self.save_history();
         self.cancel.cancel();
         if let Some(t) = self.thread.take() {
             // The engine's own teardown is bounded (≤ ~2s), so this join is bounded too.

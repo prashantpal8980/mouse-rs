@@ -591,6 +591,29 @@ out and every large item went inline. It now dials the address the input link co
 
 ## Build and release fragility
 
+### B45 — a cleared clipboard history came back at every start (28 Oct 2026) — **fixed in code**
+The owner cleared the history several times, yet old file entries kept reappearing on the laptop. Measured: the
+history file (`~/.mouse_share/history.json`) was written only when the engine was dropped on a clean Quit/Stop, and
+in October the app was never stopped that way — every stop was a reboot, the Windows updater or a restart command.
+Kali's file was last written 25 Oct; every launch since logged `clipboard history restored count=25` (the laptop,
+`count=2`) and no log on either machine contains `clipboard history saved`. Clear, Remove and Pin now write the file
+at once, the panel writes it every 30 s when the list has changed, and Quit writes it before the hard exit.
+File entries are still kept across restarts even with "Keep history after restart" off (by design: they point at
+transfers, not content), but they now follow Clear and the history size like everything else.
+
+### B44 — reinstalling the login-screen copy did not reach the login screen until a reboot (28 Oct 2026) — **fixed in code**
+Found while answering "the login screen didn't ask for my password". The installed copy at `/usr/local/bin/mouse-rs`
+dated from 27 Oct 11:44, before pairing and the password. `greeter-install` (and the panel's toggle, and saving a PIN,
+which re-run it) replaced the file but left the already-running service alone, and that process waits in memory for the
+login screen and then serves it with the old code. `greeter-install` now ends with `systemctl try-restart`.
+Separately, Kali had no PIN set (`connection_pin` empty), so even a current copy had nothing to ask for.
+
+### B43 — a clipboard test fails now and then in a full test run (28 Oct 2026) — open, test-only
+`transfer::tests::a_send_is_counted_only_while_it_runs` failed once in `cargo test --workspace` and passed alone and in
+three further full runs. It compares the process-wide `sending_now()` count before and after, and other tests that send
+files in parallel move the same counter. The product code is not affected. Fix: make the test read a counter it owns,
+or run the counting tests serially.
+
 ### B11 — the served Windows exe was a symlink into the build tree
 **fixed 2026-10-09** · found 2026-10-08
 
