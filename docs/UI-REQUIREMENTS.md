@@ -179,7 +179,11 @@ re-author them.
 - The settings list and these rows share one helper (`nav_row`), so the two parts of the app look
   the same.
 
-### R32 — lock-screen unlock password (agreed in principle 2026-10-15, **PARKED**: functionality first, then a security phase)
+### R32 — lock-screen unlock password (agreed in principle 2026-10-15; **boot login screen built 27 Oct as part of R35**, idle screen lock moved to v1.1 on 29 Oct)
+
+*Status 29 Oct:* the password of R35/R38, with "Ask at the login screen" on by default, is what guards the boot login
+screen; the login-screen copy checks it itself. The idle **screen lock** while someone is logged in is covered only
+when "Ask when someone is logged in here" is on; a separate lock-screen check is v1.1 (the launch plan's cut list).
 
 - The owner's rule: before the other computer's keyboard can type into a login or lock screen, the
   person must give a **mouse-rs unlock password**. It is separate from the OS login password, and
@@ -231,10 +235,25 @@ but "if the person don't want their password because that is annoying for them t
 R32 (lock-screen password) gets the same rule: on by default, and the user can change it or turn it off.
 Timing and try limits are listed in `docs/LAUNCH-PLAN.md`.
 
-### R36 — update notice (agreed 2026-10-26)
+### R36 — update notice (agreed 2026-10-26, built 2026-10-29)
 When a newer version is published, the app says so ("Version x.y is available") and offers **Update**.
 Users won't go looking on a website, so without this nobody updates. The check runs at start and once a day,
 only while mouse-rs is running (R33).
+- **As built:** each release has `latest.json` (version, notes, and per system the file's URL, size, SHA-256) and
+  `latest.json.sig`, an Ed25519 signature made by `scripts/sign-release.sh` with the key in
+  `~/.config/mouse-rs-release/` (never in the repo; losing it means no installed copy accepts an update again).
+  The app trusts nothing unsigned, and a download only if size and hash match.
+- Banner: **Version x.y is available** — Update / Later (Later hides it until the next start). Update downloads next
+  to the program, checks it, swaps it in, then shows **Version x.y is installed — Restart mouse-rs** (owner, 29 Oct: name the app, so nobody thinks the computer
+  restarts). It restarts only the app and goes through
+  the "transfer running" warning (R33) and the new copy waits for the old one to exit.
+- If the folder cannot be written (installed somewhere only an administrator can change): "The update did not
+  install" with **Open download page**. A failed *check* shows nothing; About shows why.
+- About: version, Updates status + **Check now**, "Check for updates automatically" (on by default).
+- On Linux the login-screen copy is not updated by this; the existing "login screen runs an older copy" notice
+  asks to reinstall it.
+- Addresses: `https://github.com/prashantpal8980/mouse-rs-downloads/releases/latest/download/latest.json`.
+  Test builds set `MOUSE_RS_UPDATE_URL` / `MOUSE_RS_VERSION` at build time (`scripts/fake-release.sh`).
 
 ### R37 — no manual network setup (agreed 2026-10-26)
 A user who can't set a static IP must still be able to connect. Two devices on the same Wi-Fi, hotspot or
@@ -309,5 +328,28 @@ permissions… then set the password and only then" can the login screen be type
 - **Windows, Start at login as administrator:** from a normal window it now shows Windows' own Yes/No prompt; on Yes a
   short elevated `mouse-rs autostart-elevated-on|off` makes the change. It no longer refuses with "restart as
   administrator first".
-- Not built: typing into the **Windows** sign-in/lock screen. Windows shows it on a separate secure desktop that a
-  normal or elevated program cannot reach; it needs a SYSTEM service. Owner decision pending.
+- **Parked (owner, 28 Oct): typing into the Windows sign-in/lock screen is not in v1.0.** Windows shows that screen on
+  a separate secure desktop that an ordinary or administrator program cannot reach; only a system service could. That
+  is a different, much larger piece of work with its own security review, and there is no time for it before the
+  1 Nov launch. Linux has it because its login screen can be given input through the kernel's own input device by a
+  system service we already ship (B2, `docs/LOGIN-SCREEN.md`). Revisit after launch.
+
+### R42 — lane port: example, checks, firewall (agreed 2026-10-28)
+Owner: the lane-port box should show an example instead of being blank, must not accept ports like 20, 22, 80, 443
+or one already in use, and a port typed there should get the permission it needs.
+- Placeholder `e.g. 24802`; the line under it says blank shares the main port and that both computers need the same port.
+- Refused, with the reason in red and the old value kept: below 1024 (system services), and on the server a port
+  another program already holds (tried by binding it). The main port and this session's own lane port are fine.
+- Windows server with its own lane port and no firewall rule for mouse-rs: an "Allow…" button adds one inbound rule
+  for the mouse-rs program (all ports, all network profiles) through Windows' Yes/No prompt
+  (`mouse-rs firewall-allow`, elevated). Linux desktops have no firewall on by default, so nothing to add there.
+
+### R43 — screens & edges decided on the computer with the mouse (agreed 2026-10-28)
+Owner: on Kali (client) the side was changed but the crossing did not change; the picture did not say where the pointer
+leaves and appears; no restart prompt was visible; only the server should decide this.
+- The server decides: it leaves through `exit_edge` and places the pointer on the client's `entry_edge`. The client now
+  **learns its way back from where the pointer arrives** (engine, every arrival) and the panel saves it, without a
+  restart. The client's page shows the arrangement read-only: "Set on laptop… change it there".
+- Server picture: both screens have four clickable edge strips — this one's choose where the pointer leaves, the other's where it appears (no longer hidden in Advanced). The lit one is "leaves: right", the other screen sits on
+  that side with its "appears: left" strip lit, an arrow between. Advanced keeps "Appears on … at: Auto…".
+- "N changes wait for a restart" + a Restart button now sit in the footer on every page, Settings included.

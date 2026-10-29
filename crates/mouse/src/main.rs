@@ -17,6 +17,7 @@ use tokio_util::sync::CancellationToken;
 mod logging;
 mod logship;
 mod run;
+mod update;
 
 #[cfg(target_os = "linux")]
 mod greeter;
@@ -33,6 +34,11 @@ mod tray;
 mod notify;
 
 fn main() -> anyhow::Result<()> {
+    // Before anything else: the path has to be read while it still names this file, and
+    // a copy started by an update waits here for the one it replaces to be gone.
+    let _ = update::exe_path();
+    update::after_restart();
+
     let sub = std::env::args().nth(1);
 
     let is_gui = matches!(sub.as_deref(), None | Some("gui"));
@@ -120,6 +126,8 @@ fn main() -> anyhow::Result<()> {
         Some("autostart-elevated-on") => autostart::enable_elevated(),
         #[cfg(windows)]
         Some("autostart-elevated-off") => autostart::disable_elevated(),
+        #[cfg(windows)]
+        Some("firewall-allow") => autostart::firewall_allow(),
 
         // --- the login-screen instance and its setup (Linux only) ---
         #[cfg(target_os = "linux")]

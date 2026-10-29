@@ -45,6 +45,9 @@ pub struct BlobCache {
     /// on the tick loop, so an unreclaimable overrun would otherwise log ten times a
     /// second for as long as the condition lasts.
     over_budget_logged: AtomicU64,
+    /// Files a paste read in full, after which our copy was removed (B35). They have
+    /// arrived even though they are no longer here, however they got here.
+    pasted: std::sync::Mutex<HashSet<String>>,
 }
 
 impl BlobCache {
@@ -52,7 +55,7 @@ impl BlobCache {
     pub fn new(root: PathBuf) -> io::Result<BlobCache> {
         fs::create_dir_all(root.join("blobs"))?;
         fs::create_dir_all(root.join("names"))?;
-        Ok(BlobCache { root, over_budget_logged: AtomicU64::new(0) })
+        Ok(BlobCache { root, over_budget_logged: AtomicU64::new(0), pasted: Default::default() })
     }
 
     /// True at most once a minute, so a standing overrun states itself without flooding.
@@ -277,6 +280,19 @@ impl BlobCache {
         let _ = fs::remove_file(self.blob_path(hash));
         let _ = fs::remove_file(self.part_path(hash));
         let _ = fs::remove_dir_all(self.root.join("names").join(hash));
+    }
+
+    /// A paste has the whole file, so our copy goes; remember that it arrived (B35).
+    pub fn discard_pasted(&self, hash: &str) {
+        self.discard(hash);
+        if let Ok(mut p) = self.pasted.lock() {
+            p.insert(hash.to_string());
+        }
+    }
+
+    /// Whether a paste took this file in full and our copy was then removed.
+    pub fn was_pasted(&self, hash: &str) -> bool {
+        self.pasted.lock().is_ok_and(|p| p.contains(hash))
     }
 
     /// Discard a partial transfer.

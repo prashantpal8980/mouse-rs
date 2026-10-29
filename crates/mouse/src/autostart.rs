@@ -104,6 +104,18 @@ pub fn set_elevated_via_prompt(_on: bool) -> Result<bool> {
     anyhow::bail!("elevated autostart is a Windows-only setting")
 }
 
+/// Windows Firewall only: a stock Linux desktop accepts the connection, so there is no
+/// rule to add.
+#[cfg(unix)]
+pub fn firewall_rule_exists() -> bool {
+    true
+}
+
+#[cfg(unix)]
+pub fn firewall_allow_via_prompt() -> Result<bool> {
+    Ok(true)
+}
+
 // --------------------------------------------------------------------- Windows
 
 #[cfg(windows)]
@@ -234,6 +246,53 @@ mod win {
     ///
     /// Returns `Ok(false)` when the prompt was declined.
     pub fn set_elevated_via_prompt(on: bool) -> Result<bool> {
+        run_elevated(if on { "autostart-elevated-on" } else { "autostart-elevated-off" })
+    }
+
+    /// The firewall rule's name, shared by the check and the helper that adds it.
+    const FIREWALL_RULE: &str = "mouse-rs";
+
+    /// Is there an inbound Windows Firewall rule for this program?
+    pub fn firewall_rule_exists() -> bool {
+        std::process::Command::new("netsh.exe")
+            .args(["advfirewall", "firewall", "show", "rule", &format!("name={FIREWALL_RULE}")])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    /// Ask, through Windows' own prompt, to let mouse-rs through the firewall.
+    pub fn firewall_allow_via_prompt() -> Result<bool> {
+        run_elevated("firewall-allow")
+    }
+
+    /// The elevated half: one inbound rule for this program, on every network profile.
+    /// A rule for the program rather than a port, so the main port, the lane port and
+    /// any port chosen later are all covered by one approval.
+    pub fn firewall_allow() -> Result<()> {
+        let exe = super::exe_path()?;
+        let name = format!("name={FIREWALL_RULE}");
+        // Replaced rather than added beside: an old rule may name an older exe path.
+        let _ = std::process::Command::new("netsh.exe")
+            .args(["advfirewall", "firewall", "delete", "rule", &name])
+            .output();
+        let out = std::process::Command::new("netsh.exe")
+            .args([
+                "advfirewall", "firewall", "add", "rule", &name, "dir=in", "action=allow",
+                &format!("program={}", exe.display()), "enable=yes", "profile=any",
+            ])
+            .output()?;
+        if !out.status.success() {
+            anyhow::bail!("netsh could not add the rule: {}", String::from_utf8_lossy(&out.stdout).trim());
+        }
+        Ok(())
+    }
+
+    /// Run this program elevated with `params`, through Windows' consent prompt, and wait
+    /// for it to finish. `Ok(false)` when the prompt was declined.
+    fn run_elevated(params: &str) -> Result<bool> {
         use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_CANCELLED};
         use windows_sys::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject};
         use windows_sys::Win32::UI::Shell::{
@@ -244,7 +303,7 @@ mod win {
         let exe = super::exe_path()?;
         let verb = wide("runas");
         let file = wide(&exe.to_string_lossy());
-        let params = wide(if on { "autostart-elevated-on" } else { "autostart-elevated-off" });
+        let params = wide(params);
         // SAFETY: a zeroed SHELLEXECUTEINFOW is valid (all pointers null); the strings are
         // NUL-terminated wide buffers that outlive the call, and the process handle is
         // closed below.
@@ -360,7 +419,8 @@ mod win {
 #[cfg(windows)]
 pub use win::{
     disable, disable_elevated, elevated_is_enabled, enable, enable_elevated, is_enabled,
-    relaunch_elevated, set_elevated_via_prompt,
+    firewall_allow, firewall_allow_via_prompt, firewall_rule_exists, relaunch_elevated,
+    set_elevated_via_prompt,
 };
 
 #[cfg(test)]

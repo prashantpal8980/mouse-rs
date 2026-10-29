@@ -22,6 +22,8 @@ struct Inner {
     peer_at_login_screen: AtomicBool,
     /// Why the last connection attempt was refused, in words for the user.
     refused: Mutex<Option<String>>,
+    /// Client: the edge the pointer last arrived on, which the server chose.
+    arrival_edge: Mutex<Option<mouse_core::config::Edge>>,
 }
 
 /// A shared, cheaply-cloned handle to the engine's live status.
@@ -41,6 +43,9 @@ pub struct StatusSnapshot {
     /// Why the last connection attempt was refused (wrong secret, older version…).
     /// Cleared by the next successful connection.
     pub refused: Option<String>,
+    /// Client: the edge of this screen the pointer last arrived on. The server decides it,
+    /// and it is also the edge to push back through.
+    pub arrival_edge: Option<mouse_core::config::Edge>,
 }
 
 impl StatusHandle {
@@ -86,6 +91,7 @@ impl StatusHandle {
             peer_h: self.0.peer_h.load(Ordering::SeqCst),
             peer_at_login_screen: self.0.peer_at_login_screen.load(Ordering::SeqCst),
             refused: self.0.refused.lock().map(|r| r.clone()).unwrap_or_default(),
+            arrival_edge: self.0.arrival_edge.lock().map(|e| *e).unwrap_or_default(),
         }
     }
 }
@@ -165,6 +171,15 @@ pub(crate) fn set_status_disconnected(s: &Option<StatusHandle>) {
 /// Two sinks, deliberately independent: the UI's status handle (absent headless) and
 /// the shared link health the bulk lane paces against (present in both builds, because
 /// a headless session still must not stutter under a transfer).
+/// Client: record the edge the pointer arrived on.
+pub(crate) fn set_status_arrival(s: &Option<StatusHandle>, edge: mouse_core::config::Edge) {
+    if let Some(s) = s {
+        if let Ok(mut e) = s.0.arrival_edge.lock() {
+            *e = Some(edge);
+        }
+    }
+}
+
 pub(crate) fn set_status_engaged(s: &Option<StatusHandle>, engaged: bool) {
     if let Some(s) = s {
         s.set_engaged(engaged);

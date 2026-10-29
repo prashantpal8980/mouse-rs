@@ -498,8 +498,12 @@ attacker could test guesses against offline. A generated 32-character secret mak
 a short hand-typed secret does not. The pairing code (PAKE) removes the typed secret.
 With `tls_enabled: false` (config file only, not in the UI) there is no binding.
 
-### B35 — a copy whose small files are pasted before its big ones is never marked done
-**open** · found 2026-10-15 in the B3 run (laptop log, 11:37–11:38 UTC)
+### B35 — a copy whose small files are pasted before its big ones is never marked done — **fixed in code 2026-10-29**
+**fixed in code** · found 2026-10-15 in the B3 run (laptop log, 11:37–11:38 UTC)
+
+*Fix (29 Oct):* both paste paths now remove our copy with `BlobCache::discard_pasted`, which remembers the file, and
+`has_arrived` counts a remembered file. This covers files that were in the cache before this run, which the 14 Oct
+change (recording arrivals in `arrived`) did not. Test: `files_pasted_from_the_cache_before_the_big_one_still_count_as_arrived`.
 
 A 4.65 GB, 6-file copy from Kali pasted completely into Explorer: every file streamed in full,
 with no restarts. But the entry never logged "every file of this copy has been pasted", so its
@@ -590,6 +594,20 @@ out and every large item went inline. It now dials the address the input link co
 ---
 
 ## Build and release fragility
+
+### B46 — the pointer arrived on Kali but its sleeping monitor stayed dark (29 Oct 2026) — **fixed; owner confirmed 29 Oct** (log 11:37 UTC: "the monitor was asleep; waking it… level=STANDBY")
+Owner: with the new screen lock (xfce4-screensaver, set up 29 Oct), Kali's monitor went off; moving onto Kali from the
+laptop did not wake it, and a physical mouse had to be plugged in. Measured on Kali: input made through XTEST (how
+the client moves the pointer and types) resets the idle timer (idle 16 s → 27 ms) but leaves a DPMS-off monitor off
+(`xset dpms force off`, an XTEST move, still "Monitor is Off"); `xset s reset` does not wake it either. Before the
+lock was working, the screen usually was not DPMS-off when the pointer arrived, so this never showed.
+Fix: the X11 injector checks the DPMS power level at most twice a second while it injects, and asks for "on" when it
+is not (logs "the monitor was asleep; waking it"). Test (needs a display, run by hand):
+`injected_input_wakes_a_sleeping_monitor` — passed on Kali. The login-screen copy uses uinput, a real input device,
+so it was not affected.
+Also seen in the logs: between 13:46 and 14:10 the laptop logged no crossing at all, so some of the dark-screen time
+may have been the pointer not crossing rather than the screen not waking. If the screen stays dark with this fix,
+the laptop log will say which.
 
 ### B45 — a cleared clipboard history came back at every start (28 Oct 2026) — **fixed in code**
 The owner cleared the history several times, yet old file entries kept reappearing on the laptop. Measured: the
@@ -941,7 +959,7 @@ end frame, the paste is recorded. Test:
 - The login screen reads the password from `/etc/mouse-rs/config.json`. The panel refreshes it after a change only
   while login-screen sharing is on, and only if the user accepts the permission prompt.
 
-### B41 — pointer shook back and forth on the cable (27 Oct 2026) — **fixed in code, not yet confirmed by the owner**
+### B41 — pointer shook back and forth on the cable (27 Oct 2026) — **fixed; owner confirmed on the cable 29 Oct** ("no literal jittering… on LAN")
 Owner: "even when i was on ethernet… the mouse go front and back… like it is vibrating". Kali's log, 14:24 UTC: delay
 1 ms, round trip 0.5 ms, yet 3,498 guessed frames for 1,235 real moves in a minute. At a 1 ms delay, playback passed the
 newest move between every two moves and guessed ahead; when the hand slowed, the guess was ahead of it and had to come

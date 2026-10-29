@@ -457,6 +457,8 @@ pub struct Config {
     /// The other computer's name from the last connection, so the panel can name it
     /// while sharing is off. Display only.
     pub peer_name: String,
+    /// Look for a newer version at start and once a day (R36).
+    pub check_updates: bool,
     // `warp_threshold_px` (the Python app's "return distance") was dropped on 2026-10-14
     // by the owner's decision: the Rust engine never read it. Old config files that still
     // carry the key load fine, because unknown keys are ignored.
@@ -531,6 +533,7 @@ impl Default for Config {
             theme: default_theme(),
             theme_follow_system: false,
             peer_name: String::new(),
+            check_updates: true,
         }
     }
 }

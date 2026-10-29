@@ -506,7 +506,7 @@ impl Fs {
             return;
         }
         drop(opens);
-        self.0.cache.discard(&open.hash);
+        self.0.cache.discard_pasted(&open.hash);
         tracing::info!(hash = %open.hash, "pasted copy complete; mouse-rs's own copy removed");
     }
 }

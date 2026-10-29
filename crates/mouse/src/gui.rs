@@ -165,6 +165,19 @@ enum Message {
     ClipImagePxChanged(String),
     BulkEnabledToggled(bool),
     BulkPortChanged(String),
+    /// Windows: add the firewall rule for mouse-rs, through Windows' Yes/No prompt.
+    AllowFirewall,
+    /// About → Check now.
+    UpdateCheckNow,
+    /// The update banner's Update: download, check, swap in.
+    UpdateInstall,
+    /// The update banner's Later: hidden until the next start.
+    UpdateLater,
+    /// "Restart mouse-rs" once the new version is in place.
+    UpdateRestart,
+    UpdatesToggled(bool),
+    /// When updating in place is not possible: the download page.
+    OpenDownloadPage,
     ClipSyncFilesToggled(bool),
     ClipFollowSymlinksToggled(bool),
     ClipImagesAsFileToggled(bool),
@@ -271,6 +284,8 @@ enum Leave {
     Restart,
     /// Windows "Restart as administrator": this copy exits for an elevated one.
     Elevate,
+    /// The new version is in place: this copy exits for it.
+    Update,
 }
 
 /// Settings the running engine read at startup and will not notice changing underneath
@@ -375,6 +390,19 @@ struct App {
     /// When the clipboard history was last checked for saving, and what it held then (a
     /// fingerprint of ids and pins), so it is written only when it has changed.
     history_mark: (std::time::Instant, u64),
+    /// Why the lane port typed was not taken (reserved, or another program has it).
+    bulk_port_error: String,
+    /// Windows: whether the firewall rule for mouse-rs exists. Read at launch and after
+    /// adding it, not per frame: it starts a process.
+    firewall_ok: bool,
+    /// The update check and install, run on threads of their own (R36).
+    update: crate::update::Shared,
+    /// When the last check was started, for the once-a-day repeat.
+    update_checked_at: Option<std::time::Instant>,
+    /// "Later" on the update banner: hidden until the next start.
+    update_dismissed: bool,
+    /// The first check waits a little after launch, so start-up is not slowed by it.
+    opened_at: std::time::Instant,
     // String buffers for numeric fields (so partial edits don't fight the parse).
     server_port_s: String,
     listen_port_s: String,
@@ -577,6 +605,12 @@ impl App {
             feedback_at: None,
             last_peer: None,
             history_mark: (std::time::Instant::now(), 0),
+            bulk_port_error: String::new(),
+            firewall_ok: crate::autostart::firewall_rule_exists(),
+            update: Default::default(),
+            update_checked_at: None,
+            update_dismissed: false,
+            opened_at: std::time::Instant::now(),
             server_port_s: cfg.server_port.to_string(),
             listen_port_s: cfg.listen_port.to_string(),
             screen_w_s: cfg.screen_width.to_string(),
@@ -856,6 +890,16 @@ impl App {
                 Task::none()
             }
             Leave::Elevate => self.update(Message::RelaunchElevatedNow),
+            Leave::Update => match crate::update::relaunch() {
+                Ok(()) => {
+                    tracing::info!("restarting into the new version");
+                    self.leave_now(Leave::Quit)
+                }
+                Err(e) => {
+                    self.feedback = e;
+                    Task::none()
+                }
+            },
             Leave::Quit => {
                 // An edit made a moment ago has not been written yet.
                 self.autosave();
@@ -903,6 +947,15 @@ impl App {
     fn handle(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::Tick => {
+                // At start (a little after, so launch is not slowed) and once a day.
+                let due = match self.update_checked_at {
+                    None => self.opened_at.elapsed() >= std::time::Duration::from_secs(8),
+                    Some(t) => t.elapsed() >= std::time::Duration::from_secs(24 * 3600),
+                };
+                if self.cfg.check_updates && due && self.update_idle() {
+                    self.update_checked_at = Some(std::time::Instant::now());
+                    crate::update::spawn_check(self.update.clone());
+                }
                 // Save once the last edit is a moment old.
                 if self.last_edit.is_some_and(|t| t.elapsed() >= std::time::Duration::from_millis(600)) {
                     self.autosave();
@@ -929,6 +982,20 @@ impl App {
                         self.history_mark = (std::time::Instant::now(), fp);
                     } else {
                         self.history_mark.0 = std::time::Instant::now();
+                    }
+                }
+                // Client: the server decides where the pointer arrives; keep the learned edge
+                // as this computer's setting, without asking for a restart (the engine
+                // already uses it).
+                if self.cfg.role == Role::Client {
+                    if let Some(edge) = self.engine.as_ref().and_then(|e| e.status().arrival_edge) {
+                        if self.cfg.entry_edge != edge {
+                            self.cfg.entry_edge = edge;
+                            if let Some(live) = self.live_cfg.as_mut() {
+                                live.entry_edge = edge;
+                            }
+                            self.last_edit = Some(std::time::Instant::now());
+                        }
                     }
                 }
                 if let Some(s) = self.engine.as_ref().map(|e| e.status()).filter(|s| s.connected) {
@@ -1438,13 +1505,56 @@ impl App {
                 self.clip_cache_gb_s = s;
             }
             Message::BulkPortChanged(s) => {
-                // 0 (or an empty box) means "share the input link's port".
-                if s.trim().is_empty() {
-                    self.cfg.bulk_port = 0;
-                } else if let Ok(v) = s.trim().parse::<u16>() {
-                    self.cfg.bulk_port = v;
+                // 0 (or an empty box) means "share the input link's port". A port is only
+                // taken once it is one that can work; until then the old one stays.
+                self.bulk_port_error.clear();
+                match s.trim().parse::<u16>() {
+                    _ if s.trim().is_empty() => self.cfg.bulk_port = 0,
+                    Ok(0) => self.cfg.bulk_port = 0,
+                    // Still typing: "2" on the way to "24802" is not an error yet.
+                    Ok(_) if s.trim().len() < 4 => {}
+                    Ok(v) => match lane_port_problem(v, &self.cfg, self.live_cfg.as_ref()) {
+                        Some(why) => self.bulk_port_error = why,
+                        None => self.cfg.bulk_port = v,
+                    },
+                    Err(_) => self.bulk_port_error = "A port is a number from 1024 to 65535, e.g. 24802.".into(),
                 }
                 self.bulk_port_s = s;
+            }
+            Message::UpdateCheckNow => {
+                if self.update_idle() {
+                    self.update_checked_at = Some(std::time::Instant::now());
+                    crate::update::spawn_check(self.update.clone());
+                }
+            }
+            Message::UpdateInstall => {
+                if let crate::update::State::Available(m) = crate::update::get(&self.update) {
+                    crate::update::spawn_install(self.update.clone(), m);
+                }
+            }
+            Message::UpdateLater => self.update_dismissed = true,
+            Message::UpdateRestart => return self.leave(Leave::Update),
+            Message::UpdatesToggled(on) => self.cfg.check_updates = on,
+            Message::OpenDownloadPage => {
+                let opener = if cfg!(windows) { "explorer" } else { "xdg-open" };
+                self.feedback = match std::process::Command::new(opener).arg(crate::update::DOWNLOAD_PAGE).spawn() {
+                    Ok(_) => "opened the download page".into(),
+                    Err(e) => format!("could not open {}: {e}", crate::update::DOWNLOAD_PAGE),
+                };
+            }
+            Message::AllowFirewall => {
+                self.feedback = match crate::autostart::firewall_allow_via_prompt() {
+                    Ok(true) => {
+                        self.firewall_ok = crate::autostart::firewall_rule_exists();
+                        if self.firewall_ok {
+                            "mouse-rs is allowed through Windows Firewall on every port".into()
+                        } else {
+                            "the firewall rule did not appear — see the log".into()
+                        }
+                    }
+                    Ok(false) => "Windows prompt declined — nothing was changed".into(),
+                    Err(e) => format!("{e}"),
+                };
             }
             Message::ReconnectToggled(v) => self.cfg.reconnect = v,
             // Same shape as the plain one: touches the OS, applies immediately, and
@@ -2007,6 +2117,7 @@ impl App {
             Leave::Stop => ("Stop sharing while a transfer is running?", "Stop anyway", "Stopping"),
             Leave::Restart => ("Restart sharing while a transfer is running?", "Restart anyway", "Restarting"),
             Leave::Elevate => ("Restart as administrator while a transfer is running?", "Restart anyway", "Restarting"),
+            Leave::Update => ("Restart into the new version while a transfer is running?", "Restart anyway", "Restarting"),
         };
         dialog(
             p,
@@ -2130,7 +2241,87 @@ impl App {
         if let Some(b) = self.pin_waiting_banner(p) {
             v.push(b);
         }
+        if let Some(b) = self.update_banner(p) {
+            v.push(b);
+        }
         v
+    }
+
+    /// Whether a new check may start: not while one runs, and never over a download or
+    /// a version already waiting for a restart.
+    fn update_idle(&self) -> bool {
+        use crate::update::State as U;
+        matches!(crate::update::get(&self.update), U::Idle | U::UpToDate | U::CheckFailed(_))
+    }
+
+    /// "Version x.y is available" (R36). A failed check shows nothing: a network blip
+    /// is not news. A failed install is, with the download page as the way out.
+    fn update_banner(&self, p: Palette) -> Option<(Element<'_, Message>, Element<'_, Message>)> {
+        use crate::update::State as U;
+        match crate::update::get(&self.update) {
+            U::Available(m) if !self.update_dismissed => {
+                let title = format!("Version {} is available", m.version);
+                let body = if m.notes.trim().is_empty() {
+                    format!("You have {}.", crate::update::VERSION)
+                } else {
+                    format!("{} You have {}.", m.notes.trim(), crate::update::VERSION)
+                };
+                let compact = banner_line(p, p.accent, title.clone(), Some(("Update", Message::UpdateInstall)));
+                let full = banner(
+                    p,
+                    p.accent,
+                    title,
+                    body,
+                    row![
+                        btn_primary(p, "Update", Some(Message::UpdateInstall)),
+                        btn_secondary(p, "Later", Some(Message::UpdateLater)),
+                    ]
+                    .spacing(8.0)
+                    .into(),
+                );
+                Some((full, compact))
+            }
+            U::Downloading { version, done, total } => {
+                let pct = if total > 0 { done * 100 / total } else { 0 };
+                let title = format!("Downloading version {version}… {pct}%");
+                Some((
+                    banner_line(p, p.accent, title.clone(), None),
+                    banner_line(p, p.accent, title, None),
+                ))
+            }
+            U::Ready(version) => {
+                let title = format!("Version {version} is installed");
+                let compact = banner_line(p, p.good, title.clone(), Some(("Restart mouse-rs", Message::UpdateRestart)));
+                let full = banner(
+                    p,
+                    p.good,
+                    title,
+                    "It starts the next time mouse-rs starts. Restarting mouse-rs now takes a few \
+                     seconds and only restarts this app, not the computer; the other computer \
+                     reconnects by itself."
+                        .into(),
+                    btn_primary(p, "Restart mouse-rs", Some(Message::UpdateRestart)).into(),
+                );
+                Some((full, compact))
+            }
+            U::Failed(why) if !self.update_dismissed => {
+                let compact = banner_line(p, p.warn, "The update did not install".into(), Some(("Download", Message::OpenDownloadPage)));
+                let full = banner(
+                    p,
+                    p.warn,
+                    "The update did not install",
+                    format!("{why}. This version keeps working. You can download the new one from the website instead."),
+                    row![
+                        btn_primary(p, "Open download page", Some(Message::OpenDownloadPage)),
+                        btn_secondary(p, "Later", Some(Message::UpdateLater)),
+                    ]
+                    .spacing(8.0)
+                    .into(),
+                );
+                Some((full, compact))
+            }
+            _ => None,
+        }
     }
 
     /// "Restart needed": the panel's only honest answer to "did my change take effect?".
@@ -3132,8 +3323,11 @@ impl App {
     /// One line of news and one action. Settings save themselves, so there is no Save
     /// (R40); Start and Stop are one button because they are mutually exclusive.
     fn footer(&self, p: Palette, running: bool) -> Element<'_, Message> {
+        let pending = self.pending_changes().len();
         let left = if !self.feedback.is_empty() {
             self.feedback.clone()
+        } else if pending > 0 {
+            format!("{pending} change{} wait for a restart", if pending == 1 { "" } else { "s" })
         } else if !running && !self.paired() {
             "Not connected yet".to_string()
         } else {
@@ -3146,11 +3340,16 @@ impl App {
         };
         column![
             hairline(p),
-            container(
-                row![text(left).size(12.0).color(p.txt3).width(Length::Fill), run]
+            container({
+                // Shown on every page, Settings included: that is where changes are made.
+                let mut r = row![text(left).size(12.0).color(if pending > 0 && self.feedback.is_empty() { p.warn } else { p.txt3 }).width(Length::Fill)]
                     .spacing(10.0)
-                    .align_y(Alignment::Center),
-            )
+                    .align_y(Alignment::Center);
+                if pending > 0 {
+                    r = r.push(btn_secondary(p, "Restart", Some(Message::RestartNow)));
+                }
+                r.push(run)
+            })
             .padding([12.0, 20.0]),
         ]
         .into()
@@ -3283,7 +3482,7 @@ impl App {
             Page::Appearance => {
                 if c.theme_follow_system { "Match system".to_string() } else { Theme6::from_key(&c.theme).label().to_string() }
             }
-            Page::About => format!("Version {}", env!("CARGO_PKG_VERSION")),
+            Page::About => format!("Version {}", crate::update::VERSION),
             Page::Index | Page::Diagnostics => String::new(),
         };
         value_text(p, v)
@@ -3397,14 +3596,7 @@ impl App {
                 num(p, "Speed limit", "0 = automatic", &self.bulk_rate_s, "MB/s", Message::BulkRateChanged),
                 num(p, "Send buffer", "Max file data held in memory", &self.bulk_buf_s, "MB", Message::BulkBufferChanged),
                 tog(p, "Separate lane for large transfers", "Keeps big items from delaying the mouse", c.bulk_enabled, Message::BulkEnabledToggled),
-                num(
-                    p,
-                    "Port for that lane",
-                    if c.bulk_port == 0 { "Blank = share the main port".to_string() } else { format!("Port {} must be reachable both ways", c.bulk_port) },
-                    &self.bulk_port_s,
-                    "",
-                    Message::BulkPortChanged,
-                ),
+                self.lane_port_row(p),
                 num(p, "Fingerprint files up to", "Bigger files are matched by size", &self.hash_limit_mb_s, "MB", Message::HashLimitMbChanged),
             ]),
             section(p, "Storage & memory"),
@@ -3450,72 +3642,118 @@ impl App {
         .into()
     }
 
-    /// Settings → Screens & edges (S2): a picture and one choice. The matching entry edge
-    /// is set for you; overriding it is under Advanced.
+    /// The lane port: an example in the box, the reason when a port is refused, and on a
+    /// Windows server a way to let the port through the firewall.
+    fn lane_port_row(&self, p: Palette) -> Element<'_, Message> {
+        let c = &self.cfg;
+        let (sub, colour) = if !self.bulk_port_error.is_empty() {
+            (self.bulk_port_error.clone(), p.danger)
+        } else if c.bulk_port == 0 {
+            ("Blank = share the main port. Set the same port on both computers.".to_string(), p.txt3)
+        } else {
+            (format!("Port {} · set the same port on both computers", c.bulk_port), p.txt3)
+        };
+        let field = text_input("e.g. 24802", &self.bulk_port_s)
+            .on_input(Message::BulkPortChanged)
+            .style(ui_theme::input(p))
+            .padding([7.0, 10.0])
+            .size(13.0)
+            .font(MONO)
+            .width(104.0);
+        let mut col = column![row![
+            column![
+                text("Port for that lane").size(13.5).font(BOLD).color(p.txt),
+                text(sub).size(11.5).color(colour),
+            ]
+            .spacing(2.0)
+            .width(Length::Fill),
+            field,
+        ]
+        .spacing(12.0)
+        .align_y(Alignment::Center)]
+        .spacing(10.0);
+        // Only the computer that listens needs an inbound rule.
+        if c.bulk_port != 0 && c.role == Role::Server && !self.firewall_ok {
+            col = col.push(
+                row![
+                    text("Windows Firewall may block this port. Allow mouse-rs through it once and every port it uses works.")
+                        .size(11.5)
+                        .color(p.warn)
+                        .width(Length::Fill),
+                    btn_secondary(p, "Allow…", Some(Message::AllowFirewall)),
+                ]
+                .spacing(10.0)
+                .align_y(Alignment::Center),
+            );
+        }
+        container(col).padding([12.0, 14.0]).width(Length::Fill).into()
+    }
+
+    /// Settings → Screens & edges (S2).
     ///
-    /// The client engine reads `entry_edge` and nothing else, so a client is only asked
-    /// where the pointer arrives; deciding where to leave from is the server's business.
+    /// Only the computer with the mouse decides the arrangement: it leaves through one of
+    /// its edges and places the pointer on the facing edge of the other screen. So on that
+    /// computer this is a picture you click; on the controlled one it shows what the other
+    /// computer set, and the way back follows it by itself (owner, 28 Oct).
     fn page_screens(&self, p: Palette) -> Element<'_, Message> {
         let peer = self.peer_label();
         let peer_in_text = self.peer_name();
-        let side = self.peer_side();
-        let pick = |e: Edge, label: &str| (label.to_string(), side == e, Message::PeerSidePicked(e));
+        let server = shows_exit_edge(self.cfg.role);
 
-        let mut body = column![
-            self.screens_picture(p),
-        ]
-        .spacing(0.0);
-        body = body.push(container(
-            row![
-                labels(p, format!("{peer} sits"), "Pick the side it is on".to_string()),
-                segmented(p, vec![pick(Edge::Left, "Left"), pick(Edge::Right, "Right"), pick(Edge::Top, "Above"), pick(Edge::Bottom, "Below")]),
-            ]
-            .spacing(12.0)
-            .align_y(Alignment::Center),
-        )
-        .padding([12.0, 14.0]));
-
-        let explain = match self.cfg.role {
-            Role::Server => format!(
-                "The pointer leaves this screen at the {} edge and arrives at {}'s {} edge.",
-                self.cfg.exit_edge.label(),
-                peer_in_text,
-                self.cfg.entry_edge.label()
-            ),
-            Role::Client => format!(
-                "The pointer arrives at this screen's {} edge; push back through it to return to {peer_in_text}.",
-                self.cfg.entry_edge.label()
-            ),
-        };
         let mut col = column![
-            container(body).style(move |_| ui_theme::group(p)).width(Length::Fill),
+            Space::new().height(6.0),
+            container(self.screens_picture(p)).style(move |_| ui_theme::group(p)).width(Length::Fill),
             Space::new().height(10.0),
-            note(p, p.good, explain),
         ];
-        // Leaving through one edge means arriving through the facing one; anything else
-        // puts the two screens on top of each other, so say so. Only the server reads both
-        // edges, so only it can be inconsistent.
-        if shows_exit_edge(self.cfg.role) && self.cfg.entry_edge != self.cfg.exit_edge.opposite() {
-            col = col.push(Space::new().height(8.0)).push(note(
+        if server {
+            col = col.push(note(
                 p,
-                p.warn,
+                p.accent,
                 format!(
-                    "Leaving at the {} edge should bring the pointer in at the {} edge of the other screen — {} will feel like the screens overlap.",
+                    "Leaves {} at its {} edge, appears on {}'s {} edge. Click an edge of {} for where it leaves, and an edge of {} for where it appears.",
+                    self.cfg.name,
                     self.cfg.exit_edge.label(),
-                    self.cfg.exit_edge.opposite().label(),
+                    peer_in_text,
+                    self.cfg.entry_edge.label(),
+                    self.cfg.name,
+                    peer_in_text
+                ),
+            ));
+            // Leaving through one edge means arriving through the facing one; anything else
+            // feels as if the screens overlap.
+            if self.cfg.entry_edge != self.cfg.exit_edge.opposite() {
+                col = col.push(Space::new().height(8.0)).push(note(
+                    p,
+                    p.warn,
+                    format!(
+                        "Your choice: leaving at the {} edge would usually appear at the {} edge of {}. With {} it works, and the way back is the same edge — it just doesn't match where the screens sit on your desk. Choosing a {} edge here resets it.",
+                        self.cfg.exit_edge.label(),
+                        self.cfg.exit_edge.opposite().label(),
+                        peer_in_text,
+                        self.cfg.entry_edge.label(),
+                        self.cfg.name
+                    ),
+                ));
+            }
+        } else {
+            col = col.push(note(
+                p,
+                p.accent,
+                format!(
+                    "Set on {peer_in_text}, the computer with the mouse — change it there. The pointer arrives at this screen's {} edge, and pushing back through it returns to {peer_in_text}. This computer follows by itself.",
                     self.cfg.entry_edge.label()
                 ),
             ));
         }
 
         let mut adv_rows: Vec<Element<'_, Message>> = Vec::new();
-        if shows_exit_edge(self.cfg.role) {
+        if server {
             let auto = self.cfg.entry_edge == self.cfg.exit_edge.opposite();
             let e = |edge: Edge, label: &str| (label.to_string(), !auto && self.cfg.entry_edge == edge, Message::EntryEdgePicked(edge));
             adv_rows.push(srow(
                 p,
-                format!("Arrives on {peer} at"),
-                "Auto matches the side you picked",
+                format!("Appears on {peer} at"),
+                "Auto matches the edge you picked",
                 segmented(p, vec![
                     ("Auto".into(), auto, Message::EntryEdgeAuto),
                     e(Edge::Left, "Left"),
@@ -3550,55 +3788,107 @@ impl App {
         col.push(self.advanced(p, Page::Screens, group(p, adv_rows))).into()
     }
 
-    /// The two screens drawn side by side, in proportion, joined at the crossing edge.
+    /// The two screens, in proportion. This computer has an edge strip on each side; the
+    /// lit one is where the pointer leaves, and on the other screen the lit strip is where
+    /// it appears. On the computer with the mouse the strips are buttons.
     fn screens_picture(&self, p: Palette) -> Element<'_, Message> {
-        let side = self.peer_side();
+        let server = shows_exit_edge(self.cfg.role);
+        // Server: it leaves here through `exit_edge`, and appears over there at `entry_edge`.
+        // Client: it arrives here at `entry_edge` from the computer on that side.
+        let (here_edge, there_edge) = if server {
+            (self.cfg.exit_edge, self.cfg.entry_edge)
+        } else {
+            (self.cfg.entry_edge, self.cfg.entry_edge.opposite())
+        };
         let (lw, lh) = (self.cfg.screen_width.max(1) as f32, self.cfg.screen_height.max(1) as f32);
         let (pw, ph, peer_res) = match &self.last_peer {
             Some((_, w, h)) if *w > 0 && *h > 0 => (*w as f32, *h as f32, format!("{w}×{h}")),
             _ => (1920.0, 1080.0, String::new()),
         };
-        // Both at one scale, the larger screen 170 px wide.
-        let scale = 170.0 / lw.max(pw);
-        let screen = |name: String, detail: String, w: f32, h: f32, me: bool| -> Element<'_, Message> {
-            container(
+        // Both at one scale, the larger screen 150 px wide.
+        let scale = 150.0 / lw.max(pw);
+        const BAR: f32 = 6.0;
+
+        // `pick`: what clicking an edge strip does — choose where the pointer leaves this
+        // screen, or where it appears on the other one. `None` draws the strips only.
+        let screen = |name: String, line1: String, line2: String, w: f32, h: f32, lit: Edge, pick: Option<(fn(Edge) -> Message, &'static str)>, me: bool| -> Element<'_, Message> {
+            let (bw, bh) = (w * scale, (h * scale).max(64.0));
+            let face = container(
                 column![
                     Space::new().height(Length::Fill),
                     text(name).size(12.0).font(BOLD).color(p.txt),
-                    text(detail).size(10.0).font(MONO).color(p.txt3),
+                    text(line1).size(10.5).color(if me { p.accent } else { p.txt2 }),
+                    text(line2).size(10.0).font(MONO).color(p.txt3),
                 ]
                 .spacing(1.0),
             )
             .padding([6.0, 8.0])
-            .width(w * scale)
-            .height((h * scale).max(48.0))
-            .style(move |_| ui_theme::tile(p, me, true))
+            .width(bw)
+            .height(bh)
+            .style(move |_| ui_theme::tile(p, me, true));
+            let strip = |edge: Edge, w: f32, h: f32| -> Element<'_, Message> {
+                let on = edge == lit;
+                if let Some((msg, tip)) = pick {
+                    hint(
+                        p,
+                        button(Space::new().width(w).height(h))
+                            .style(ui_theme::edge_strip(p, on))
+                            .padding(0.0)
+                            .on_press(msg(edge)),
+                        tip,
+                    )
+                } else {
+                    container(Space::new().width(w).height(h))
+                        .style(move |_| ui_theme::fill(if on { p.accent } else { iced::Color::TRANSPARENT }, 3.0))
+                        .into()
+                }
+            };
+            column![
+                row![Space::new().width(BAR), strip(Edge::Top, bw, BAR), Space::new().width(BAR)].spacing(3.0),
+                row![strip(Edge::Left, BAR, bh), face, strip(Edge::Right, BAR, bh)].spacing(3.0).align_y(Alignment::Center),
+                row![Space::new().width(BAR), strip(Edge::Bottom, bw, BAR), Space::new().width(BAR)].spacing(3.0),
+            ]
+            .spacing(3.0)
             .into()
         };
+
         let me = screen(
             self.cfg.name.clone(),
+            if server { format!("leaves: {}", here_edge.label()) } else { format!("arrives: {}", here_edge.label()) },
             format!("this · {}×{}", self.cfg.screen_width, self.cfg.screen_height),
             lw,
             lh,
+            here_edge,
+            server.then_some((Message::PeerSidePicked as fn(Edge) -> Message, "The pointer leaves through this edge")),
             true,
         );
-        let other = screen(self.peer_label(), peer_res, pw, ph, false);
-        let vertical = matches!(side, Edge::Top | Edge::Bottom);
-        let bar: Element<'_, Message> = if vertical {
-            container(Space::new()).width(60.0).height(3.0).style(move |_| ui_theme::fill(p.accent, 2.0)).into()
-        } else {
-            container(Space::new()).width(3.0).height(44.0).style(move |_| ui_theme::fill(p.accent, 2.0)).into()
+        let other = screen(
+            self.peer_label(),
+            if server { format!("appears: {}", there_edge.label()) } else { "has the mouse".to_string() },
+            peer_res,
+            pw,
+            ph,
+            there_edge,
+            server.then_some((Message::EntryEdgePicked as fn(Edge) -> Message, "The pointer appears on this edge")),
+            false,
+        );
+        let arrow = |s: &'static str| text(s).size(18.0).color(p.accent);
+        // The other screen sits on the side this one is left through (or entered from).
+        let arrangement: Element<'_, Message> = match (here_edge, server) {
+            (Edge::Right, true) => row![me, arrow("→"), other].spacing(8.0).align_y(Alignment::Center).into(),
+            (Edge::Right, false) => row![me, arrow("←"), other].spacing(8.0).align_y(Alignment::Center).into(),
+            (Edge::Left, true) => row![other, arrow("←"), me].spacing(8.0).align_y(Alignment::Center).into(),
+            (Edge::Left, false) => row![other, arrow("→"), me].spacing(8.0).align_y(Alignment::Center).into(),
+            (Edge::Top, true) => column![other, arrow("↑"), me].spacing(4.0).align_x(Alignment::Center).into(),
+            (Edge::Top, false) => column![other, arrow("↓"), me].spacing(4.0).align_x(Alignment::Center).into(),
+            (Edge::Bottom, true) => column![me, arrow("↓"), other].spacing(4.0).align_x(Alignment::Center).into(),
+            (Edge::Bottom, false) => column![me, arrow("↑"), other].spacing(4.0).align_x(Alignment::Center).into(),
         };
-        let arrangement: Element<'_, Message> = match side {
-            Edge::Left => row![other, bar, me].spacing(5.0).align_y(Alignment::Center).into(),
-            Edge::Right => row![me, bar, other].spacing(5.0).align_y(Alignment::Center).into(),
-            Edge::Top => column![other, bar, me].spacing(5.0).align_x(Alignment::Center).into(),
-            Edge::Bottom => column![me, bar, other].spacing(5.0).align_x(Alignment::Center).into(),
-        };
+        let vertical = matches!(here_edge, Edge::Top | Edge::Bottom);
         container(container(arrangement).center(Length::Fill))
-            .height(if vertical { 230.0 } else { 170.0 })
+            .height(if vertical { 290.0 } else { 190.0 })
             .width(Length::Fill)
-            .padding(10.0)
+            .padding(12.0)
             .style(move |_| ui_theme::stage(p))
             .into()
     }
@@ -4079,11 +4369,37 @@ impl App {
     }
 
     /// Settings → About (S10): the version, and Restore defaults, which asks first.
+    /// The About page's line on updates.
+    fn update_status(&self) -> String {
+        use crate::update::State as U;
+        match crate::update::get(&self.update) {
+            U::Idle => "Not checked yet".into(),
+            U::Checking => "Checking…".into(),
+            U::UpToDate => "This is the newest version".into(),
+            U::CheckFailed(e) => format!("Could not check: {e}"),
+            U::Available(m) => format!("Version {} is available", m.version),
+            U::Downloading { version, .. } => format!("Downloading version {version}…"),
+            U::Ready(v) => format!("Version {v} is installed; it starts at the next restart"),
+            U::Failed(e) => format!("The update did not install: {e}"),
+        }
+    }
+
     fn page_about(&self, p: Palette) -> Element<'_, Message> {
         column![
             Space::new().height(8.0),
             group(p, vec![
-                srow(p, "mouse-rs", format!("Version {}", env!("CARGO_PKG_VERSION")), Space::new().width(0.0)),
+                srow(p, "mouse-rs", format!("Version {}", crate::update::VERSION), Space::new().width(0.0)),
+                srow(p, "Updates", self.update_status(), {
+                    let can = self.update_idle();
+                    btn_secondary(p, "Check now", can.then_some(Message::UpdateCheckNow))
+                }),
+                tog(
+                    p,
+                    "Check for updates automatically",
+                    "At start and once a day, only while mouse-rs is running",
+                    self.cfg.check_updates,
+                    Message::UpdatesToggled,
+                ),
                 srow(
                     p,
                     "Restore default settings",
@@ -4485,6 +4801,37 @@ fn btn_link<'a>(p: Palette, label: impl Into<String>, msg: Message) -> Element<'
         .padding([6.0, 4.0])
         .on_press(msg)
         .into()
+}
+
+/// Why a lane port cannot be used, or `None` when it can.
+///
+/// Below 1024 are the system's own services (22 ssh, 80/443 web…). On the computer that
+/// listens, a port another program already holds would leave file copying silently dead,
+/// so it is tried here first; a port this session's own lane holds is of course fine.
+fn lane_port_problem(port: u16, cfg: &Config, live: Option<&Config>) -> Option<String> {
+    if port < 1024 {
+        return Some(format!(
+            "{port} is reserved for system services (like 22, 80, 443). Use 1024–65535, e.g. 24802."
+        ));
+    }
+    if cfg.role != Role::Server {
+        return None;
+    }
+    let main = cfg.listen_port;
+    let ours = live.is_some_and(|l| {
+        let lane = if l.bulk_port == 0 { l.listen_port } else { l.bulk_port };
+        lane == port || l.listen_port == port
+    });
+    if port == main || ours {
+        return None;
+    }
+    match std::net::TcpListener::bind(("0.0.0.0", port)) {
+        Ok(_) => None,
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+            Some(format!("{port} is already used by another program here. Try another, e.g. 24802."))
+        }
+        Err(_) => Some(format!("This computer won't let mouse-rs use {port}. Try another, e.g. 24802.")),
+    }
 }
 
 /// This computer's addresses another computer could type, without the 0.0.0.0 wildcard
@@ -5020,5 +5367,24 @@ mod layout_role_tests {
         b.exit_edge = b.exit_edge.opposite();
         assert!(!same_settings(&a, &b));
         assert!(profile_summary(&a).contains("Scroll Lock"));
+    }
+
+    /// Reserved ports are refused with a reason; a port this computer is already using
+    /// for something else is refused; a free high port is taken.
+    #[test]
+    fn the_lane_port_must_be_one_that_can_work() {
+        let mut cfg = Config::default();
+        cfg.role = Role::Server;
+        for reserved in [20, 22, 80, 443, 1023] {
+            assert!(lane_port_problem(reserved, &cfg, None).unwrap().contains("reserved"));
+        }
+        let held = std::net::TcpListener::bind(("0.0.0.0", 0)).unwrap();
+        let busy = held.local_addr().unwrap().port();
+        assert!(lane_port_problem(busy, &cfg, None).unwrap().contains("already used"));
+        let free = { let l = std::net::TcpListener::bind(("0.0.0.0", 0)).unwrap(); l.local_addr().unwrap().port() };
+        assert_eq!(lane_port_problem(free, &cfg, None), None);
+        assert_eq!(lane_port_problem(cfg.listen_port, &cfg, None), None, "the main port is the shared default");
+        cfg.role = Role::Client;
+        assert_eq!(lane_port_problem(busy, &cfg, None), None, "a client does not listen");
     }
 }

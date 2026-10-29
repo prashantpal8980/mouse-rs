@@ -79,6 +79,7 @@ pub fn run_blocking_in(
         name = %cfg.name,
         role = ?cfg.role,
         tls = cfg.tls_enabled,
+        version = crate::update::VERSION,
         "starting mouse-rs for {}x{} screen",
         local_dims.0,
         local_dims.1,

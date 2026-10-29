@@ -34,7 +34,7 @@ sha2 = "0.10"
 rand = "0.8"
 
 # platform input
-x11rb = { version = "0.13", features = ["xtest", "xfixes", "xkb"] }
+x11rb = { version = "0.13", features = ["xtest", "xfixes", "xkb", "dpms"] }
 libc = "0.2"
 
 # errors + logging

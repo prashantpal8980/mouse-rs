@@ -49,6 +49,16 @@ Code for items 1–5 depends on these. A suggested answer is given for each; "ye
 6. **Windows "unknown publisher" warning.** There is no code-signing certificate, so SmartScreen will warn on
    first run. There is not enough time left to get one. Suggested: accept it for launch, and add one line to the README telling users to click "More info → Run anyway".
 
+## Owner's decisions, 29 Oct
+
+- **Ethernet first for launch.** The cable is confirmed smooth (B41). Wi-Fi was optimized as far as there was time;
+  more Wi-Fi work is v1.1 unless time is left over. Item 6 above is done for launch.
+- **Lock-screen password:** the boot login screen is covered by the password (R35, "Ask at the login screen", built
+  27 Oct). The idle screen lock moves to v1.1, as the cut list allows.
+- **Windows sign-in screen typing:** parked, not in v1.0 (see R41 in UI-REQUIREMENTS).
+- VMs run on Kali under virt-manager/KVM (VirtualBox conflicts with KVM on Kali's 6.19 kernel). Mint on the NAT network
+  talks to Kali; the Windows VM is on macvtap over eth0 and talks to the laptop.
+
 ## Day by day
 
 ### Mon 26 Oct (today)
@@ -81,7 +91,11 @@ Code for items 1–5 depends on these. A suggested answer is given for each; "ye
 - [ ] Claude: **lock-screen password** (R32) with the agreed defaults, plus Change / Turn off in Settings → Security.
 - [ ] Claude: **update notice**: version check, banner, Update button, signature check, swap and restart,
       on both Windows and Linux. Tested against a local fake release server, because the public repo doesn't exist yet.
+      *Built 29 Oct (R36). Signed latest.json, download checked by size + SHA-256, swap, restart. Unit tests cover
+      the signature, versions, a good/bad/short download; a test1 build found test2 on a local server and showed the
+      banner. Rehearsal staged: `scripts/fake-release.sh`.*
 - [ ] Claude: **B35** (small), **B6**: confirm the Windows toast.
+      *B35 fixed in code 29 Oct. B6 is a look on the laptop, in the owner's test.*
 - [ ] Owner, evening: reboot Kali, then unlock the login screen from the laptop with the password, a wrong password, and with the password turned off;
       run an update from 1.0.0-test1 to 1.0.0-test2 on both machines.
 

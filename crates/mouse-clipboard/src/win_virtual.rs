@@ -471,7 +471,7 @@ impl Drop for VStream {
             tracing::info!(hash = %src.hash, "Explorer closed the streamed file; stream stopped and its memory freed");
         } else if self.tail.load(Ordering::SeqCst) {
             // The paste has it all: our copy would be the "middle cache" nobody wants.
-            self.cache.discard(&src.hash);
+            self.cache.discard_pasted(&src.hash);
             tracing::info!(hash = %src.hash, "pasted copy complete; mouse-rs's own copy removed");
         }
     }

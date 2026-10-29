@@ -12,10 +12,10 @@ use mouse_core::protocol::Message;
 use mouse_input::InputEvent;
 use tokio_util::sync::CancellationToken;
 
-use crate::geometry::in_edge_band;
+use crate::geometry::{edge_at, in_edge_band};
 use crate::injector::{InjectCmd, InjectorTx};
 use crate::status::{
-    set_crossed, set_status_connected, set_status_disconnected, set_status_engaged,
+    set_crossed, set_status_connected, set_status_disconnected, set_status_arrival, set_status_engaged,
     set_status_refused,
 };
 use crate::{set_clipboard_connected, ClipboardRoute, EngineLink};
@@ -37,7 +37,12 @@ pub async fn run_client_engine(
         health,
     } = link;
 
-    let entry_edge = cfg.entry_edge;
+    // The edge to push back through. Where the pointer arrives is the server's decision,
+    // and it arrives on the edge facing the server, so that edge is learned on every
+    // arrival. The config value only matters until the first one. Before this, a client
+    // set to a different edge than the server let the pointer arrive on one side and only
+    // return through another (owner, 28 Oct).
+    let mut entry_edge = cfg.entry_edge;
     let threshold = cfg.edge_threshold_px;
     // At the login screen every key is part of a password, so none is ever named in a log.
     let at_login_screen = cfg.at_login_screen;
@@ -87,6 +92,17 @@ pub async fn run_client_engine(
                         keys = 0;
                         set_status_engaged(&status, true);
                         set_crossed(&health, true);
+                        if let Some(edge) = edge_at(cx, cy, w, h) {
+                            if edge != entry_edge {
+                                tracing::info!(
+                                    "the pointer arrives on the {} edge, so that is now the way back (was {})",
+                                    edge.label(),
+                                    entry_edge.label()
+                                );
+                                entry_edge = edge;
+                            }
+                            set_status_arrival(&status, edge);
+                        }
                         tracing::info!("peer took control, entry ({cx},{cy})");
                     }
                     Message::Leave => {

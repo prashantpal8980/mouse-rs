@@ -28,6 +28,13 @@ anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 serde_json.workspace = true
+serde.workspace = true
+# Update notice (R36): checking the signed release description and the download.
+sha2.workspace = true
+ring = "0.17"
+# The release check over HTTPS (MIT/Apache). rustls on ring like the rest of the
+# project, with the public CA roots built in so it works the same on every machine.
+ureq = { version = "2.12", default-features = false, features = ["tls"] }
 
 # GUI: iced 0.14 (MIT). Default features give the wgpu renderer with a tiny-skia
 # software fallback (runs on GPU-less machines / VMs / RDP), and winit windowing

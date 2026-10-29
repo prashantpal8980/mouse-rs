@@ -984,7 +984,9 @@ impl Transfers {
     /// never did for a set mixing streamed videos with a small file: it sat at "0% of
     /// 4.9 GB" after every file had been pasted.
     pub fn has_arrived(&self, set: &FileSet) -> bool {
-        set.files.iter().all(|f| self.cache.contains(&f.hash) || self.arrived.contains(&f.hash))
+        set.files
+            .iter()
+            .all(|f| self.cache.contains(&f.hash) || self.arrived.contains(&f.hash) || self.cache.was_pasted(&f.hash))
     }
 
     /// Materialise a complete set under its real names, ready for the clipboard.
@@ -1667,6 +1669,39 @@ mod tests {
         t.on_bulk_frame(BulkFrame::Begin { transfer: 3, total: 10, meta }, &hist);
         t.on_bulk_frame(BulkFrame::Chunk { transfer: 3, seq: 0, data: b"01234".to_vec() }, &hist);
         assert!(!t.has_arrived(&set), "half a video has not arrived, whatever an earlier paste did");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// B35: small files already in the cache (from before this run, say) are pasted and
+    /// our copies removed before the big file streams. They never passed through this
+    /// run's arrivals, so only the paste's own record can say they arrived.
+    #[test]
+    fn files_pasted_from_the_cache_before_the_big_one_still_count_as_arrived() {
+        let (root, t, _hist) = setup("b35");
+        let small = b"small file".to_vec();
+        let small_hash = cache::hash_bytes(&small);
+        {
+            use std::io::Write;
+            let mut f = t.cache.open_partial(&small_hash).unwrap();
+            f.write_all(&small).unwrap();
+        }
+        t.cache.finish(&small_hash).unwrap();
+        let set = FileSet {
+            files: vec![FileRef {
+                name: "s.txt".into(),
+                size: small.len() as u64,
+                hash: small_hash.clone(),
+                content_hashed: true,
+                source_path: None,
+                rel: String::new(),
+            }],
+            dirs: Vec::new(),
+            origin: "kali".into(),
+        };
+        assert!(t.has_arrived(&set));
+        t.cache.discard_pasted(&small_hash);
+        assert!(!t.cache.contains(&small_hash));
+        assert!(t.has_arrived(&set), "pasted in full, then our copy removed: still arrived");
         let _ = fs::remove_dir_all(&root);
     }
 

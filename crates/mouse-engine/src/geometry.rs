@@ -19,6 +19,24 @@ pub fn in_edge_band(edge: Edge, x: i32, y: i32, w: i32, h: i32, threshold: i32) 
     }
 }
 
+/// Which edge of a `w`×`h` screen the point `(x, y)` sits on, if any.
+///
+/// The client uses it on arrival: the server places the pointer on the edge facing it, so
+/// that edge is the way back. Left/right are checked first, so a corner counts as a side.
+pub fn edge_at(x: i32, y: i32, w: i32, h: i32) -> Option<Edge> {
+    if x <= 0 {
+        Some(Edge::Left)
+    } else if x >= w - 1 {
+        Some(Edge::Right)
+    } else if y <= 0 {
+        Some(Edge::Top)
+    } else if y >= h - 1 {
+        Some(Edge::Bottom)
+    } else {
+        None
+    }
+}
+
 /// The free axis of `edge` is the one the cursor slides along *on* that edge:
 /// vertical edges (Left/Right) vary in Y, horizontal edges (Top/Bottom) in X.
 fn free_axis_is_y(edge: Edge) -> bool {
@@ -153,5 +171,20 @@ mod tests {
         assert!(is_opposing(Edge::Bottom, Edge::Top));
         assert!(!is_opposing(Edge::Left, Edge::Top));
         assert!(!is_opposing(Edge::Left, Edge::Left));
+    }
+}
+
+#[cfg(test)]
+mod edge_at_tests {
+    use super::*;
+
+    /// The client learns the way back from where the server put the pointer.
+    #[test]
+    fn the_arrival_point_names_its_edge() {
+        assert_eq!(edge_at(0, 694, 1440, 900), Some(Edge::Left));
+        assert_eq!(edge_at(1439, 10, 1440, 900), Some(Edge::Right));
+        assert_eq!(edge_at(500, 0, 1440, 900), Some(Edge::Top));
+        assert_eq!(edge_at(500, 899, 1440, 900), Some(Edge::Bottom));
+        assert_eq!(edge_at(700, 450, 1440, 900), None, "mid-screen names no edge");
     }
 }

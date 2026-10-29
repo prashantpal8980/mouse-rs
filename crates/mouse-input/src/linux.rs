@@ -265,6 +265,8 @@ pub struct X11Injector {
     root: Window,
     kbd: KeyboardMap,
     shift_keycode: u8,
+    /// When the monitor's power state was last checked; see [`X11Injector::wake_display`].
+    wake_checked: std::cell::Cell<Option<std::time::Instant>>,
 }
 
 impl X11Injector {
@@ -278,10 +280,33 @@ impl X11Injector {
             root,
             kbd,
             shift_keycode,
+            wake_checked: std::cell::Cell::new(None),
         })
     }
 
+    /// Switch a sleeping monitor back on. Input made through XTEST counts as activity
+    /// (the idle timer resets) but, measured on Kali's Xorg on 29 Oct, it does not wake a
+    /// monitor that DPMS has turned off: the pointer arrived and the screen stayed dark
+    /// until a real mouse was plugged in. So while input is arriving, check the power
+    /// state twice a second and ask for "on" when it is not.
+    fn wake_display(&self) {
+        use x11rb::protocol::dpms::{ConnectionExt as _, DPMSMode};
+        let now = std::time::Instant::now();
+        if self.wake_checked.get().is_some_and(|t| now.duration_since(t) < std::time::Duration::from_millis(500)) {
+            return;
+        }
+        self.wake_checked.set(Some(now));
+        let Ok(info) = self.conn.dpms_info().map_err(|_| ()).and_then(|c| c.reply().map_err(|_| ())) else {
+            return; // no DPMS on this display: nothing can be asleep
+        };
+        if info.state && info.power_level != DPMSMode::ON {
+            tracing::info!(level = ?info.power_level, "the monitor was asleep; waking it for the incoming input");
+            let _ = self.conn.dpms_force_level(DPMSMode::ON);
+        }
+    }
+
     fn fake(&self, type_: u8, detail: u8, x: i16, y: i16, root: Window) -> Result<(), InputError> {
+        self.wake_display();
         self.conn
             .xtest_fake_input(type_, detail, 0, root, x, y, 0)?;
         self.conn.flush()?;
@@ -813,5 +838,28 @@ mod tests {
             let ks = key_to_keysym(&key);
             assert_eq!(keysym_to_key(ks), Some(key));
         }
+    }
+
+    /// Needs a real X display whose monitor may be switched off for a moment, so it is
+    /// not part of the normal run: `cargo test -p mouse-input -- --ignored wakes_a_sleeping`.
+    #[test]
+    #[ignore]
+    fn injected_input_wakes_a_sleeping_monitor() {
+        use x11rb::protocol::dpms::{ConnectionExt as _, DPMSMode};
+        let mut inj = X11Injector::new().expect("an X display");
+        inj.conn.dpms_force_level(DPMSMode::OFF).unwrap();
+        inj.conn.flush().unwrap();
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        fn level(i: &X11Injector) -> DPMSMode {
+            i.conn.dpms_info().unwrap().reply().unwrap().power_level
+        }
+        assert_ne!(level(&inj), DPMSMode::ON, "the monitor went to sleep");
+        inj.mouse_move_rel(1, 0).unwrap();
+        inj.mouse_move_rel(-1, 0).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let after = level(&inj);
+        let _ = inj.conn.dpms_force_level(DPMSMode::ON);
+        let _ = inj.conn.flush();
+        assert_eq!(after, DPMSMode::ON, "a move through the injector wakes it");
     }
 }

@@ -537,3 +537,18 @@ pub fn scrim() -> container::Style {
         ..container::Style::default()
     }
 }
+
+/// A clickable edge strip in the screens picture: lit when it is the edge the pointer
+/// leaves through.
+pub fn edge_strip(p: Palette, on: bool) -> impl Fn(&iced::Theme, button::Status) -> button::Style {
+    move |_theme, status| {
+        let fill = if on {
+            p.accent
+        } else if matches!(status, button::Status::Hovered) {
+            alpha(p.accent, 0.55)
+        } else {
+            p.line
+        };
+        btn(Some(fill), p.ink, None, 3.0)
+    }
+}
