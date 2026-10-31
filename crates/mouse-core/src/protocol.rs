@@ -105,9 +105,16 @@ pub enum Message {
         /// version 1 peer, which is refused.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         nonce: Option<String>,
+        /// The client's device ID (R44): which pairing's key the server must use.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        device: Option<String>,
     },
     AuthChallenge {
         nonce: String, // hex-encoded
+        /// The server's device ID (R44). The client goes no further with a server it is
+        /// not paired with.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        device: Option<String>,
         /// The server's proof that it knows the shared secret, hex-encoded. Absent from a
         /// version 1 server, which the client refuses.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -123,29 +130,34 @@ pub enum Message {
     },
 
     // --- pairing with a code (see `pairing`) ---
-    /// Client → server, instead of a Hello: SPAKE2 message, hex.
+    /// Client → server, instead of a Hello: SPAKE2 message, hex, and who is asking.
     PairStart {
         name: String,
         msg: String,
+        /// The client's device ID; part of what both sides confirm (R44).
+        #[serde(default)]
+        device: String,
     },
-    /// Server → client: its SPAKE2 message and its key confirmation.
+    /// Server → client: its SPAKE2 message, who it is, and its key confirmation (which
+    /// covers both computers' IDs and names).
     PairReply {
         msg: String,
         confirm: String,
+        #[serde(default)]
+        device: String,
+        #[serde(default)]
+        name: String,
     },
     /// Client → server: its key confirmation.
     PairConfirm {
         confirm: String,
     },
-    /// Server → client: the shared secret sealed under the pairing key, or why not.
+    /// Server → client: the pairing is done (both now hold the key), or why not. No
+    /// secret travels: each side derived the key itself.
     PairDone {
         ok: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         server: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        secret: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        tag: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
     },
@@ -361,6 +373,7 @@ mod tests {
             lane: Lane::Input,
             login_screen: true,
             nonce: None,
+            device: None,
         };
         let mut value = serde_json::to_value(&hello).unwrap();
         assert!(value.as_object_mut().unwrap().remove("login_screen").is_some());
@@ -381,8 +394,16 @@ mod tests {
                 lane: Lane::Bulk,
                 login_screen: true,
                 nonce: Some("cd".into()),
+                device: Some("id-vm".into()),
             },
-            Message::AuthChallenge { nonce: "ab".into(), proof: Some("ef".into()), pin_proof: Some("01".into()) },
+            Message::AuthChallenge {
+                nonce: "ab".into(),
+                device: Some("id-laptop".into()),
+                proof: Some("ef".into()),
+                pin_proof: Some("01".into()),
+            },
+            Message::PairStart { name: "win-vm".into(), msg: "aa".into(), device: "id-vm".into() },
+            Message::PairReply { msg: "bb".into(), confirm: "cc".into(), device: "id-laptop".into(), name: "laptop".into() },
             Message::MouseMove { dx: 3, dy: -7 },
             Message::MouseButton {
                 button: Button::Left,

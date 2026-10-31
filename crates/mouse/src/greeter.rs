@@ -28,8 +28,8 @@
 //! ## What this costs, stated plainly
 //!
 //! It is a network-driven keystroke injector running before anyone has authenticated.
-//! A peer that holds `shared_secret` can type at the login prompt — that is the feature,
-//! not a flaw in it, but it means the secret is now what stands between the network and
+//! A computer this one is paired with (R44) can type at the login prompt — that is the feature,
+//! not a flaw in it, but it means the pairing keys are now what stand between the network and
 //! this machine's login. Hence: off unless installed deliberately, and a config readable
 //! only by root.
 
@@ -337,10 +337,10 @@ pub fn install(source: Option<PathBuf>) -> anyhow::Result<()> {
     let mut cfg = Config::load(&source)
         .map_err(|e| anyhow::anyhow!("cannot read {}: {e}", source.display()))?;
 
-    if cfg.shared_secret.is_empty() {
+    if cfg.paired.is_empty() {
         anyhow::bail!(
-            "{} has no shared secret, so the login-screen instance could not \
-             authenticate to the peer. Pair the two machines normally first.",
+            "{} is not paired with any computer, so the login-screen instance could not \
+             authenticate to one. Pair the two machines normally first.",
             source.display()
         );
     }

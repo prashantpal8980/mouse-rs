@@ -595,6 +595,56 @@ out and every large item went inline. It now dials the address the input link co
 
 ## Build and release fragility
 
+### B50 — a device paired with one computer connected to a different one (30 Oct 2026) — **fixed in code 30 Oct (R44), awaiting the owner's test**
+Owner, pairing the new Windows VM with the laptop: the VM ended up connected to **Kali**, which it never paired with.
+Logs (UTC): laptop 09:20:09 "pairing: mouse-rs typed a wrong code", 09:20:34 "pairing: paired with mouse-rs". Kali
+09:20:13 and 09:20:37 "mouse-rs tried to pair, but no code is showing" (refused), then 09:20:49 "peer 'mouse-rs'
+connected" from 192.168.122.228 (the VM), and 09:20:49.586 "clipboard text sent to the peer bytes=5".
+Two causes, both in the design, not a one-off glitch:
+1. **One secret for the whole group.** Pairing hands the client the server's single `shared_secret`
+   (`net.rs` `server_pair` → `session.seal(&cfg.shared_secret)`). Kali was paired with the laptop earlier, so both hold
+   the same secret, and a device paired with either one is accepted by both.
+2. **The client does not remember whom it paired with.** With no server address set it tries every machine that
+   answers on the port (R38) and keeps the first that accepts its secret. Kali answered first, over virbr0.
+What did hold: a device that has never been paired anywhere is refused (Kali refused both pairing tries without a code).
+What leaked: Kali's clipboard went to the VM. The connection PIN (R35) did not apply: it protects the *controlled*
+computer, the VM had none set, and "ask when someone is logged in" is off by default by design.
+Fix (R44, protocol 3): every install has a device ID; pairing derives a new key for those two computers only (from
+the SPAKE2 exchange, with both IDs and names in what each side confirms, so the key never crosses the network); each
+computer keeps a list of paired computers with Remove; the handshake picks the key by device ID on both sides and
+refuses an unlisted computer before any proof is made; proofs carry both device IDs; the PIN proof is keyed with the
+pairing too; beacons are signed per pairing; the bulk lane is served only to the computer holding the input link, and
+a second paired computer waits instead of pushing the first off. Tests:
+`a_computer_paired_with_one_computer_is_refused_by_another` (this exact case), `swapping_roles_uses_the_same_pairing`,
+`a_client_gives_nothing_to_a_server_it_is_not_paired_with`, `a_removed_computer_is_refused_at_once`,
+`pairing_with_the_code_makes_a_key_for_these_two_and_they_connect_with_it`, plus unit tests in auth, pairing, pin,
+beacon, trust and config. Not covered by a test: the bulk-lane refusal to a second paired computer (code only).
+Cost: computers set up before this must pair once more; the login-screen copy is refreshed (password prompt) after
+each pairing change while that service is on.
+
+### B49 — on a Linux computer that shares its mouse, an open menu blocks crossing (30 Oct 2026) — **open, limitation; v1.1**
+Owner, D4 on the same-OS checklist: with a right-click menu open on Kali, pushing to the right edge would not cross to
+Mint until the menu was closed. Kali's log, 03:45:06 UTC: "crossed to remote" then "input grab refused (another grab
+active?); staying local" 5 ms later, once per push. Cause: on X11 an open menu holds the only pointer and keyboard grab, and
+crossing needs that grab, so it is refused and control stays local. Nothing freezes. Barrier and Synergy have the same
+limit on X11; Windows is not affected (its hooks need no grab). Possible v1.1 fix: when the grab is refused at the edge,
+send Escape to close the menu and try again. Cost: Escape also cancels a drag in progress, so it needs care. Side effect today:
+each refused push sends Mint an enter and a leave 5 ms apart.
+
+### B48 — coming back to a Linux computer, the pointer appeared in the middle of its screen (29 Oct 2026) — **fixed in code**
+Owner, Kali sharing to the Mint VM: leaving Kali at the right edge was smooth, but coming back put Kali's pointer in the
+middle of the screen instead of at the edge it left by. Cause, in `mouse-input/src/linux.rs`: while sharing, the capture
+grabs the pointer and parks it in the screen centre to read motion, and releasing the grab left it there. Fix: the
+position just before the grab is remembered, and on release the pointer goes back to it, 8 px inside the edge (outside
+the crossing band, so it does not cross straight back). It returns at the height it left at, not the height it was at on
+the other computer: the return message carries no position. Test: `a_returning_pointer_lands_just_inside_the_edge_it_left_by`.
+
+### B47 — a Linux build made on Kali would not start on Mint / Ubuntu 24.04 (29 Oct 2026) — **fixed in code**
+Kali has glibc 2.43, which gave `atan2f`, `acosf`, `asinf`, `acoshf`, `sinhf` and `coshf` new symbol versions, so a Kali
+build asked for GLIBC_2.43 and Mint 22 (glibc 2.39) refused to run it. The calls are now wrapped (`build.rs`
+`--wrap`, `src/glibc_compat.rs`) and bound to the long-standing `@GLIBC_2.2.5` versions. The binary now needs at most
+GLIBC_2.39 (`pidfd_spawnp`, `pidfd_getpid`), so **Ubuntu 22.04 (glibc 2.35) is still not supported**: open for the release.
+
 ### B46 — the pointer arrived on Kali but its sleeping monitor stayed dark (29 Oct 2026) — **fixed; owner confirmed 29 Oct** (log 11:37 UTC: "the monitor was asleep; waking it… level=STANDBY")
 Owner: with the new screen lock (xfce4-screensaver, set up 29 Oct), Kali's monitor went off; moving onto Kali from the
 laptop did not wake it, and a physical mouse had to be plugged in. Measured on Kali: input made through XTEST (how
@@ -973,3 +1023,41 @@ first, so for a minute the laptop counted the link as Wi-Fi. The race now ranks 
 reached on (R39) and waits up to 400 ms for the preferred one. A connection that opens and closes without a hello
 (a dropped race loser, a Detect scan) is no longer reported by the server as a failed login.
 
+
+---
+
+## Found in Claude's own testing, 31 Oct 2026
+
+These come from two isolated test copies driven on hidden displays on Kali, plus the Windows VM driven through virsh. They were fixed the same day in test12/test13 unless marked open.
+
+### B51 — Windows: "Restart mouse-rs" after an update failed with os error 50
+**fixed in test10, proven on the laptop 31 Oct (test10→test11 restarted itself in 3 s)**
+When mouse-rs had been started by the logon task (Task Scheduler, elevated), its standard handles could not be passed to the new copy. The spawn failed with "The request is not supported (os error 50)". The new copy now gets no standard handles. A `cmd /c start` fallback and log lines cover the rest.
+
+### B52 — About: "Check now" greyed out while an update waits for a restart; "Try again" did nothing
+**fixed in test11** · Both states blocked checking. A second update before restarting would also have failed on Windows, because `mouse-rs.exe.old` was still the running copy. Now the first free spare name is used, and all spares are cleaned on the next start.
+
+### B53 — after pairing, a restart needed "Start sharing" on both computers
+**fixed in test13** · `autoconnect` stayed off after a successful pairing. So a new user who restarted either computer found sharing off (seen on the test copies and on the Windows VM). Pairing now turns it on. Settings › Startup can turn it off again.
+
+### B54 — images over 5 MB were silently not shared
+**fixed in test12** · The 5 MB per-item limit was applied to large images too, though they go over the bulk lane. A 4K screenshot or a photo did nothing, with only a debug-level log line. Images sent by reference may now be up to 64 MB, and the "too big" case is logged at info.
+*Not proven on hardware yet:* a large image (over 5 MB) end to end.
+
+### B55 — "This computer · 1920×1080" on a screen of another size
+**fixed in test12** · The main window showed the config's default size until sharing had started once. The real size is now read when the window opens.
+
+### B56 — switching to a saved profile undid pairings made after it was saved
+**fixed in test12** · A profile replaced the whole config, including `paired`, `device_id` and `connect_to`. Those now stay as they are. Profile and Restore-defaults texts no longer mention the shared secret.
+
+### B57 — a Windows VM named itself "mouse-rs"
+**fixed in test13** · Its config was created when `COMPUTERNAME` could not be read (cause unknown), and the fallback name stuck. A saved name equal to the fallback is now replaced by the real computer name when it can be read.
+
+### B58 — first-run hint on the controlled computer pointed into Settings
+**fixed in test12** · It now says to press "Pair a new device" on the computer with the mouse.
+
+### B59 — Clipboard tab: the "History" heading is clipped at the top
+**open, cosmetic** · Seen on Linux with 4 entries. The list starts a few pixels scrolled.
+
+### B60 — files or a large image copied on one controlled computer don't reach another controlled computer
+**open, by design for v1.0 (R47)** · Text and images up to 256 KB are relayed between all computers. Files go between the computer with the mouse and each other computer.

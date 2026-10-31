@@ -6,9 +6,13 @@
 //! on every network it is attached to, listing its current addresses. A client listening on
 //! the same network hears it and learns where to connect, whichever network that is.
 //!
-//! * **Signed.** A beacon carries an HMAC over its body, keyed with the shared secret. A
-//!   machine that does not hold the secret cannot make a client connect somewhere else.
-//!   The beacon only offers addresses. Authentication still happens in the real handshake.
+//! * **Signed.** A beacon carries an HMAC over its body for each computer the server is
+//!   paired with, keyed with that pairing's key (R44). A client opens it only with the key
+//!   of its own pairing with that server, so a machine that is not paired with it cannot
+//!   make it connect somewhere else, and a server it is not paired with is not even a
+//!   candidate. A server paired with nobody sends no beacon (pairing finds computers by
+//!   scanning). The beacon only offers addresses: authentication still happens in the
+//!   real handshake.
 //! * **No clock.** A beacon is not timestamped, because the two machines' clocks may differ.
 //!   A client expires a server by when it last heard one, on its own clock.
 //! * **Bounded.** Beacons are small and sent every [`BEACON_EVERY`]. Nothing is sent when the
@@ -54,18 +58,25 @@ pub const NETWORK_WATCH_EVERY: Duration = Duration::from_secs(2);
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct BeaconBody {
     pub name: String,
+    /// The server's device ID: which pairing's key the client checks the beacon with.
+    #[serde(default)]
+    pub device: String,
     /// The TCP port the server listens on.
     pub port: u16,
     /// Its IPv4 addresses, on every network it is attached to right now.
     pub addrs: Vec<String>,
 }
 
-/// The wire form: the body as exact text, and an HMAC over those exact bytes.
+/// The wire form: the body as exact text, and an HMAC over those exact bytes for each
+/// pairing the server has.
 #[derive(Serialize, Deserialize)]
 struct Envelope {
     body: String,
-    mac: String,
+    macs: Vec<String>,
 }
+
+/// Most pairings a beacon carries a MAC for, which keeps it well inside one datagram.
+pub const MAX_BEACON_MACS: usize = 16;
 
 fn hmac_for(secret: &str) -> Hmac<Sha256> {
     // HMAC takes a key of any length, so this cannot fail.
@@ -86,24 +97,36 @@ fn from_hex(text: &str) -> Option<Vec<u8>> {
         .collect()
 }
 
-/// The packet a server sends for `body`, sealed with `secret`.
-pub fn seal(secret: &str, body: &BeaconBody) -> Vec<u8> {
+/// The packet a server sends for `body`, with one MAC per pairing key in `keys`.
+pub fn seal(keys: &[String], body: &BeaconBody) -> Vec<u8> {
     let text = serde_json::to_string(body).expect("a plain struct always serialises");
-    let mut mac = hmac_for(secret);
-    mac.update(text.as_bytes());
-    let envelope = Envelope { body: text, mac: to_hex(&mac.finalize().into_bytes()) };
+    let macs = keys
+        .iter()
+        .take(MAX_BEACON_MACS)
+        .map(|k| {
+            let mut mac = hmac_for(k);
+            mac.update(text.as_bytes());
+            to_hex(&mac.finalize().into_bytes())
+        })
+        .collect();
+    let envelope = Envelope { body: text, macs };
     serde_json::to_vec(&envelope).expect("a plain struct always serialises")
 }
 
-/// The body in `packet`, if it was sealed with `secret` and is intact. Anything else is `None`,
-/// and a client simply ignores it.
-pub fn open(secret: &str, packet: &[u8]) -> Option<BeaconBody> {
+/// The body in `packet`, if it comes from a server this computer is paired with and is
+/// intact. `key_for` gives our pairing key for a server's device ID. Anything else is
+/// `None`, and a client simply ignores it.
+pub fn open(packet: &[u8], key_for: impl Fn(&str) -> Option<String>) -> Option<BeaconBody> {
     let envelope: Envelope = serde_json::from_slice(packet).ok()?;
-    let want = from_hex(&envelope.mac)?;
-    let mut mac = hmac_for(secret);
-    mac.update(envelope.body.as_bytes());
-    mac.verify_slice(&want).ok()?;
-    serde_json::from_str(&envelope.body).ok()
+    let body: BeaconBody = serde_json::from_str(&envelope.body).ok()?;
+    let key = key_for(&body.device)?;
+    let ok = envelope.macs.iter().any(|m| {
+        let Some(want) = from_hex(m) else { return false };
+        let mut mac = hmac_for(&key);
+        mac.update(envelope.body.as_bytes());
+        mac.verify_slice(&want).is_ok()
+    });
+    ok.then_some(body)
 }
 
 /// Where a beacon can be sent on one network: that network's broadcast address, and the
@@ -134,6 +157,8 @@ pub struct Found {
 }
 
 struct Heard {
+    /// The server's device ID, or its name from a beacon without one.
+    key: String,
     name: String,
     addrs: Vec<SocketAddr>,
     at: Instant,
@@ -166,10 +191,11 @@ impl Found {
                 addrs.push(src);
             }
         }
+        let key = if body.device.is_empty() { body.name.clone() } else { body.device.clone() };
         let Ok(mut heard) = self.inner.lock() else { return };
         // One tick's IPv4 and IPv6 beacons arrive as separate packets a moment apart: merge
         // those. A later tick's beacon replaces, so addresses the server lost are forgotten.
-        if let Some(h) = heard.iter_mut().find(|h| h.name == body.name) {
+        if let Some(h) = heard.iter_mut().find(|h| h.key == key) {
             if now.saturating_duration_since(h.at) < SAME_TICK {
                 for a in addrs {
                     if !h.addrs.contains(&a) {
@@ -180,16 +206,23 @@ impl Found {
                 return;
             }
         }
-        heard.retain(|h| h.name != body.name);
-        heard.push(Heard { name: body.name.clone(), addrs, at: now });
+        heard.retain(|h| h.key != key);
+        heard.push(Heard { key, name: body.name.clone(), addrs, at: now });
     }
 
     /// Every address of every server heard within [`BEACON_TTL`], most recently heard first.
     pub fn candidates(&self, now: Instant) -> Vec<SocketAddr> {
+        self.candidates_for(now, None)
+    }
+
+    /// As [`Found::candidates`], but only the server with device ID `only` when given: a
+    /// client goes back to the computer it was last with, not whichever answers (R45).
+    pub fn candidates_for(&self, now: Instant, only: Option<&str>) -> Vec<SocketAddr> {
         let Ok(heard) = self.inner.lock() else { return Vec::new() };
         let mut fresh: Vec<&Heard> = heard
             .iter()
             .filter(|h| now.saturating_duration_since(h.at) < BEACON_TTL)
+            .filter(|h| only.is_none_or(|d| h.key == d))
             .collect();
         fresh.sort_by_key(|h| std::cmp::Reverse(h.at));
         let mut out: Vec<SocketAddr> = Vec::new();
@@ -256,7 +289,7 @@ fn bind_udp6(port: u16) -> std::io::Result<UdpSocket> {
 /// Server side: send a sealed beacon every [`BEACON_EVERY`] on every attached network, until
 /// cancelled. Does nothing when there is no network or `discovery_port` is 0.
 pub async fn run_sender(
-    secret: String,
+    device: String,
     name: String,
     port: u16,
     discovery_port: u16,
@@ -291,8 +324,15 @@ pub async fn run_sender(
         if locals.is_empty() && v6_ifaces.is_empty() {
             continue;
         }
+        // Read every tick: a computer paired a moment ago finds us at once, and one that
+        // was removed stops hearing us.
+        let keys: Vec<String> = crate::trust::all(&device).into_iter().map(|d| d.key).collect();
+        if keys.is_empty() {
+            continue;
+        }
         let body = BeaconBody {
             name: name.clone(),
+            device: device.clone(),
             port,
             // Link-local (169.254.x.x) addresses are not reachable from another machine's
             // route, so they are left out.
@@ -302,7 +342,7 @@ pub async fn run_sender(
                 .map(|a| a.ip.to_string())
                 .collect(),
         };
-        let packet = seal(&secret, &body);
+        let packet = seal(&keys, &body);
         if !locals.is_empty() {
             for target in broadcast_targets(&locals) {
                 // A send can fail on a network that just went away. The next tick retries.
@@ -338,7 +378,7 @@ pub fn describe_locals(locals: &[LocalAddr], v6_ifaces: &[u32]) -> String {
 /// Client side: listen for beacons and record the servers that send valid ones, until
 /// cancelled. Does nothing when `discovery_port` is 0.
 pub async fn run_listener(
-    secret: String,
+    device: String,
     discovery_port: u16,
     found: Found,
     cancel: CancellationToken,
@@ -370,7 +410,7 @@ pub async fn run_listener(
         };
         match received {
             Ok((packet, from)) => {
-                if let Some(body) = open(&secret, packet) {
+                if let Some(body) = open(packet, |server| crate::trust::get(&device, server).map(|d| d.key)) {
                     found.record(&body, Some(from), Instant::now());
                 }
             }
@@ -423,35 +463,46 @@ mod tests {
     fn body() -> BeaconBody {
         BeaconBody {
             name: "laptop".into(),
+            device: "id-laptop".into(),
             port: 24800,
             addrs: vec!["192.168.137.2".into(), "192.168.1.9".into()],
         }
     }
 
-    #[test]
-    fn a_sealed_beacon_opens_with_the_same_secret() {
-        let packet = seal("s3cret", &body());
-        assert_eq!(open("s3cret", &packet), Some(body()));
+    /// A client paired with the laptop under `k`.
+    fn paired_with_laptop(k: &'static str) -> impl Fn(&str) -> Option<String> {
+        move |id| (id == "id-laptop").then(|| k.to_string())
     }
 
     #[test]
-    fn a_beacon_from_a_machine_without_the_secret_is_ignored() {
-        let packet = seal("not-the-secret", &body());
-        assert_eq!(open("s3cret", &packet), None);
+    fn a_beacon_opens_for_each_computer_the_server_is_paired_with() {
+        let packet = seal(&["key-vm".into(), "key-kali".into()], &body());
+        assert_eq!(open(&packet, paired_with_laptop("key-vm")), Some(body()));
+        assert_eq!(open(&packet, paired_with_laptop("key-kali")), Some(body()));
+    }
+
+    #[test]
+    fn a_beacon_from_a_server_we_are_not_paired_with_is_ignored() {
+        // Signed for other pairings only.
+        let packet = seal(&["key-someone-else".into()], &body());
+        assert_eq!(open(&packet, paired_with_laptop("key-vm")), None);
+        // Or from a server whose device ID we do not know at all.
+        let packet = seal(&["key-vm".into()], &body());
+        assert_eq!(open(&packet, |_| None), None);
     }
 
     #[test]
     fn a_tampered_beacon_is_ignored() {
         // Change the advertised address, keep the old MAC. A forged redirect must fail.
-        let packet = seal("s3cret", &body());
+        let packet = seal(&["key-vm".into()], &body());
         let text = String::from_utf8(packet).unwrap().replace("192.168.137.2", "10.0.0.66");
-        assert_eq!(open("s3cret", text.as_bytes()), None);
+        assert_eq!(open(text.as_bytes(), paired_with_laptop("key-vm")), None);
     }
 
     #[test]
     fn junk_on_the_discovery_port_is_ignored() {
-        assert_eq!(open("s3cret", b"not json at all"), None);
-        assert_eq!(open("s3cret", b"{\"body\":\"{}\",\"mac\":\"zz\"}"), None);
+        assert_eq!(open(b"not json at all", paired_with_laptop("k")), None);
+        assert_eq!(open(b"{\"body\":\"{}\",\"macs\":[\"zz\"]}", paired_with_laptop("k")), None);
     }
 
     #[test]

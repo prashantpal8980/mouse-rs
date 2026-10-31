@@ -16,7 +16,7 @@
 #   2. Downloads the exe to mouse-rs.exe.new and checks size and hash. On a mismatch it
 #      deletes the download and stops. The installed exe and the running app are untouched.
 #   3. Records the running instance's executable path and command line, so it can be started
-#      again the same way. If none is running, it records that and will not start one.
+#      again the same way. If none is running, it is started with no arguments afterwards.
 #   4. Stops it and proves it stopped.
 #   5. Keeps the previous exe as mouse-rs.exe.bak, moves the verified download into place, and
 #      checks the installed file's size and hash.
@@ -150,7 +150,8 @@ if ($running.Count -gt 0) {
     Say "running before: pid $($running.ProcessId -join ', ') from $($first.ExecutablePath)"
     Say "restarting it with the same arguments: '$restartArgs'"
 } else {
-    Say 'running before: no. It was not running, so it will not be started.'
+    $restartArgs = ''
+    Say 'running before: no. It will be started anyway, so the update ends with mouse-rs running.'
 }
 
 # --- 4. stop it, and prove it stopped ----------------------------------------

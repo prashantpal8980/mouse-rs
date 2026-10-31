@@ -4,8 +4,13 @@
 //! with the code as the password. Someone listening learns nothing they could test a
 //! guess against offline, and someone in the middle gets one guess per attempt, which the
 //! server limits to [`MAX_FAILS`] before the code is thrown away. Each side then proves it
-//! derived the same key, bound to this TLS session, and the server hands over its shared
-//! secret sealed under that key. From then on the two connect with the secret as before.
+//! derived the same key, bound to this TLS session and to **both computers' device IDs and
+//! names**: a correct confirmation means "the computer that knows the code on that screen
+//! is device X, called Y", and nobody can swap in another ID on the way (R44).
+//!
+//! Both sides then derive the pairing key from the same exchange. It is new for every
+//! pairing, belongs to these two computers only, and never crosses the network, not even
+//! encrypted. From then on the two connect with it (see `auth`).
 //!
 //! The transport lives in `net`; this module is the code itself and the crypto.
 
@@ -142,8 +147,15 @@ pub fn start_server(code: &str) -> Start {
     }
 }
 
-/// The key both sides share once each has the other's message, tied to this TLS session
-/// and both messages. A wrong code gives a different key on each side, which the
+/// One side of a pairing: its device ID and name, as each side announced it.
+#[derive(Debug, Clone, Copy)]
+pub struct Party<'a> {
+    pub id: &'a str,
+    pub name: &'a str,
+}
+
+/// The key both sides share once each has the other's message, tied to this TLS session,
+/// both messages and both computers. A wrong code gives a different key on each side, which the
 /// confirmations then catch.
 pub struct Session {
     key: Vec<u8>,
@@ -159,6 +171,8 @@ impl Start {
         binding: &[u8],
         client_msg: &str,
         server_msg: &str,
+        client: Party,
+        server: Party,
     ) -> Result<Session, String> {
         let theirs = unhex(theirs).ok_or("bad pairing message")?;
         let key = self
@@ -166,7 +180,15 @@ impl Start {
             .finish(&theirs)
             .map_err(|e| format!("pairing: {e:?}"))?;
         let mut transcript = Vec::new();
-        for part in [binding, client_msg.as_bytes(), server_msg.as_bytes()] {
+        for part in [
+            binding,
+            client_msg.as_bytes(),
+            server_msg.as_bytes(),
+            client.id.as_bytes(),
+            client.name.as_bytes(),
+            server.id.as_bytes(),
+            server.name.as_bytes(),
+        ] {
             transcript.extend_from_slice(&(part.len() as u32).to_be_bytes());
             transcript.extend_from_slice(part);
         }
@@ -204,42 +226,9 @@ impl Session {
                 == 0
     }
 
-    /// Seal `secret` for the client: (ciphertext hex, tag hex).
-    pub fn seal(&self, secret: &str) -> (String, String) {
-        let ct: Vec<u8> = secret
-            .bytes()
-            .zip(self.pad(secret.len()))
-            .map(|(a, b)| a ^ b)
-            .collect();
-        let tag = self.mac(b"seal", &ct).finalize().into_bytes();
-        (hex(&ct), hex(&tag))
-    }
-
-    /// Open a sealed secret, checking its tag first.
-    pub fn open(&self, ct_hex: &str, tag_hex: &str) -> Result<String, String> {
-        let ct = unhex(ct_hex).ok_or("bad sealed secret")?;
-        let tag = unhex(tag_hex).ok_or("bad sealed secret")?;
-        self.mac(b"seal", &ct)
-            .verify_slice(&tag)
-            .map_err(|_| "the sealed secret was altered".to_string())?;
-        let plain: Vec<u8> = ct
-            .iter()
-            .zip(self.pad(ct.len()))
-            .map(|(a, b)| a ^ b)
-            .collect();
-        String::from_utf8(plain).map_err(|_| "the sealed secret is not text".to_string())
-    }
-
-    /// A keystream of `len` bytes: HMAC blocks over a counter.
-    fn pad(&self, len: usize) -> Vec<u8> {
-        let mut out = Vec::with_capacity(len + 32);
-        let mut i = 0u32;
-        while out.len() < len {
-            out.extend_from_slice(&self.mac(b"pad", &i.to_be_bytes()).finalize().into_bytes());
-            i += 1;
-        }
-        out.truncate(len);
-        out
+    /// The pairing key both sides keep, hex. Derived, never sent.
+    pub fn pair_key(&self) -> String {
+        hex(&self.mac(b"pair key", b"").finalize().into_bytes())
     }
 }
 
@@ -261,6 +250,10 @@ fn unhex(s: &str) -> Option<Vec<u8>> {
 mod tests {
     use super::*;
 
+    const VM: Party = Party { id: "id-vm", name: "win-vm" };
+    const LAPTOP: Party = Party { id: "id-laptop", name: "laptop" };
+    const KALI: Party = Party { id: "id-kali", name: "kali-desktop" };
+
     fn run(
         client_code: &str,
         server_code: &str,
@@ -270,27 +263,41 @@ mod tests {
         let c = start_client(client_code);
         let s = start_server(server_code);
         let (cm, sm) = (c.msg.clone(), s.msg.clone());
-        let cs = c.finish(&sm, binding_c, &cm, &sm).unwrap();
-        let ss = s.finish(&cm, binding_s, &cm, &sm).unwrap();
+        let cs = c.finish(&sm, binding_c, &cm, &sm, VM, LAPTOP).unwrap();
+        let ss = s.finish(&cm, binding_s, &cm, &sm, VM, LAPTOP).unwrap();
         (cs, ss)
     }
 
     #[test]
-    fn the_same_code_pairs_and_the_secret_arrives() {
+    fn the_same_code_pairs_and_both_sides_hold_the_same_new_key() {
         let (c, s) = run("123456", "123456", b"tls", b"tls");
         assert!(c.check(&c.server_confirm(), &s.server_confirm()));
         assert!(s.check(&s.client_confirm(), &c.client_confirm()));
-        let (ct, tag) = s.seal("a-long-shared-secret");
-        assert_ne!(ct, hex(b"a-long-shared-secret"), "never sent in the clear");
-        assert_eq!(c.open(&ct, &tag).unwrap(), "a-long-shared-secret");
+        assert_eq!(c.pair_key(), s.pair_key());
+        assert_eq!(c.pair_key().len(), 64);
+        // Pairing the same two computers again makes a different key.
+        let (c2, _) = run("123456", "123456", b"tls", b"tls");
+        assert_ne!(c.pair_key(), c2.pair_key());
+    }
+
+    #[test]
+    fn a_device_cannot_claim_to_be_another_one_during_pairing() {
+        // The client believes it is pairing with the laptop, but the answer comes from a
+        // machine that says it is Kali (or was altered on the way): the confirmations fail.
+        let c = start_client("123456");
+        let s = start_server("123456");
+        let (cm, sm) = (c.msg.clone(), s.msg.clone());
+        let cs = c.finish(&sm, b"tls", &cm, &sm, VM, LAPTOP).unwrap();
+        let ss = s.finish(&cm, b"tls", &cm, &sm, VM, KALI).unwrap();
+        assert!(!cs.check(&cs.server_confirm(), &ss.server_confirm()));
+        assert_ne!(cs.pair_key(), ss.pair_key());
     }
 
     #[test]
     fn a_wrong_code_fails_the_confirmation() {
         let (c, s) = run("123456", "654321", b"tls", b"tls");
         assert!(!c.check(&c.server_confirm(), &s.server_confirm()));
-        let (ct, tag) = s.seal("secret");
-        assert!(c.open(&ct, &tag).is_err());
+        assert_ne!(c.pair_key(), s.pair_key());
     }
 
     #[test]

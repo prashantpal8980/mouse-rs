@@ -18,6 +18,7 @@ pub mod protocol;
 pub mod qos;
 pub mod timing;
 pub mod tls;
+pub mod trust;
 
 pub use config::{sanitize_profile_name, Config, Edge, NetworkPreference, Role};
 pub use net::{run_client, run_server, DisconnectReason, LinkChannels, LinkEvent, LinkParams};

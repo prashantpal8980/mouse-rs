@@ -207,6 +207,15 @@ pub fn group_accent(p: Palette) -> container::Style {
     }
 }
 
+/// A paired computer's row while it is connected (R45): tinted with the "good" colour.
+pub fn row_connected(p: Palette) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(Color { a: 0.14, ..p.good })),
+        border: Border { color: Color { a: 0.55, ..p.good }, width: 1.0, radius: radius(8.0) },
+        ..container::Style::default()
+    }
+}
+
 /// The status card at the top of the main window.
 pub fn hero(p: Palette) -> container::Style {
     boxed(p.surf, p.line, 12.0)
@@ -288,19 +297,6 @@ pub fn floating(p: Palette) -> container::Style {
     }
 }
 
-/// One box of a code being typed. `next` = where the next digit goes.
-pub fn code_box(p: Palette, next: bool) -> container::Style {
-    container::Style {
-        background: Some(Background::Color(if p.dark { p.bg } else { p.surf })),
-        border: Border {
-            color: if next { p.accent } else { p.line },
-            width: if next { 1.5 } else { 1.0 },
-            radius: radius(8.0),
-        },
-        ..container::Style::default()
-    }
-}
-
 /// The area the screens picture is drawn in.
 pub fn stage(p: Palette) -> container::Style {
     container::Style {
@@ -336,18 +332,6 @@ pub fn input(p: Palette) -> impl Fn(&iced::Theme, text_input::Status) -> text_in
             value: p.txt,
             selection: alpha(p.accent, 0.35),
         }
-    }
-}
-
-/// An input with nothing drawn: it sits over the code boxes and only takes the typing.
-pub fn input_invisible() -> impl Fn(&iced::Theme, text_input::Status) -> text_input::Style {
-    move |_theme, _status| text_input::Style {
-        background: Background::Color(Color::TRANSPARENT),
-        border: Border { color: Color::TRANSPARENT, width: 0.0, radius: radius(0.0) },
-        icon: Color::TRANSPARENT,
-        placeholder: Color::TRANSPARENT,
-        value: Color::TRANSPARENT,
-        selection: Color::TRANSPARENT,
     }
 }
 

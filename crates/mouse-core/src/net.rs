@@ -14,6 +14,7 @@
 
 use std::io;
 use std::net::SocketAddr;
+use std::collections::HashMap;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -31,7 +32,7 @@ use tokio_rustls::server::TlsStream as ServerTlsStream;
 use tokio_util::codec::Framed;
 use tokio_util::sync::CancellationToken;
 
-use crate::config::Config;
+use crate::config::{Config, PairedDevice};
 use std::sync::Arc;
 
 use crate::bulk::{BulkServer, LinkHealth};
@@ -259,6 +260,9 @@ pub async fn run_server(
     bulk: BulkServer,
     health: Arc<LinkHealth>,
 ) {
+    // The computers we are paired with, live from here on (R44).
+    crate::trust::load(&cfg.device_id, &cfg.paired);
+    crate::trust::set_input_peer(&cfg.device_id, None);
     // Kept for the accept loop's own diagnostics: `ch` moves into the session task for
     // the duration of a session, and an accept error still has to be reportable.
     let link_events = ch.events.clone();
@@ -308,7 +312,7 @@ pub async fn run_server(
     };
     // Tell any client on any network we are attached to where to find us. Stops with `cancel`.
     tokio::spawn(beacon::run_sender(
-        cfg.shared_secret.clone(),
+        cfg.device_id.clone(),
         cfg.name.clone(),
         cfg.listen_port,
         cfg.discovery_port,
@@ -327,44 +331,117 @@ pub async fn run_server(
         None
     };
 
-    // The input session runs as a *task* rather than inline, so the accept loop keeps
-    // running while a session is live. That is what lets the bulk lane connect on this
-    // same port at any moment instead of having to arrive in a particular order.
-    //
-    // `pump` itself is untouched — only the orchestration around it changed. The
-    // channels can only belong to one session at a time, so they are handed to the
-    // session task and handed back when it ends; `ch_slot` being `None` is precisely
-    // "an input session is live".
-    let mut ch_slot: Option<LinkChannels> = Some(ch);
-    let mut session: Option<tokio::task::JoinHandle<(LinkChannels, DisconnectReason)>> = None;
-    // Cancels the live session on its own, so a newer connection can replace it.
-    let mut session_cancel: Option<CancellationToken> = None;
+    // R46: one input session per connected computer, all at once. The engine still sees
+    // a single peer: the one in use. This hub forwards the engine's messages to that one,
+    // passes on what that one sends, and tells the engine when the one in use changes.
+    // Switching is instant because nothing reconnects; the computer left is sent a Leave.
+    let LinkChannels { to_peer: mut engine_out, from_peer: engine_in, events: engine_events } = ch;
+    let own = cfg.device_id.clone();
+    let mut live: HashMap<String, LiveSession> = HashMap::new();
+    let (ended_tx, mut ended_rx) = mpsc::unbounded_channel::<(String, u64, DisconnectReason)>();
+    let (incoming_tx, mut incoming_rx) = mpsc::unbounded_channel::<(String, Message)>();
+    let mut active: Option<String> = None;
+    let mut epoch = 0u64;
+    // How often a switch asked for by a shortcut or a click is picked up.
+    let mut tick = tokio::time::interval(Duration::from_millis(20));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let events = link_events.clone();
+    crate::trust::set_connected(&own, &[]);
+    // The last large image or file list copied here, and the computers that were
+    // connected then but not in use, so are still owed it. One that connects later is
+    // not handed an old copy.
+    let mut last_offer: Option<Message> = None;
+    let mut owed: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     loop {
+        if let (Some(a), Some(m)) = (active.as_ref(), last_offer.as_ref()) {
+            if owed.remove(a) {
+                if let Some(l) = live.get(a).filter(|l| !l.login_screen) {
+                    tracing::info!(peer = %l.name, "offering the last copied files/image to {}", l.name);
+                    let _ = l.to.send(m.clone());
+                }
+            }
+        }
         tokio::select! {
             _ = cancel.cancelled() => break,
 
-            // An input session ended: take the channels back so the next client can be
-            // served, and surface the reason exactly as the inline version did.
-            joined = async { session.as_mut().expect("guarded by the `if`").await },
-                if session.is_some() =>
-            {
-                session = None;
-                match joined {
-                    Ok((returned, reason)) => {
-                        let stop = matches!(reason, DisconnectReason::Cancelled);
-                        let _ = returned.events.send(LinkEvent::Disconnected(reason));
-                        ch_slot = Some(returned);
-                        if stop {
-                            break;
-                        }
+            // A session ended. A stale end (from a session already replaced by a newer
+            // path from the same computer) is ignored by its epoch.
+            Some((dev, ep, reason)) = ended_rx.recv() => {
+                if live.get(&dev).is_none_or(|l| l.epoch != ep) {
+                    continue;
+                }
+                let gone = live.remove(&dev).expect("checked above");
+                owed.remove(&dev);
+                crate::trust::set_connected(&own, &live.keys().cloned().collect::<Vec<_>>());
+                tracing::info!(peer = %gone.name, "{} disconnected ({reason:?}); {} still connected", gone.name, live.len());
+                if active.as_deref() == Some(dev.as_str()) {
+                    active = None;
+                    crate::trust::clear_input_peer(&own, &dev);
+                    let _ = engine_events.send(LinkEvent::Disconnected(reason));
+                    // Carry on with the computer that connected most recently, so the edge
+                    // still leads somewhere.
+                    if let Some(next) = live.iter().max_by_key(|(_, l)| l.epoch).map(|(d, _)| d.clone()) {
+                        activate(&own, &live, &mut active, &next, &engine_events);
                     }
-                    Err(e) => {
-                        // The session task panicked. Without the channels back there is
-                        // no way to serve another client, so stop rather than spin.
-                        let _ = events.send(LinkEvent::Error(format!("session task failed: {e}")));
-                        break;
+                }
+            }
+
+            // From the engine: to the computer in use. Copied text and small images go
+            // to every connected computer, so all of them share one clipboard.
+            out = engine_out.recv() => match out {
+                None => break,
+                Some(m) if is_shared_clip(&m) => {
+                    let mut to = Vec::new();
+                    for l in live.values().filter(|l| !l.login_screen) {
+                        let _ = l.to.send(m.clone());
+                        to.push(l.name.as_str());
+                    }
+                    tracing::info!("clipboard copied here, shared with: {}", to.join(", "));
+                }
+                Some(m) => {
+                    // Large images and files are fetched over the bulk lane, which serves
+                    // one computer at a time: offered to the one in use now, and to each
+                    // other one when it comes into use.
+                    if matches!(m, Message::ClipboardImageRef { .. } | Message::ClipboardFiles { .. }) {
+                        last_offer = Some(m.clone());
+                        owed = live.keys().filter(|d| active.as_ref() != Some(*d)).cloned().collect();
+                    }
+                    if let Some(l) = active.as_ref().and_then(|a| live.get(a)) {
+                        let _ = l.to.send(m);
+                    }
+                }
+            },
+
+            // From a computer: only the one in use speaks to the engine, except for copied
+            // text and small images, which any of them shares with this computer and the
+            // others.
+            Some((dev, m)) = incoming_rx.recv() => {
+                if is_shared_clip(&m) {
+                    if let Some(from) = live.get(&dev).filter(|l| !l.login_screen) {
+                        let mut to = Vec::new();
+                        for (_, l) in live.iter().filter(|(d, l)| **d != dev && !l.login_screen) {
+                            let _ = l.to.send(m.clone());
+                            to.push(l.name.as_str());
+                        }
+                        tracing::info!("clipboard copied on {}, shared with this computer and: {}", from.name, to.join(", "));
+                        let _ = engine_in.send(m);
+                    }
+                } else if active.as_deref() == Some(dev.as_str()) {
+                    let _ = engine_in.send(m);
+                }
+            }
+
+            // A switch asked for (a shortcut or Connect): take it if that one is here.
+            _ = tick.tick() => {
+                if let Some(want) = crate::trust::reserved(&own) {
+                    if active.as_deref() != Some(want.as_str()) && live.contains_key(&want) {
+                        if let Some(old) = active.as_ref().and_then(|a| live.get(a)) {
+                            let _ = old.to.send(Message::Leave);
+                        }
+                        activate(&own, &live, &mut active, &want, &engine_events);
+                    } else if active.as_deref() == Some(want.as_str()) {
+                        crate::trust::reserve(&own, None);
                     }
                 }
             }
@@ -405,7 +482,7 @@ pub async fn run_server(
                     _ = cancel.cancelled() => break,
                     r = timeout(params.handshake_timeout, server_handshake(&mut framed, &cfg)) => r,
                 };
-                let (peer_name, peer_w, peer_h, lane, peer_login_screen) = match shook {
+                let hello = match shook {
                     Ok(Ok(v)) => v,
                     Ok(Err(reason)) if reason.starts_with("pairing:") => {
                         tracing::info!("{reason}");
@@ -427,77 +504,156 @@ pub async fn run_server(
                     }
                 };
 
+                let ClientHello { name: peer_name, device: peer_device, width: peer_w, height: peer_h, lane, login_screen: peer_login_screen } = hello;
                 match lane {
                     Lane::Bulk => {
                         // Bulk connections are handed off and the loop continues. A new
-                        // one replaces whatever came before: the only reason a second
-                        // arrives is that the peer reconnected it.
-                        bulk.take_server_connection(framed, &cancel);
+                        // one replaces whatever came before. Only the computer in use gets
+                        // one: another paired computer must not be served the clipboard of
+                        // someone else's session (R44).
+                        if crate::trust::input_peer(&own).as_deref() == Some(peer_device.as_str()) {
+                            bulk.take_server_connection(framed, &cancel);
+                        } else {
+                            tracing::debug!(peer = %peer_name, "bulk lane from a computer not in use; refused for now");
+                        }
                     }
                     Lane::Input => {
                         crate::qos::prioritise_input(framed.get_ref().tcp());
                         note_peer_ip(peer_addr.ip());
-                        // A new input connection that has passed the handshake is from the same
-                        // trusted peer, now on a newer path. It replaces a session still open on
-                        // the old one, rather than being refused until that session times out.
-                        if session.is_some() {
-                            if let Some(old) = session_cancel.take() {
-                                old.cancel();
-                            }
-                            if let Some(h) = session.take() {
-                                if let Ok((returned, _reason)) = h.await {
-                                    let _ = returned.events.send(LinkEvent::Disconnected(DisconnectReason::Superseded));
-                                    ch_slot = Some(returned);
-                                }
-                            }
+                        // The same computer on a newer path replaces its own old session.
+                        let replacing = live.remove(&peer_device);
+                        if let Some(old) = &replacing {
+                            old.cancel.cancel();
                         }
-                        let Some(mut owned) = ch_slot.take() else {
-                            // One input client at a time. Refusing immediately is kinder
-                            // than accepting into a queue the peer will time out on; it
-                            // retries with backoff and connects once the stale session
-                            // hits its liveness timeout.
-                            tracing::warn!(
-                                peer = %peer_name,
-                                "refusing a second input connection; one is already live"
-                            );
-                            continue;
-                        };
                         tracing::info!(
                             peer = %peer_name,
+                            device = short_id(&peer_device),
                             "input link from {peer_addr} arrived through {}",
                             local_path(local_addr)
                         );
-                        let _ = owned.events.send(LinkEvent::Connecting(peer_addr.to_string()));
-                        let _ = owned.events.send(LinkEvent::Connected {
-                            peer: peer_name,
-                            width: peer_w,
-                            height: peer_h,
-                            login_screen: peer_login_screen,
-                        });
                         let sock = if peer_addr.is_ipv6() { &motion_sock6 } else { &motion_sock };
                         let motion = match (sock, framed.get_ref().motion_key()) {
                             (Some(sock), Some(key)) => Motion::Server(ServerMotion::new(sock.clone(), key, peer_addr)),
                             _ => Motion::Off,
                         };
+                        epoch += 1;
                         let c = cancel.child_token();
-                        session_cancel = Some(c.clone());
-                        let h = health.clone();
-                        session = Some(tokio::spawn(async move {
-                            let reason = pump(framed, params, &c, &mut owned, &h, None, motion).await;
-                            (owned, reason)
-                        }));
+                        let (to_tx, to_rx) = mpsc::unbounded_channel();
+                        let (from_tx, mut from_rx) = mpsc::unbounded_channel();
+                        // Nothing in a session reports events; this end just has to exist.
+                        let (ev_tx, _ev_rx) = mpsc::unbounded_channel();
+                        let mut session_ch = LinkChannels { to_peer: to_rx, from_peer: from_tx, events: ev_tx };
+                        let tagged = incoming_tx.clone();
+                        let dev = peer_device.clone();
+                        tokio::spawn(async move {
+                            while let Some(m) = from_rx.recv().await {
+                                if tagged.send((dev.clone(), m)).is_err() {
+                                    break;
+                                }
+                            }
+                        });
+                        let (h, ended, dev, ep, sc) = (health.clone(), ended_tx.clone(), peer_device.clone(), epoch, c.clone());
+                        tokio::spawn(async move {
+                            let reason = pump(framed, params, &sc, &mut session_ch, &h, None, motion).await;
+                            let _ = ended.send((dev, ep, reason));
+                        });
+                        live.insert(
+                            peer_device.clone(),
+                            LiveSession {
+                                name: peer_name.clone(),
+                                width: peer_w,
+                                height: peer_h,
+                                login_screen: peer_login_screen,
+                                to: to_tx,
+                                cancel: c,
+                                epoch,
+                            },
+                        );
+                        crate::trust::set_connected(&own, &live.keys().cloned().collect::<Vec<_>>());
+                        let was_active = active.as_deref() == Some(peer_device.as_str());
+                        let wanted = crate::trust::reserved(&own).as_deref() == Some(peer_device.as_str());
+                        if was_active {
+                            // The one in use came back on a newer path: same as before.
+                            let _ = engine_events.send(LinkEvent::Disconnected(DisconnectReason::Superseded));
+                            activate(&own, &live, &mut active, &peer_device, &engine_events);
+                        } else if active.is_none() || wanted {
+                            if let Some(old) = active.as_ref().and_then(|a| live.get(a)) {
+                                let _ = old.to.send(Message::Leave);
+                            }
+                            activate(&own, &live, &mut active, &peer_device, &engine_events);
+                        } else {
+                            tracing::info!(peer = %peer_name, "{peer_name} is connected too; switch to it with its shortcut or Connect");
+                        }
                     }
                 }
             }
         }
     }
 
-    // Cancelled: let a live session finish its own bounded teardown, then report it.
-    if let Some(handle) = session {
-        if let Ok((returned, reason)) = handle.await {
-            let _ = returned.events.send(LinkEvent::Disconnected(reason));
+    // Cancelled: every session ends its own bounded teardown; report the one in use.
+    for l in live.values() {
+        l.cancel.cancel();
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let mut active_reason = None;
+    while !live.is_empty() {
+        match tokio::time::timeout_at(deadline, ended_rx.recv()).await {
+            Ok(Some((dev, ep, reason))) => {
+                if live.get(&dev).is_some_and(|l| l.epoch == ep) {
+                    live.remove(&dev);
+                    if active.as_deref() == Some(dev.as_str()) {
+                        active_reason = Some(reason);
+                    }
+                }
+            }
+            _ => break,
         }
     }
+    crate::trust::set_connected(&own, &[]);
+    if let Some(reason) = active_reason {
+        let _ = engine_events.send(LinkEvent::Disconnected(reason));
+    }
+}
+
+/// Copied text and small images: small enough to send to every connected computer at
+/// once, so they all share one clipboard.
+fn is_shared_clip(m: &Message) -> bool {
+    matches!(m, Message::Clipboard { .. } | Message::ClipboardImage { .. })
+}
+
+/// One connected computer on the server (R46).
+struct LiveSession {
+    name: String,
+    width: i32,
+    height: i32,
+    login_screen: bool,
+    /// To this computer's session.
+    to: mpsc::UnboundedSender<Message>,
+    cancel: CancellationToken,
+    /// Which session this is, so the end of a replaced one is not taken for the new one's.
+    epoch: u64,
+}
+
+/// Make `dev` the computer in use and tell the engine, which treats it as a fresh
+/// connection (it starts on this side of the edge).
+fn activate(
+    own: &str,
+    live: &HashMap<String, LiveSession>,
+    active: &mut Option<String>,
+    dev: &str,
+    engine_events: &mpsc::UnboundedSender<LinkEvent>,
+) {
+    let Some(l) = live.get(dev) else { return };
+    *active = Some(dev.to_owned());
+    crate::trust::set_input_peer(own, Some(dev));
+    crate::trust::connected_with(own, dev);
+    tracing::info!(peer = %l.name, "now using {}", l.name);
+    let _ = engine_events.send(LinkEvent::Connected {
+        peer: l.name.clone(),
+        width: l.width,
+        height: l.height,
+        login_screen: l.login_screen,
+    });
 }
 
 // ----------------------------------------------------------------------------
@@ -542,10 +698,14 @@ pub async fn run_client(
     mut ch: LinkChannels,
     health: Arc<LinkHealth>,
 ) {
+    crate::trust::load(&cfg.device_id, &cfg.paired);
+    // Back to the computer this one was last with (R45), if it is still paired.
+    let chosen = Some(cfg.connect_to.as_str()).filter(|c| crate::trust::get(&cfg.device_id, c).is_some());
+    crate::trust::set_choice(&cfg.device_id, chosen);
     let found = beacon::Found::new();
     let (epoch_tx, epoch_rx) = watch::channel(0u64);
     tokio::spawn(beacon::run_listener(
-        cfg.shared_secret.clone(),
+        cfg.device_id.clone(),
         cfg.discovery_port,
         found.clone(),
         cancel.child_token(),
@@ -578,7 +738,8 @@ pub async fn run_client(
                 }
             }
         }
-        for a in found.candidates(std::time::Instant::now()) {
+        let only = crate::trust::choice(&cfg.device_id);
+        for a in found.candidates_for(std::time::Instant::now(), only.as_deref()) {
             if !targets.contains(&a) {
                 targets.push(a);
             }
@@ -862,11 +1023,18 @@ pub async fn run_bulk_listener(
             r = timeout(params.handshake_timeout, server_handshake(&mut framed, &cfg)) => r,
         };
         match shook {
-            // The same shared secret guards this port as the input one; a connection
+            // The same pairing keys guard this port as the input one; a connection
             // that authenticates but asks for the input lane is refused here, because
             // input has exactly one home and it is not this listener.
-            Ok(Ok((_, _, _, Lane::Bulk, _))) => bulk.take_server_connection(framed, &cancel),
-            Ok(Ok((name, _, _, Lane::Input, _))) => {
+            Ok(Ok(ClientHello { lane: Lane::Bulk, device, name, .. })) => {
+                // Only the computer that holds the input link (R44).
+                if crate::trust::input_peer(&cfg.device_id).as_deref() == Some(device.as_str()) {
+                    bulk.take_server_connection(framed, &cancel)
+                } else {
+                    tracing::warn!(peer = %name, "bulk lane from a computer that does not hold the input link; refused")
+                }
+            }
+            Ok(Ok(ClientHello { lane: Lane::Input, name, .. })) => {
                 tracing::warn!(peer = %name, "input connection offered to the bulk port; refused")
             }
             Ok(Err(reason)) => tracing::warn!("bulk handshake rejected: {reason}"),
@@ -937,26 +1105,38 @@ pub async fn connect_and_handshake(
 // Handshake (async) — mirrors auth.py's HMAC challenge/response.
 // ----------------------------------------------------------------------------
 
+/// Who a client said it is, once the handshake has proved it.
+#[derive(Debug, Clone)]
+struct ClientHello {
+    name: String,
+    /// Its device ID: the pairing it proved it holds (R44).
+    device: String,
+    width: i32,
+    height: i32,
+    lane: Lane,
+    login_screen: bool,
+}
+
 async fn server_handshake(
     framed: &mut Framed<LinkStream, MessageCodec>,
     cfg: &Config,
-) -> Result<(String, i32, i32, Lane, bool), String> {
+) -> Result<ClientHello, String> {
     let hello = framed.next().await;
-    let (name, width, height, lane, login_screen, version, client_nonce) = match hello {
-        Some(Ok(Message::Hello { name, width, height, lane, login_screen, version, nonce })) => {
-            (name, width, height, lane, login_screen, version, nonce)
+    let (name, width, height, lane, login_screen, version, client_nonce, device) = match hello {
+        Some(Ok(Message::Hello { name, width, height, lane, login_screen, version, nonce, device })) => {
+            (name, width, height, lane, login_screen, version, nonce, device)
         }
-        Some(Ok(Message::PairStart { name, msg })) => {
-            return Err(server_pair(framed, cfg, name, msg).await);
+        Some(Ok(Message::PairStart { name, msg, device })) => {
+            return Err(server_pair(framed, cfg, name, device, msg).await);
         }
         Some(Ok(other)) => return Err(format!("expected hello, got {other:?}")),
         Some(Err(e)) => return Err(format!("hello decode: {e}")),
         None => return Err("peer closed before hello".into()),
     };
-    // A version 1 peer can't prove anything about this session: refuse it rather than
-    // fall back, or anyone could downgrade a connection to the one-way check (B34).
-    let client_nonce = match client_nonce {
-        Some(n) if version >= PROTOCOL_VERSION => n,
+    // An older peer can't prove anything about this pairing: refuse it rather than fall
+    // back, or anyone could downgrade a connection to a weaker check (B34, R44).
+    let (client_nonce, device) = match (client_nonce, device) {
+        (Some(n), Some(d)) if version >= PROTOCOL_VERSION && !d.is_empty() => (n, d),
         _ => {
             let _ = framed.send(refusal("old_version")).await;
             return Err(format!(
@@ -964,16 +1144,28 @@ async fn server_handshake(
             ));
         }
     };
+    // Only a computer this one paired with gets any further, and only with the key of
+    // that pairing (R44). Nothing is proved to a stranger.
+    let Some(pairing) = crate::trust::get(&cfg.device_id, &device) else {
+        let _ = framed.send(refusal("not_paired")).await;
+        return Err(format!("{name} is not paired with this computer; refused"));
+    };
+    let ends = auth::Ends { client: &device, server: &cfg.device_id };
 
     let binding = framed.get_ref().auth_binding()?;
     let nonce = auth::generate_nonce_hex();
-    let proof = auth::proof_hex(&cfg.shared_secret, Side::Server, &binding, &client_nonce, &nonce)
+    let proof = auth::proof_hex(&pairing.key, Side::Server, ends, &binding, &client_nonce, &nonce)
         .map_err(|e| format!("bad nonce from {name}: {e}"))?;
     // The client's PIN, if someone has typed it here this run. The client checks it.
-    let pin_proof = crate::pin::typed_for(&name)
-        .map(|pin| crate::pin::proof_hex(&pin, &binding, &client_nonce, &nonce));
+    let pin_proof = crate::pin::typed_for(&device)
+        .map(|pin| crate::pin::proof_hex(&pairing.key, &pin, &binding, &client_nonce, &nonce));
     framed
-        .send(Message::AuthChallenge { nonce: nonce.clone(), proof: Some(proof), pin_proof })
+        .send(Message::AuthChallenge {
+            nonce: nonce.clone(),
+            device: Some(cfg.device_id.clone()),
+            proof: Some(proof),
+            pin_proof,
+        })
         .await
         .map_err(|e| format!("send challenge: {e}"))?;
 
@@ -983,7 +1175,7 @@ async fn server_handshake(
         // The client refused us, most often over its PIN: ask our user for it.
         Some(Ok(Message::AuthOk { ok: false, reason, .. })) => {
             let reason = reason.unwrap_or_else(|| "refused".into());
-            return Err(if crate::pin::note_refusal(&name, &reason) {
+            return Err(if crate::pin::note_refusal(&device, &name, &reason) {
                 format!("{reason} from {name}")
             } else {
                 format!("{name} refused: {reason}")
@@ -994,12 +1186,11 @@ async fn server_handshake(
         None => return Err("peer closed before auth response".into()),
     };
 
-    if !auth::verify_proof(&cfg.shared_secret, Side::Client, &binding, &client_nonce, &nonce, &hmac)
-    {
+    if !auth::verify_proof(&pairing.key, Side::Client, ends, &binding, &client_nonce, &nonce, &hmac) {
         let _ = framed.send(refusal("bad_secret")).await;
-        return Err(format!("bad secret from {name}"));
+        return Err(format!("bad proof from {name}"));
     }
-    crate::pin::accepted(&name);
+    crate::pin::accepted(&device);
 
     framed
         .send(Message::AuthOk {
@@ -1012,7 +1203,7 @@ async fn server_handshake(
         .await
         .map_err(|e| format!("send auth ok: {e}"))?;
 
-    Ok((name, width, height, lane, login_screen))
+    Ok(ClientHello { name, device, width, height, lane, login_screen })
 }
 
 /// Serve one pairing attempt (see `pairing`). Always ends the connection: the client
@@ -1022,9 +1213,14 @@ async fn server_pair(
     framed: &mut Framed<LinkStream, MessageCodec>,
     cfg: &Config,
     client: String,
+    client_device: String,
     client_msg: String,
 ) -> String {
-    let done = |reason: &str| Message::PairDone { ok: false, server: None, secret: None, tag: None, reason: Some(reason.into()) };
+    let done = |reason: &str| Message::PairDone { ok: false, server: None, reason: Some(reason.into()) };
+    if client_device.is_empty() {
+        let _ = framed.send(done("old_version")).await;
+        return format!("pairing: {client} runs an older mouse-rs; update it");
+    }
     let Some(code) = crate::pairing::code_for_attempt() else {
         let _ = framed.send(done("no_code")).await;
         return format!("pairing: {client} tried to pair, but no code is showing");
@@ -1035,14 +1231,22 @@ async fn server_pair(
     };
     let start = crate::pairing::start_server(&code);
     let server_msg = start.msg.clone();
-    let session = match start.finish(&client_msg, &binding, &client_msg, &server_msg) {
+    let us = crate::pairing::Party { id: &cfg.device_id, name: &cfg.name };
+    let them = crate::pairing::Party { id: &client_device, name: &client };
+    let session = match start.finish(&client_msg, &binding, &client_msg, &server_msg, them, us) {
         Ok(s) => s,
         Err(e) => {
             crate::pairing::note_failure();
             return format!("pairing: {client}: {e}");
         }
     };
-    if framed.send(Message::PairReply { msg: server_msg, confirm: session.server_confirm() }).await.is_err() {
+    let reply = Message::PairReply {
+        msg: server_msg,
+        confirm: session.server_confirm(),
+        device: cfg.device_id.clone(),
+        name: cfg.name.clone(),
+    };
+    if framed.send(reply).await.is_err() {
         return format!("pairing: {client} went away");
     }
     let confirmed = match framed.next().await {
@@ -1055,17 +1259,32 @@ async fn server_pair(
         let _ = framed.send(done("wrong_code")).await;
         return format!("pairing: {client} typed a wrong code");
     }
-    let (secret, tag) = session.seal(&cfg.shared_secret);
-    let _ = framed
-        .send(Message::PairDone { ok: true, server: Some(cfg.name.clone()), secret: Some(secret), tag: Some(tag), reason: None })
-        .await;
+    // Both sides now hold the same new key, and know exactly whom they share it with.
+    crate::trust::add(
+        &cfg.device_id,
+        PairedDevice { id: client_device.clone(), name: client.clone(), key: session.pair_key(), paired_at: now_secs() },
+    );
+    let _ = framed.send(Message::PairDone { ok: true, server: Some(cfg.name.clone()), reason: None }).await;
     crate::pairing::note_success(&client);
-    format!("pairing: paired with {client}")
+    format!("pairing: paired with {client} (device {})", short_id(&client_device))
 }
 
-/// Pair with the server at `to` using the code it shows. Returns the server's name and
-/// the shared secret to save.
-pub async fn pair_with_server(cfg: &Config, to: &str, code: &str, wait: Duration) -> Result<(String, String), String> {
+/// Seconds since 1970, for when a pairing was made.
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// The start of a device ID, enough to tell two apart in a log.
+fn short_id(id: &str) -> &str {
+    id.get(..8).unwrap_or(id)
+}
+
+/// Pair with the server at `to` using the code it shows. On success the new pairing is
+/// live in `trust` (and waiting there for the panel to save), and is returned too.
+pub async fn pair_with_server(cfg: &Config, to: &str, code: &str, wait: Duration) -> Result<PairedDevice, String> {
     // "1.2.3.4", "1.2.3.4:24800", "fe80::1%3", "[fe80::1%3]:24800" or "name[:port]".
     let to = if to.parse::<SocketAddr>().is_ok() {
         to.to_owned()
@@ -1102,22 +1321,30 @@ async fn client_pair(
     framed: &mut Framed<LinkStream, MessageCodec>,
     cfg: &Config,
     code: &str,
-) -> Result<(String, String), String> {
+) -> Result<PairedDevice, String> {
     let binding = framed.get_ref().auth_binding()?;
     let start = crate::pairing::start_client(code);
     let client_msg = start.msg.clone();
     framed
-        .send(Message::PairStart { name: cfg.name.clone(), msg: client_msg.clone() })
+        .send(Message::PairStart { name: cfg.name.clone(), msg: client_msg.clone(), device: cfg.device_id.clone() })
         .await
         .map_err(|e| format!("send: {e}"))?;
-    let (server_msg, confirm) = match framed.next().await {
-        Some(Ok(Message::PairReply { msg, confirm })) => (msg, confirm),
+    let (server_msg, confirm, server_device, server_name) = match framed.next().await {
+        Some(Ok(Message::PairReply { msg, confirm, device, name })) if !device.is_empty() => (msg, confirm, device, name),
+        Some(Ok(Message::PairReply { .. })) => return Err("old_version".into()),
         Some(Ok(Message::PairDone { reason, .. })) => return Err(reason.unwrap_or_else(|| "refused".into())),
         Some(Ok(Message::AuthOk { ok: false, reason, .. })) => return Err(reason.unwrap_or_else(|| "refused".into())),
         Some(Ok(_)) | Some(Err(_)) => return Err("old_version".into()),
         None => return Err("old_version".into()),
     };
-    let session = start.finish(&server_msg, &binding, &client_msg, &server_msg)?;
+    if server_device == cfg.device_id {
+        return Err("that is this computer".into());
+    }
+    let us = crate::pairing::Party { id: &cfg.device_id, name: &cfg.name };
+    let them = crate::pairing::Party { id: &server_device, name: &server_name };
+    // The confirmation covers both IDs and names: if it checks out, the computer showing
+    // this code is `server_device`, and nobody changed that on the way.
+    let session = start.finish(&server_msg, &binding, &client_msg, &server_msg, us, them)?;
     if !session.check(&session.server_confirm(), &confirm) {
         // Either the code is wrong or someone is in the middle; nothing is sent either way.
         return Err("wrong_code".into());
@@ -1127,9 +1354,10 @@ async fn client_pair(
         .await
         .map_err(|e| format!("send: {e}"))?;
     match framed.next().await {
-        Some(Ok(Message::PairDone { ok: true, server, secret: Some(secret), tag: Some(tag), .. })) => {
-            let secret = session.open(&secret, &tag)?;
-            Ok((server.unwrap_or_else(|| "server".into()), secret))
+        Some(Ok(Message::PairDone { ok: true, .. })) => {
+            let dev = PairedDevice { id: server_device, name: server_name, key: session.pair_key(), paired_at: now_secs() };
+            crate::trust::add(&cfg.device_id, dev.clone());
+            Ok(dev)
         }
         Some(Ok(Message::PairDone { reason, .. })) => Err(reason.unwrap_or_else(|| "refused".into())),
         _ => Err("the server closed the connection".into()),
@@ -1156,12 +1384,13 @@ async fn client_handshake(
             lane,
             login_screen: cfg.at_login_screen,
             nonce: Some(client_nonce.clone()),
+            device: Some(cfg.device_id.clone()),
         })
         .await
         .map_err(|e| format!("send hello: {e}"))?;
 
-    let (nonce, proof, pin_proof) = match framed.next().await {
-        Some(Ok(Message::AuthChallenge { nonce, proof, pin_proof })) => (nonce, proof, pin_proof),
+    let (nonce, proof, pin_proof, server_device) = match framed.next().await {
+        Some(Ok(Message::AuthChallenge { nonce, proof, pin_proof, device })) => (nonce, proof, pin_proof, device),
         Some(Ok(Message::AuthOk { ok: false, reason, .. })) => {
             return Err(reason.unwrap_or_else(|| "rejected".into()))
         }
@@ -1170,17 +1399,26 @@ async fn client_handshake(
         None => return Err("peer closed before challenge".into()),
     };
 
-    // The server proves itself first; nothing about our secret is sent to a server
-    // that can't (B34).
-    let Some(proof) = proof else {
+    // The server proves itself first; nothing about our key is sent to a server that
+    // can't (B34). And it must be a computer we paired with (R44): a server we are not
+    // paired with gets nothing at all, even if it answered first.
+    let (Some(proof), Some(server_device)) = (proof, server_device) else {
         return Err("old_version".into());
     };
-    if !auth::verify_proof(&cfg.shared_secret, Side::Server, &binding, &client_nonce, &nonce, &proof)
-    {
+    let Some(pairing) = crate::trust::get(&cfg.device_id, &server_device) else {
+        return Err("not_paired_server".into());
+    };
+    // Paired, but not the computer this one is to be with right now (R45): go no further,
+    // so the one we were last with, or the one the user chose, is the one we reach.
+    if crate::trust::choice(&cfg.device_id).is_some_and(|c| c != server_device) {
+        return Err("not_chosen_server".into());
+    }
+    let ends = auth::Ends { client: &cfg.device_id, server: &server_device };
+    if !auth::verify_proof(&pairing.key, Side::Server, ends, &binding, &client_nonce, &nonce, &proof) {
         return Err("server_not_verified".into());
     }
 
-    let hmac = auth::proof_hex(&cfg.shared_secret, Side::Client, &binding, &client_nonce, &nonce)
+    let hmac = auth::proof_hex(&pairing.key, Side::Client, ends, &binding, &client_nonce, &nonce)
         .map_err(|e| format!("hmac: {e}"))?;
     // The connection PIN (R35): this machine is the one being driven, so it decides who
     // may drive it. The server must show the PIN, typed there by its user; the check and
@@ -1193,7 +1431,7 @@ async fn client_handshake(
             (Some(left), _) => Some(Verdict::Locked(left)),
             // No PIN typed there yet: not a wrong guess, nothing to count.
             (None, None) => None,
-            (None, Some(p)) => Some(check_attempt(verify(&cfg.connection_pin, &binding, &client_nonce, &nonce, &p))),
+            (None, Some(p)) => Some(check_attempt(verify(&pairing.key, &cfg.connection_pin, &binding, &client_nonce, &nonce, &p))),
         };
         let reason = match verdict {
             Some(Verdict::Accept) => None,
@@ -1213,11 +1451,12 @@ async fn client_handshake(
         .map_err(|e| format!("send auth response: {e}"))?;
 
     match framed.next().await {
-        Some(Ok(Message::AuthOk { ok: true, server, width, height, .. })) => Ok((
-            server.unwrap_or_else(|| "server".into()),
-            width.unwrap_or(0),
-            height.unwrap_or(0),
-        )),
+        Some(Ok(Message::AuthOk { ok: true, server, width, height, .. })) => {
+            if lane == Lane::Input {
+                crate::trust::connected_with(&cfg.device_id, &server_device);
+            }
+            Ok((server.unwrap_or_else(|| "server".into()), width.unwrap_or(0), height.unwrap_or(0)))
+        }
         Some(Ok(Message::AuthOk { ok: false, reason, .. })) => {
             Err(reason.unwrap_or_else(|| "rejected".into()))
         }
@@ -1663,14 +1902,36 @@ mod tests {
         );
     }
 
+    /// The pairing key the test server and test client share.
+    const TEST_KEY: &str = "test-key";
+
+    /// The test server's and client's device IDs. They include the port, which each test
+    /// picks fresh, so tests running at once never see each other's pairings in `trust`.
+    fn server_id(port: u16) -> String {
+        format!("srv-{port}")
+    }
+    fn client_id(port: u16) -> String {
+        format!("cli-{port}")
+    }
+
+    fn pairing(id: String, name: &str, key: &str) -> PairedDevice {
+        PairedDevice { id, name: name.into(), key: key.into(), paired_at: 0 }
+    }
+
+    /// A server or client for `port`, paired with the other one under [`TEST_KEY`].
     fn test_cfg(role: Role, port: u16, tls: bool) -> Config {
+        let (device_id, peer) = match role {
+            Role::Server => (server_id(port), pairing(client_id(port), "test-client", TEST_KEY)),
+            Role::Client => (client_id(port), pairing(server_id(port), "test-server", TEST_KEY)),
+        };
         Config {
             name: match role {
                 Role::Server => "test-server".into(),
                 Role::Client => "test-client".into(),
             },
             role,
-            shared_secret: "test-secret".into(),
+            device_id,
+            paired: vec![peer],
             tls_enabled: tls,
             listen_host: "127.0.0.1".into(),
             listen_port: port,
@@ -1756,7 +2017,7 @@ mod tests {
     /// A client that completes the handshake then holds the socket open while
     /// going completely silent — never answering pings. This is a genuinely dead
     /// peer (no FIN), unlike a dropped socket which closes cleanly.
-    async fn silent_client_after_handshake(port: u16, secret: &str) {
+    async fn silent_client_after_handshake(port: u16, key: &str) {
         let tcp = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
         let mut framed = Framed::new(LinkStream::Plain(tcp), MessageCodec::new());
         let client_nonce = auth::generate_nonce_hex();
@@ -1769,6 +2030,7 @@ mod tests {
                 lane: Lane::Input,
                 login_screen: false,
                 nonce: Some(client_nonce.clone()),
+                device: Some(client_id(port)),
             })
             .await
             .unwrap();
@@ -1776,7 +2038,9 @@ mod tests {
             Some(Ok(Message::AuthChallenge { nonce, .. })) => nonce,
             other => panic!("expected challenge, got {other:?}"),
         };
-        let hmac = auth::proof_hex(secret, Side::Client, &[], &client_nonce, &nonce).unwrap();
+        let (cid, sid) = (client_id(port), server_id(port));
+        let ends = auth::Ends { client: &cid, server: &sid };
+        let hmac = auth::proof_hex(key, Side::Client, ends, &[], &client_nonce, &nonce).unwrap();
         framed.send(Message::AuthResponse { hmac }).await.unwrap();
         let _ = framed.next().await; // consume AuthOk
         // Go silent but keep the socket alive — do not answer pings.
@@ -1816,7 +2080,7 @@ mod tests {
         assert_eq!(next_refusal(&mut s_events).await.as_deref(), Some("pin_required from test-client"));
         assert_eq!(crate::pin::prompt(), Some(("test-client".into(), crate::pin::Prompt::Needed)));
 
-        crate::pin::enter("test-client", "1111".into());
+        assert_eq!(crate::pin::enter("1111".into()).as_deref(), Some("test-client"));
         let mut wrong = None;
         for _ in 0..5 {
             match next_refusal(&mut c_events).await {
@@ -1834,9 +2098,9 @@ mod tests {
                 break;
             }
         }
-        assert_eq!(crate::pin::typed_for("test-client"), None, "the server forgets a wrong PIN");
+        assert_eq!(crate::pin::typed_for(&client_id(port)), None, "the server forgets a wrong PIN");
 
-        crate::pin::enter("test-client", "Ab#4321".into());
+        crate::pin::enter("Ab#4321".into());
         assert!(wait_for_connect(&mut c_events, Duration::from_secs(5)).await, "the right PIN connects");
         assert_eq!(crate::pin::prompt(), None);
 
@@ -1848,15 +2112,18 @@ mod tests {
 
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
-    async fn pairing_with_the_code_hands_over_the_secret() {
+    async fn pairing_with_the_code_makes_a_key_for_these_two_and_they_connect_with_it() {
         let _g = crate::pin::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let port = free_port().await;
         let cancel = CancellationToken::new();
-        let (s_ch, _s_to, _s_from, _s_events) = channels();
-        let server = tokio::spawn(run_server(test_cfg(Role::Server, port, true), fast_params(), cancel.clone(), s_ch, BulkServer::disabled(), LinkHealth::new()));
+        let (s_ch, _s_to, _s_from, mut s_events) = channels();
+        // A server paired with nobody yet, and a fresh client.
+        let mut server_cfg = test_cfg(Role::Server, port, true);
+        server_cfg.paired.clear();
+        let server = tokio::spawn(run_server(server_cfg, fast_params(), cancel.clone(), s_ch, BulkServer::disabled(), LinkHealth::new()));
         tokio::time::sleep(Duration::from_millis(100)).await;
         let mut fresh = test_cfg(Role::Client, port, true);
-        fresh.shared_secret = crate::config::DEFAULT_SECRET.into();
+        fresh.paired.clear();
         let to = format!("127.0.0.1:{port}");
         let wait = Duration::from_secs(3);
 
@@ -1866,14 +2133,367 @@ mod tests {
         let code = crate::pairing::start_code();
         let wrong = if code == "111111" { "222222" } else { "111111" };
         assert_eq!(pair_with_server(&fresh, &to, wrong, wait).await, Err("wrong_code".into()));
+        assert!(crate::trust::get(&server_id(port), &client_id(port)).is_none(), "a wrong code pairs nothing");
 
-        let got = pair_with_server(&fresh, "127.0.0.1", &code, wait).await;
-        assert_eq!(got, Ok(("test-server".into(), "test-secret".into())));
+        let got = pair_with_server(&fresh, "127.0.0.1", &code, wait).await.expect("pairs");
         assert_eq!(crate::pairing::current_code(), None, "a code is used once");
         assert_eq!(crate::pairing::take_last_paired().as_deref(), Some("test-client"));
+        // The client knows exactly which computer showed the code, and the two hold the
+        // same new key, which is not the test key nor any old shared secret.
+        assert_eq!(got.id, server_id(port));
+        assert_eq!(got.name, "test-server");
+        let server_side = crate::trust::get(&server_id(port), &client_id(port)).expect("the server kept the pairing");
+        assert_eq!(server_side.key, got.key);
+        assert_eq!(server_side.name, "test-client");
+        assert_ne!(got.key, TEST_KEY);
+        // Both are waiting for their panels to save.
+        assert_eq!(crate::trust::take_unsaved(&server_id(port)).len(), 1);
+        assert_eq!(crate::trust::take_unsaved(&client_id(port)).len(), 1);
+
+        // And with that key, and nothing else, the client connects.
+        fresh.paired = vec![got];
+        let (c_ch, _c_to, _c_from, mut c_events) = channels();
+        let client = tokio::spawn(run_client(fresh, fast_params(), cancel.clone(), c_ch, LinkHealth::new()));
+        assert!(wait_connected(&mut c_events).await, "the new pairing connects");
+        assert!(wait_connected(&mut s_events).await);
 
         cancel.cancel();
-        let _ = server.await;
+        let _ = tokio::join!(server, client);
+    }
+
+    /// A computer for these tests: `id`, called `name`, serving or connecting on `port`,
+    /// paired with exactly the computers in `paired`.
+    fn computer(role: Role, port: u16, id: &str, name: &str, paired: Vec<PairedDevice>) -> Config {
+        Config { device_id: id.into(), name: name.into(), paired, ..test_cfg(role, port, false) }
+    }
+
+    /// The first AuthFailed or Connected on `events`: Ok(()) for connected, Err(reason).
+    async fn outcome(events: &mut mpsc::UnboundedReceiver<LinkEvent>) -> Result<(), String> {
+        // An overall deadline too: a client retrying a dead address sends other events
+        // for ever, and each one would otherwise restart the wait.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            match tokio::time::timeout_at(deadline, events.recv()).await {
+                Ok(Some(LinkEvent::Connected { .. })) => return Ok(()),
+                Ok(Some(LinkEvent::AuthFailed(r))) => return Err(r),
+                Ok(Some(_)) => continue,
+                Ok(None) | Err(_) => return Err("nothing happened".into()),
+            }
+        }
+    }
+
+    /// B50, exactly as it happened on 30 Oct: the laptop and Kali are paired with each
+    /// other; the VM pairs with the laptop only. The VM must be refused by Kali, and get
+    /// in to the laptop.
+    #[tokio::test]
+    async fn a_computer_paired_with_one_computer_is_refused_by_another() {
+        let (laptop_port, kali_port) = (free_port().await, free_port().await);
+        let tag = format!("{laptop_port}-{kali_port}");
+        let (laptop, kali, vm) = (format!("laptop-{tag}"), format!("kali-{tag}"), format!("vm-{tag}"));
+        let cancel = CancellationToken::new();
+        let start = |cfg: Config| {
+            let (ch, _to, _from, events) = channels();
+            let h = tokio::spawn(run_server(cfg, fast_params(), cancel.clone(), ch, BulkServer::disabled(), LinkHealth::new()));
+            (h, events, _to, _from)
+        };
+        let (s1, mut laptop_events, _a, _b) = start(computer(
+            Role::Server,
+            laptop_port,
+            &laptop,
+            "laptop",
+            vec![pairing(kali.clone(), "kali", "laptop-kali"), pairing(vm.clone(), "vm", "laptop-vm")],
+        ));
+        let (s2, mut kali_events, _c, _d) =
+            start(computer(Role::Server, kali_port, &kali, "kali", vec![pairing(laptop.clone(), "laptop", "laptop-kali")]));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // The VM tries Kali.
+        let vm_cfg = computer(Role::Client, kali_port, &vm, "vm", vec![pairing(laptop.clone(), "laptop", "laptop-vm")]);
+        let (c_ch, _e, _f, mut vm_events) = channels();
+        let c1 = tokio::spawn(run_client(vm_cfg.clone(), fast_params(), cancel.clone(), c_ch, LinkHealth::new()));
+        assert_eq!(outcome(&mut vm_events).await, Err("not_paired".into()), "the VM must not get into Kali");
+        let kali_said = outcome(&mut kali_events).await.unwrap_err();
+        assert!(kali_said.contains("not paired"), "Kali says why, by name: {kali_said}");
+
+        // The same VM, pointed at the laptop it paired with, gets in.
+        let (c_ch, _g, _h, mut vm_events2) = channels();
+        let c2 = tokio::spawn(run_client(
+            Config { server_port: laptop_port, ..vm_cfg },
+            fast_params(),
+            cancel.clone(),
+            c_ch,
+            LinkHealth::new(),
+        ));
+        assert_eq!(outcome(&mut vm_events2).await, Ok(()));
+        assert_eq!(outcome(&mut laptop_events).await, Ok(()));
+
+        cancel.cancel();
+        let _ = tokio::join!(s1, s2, c1, c2);
+    }
+
+    /// Swapping who has the mouse needs no new pairing: the one key works both ways.
+    #[tokio::test]
+    async fn swapping_roles_uses_the_same_pairing() {
+        for swapped in [false, true] {
+            let port = free_port().await;
+            let (a, b) = (format!("a-{port}"), format!("b-{port}"));
+            let a_pairs = vec![pairing(b.clone(), "b", "ab-key")];
+            let b_pairs = vec![pairing(a.clone(), "a", "ab-key")];
+            let (server_cfg, client_cfg) = if swapped {
+                (computer(Role::Server, port, &b, "b", b_pairs), computer(Role::Client, port, &a, "a", a_pairs))
+            } else {
+                (computer(Role::Server, port, &a, "a", a_pairs), computer(Role::Client, port, &b, "b", b_pairs))
+            };
+            let cancel = CancellationToken::new();
+            let (s_ch, _s_to, _s_from, mut s_events) = channels();
+            let (c_ch, _c_to, _c_from, mut c_events) = channels();
+            let server = tokio::spawn(run_server(server_cfg, fast_params(), cancel.clone(), s_ch, BulkServer::disabled(), LinkHealth::new()));
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let client = tokio::spawn(run_client(client_cfg, fast_params(), cancel.clone(), c_ch, LinkHealth::new()));
+            assert_eq!(outcome(&mut c_events).await, Ok(()), "swapped={swapped}");
+            assert_eq!(outcome(&mut s_events).await, Ok(()), "swapped={swapped}");
+            cancel.cancel();
+            let _ = tokio::join!(server, client);
+        }
+    }
+
+    /// A server the client is not paired with gets nothing from it, not even a proof made
+    /// with some other key, whatever name it gives.
+    #[tokio::test]
+    async fn a_client_gives_nothing_to_a_server_it_is_not_paired_with() {
+        let port = free_port().await;
+        let listener = TcpListener::bind(("127.0.0.1", port)).await.unwrap();
+        let fake = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut framed = Framed::new(LinkStream::Plain(tcp), MessageCodec::new());
+            let client_nonce = match framed.next().await {
+                Some(Ok(Message::Hello { nonce: Some(n), .. })) => n,
+                other => panic!("expected a hello, got {other:?}"),
+            };
+            let nonce = auth::generate_nonce_hex();
+            let ends = auth::Ends { client: "whoever", server: "stranger" };
+            let proof = auth::proof_hex("k", Side::Server, ends, &[], &client_nonce, &nonce).unwrap();
+            framed
+                .send(Message::AuthChallenge { nonce, device: Some("stranger".into()), proof: Some(proof), pin_proof: None })
+                .await
+                .unwrap();
+            timeout(Duration::from_secs(2), framed.next()).await.ok().flatten()
+        });
+        let cancel = CancellationToken::new();
+        let (c_ch, _c_to, _c_from, mut c_events) = channels();
+        let client = tokio::spawn(run_client(test_cfg(Role::Client, port, false), fast_params(), cancel.clone(), c_ch, LinkHealth::new()));
+        assert_eq!(outcome(&mut c_events).await, Err("not_paired_server".into()));
+        let after = fake.await.unwrap();
+        assert!(
+            !matches!(after, Some(Ok(Message::AuthResponse { .. }))),
+            "the client sent a proof to a server it is not paired with: {after:?}"
+        );
+        cancel.cancel();
+        let _ = timeout(Duration::from_secs(2), client).await;
+    }
+
+    /// R46: the computer with the mouse stays connected to every paired computer at once,
+    /// and a switch (a shortcut or a click) moves input to another instantly: the engine
+    /// is told, what it sends goes to the new one, and the one left is sent a Leave.
+    #[tokio::test]
+    async fn the_computer_with_the_mouse_is_connected_to_all_and_switches_instantly() {
+        let port = free_port().await;
+        let (srv, a, b) = (format!("srv46-{port}"), format!("a46-{port}"), format!("b46-{port}"));
+        let cancel = CancellationToken::new();
+        let server_cfg = computer(
+            Role::Server,
+            port,
+            &srv,
+            "laptop",
+            vec![pairing(a.clone(), "kali", "k-a"), pairing(b.clone(), "win-vm", "k-b")],
+        );
+        let (s_ch, s_to, _s_from, mut s_events) = channels();
+        let server = tokio::spawn(run_server(server_cfg, fast_params(), cancel.clone(), s_ch, BulkServer::disabled(), LinkHealth::new()));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let client = |id: &str, name: &str, key: &str| computer(Role::Client, port, id, name, vec![pairing(srv.clone(), "laptop", key)]);
+
+        let (ch, _a1, mut a_from, mut a_events) = channels();
+        let ca = tokio::spawn(run_client(client(&a, "kali", "k-a"), fast_params(), cancel.clone(), ch, LinkHealth::new()));
+        assert_eq!(outcome(&mut a_events).await, Ok(()));
+        let (ch, _b1, mut b_from, mut b_events) = channels();
+        let cb = tokio::spawn(run_client(client(&b, "win-vm", "k-b"), fast_params(), cancel.clone(), ch, LinkHealth::new()));
+        assert_eq!(outcome(&mut b_events).await, Ok(()), "the second computer is let in too");
+
+        // The engine was told about Kali (first in), and nothing else yet.
+        let first = loop {
+            match timeout(Duration::from_secs(2), s_events.recv()).await {
+                Ok(Some(LinkEvent::Connected { peer, .. })) => break peer,
+                Ok(Some(_)) => continue,
+                other => panic!("no Connected: {other:?}"),
+            }
+        };
+        assert_eq!(first, "kali");
+        let mut both = crate::trust::connected(&srv);
+        both.sort();
+        let mut want = vec![a.clone(), b.clone()];
+        want.sort();
+        assert_eq!(both, want, "both are connected at once");
+
+        // What the engine sends goes to Kali.
+        s_to.send(Message::MouseMove { dx: 1, dy: 1 }).unwrap();
+        let got = timeout(Duration::from_secs(2), a_from.recv()).await.unwrap();
+        assert!(matches!(got, Some(Message::MouseMove { .. })), "{got:?}");
+
+        // Switch to the VM: the engine hears it, Kali is left, the VM gets the input.
+        crate::trust::reserve(&srv, Some(&b));
+        let switched = loop {
+            match timeout(Duration::from_secs(2), s_events.recv()).await {
+                Ok(Some(LinkEvent::Connected { peer, .. })) => break peer,
+                Ok(Some(_)) => continue,
+                other => panic!("no switch: {other:?}"),
+            }
+        };
+        assert_eq!(switched, "win-vm");
+        let left = timeout(Duration::from_secs(2), a_from.recv()).await.unwrap();
+        assert!(matches!(left, Some(Message::Leave)), "Kali is told it was left: {left:?}");
+        s_to.send(Message::MouseMove { dx: 2, dy: 2 }).unwrap();
+        let got = timeout(Duration::from_secs(2), b_from.recv()).await.unwrap();
+        assert!(matches!(got, Some(Message::MouseMove { .. })), "{got:?}");
+        assert_eq!(crate::trust::reserved(&srv), None, "the switch was taken");
+        assert_eq!(crate::trust::input_peer(&srv).as_deref(), Some(b.as_str()));
+
+        // The VM goes away: Kali, still connected, is used again.
+        let (ch2, ..) = channels();
+        drop(ch2);
+        cb.abort();
+        let back = loop {
+            match timeout(Duration::from_secs(5), s_events.recv()).await {
+                Ok(Some(LinkEvent::Connected { peer, .. })) => break peer,
+                Ok(Some(_)) => continue,
+                other => panic!("did not fall back: {other:?}"),
+            }
+        };
+        assert_eq!(back, "kali");
+
+        cancel.cancel();
+        let _ = tokio::join!(server, ca);
+    }
+
+    /// One clipboard for all: text copied on any computer reaches every connected one,
+    /// and a large image copied here is offered to each other computer when it comes
+    /// into use.
+    #[tokio::test]
+    async fn every_connected_computer_shares_one_clipboard() {
+        let port = free_port().await;
+        let (srv, a, b) = (format!("srvclip-{port}"), format!("aclip-{port}"), format!("bclip-{port}"));
+        let cancel = CancellationToken::new();
+        let server_cfg = computer(
+            Role::Server,
+            port,
+            &srv,
+            "laptop",
+            vec![pairing(a.clone(), "kali", "k-a"), pairing(b.clone(), "win-vm", "k-b")],
+        );
+        let (s_ch, s_to, mut s_from, mut s_events) = channels();
+        let server = tokio::spawn(run_server(server_cfg, fast_params(), cancel.clone(), s_ch, BulkServer::disabled(), LinkHealth::new()));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let client = |id: &str, name: &str, key: &str| computer(Role::Client, port, id, name, vec![pairing(srv.clone(), "laptop", key)]);
+        let (ch, a_to, mut a_from, mut a_events) = channels();
+        let ca = tokio::spawn(run_client(client(&a, "kali", "k-a"), fast_params(), cancel.clone(), ch, LinkHealth::new()));
+        assert_eq!(outcome(&mut a_events).await, Ok(()));
+        let (ch, _b_to, mut b_from, mut b_events) = channels();
+        let cb = tokio::spawn(run_client(client(&b, "win-vm", "k-b"), fast_params(), cancel.clone(), ch, LinkHealth::new()));
+        assert_eq!(outcome(&mut b_events).await, Ok(()));
+        loop {
+            match timeout(Duration::from_secs(2), s_events.recv()).await {
+                Ok(Some(LinkEvent::Connected { .. })) => break,
+                Ok(Some(_)) => continue,
+                other => panic!("no Connected: {other:?}"),
+            }
+        }
+        async fn next_clip(rx: &mut mpsc::UnboundedReceiver<Message>) -> Message {
+            loop {
+                match timeout(Duration::from_secs(2), rx.recv()).await {
+                    Ok(Some(m @ (Message::Clipboard { .. } | Message::ClipboardImageRef { .. }))) => return m,
+                    Ok(Some(_)) => continue,
+                    other => panic!("no clipboard message: {other:?}"),
+                }
+            }
+        }
+
+        // Copied here: both get it, though only Kali is in use.
+        s_to.send(Message::Clipboard { text: "from laptop".into() }).unwrap();
+        assert_eq!(next_clip(&mut a_from).await, Message::Clipboard { text: "from laptop".into() });
+        assert_eq!(next_clip(&mut b_from).await, Message::Clipboard { text: "from laptop".into() });
+
+        // Copied on Kali: this computer and the VM get it.
+        a_to.send(Message::Clipboard { text: "from kali".into() }).unwrap();
+        assert_eq!(next_clip(&mut s_from).await, Message::Clipboard { text: "from kali".into() });
+        assert_eq!(next_clip(&mut b_from).await, Message::Clipboard { text: "from kali".into() });
+
+        // A large image copied here goes to Kali now, and to the VM once it is in use.
+        let big = Message::ClipboardImageRef { hash: "h".into(), w: 1, h: 1, size: 1 };
+        s_to.send(big.clone()).unwrap();
+        assert_eq!(next_clip(&mut a_from).await, big);
+        crate::trust::reserve(&srv, Some(&b));
+        assert_eq!(next_clip(&mut b_from).await, big, "offered to the VM when it came into use");
+
+        cancel.cancel();
+        let _ = tokio::join!(server, ca, cb);
+    }
+
+    /// R45: a controlled computer goes back to the computer it was last with, not to
+    /// another paired one that happens to answer.
+    #[tokio::test]
+    async fn a_controlled_computer_goes_only_to_the_one_it_was_last_with() {
+        let (p1, p2) = (free_port().await, free_port().await);
+        let (laptop, kali, vm) = (format!("lap45-{p1}"), format!("kal45-{p2}"), format!("vm45-{p1}"));
+        // The servers outlive the first client.
+        let servers = CancellationToken::new();
+        let cancel = CancellationToken::new();
+        let (ch, _x, _y, _e1) = channels();
+        let s1 = tokio::spawn(run_server(
+            computer(Role::Server, p1, &laptop, "laptop", vec![pairing(vm.clone(), "vm", "k1")]),
+            fast_params(), servers.clone(), ch, BulkServer::disabled(), LinkHealth::new(),
+        ));
+        let (ch, _x2, _y2, _e2) = channels();
+        let s2 = tokio::spawn(run_server(
+            computer(Role::Server, p2, &kali, "kali", vec![pairing(vm.clone(), "vm", "k2")]),
+            fast_params(), servers.clone(), ch, BulkServer::disabled(), LinkHealth::new(),
+        ));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let vm_pairs = vec![pairing(laptop.clone(), "laptop", "k1"), pairing(kali.clone(), "kali", "k2")];
+
+        // Last with the laptop, and Kali is the one answering: nothing is given to Kali.
+        let mut vm_cfg = computer(Role::Client, p2, &vm, "vm", vm_pairs.clone());
+        vm_cfg.connect_to = laptop.clone();
+        let (ch, _a, _b, mut ev) = channels();
+        let c1 = tokio::spawn(run_client(vm_cfg, fast_params(), cancel.clone(), ch, LinkHealth::new()));
+        assert_eq!(outcome(&mut ev).await, Err("not_chosen_server".into()));
+        cancel.cancel();
+        let _ = c1.await;
+
+        // The user picks Kali: now it connects there.
+        let cancel2 = CancellationToken::new();
+        let mut vm_cfg = computer(Role::Client, p2, &vm, "vm", vm_pairs);
+        vm_cfg.connect_to = kali.clone();
+        let (ch, _a, _b, mut ev) = channels();
+        let c2 = tokio::spawn(run_client(vm_cfg, fast_params(), cancel2.clone(), ch, LinkHealth::new()));
+        assert_eq!(outcome(&mut ev).await, Ok(()));
+        cancel2.cancel();
+        servers.cancel();
+        let _ = tokio::join!(s1, s2, c2);
+    }
+
+    /// Removing a computer refuses it from that moment, without restarting sharing.
+    #[tokio::test]
+    async fn a_removed_computer_is_refused_at_once() {
+        let port = free_port().await;
+        let cancel = CancellationToken::new();
+        let (s_ch, _s_to, _s_from, _s_events) = channels();
+        let server = tokio::spawn(run_server(test_cfg(Role::Server, port, false), fast_params(), cancel.clone(), s_ch, BulkServer::disabled(), LinkHealth::new()));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        crate::trust::remove(&server_id(port), &client_id(port));
+        let (c_ch, _c_to, _c_from, mut c_events) = channels();
+        let client = tokio::spawn(run_client(test_cfg(Role::Client, port, false), fast_params(), cancel.clone(), c_ch, LinkHealth::new()));
+        assert_eq!(outcome(&mut c_events).await, Err("not_paired".into()));
+        cancel.cancel();
+        let _ = tokio::join!(server, client);
     }
 
     #[tokio::test]
@@ -1917,7 +2537,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wrong_secret_is_rejected() {
+    async fn wrong_key_is_rejected() {
         let port = free_port().await;
         let cancel = CancellationToken::new();
 
@@ -1925,7 +2545,7 @@ mod tests {
         let (c_ch, _c_to, _c_from, mut c_events) = channels();
 
         let mut bad_client = test_cfg(Role::Client, port, false);
-        bad_client.shared_secret = "WRONG".into();
+        bad_client.paired[0].key = "WRONG".into();
 
         let server = tokio::spawn(run_server(
             test_cfg(Role::Server, port, false),
@@ -1967,11 +2587,17 @@ mod tests {
             let mut framed = Framed::new(LinkStream::Plain(tcp), MessageCodec::new());
             let client_nonce = match framed.next().await {
                 Some(Ok(Message::Hello { nonce: Some(n), .. })) => n,
-                other => panic!("expected a v2 hello, got {other:?}"),
+                other => panic!("expected a v3 hello, got {other:?}"),
             };
             let nonce = auth::generate_nonce_hex();
-            let proof = auth::proof_hex("GUESS", Side::Server, &[], &client_nonce, &nonce).unwrap();
-            framed.send(Message::AuthChallenge { nonce, proof: Some(proof), pin_proof: None }).await.unwrap();
+            // It even claims the right device ID; it just does not hold the key.
+            let (cid, sid) = (client_id(port), server_id(port));
+            let ends = auth::Ends { client: &cid, server: &sid };
+            let proof = auth::proof_hex("GUESS", Side::Server, ends, &[], &client_nonce, &nonce).unwrap();
+            framed
+                .send(Message::AuthChallenge { nonce, device: Some(sid.clone()), proof: Some(proof), pin_proof: None })
+                .await
+                .unwrap();
             // Whatever comes next must not be the client's proof.
             timeout(Duration::from_secs(2), framed.next()).await.ok().flatten()
         });
@@ -2036,6 +2662,7 @@ mod tests {
                 lane: Lane::Input,
                 login_screen: false,
                 nonce: None,
+                device: None,
             })
             .await
             .unwrap();
@@ -2077,7 +2704,7 @@ mod tests {
             ));
         tokio::time::sleep(Duration::from_millis(100)).await;
 
-        let client = tokio::spawn(silent_client_after_handshake(port, "test-secret"));
+        let client = tokio::spawn(silent_client_after_handshake(port, TEST_KEY));
 
         assert!(wait_connected(&mut s_events).await, "server connect");
 
@@ -2472,6 +3099,8 @@ mod tests {
         ));
         tokio::time::sleep(Duration::from_millis(100)).await;
         let cfg = test_cfg(Role::Client, port, false);
+        // Called directly, not through run_client, so load the client's pairings here.
+        crate::trust::load(&cfg.device_id, &cfg.paired);
         let to: SocketAddr = format!("[::1]:{port}").parse().unwrap();
         let got = connect_and_handshake(&cfg, Some(to), port, Lane::Input, Duration::from_secs(2), &cancel).await;
         assert!(got.is_ok(), "IPv6 connect and handshake: {:?}", got.err());
@@ -2489,9 +3118,13 @@ mod tests {
         let disc = free_port().await;
         let cancel = CancellationToken::new();
         let found = beacon::Found::new();
-        tokio::spawn(beacon::run_listener("s".into(), disc, found.clone(), cancel.child_token()));
+        // A server and a client paired with each other.
+        let (srv, cli) = (format!("bsrv-{disc}"), format!("bcli-{disc}"));
+        crate::trust::load(&srv, &[pairing(cli.clone(), "cli", "k")]);
+        crate::trust::load(&cli, &[pairing(srv.clone(), "srv", "k")]);
+        tokio::spawn(beacon::run_listener(cli, disc, found.clone(), cancel.child_token()));
         tokio::time::sleep(Duration::from_millis(100)).await;
-        tokio::spawn(beacon::run_sender("s".into(), "srv".into(), 4321, disc, cancel.child_token()));
+        tokio::spawn(beacon::run_sender(srv, "srv".into(), 4321, disc, cancel.child_token()));
         let mut heard = None;
         for _ in 0..40 {
             heard = found

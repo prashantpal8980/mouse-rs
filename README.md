@@ -2,14 +2,14 @@
 
 # 🖱️ mouse-rs
 
-**One keyboard. One mouse. Two computers.**
+**One keyboard. One mouse. All your computers.**
 
 Move your pointer off the edge of your Windows screen and keep working on Linux.<br>
 Your keyboard follows, and so does your clipboard.
 
-![Windows](https://img.shields.io/badge/Windows-10%20%7C%2011-0078D6?logo=windows&logoColor=white) ![Linux](https://img.shields.io/badge/Linux-X11-FCC624?logo=linux&logoColor=black) ![Rust](https://img.shields.io/badge/built%20with-Rust-B7410E?logo=rust&logoColor=white) ![Tests](https://img.shields.io/badge/tests-227%20passing-2EA043) ![Licence](https://img.shields.io/badge/licence-proprietary-555555)
+![Windows](https://img.shields.io/badge/Windows-10%20%7C%2011-0078D6?logo=windows&logoColor=white) ![Linux](https://img.shields.io/badge/Linux-X11-FCC624?logo=linux&logoColor=black) ![Rust](https://img.shields.io/badge/built%20with-Rust-B7410E?logo=rust&logoColor=white) ![Tests](https://img.shields.io/badge/tests-330%20passing-2EA043) ![Licence](https://img.shields.io/badge/licence-proprietary-555555)
 
-[Install](#-install) · [Connect the two computers](#-connect-the-two-computers) · [Update](#-update) · [Report a problem](#-report-a-problem) · [Troubleshooting](#-troubleshooting) · [For developers](#-for-developers)
+[Install](#-install) · [Connect your computers](#-connect-your-computers) · [Update](#-update) · [Report a problem](#-report-a-problem) · [Troubleshooting](#-troubleshooting) · [For developers](#-for-developers)
 
 </div>
 
@@ -20,135 +20,96 @@ Your keyboard follows, and so does your clipboard.
 | | |
 |---|---|
 | 🖱️ **Keyboard and mouse sharing** | Push the pointer past the screen edge and it lands on the other computer. Tracking is 1:1, and corners are reachable. |
-| 📋 **Shared clipboard** | Copy text, images, files or whole folders on one computer and paste them on the other. |
-| 🔐 **Log in from the other computer** | Type your Linux login password from the Windows keyboard, before anyone has logged in. |
-| 🌐 **Any network** | Cable, home router, Wi-Fi or a phone hotspot. If you unplug the cable, it switches to Wi-Fi within moments, and switches back when you plug it in. |
-| 🔁 **Reconnects by itself** | Restart either computer and sharing comes back without a click. |
-| 🛡️ **Private by design** | Everything between the two computers is encrypted, and only computers with your shared secret can connect. |
+| 🖥️ **Several computers at once** | Stay connected to all of them, and jump between them with **Ctrl+Alt+Shift+1, 2, 3…** or one click. |
+| 📋 **One clipboard for all** | Copy text, images, files or whole folders on one computer and paste them on another. |
+| 🔢 **Pair with a 6-digit code** | Like pairing a Bluetooth device: one shows a code, the other types it. Each pairing gets its own key. |
+| 🔐 **Connection PIN and login screen** | Optionally ask for a PIN before a computer can be controlled, and type your Linux login password from the other keyboard. |
+| 🌐 **Any network** | Cable, home router or Wi-Fi. No IP addresses to type: the computers find each other, even after the network changes. |
+| 🔄 **Updates inside the app** | **About › Check now › Update now**. Every update is signed and checked before it runs. |
 | 🆘 **Always a way back** | Press **Scroll Lock** to take control back, even if the network drops. |
 
 ---
 
 ## 📦 Install
 
-You need **one Windows computer** and **one Linux computer** on the same network. Install
-mouse-rs on both. It takes about two minutes per computer, and nothing needs a reboot.
+Install mouse-rs on every computer you want to share between. Windows and Linux can be
+mixed in any combination. It takes about a minute per computer, and nothing needs a reboot.
 
-### 🪟 Windows
+### 🪟 Windows 10 and 11
 
-1. Download **`mouse-rs-<version>-windows-x86_64.zip`** from the [Releases](../../releases) page.
-2. Extract it anywhere, for example to `C:\Program Files\mouse-rs`.
-3. Double-click **`mouse-rs.exe`**.
-4. When Windows Firewall asks, tick **Private networks** and click **Allow access**. If you
-   will also use a phone hotspot or public Wi-Fi, tick **Public networks** too.
+1. Download **`mouse-rs-<version>-windows-x86_64.zip`** from the [Releases](../../releases/latest) page.
+2. Extract it anywhere, for example to your Documents folder, and double-click **`mouse-rs.exe`**.
+3. Windows may say **"Windows protected your PC"** the first time, because mouse-rs is new
+   and not yet code-signed. Click **More info**, then **Run anyway**.
+4. When Windows Firewall asks, tick **Private networks** and click **Allow access**.
 
-The control panel opens, and a mouse-rs icon appears in the tray, next to the clock.
+### 🐧 Linux (X11 desktops)
 
-> 💡 **Tip:** if a window running as administrator (Task Manager, an installer) has focus,
-> Windows blocks the pointer from crossing. The panel tells you when this happens, and can
-> start mouse-rs elevated so it doesn't.
-
-### 🐧 Linux
-
-1. Download **`mouse-rs-<version>-linux-x86_64.tar.gz`** from the [Releases](../../releases) page.
+1. Download **`mouse-rs-<version>-linux-x86_64.tar.gz`** from the [Releases](../../releases/latest) page.
 2. Extract it and start it:
    ```sh
    tar xzf mouse-rs-*-linux-x86_64.tar.gz
    cd mouse-rs-*-linux-x86_64
-   ./run-gui.sh
+   ./run.sh
    ```
-3. If it says a library is missing, install the two desktop libraries it uses (one time
-   only), then run it again:
+3. If it says a library is missing, install these once, then run it again:
    ```sh
    sudo apt install libgtk-3-0 libayatana-appindicator3-1
    ```
 
-The control panel opens, and the icon appears in your panel's system tray.
-
 > ℹ️ Linux needs an **X11** session. Most desktops (Xfce, MATE, KDE on X11, Kali's default)
-> use it. Wayland sessions aren't supported yet.
+> offer one. Wayland sessions aren't supported yet.
 
 ---
 
-## 🔗 Connect the two computers
+## 🔗 Connect your computers
 
-You do this once. Afterwards, mouse-rs connects by itself every time.
+You do this once per computer. Afterwards mouse-rs connects by itself whenever it starts.
 
-**1. Choose which computer owns the keyboard and mouse.** That one is the **server**; the
-other is the **client**. Usually the server is the laptop whose keyboard you type on.
+1. On the computer whose keyboard and mouse you use, choose **Shares its mouse**.
+2. On each other computer, choose **Is controlled**.
+3. On the computer that shares its mouse, press **Pair a new device**. A 6-digit code appears.
+4. Type that code into the other computer's mouse-rs window and press **Pair**.
 
-| On the… | Set **Role** to |
-|---|---|
-| Computer with the keyboard and mouse you use | **Server** |
-| The other computer | **Client** |
+That's all. Push the pointer off the edge of the screen and it appears on the other
+computer. To pair a third computer, repeat steps 2–4. Switch between them with
+**Ctrl+Alt+Shift+number**, or **Use** on the main window.
 
-**2. Give both the same secret.** On the server, open **Security** and click
-**Generate**, then **Show**. Copy it, and paste it into **Security** on the client.
-
-**3. Tell each one where the other screen is.** If Linux sits to the *left* of the laptop,
-set the laptop's exit edge to **left**. The panel only shows the edges each role uses.
-
-**4. Click Start on both.** The panel turns green and names the other computer. Push the
-pointer off the edge and it appears on the other screen.
-
-**5. Make it automatic.** In the **Startup** tab, turn on **Start at login** and
-**Auto-connect on launch** on both computers. From now on, sharing starts as soon as you log in.
-
-> 🔎 You don't need to type an IP address. The server announces itself on every network it's
-> on, and the client finds it, even after the network changes.
-
-### Optional: type your Linux password from Windows
-
-In the Linux panel's **Startup** tab, turn on **Share input at the login screen**. Linux asks for your
-password **once** to install a small system service. After the next reboot, move the
-pointer onto the Linux screen at the login prompt and type your password on the Windows
-keyboard. The Windows panel tells you when Linux is waiting at its login screen.
+**Optional:**
+- **Settings › Startup › Start at login**, so mouse-rs is running whenever you are.
+- **Settings › Screens & edges**: click the edge where the other screen sits.
+- **Settings › Security & pairing**: set a connection PIN on a computer that is controlled.
+- **Type your Linux login password from the other keyboard:** on Linux, turn on
+  **Settings › Startup › Share input at the login screen**. It asks for your password once to
+  install a small system service.
 
 ---
 
 ## 🔄 Update
 
-Your settings live outside the program folder, so updating never loses them:
-`%USERPROFILE%\.mouse_share\` on Windows, `~/.mouse_share/` on Linux.
+mouse-rs checks for a new version each time it starts. When one is available, a banner
+says so. Click **Update now**, then **Restart mouse-rs**. You can also check yourself:
+**⋯ › Settings › About › Check now**.
 
-### 🪟 Windows
-
-1. Right-click the tray icon and choose **Quit**.
-2. Download the new zip from [Releases](../../releases) and extract it over the old folder.
-3. Run **`mouse-rs.exe`**. It reconnects by itself.
-
-### 🐧 Linux
-
-1. Choose **Quit** from the tray icon.
-2. Extract the new tarball over the old folder.
-3. Run **`./run-gui.sh`**.
-4. If you use the login-screen option, turn **Share input at the login screen** off and on
-   again in the panel. That refreshes the system service's copy. The panel warns you
-   when it's out of date.
-
-> ✅ **Update both computers to the same version.** An older version still connects to a
-> newer one, but new features need both sides.
+Your settings and pairings are kept: they live in `%USERPROFILE%\.mouse_share\` on
+Windows and `~/.mouse_share/` on Linux, outside the program folder.
 
 ---
 
 ## 🐞 Report a problem
 
-Every computer keeps a log of what mouse-rs did. Send it with your report:
+Every computer keeps a log of what mouse-rs did (**Settings › Diagnostics** shows where).
+Send it with your report:
 
 | Computer | Log file |
 |---|---|
-| Windows | `%USERPROFILE%\.mouse_share\mouse-rs.log` (paste the path into Explorer's address bar) |
+| Windows | `%USERPROFILE%\.mouse_share\mouse-rs.log` |
 | Linux | `~/.mouse_share/mouse-rs.log` |
 | Linux login screen | `/var/lib/mouse-rs/.mouse_share/mouse-rs.log` |
 
-Please include:
-
-1. **What you did**, and **what happened instead**.
-2. **Roughly when.** The log is timestamped, so "around 14:20" helps a lot.
-3. **The log files from both computers.**
-
-The logs never contain your shared secret, and never contain what you type at the login
-screen.
+Please include what you did, what happened instead, roughly when (the log is
+timestamped), and the logs from both computers. The logs never contain your pairing keys
+or what you type at the login screen.
 
 ---
 
@@ -156,36 +117,13 @@ screen.
 
 | Symptom | Try this |
 |---|---|
-| Panel says **Connecting…** forever | Both computers must be on the same network, and some guest Wi-Fi and hotspots block devices from seeing each other. On Windows, allow mouse-rs in Windows Firewall for that network type. |
-| **Authentication failed** | The shared secrets differ. Copy it again from the server to the client. |
-| The pointer won't cross | Check the exit edge matches where the other screen physically is. On Windows, an administrator window might have focus (see the tip under Install). |
+| **Waiting for the other computer** forever | Both computers must be on the same network. Some guest Wi-Fi and hotspots stop devices from seeing each other. On Windows, allow mouse-rs in Windows Firewall for that network type. |
+| **"Not paired"** or **"could not prove it is the one you paired with"** | One computer was removed or reinstalled. Pair them again with a new code. |
+| The pointer won't cross | Check **Screens & edges** matches where the other screen physically is. On Windows, an administrator window with focus can block the pointer; mouse-rs tells you when this happens. |
 | A key seems stuck | Press and release it once on the computer you're typing on. **Scroll Lock** always returns control. |
 | Linux says a library is missing | `sudo apt install libgtk-3-0 libayatana-appindicator3-1` |
-| Login screen doesn't respond | Wait for the Windows notification, move the pointer inward a little, then across the edge. In the Linux panel, check the login-screen line says it's up to date. |
 
 Known issues, with their status, are listed in [docs/KNOWN-ISSUES.md](docs/KNOWN-ISSUES.md).
-
----
-
-## 🗺️ Making it one-click
-
-> The full plan for launch on **1 November 2026**, and the settings reorganisation, is in
-> [docs/PLAN-SETTINGS-AND-LAUNCH.md](docs/PLAN-SETTINGS-AND-LAUNCH.md).
-
-The goal: **download, run, done**, on both computers, with updates that take care of
-themselves. This is where each step stands today.
-
-| Step | Today | Goal |
-|---|---|---|
-| Get the program | Zip / tarball from Releases | ✅ Same, plus a Windows installer and a Linux `.deb` / AppImage |
-| Windows firewall | One "Allow access" click | 🛠 Installer adds the rule, so there's no prompt |
-| Linux libraries | Possibly one `apt install` | 🛠 Declared by the `.deb`, or bundled in an AppImage, so there's nothing to install |
-| Pair the computers | Copy a 32-character secret | 🛠 Show a **6-digit pairing code** on one, type it on the other |
-| Choose role and edges | Pick in the panel | 🛠 Guess the role from which computer moved its mouse, and confirm the edge with one push |
-| Updates | Download and replace by hand | 🛠 **Update button**: checks for a new version, downloads it, verifies its signature, restarts itself, and updates the other computer too |
-| Login-screen service after an update | Toggle off and on | 🛠 Refreshed automatically by the update |
-| Bug reports | Find and send log files | 🛠 **Report a problem** button: collects both computers' logs into one file |
-| Downloads for customers | Private repository | 🛠 A public download page or releases repository, since a private repo's releases can't be downloaded by customers |
 
 ---
 

@@ -45,10 +45,16 @@ pub fn is_valid(pin: &str) -> bool {
     (MIN_LEN..=MAX_LEN).contains(&n) && !pin.chars().any(char::is_control)
 }
 
-/// The server's proof that it knows `pin`, bound to this TLS session and these nonces.
-pub fn proof_hex(pin: &str, binding: &[u8], client_nonce: &str, server_nonce: &str) -> String {
-    let mut mac = Hmac::<Sha256>::new_from_slice(pin.as_bytes()).expect("HMAC accepts any key length");
-    for part in [b"mouse-rs pin v2".as_slice(), binding, client_nonce.as_bytes(), server_nonce.as_bytes()] {
+/// The server's proof that it knows `pin`, bound to this TLS session, these nonces and
+/// the pairing key (R44).
+///
+/// The key matters because a PIN is short. A proof made from the PIN alone could be
+/// collected by anyone who opened a connection claiming to be the client, then guessed at
+/// offline, one PIN after another, with no try limit. Keyed with the pairing as well, it
+/// is worthless to anyone who is not one of the two paired computers.
+pub fn proof_hex(pair_key: &str, pin: &str, binding: &[u8], client_nonce: &str, server_nonce: &str) -> String {
+    let mut mac = Hmac::<Sha256>::new_from_slice(pair_key.as_bytes()).expect("HMAC accepts any key length");
+    for part in [b"mouse-rs pin v3".as_slice(), pin.as_bytes(), binding, client_nonce.as_bytes(), server_nonce.as_bytes()] {
         mac.update(&(part.len() as u32).to_be_bytes());
         mac.update(part);
     }
@@ -56,8 +62,8 @@ pub fn proof_hex(pin: &str, binding: &[u8], client_nonce: &str, server_nonce: &s
 }
 
 /// Constant-time check of a PIN proof.
-pub fn verify(pin: &str, binding: &[u8], client_nonce: &str, server_nonce: &str, candidate: &str) -> bool {
-    let want = proof_hex(pin, binding, client_nonce, server_nonce);
+pub fn verify(pair_key: &str, pin: &str, binding: &[u8], client_nonce: &str, server_nonce: &str, candidate: &str) -> bool {
+    let want = proof_hex(pair_key, pin, binding, client_nonce, server_nonce);
     want.len() == candidate.len() && want.bytes().zip(candidate.bytes()).fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0
 }
 
@@ -165,10 +171,11 @@ pub enum Prompt {
 
 #[derive(Default)]
 struct ServerState {
-    /// PIN typed per client name.
+    /// PIN typed per client, by device ID (R44): a name is only a label, and two clients
+    /// can share one.
     typed: HashMap<String, String>,
-    /// The client waiting for a PIN, and why.
-    prompt: Option<(String, Prompt)>,
+    /// The client waiting for a PIN, by device ID, with its name for the panel, and why.
+    prompt: Option<(String, String, Prompt)>,
 }
 
 static SERVER: Mutex<Option<ServerState>> = Mutex::new(None);
@@ -178,39 +185,40 @@ fn with_server<T>(f: impl FnOnce(&mut ServerState) -> T) -> T {
     f(g.get_or_insert_with(ServerState::default))
 }
 
-/// The PIN typed this run for `client`, if any.
+/// The PIN typed this run for the client with device ID `client`, if any.
 pub fn typed_for(client: &str) -> Option<String> {
     with_server(|s| s.typed.get(client).cloned())
 }
 
-/// The user typed the PIN for `client`: keep it for this run. The client retries every
-/// couple of seconds while it waits, so it connects by itself straight after.
-pub fn enter(client: &str, pin: String) {
+/// The user typed the PIN for the client being asked about: keep it for this run. The
+/// client retries every couple of seconds while it waits, so it connects by itself
+/// straight after. Returns that client's name, or None if nobody is being asked about.
+pub fn enter(pin: String) -> Option<String> {
     with_server(|s| {
-        s.typed.insert(client.to_owned(), pin);
-        if s.prompt.as_ref().is_some_and(|(c, _)| c == client) {
-            s.prompt = None;
-        }
+        let (id, name, _) = s.prompt.take()?;
+        s.typed.insert(id, pin);
+        Some(name)
     })
 }
 
-/// Which client is waiting for a PIN, and why.
+/// Which client is waiting for a PIN (by name), and why.
 pub fn prompt() -> Option<(String, Prompt)> {
-    with_server(|s| s.prompt.clone())
+    with_server(|s| s.prompt.as_ref().map(|(_, name, p)| (name.clone(), p.clone())))
 }
 
-/// `client` accepted us: nothing to ask about it.
+/// The client with device ID `client` accepted us: nothing to ask about it.
 pub fn accepted(client: &str) {
     with_server(|s| {
-        if s.prompt.as_ref().is_some_and(|(c, _)| c == client) {
+        if s.prompt.as_ref().is_some_and(|(c, ..)| c == client) {
             s.prompt = None;
         }
     })
 }
 
-/// `client` refused us with `reason`. Returns true if it was a PIN refusal, which then
-/// sets what the panel asks and forgets a PIN that did not work.
-pub fn note_refusal(client: &str, reason: &str) -> bool {
+/// The client with device ID `client`, called `name`, refused us with `reason`. Returns
+/// true if it was a PIN refusal, which then sets what the panel asks and forgets a PIN
+/// that did not work.
+pub fn note_refusal(client: &str, name: &str, reason: &str) -> bool {
     let (kind, num) = match reason.split_once(':') {
         Some((k, n)) => (k, n.parse::<u64>().ok()),
         None => (reason, None),
@@ -223,7 +231,7 @@ pub fn note_refusal(client: &str, reason: &str) -> bool {
     };
     with_server(|s| {
         s.typed.remove(client);
-        s.prompt = Some((client.to_owned(), prompt));
+        s.prompt = Some((client.to_owned(), name.to_owned(), prompt));
     });
     true
 }
@@ -247,11 +255,12 @@ mod tests {
 
     #[test]
     fn the_proof_checks_the_pin_and_the_session() {
-        let p = proof_hex("1234", b"tls", "c", "s");
-        assert!(verify("1234", b"tls", "c", "s", &p));
-        assert!(!verify("1235", b"tls", "c", "s", &p), "wrong PIN");
-        assert!(!verify("1234", b"other", "c", "s", &p), "another TLS session");
-        assert!(!verify("1234", b"tls", "c", "s2", &p), "other nonces");
+        let p = proof_hex("key", "1234", b"tls", "c", "s");
+        assert!(verify("key", "1234", b"tls", "c", "s", &p));
+        assert!(!verify("key", "1235", b"tls", "c", "s", &p), "wrong PIN");
+        assert!(!verify("key", "1234", b"other", "c", "s", &p), "another TLS session");
+        assert!(!verify("key", "1234", b"tls", "c", "s2", &p), "other nonces");
+        assert!(!verify("other-pairing", "1234", b"tls", "c", "s", &p), "another pairing's key");
     }
 
     #[test]
@@ -277,17 +286,19 @@ mod tests {
     #[test]
     fn refusals_set_the_server_prompt_and_drop_that_clients_pin() {
         let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        enter("kali", "1111".into());
-        enter("other", "2222".into());
-        assert_eq!(typed_for("kali").as_deref(), Some("1111"));
-        assert!(note_refusal("kali", "wrong_pin:3"));
+        assert!(note_refusal("id-other", "other", "pin_required"));
+        assert_eq!(enter("2222".into()).as_deref(), Some("other"));
+        assert!(note_refusal("id-kali", "kali", "pin_required"));
+        assert_eq!(enter("1111".into()).as_deref(), Some("kali"));
+        assert_eq!(typed_for("id-kali").as_deref(), Some("1111"));
+        assert!(note_refusal("id-kali", "kali", "wrong_pin:3"));
         assert_eq!(prompt(), Some(("kali".into(), Prompt::Wrong(3))));
-        assert_eq!(typed_for("kali"), None);
-        assert_eq!(typed_for("other").as_deref(), Some("2222"), "other clients keep theirs");
-        assert!(note_refusal("kali", "pin_required"));
+        assert_eq!(typed_for("id-kali"), None);
+        assert_eq!(typed_for("id-other").as_deref(), Some("2222"), "other clients keep theirs");
+        assert!(note_refusal("id-kali", "kali", "pin_required"));
         assert_eq!(prompt(), Some(("kali".into(), Prompt::Needed)));
-        assert!(!note_refusal("kali", "bad_secret"));
-        enter("kali", "4321".into());
+        assert!(!note_refusal("id-kali", "kali", "bad_secret"));
+        enter("4321".into());
         assert_eq!(prompt(), None, "typing the PIN clears the prompt");
     }
 }

@@ -95,8 +95,45 @@ fn default_lock_hotkey() -> String {
 fn default_edge_threshold() -> i32 {
     2
 }
+/// This computer's own name, so the other computer shows "laptop" or "kali-desktop"
+/// rather than "mouse-rs" for every install (seen on the Mint test VM, 29 Oct).
 fn default_name() -> String {
-    "mouse-rs".into()
+    let host = if cfg!(windows) {
+        std::env::var("COMPUTERNAME").unwrap_or_default()
+    } else {
+        std::fs::read_to_string("/proc/sys/kernel/hostname")
+            .or_else(|_| std::fs::read_to_string("/etc/hostname"))
+            .unwrap_or_default()
+    };
+    let host = host.trim();
+    if host.is_empty() {
+        "mouse-rs".into()
+    } else {
+        host.into()
+    }
+}
+
+/// A new random device ID: 16 bytes, hex.
+pub fn new_device_id() -> String {
+    use rand::RngCore;
+    let mut b = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut b);
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+/// A computer this one is paired with (R44). The key is theirs and ours only: it was made
+/// when the two paired, and no other computer has it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PairedDevice {
+    /// The other computer's device ID.
+    pub id: String,
+    /// Its name when it paired (or last connected), for showing.
+    pub name: String,
+    /// The pairing key, hex.
+    pub key: String,
+    /// When they paired, seconds since 1970 (UTC).
+    #[serde(default)]
+    pub paired_at: u64,
 }
 /// Matches Windows' own clipboard history, so the default feels familiar.
 fn default_clip_history() -> usize {
@@ -167,8 +204,8 @@ fn default_stream_wait_secs() -> u32 {
     180
 }
 
-/// The placeholder secret of a fresh install. A server about to pair replaces it with a
-/// random one first, so no two installs end up paired by sharing the placeholder.
+/// The placeholder for `shared_secret`. Since R44 that secret authorises nothing on the
+/// link; it only signs the development log upload.
 pub const DEFAULT_SECRET: &str = "change-me-to-a-long-random-string";
 
 /// On-disk configuration. Field names match the Python version exactly.
@@ -178,6 +215,25 @@ pub struct Config {
     pub name: String,
     pub role: Role,
 
+    /// This computer's identity (R44): random, made once, never changes. Empty only in a
+    /// file written before R44, and filled in when such a file is loaded. (Its own serde
+    /// default is the empty string, not `Config::default()`'s fresh ID, so `load` can tell
+    /// a file without one and save the new ID instead of making another each start.)
+    #[serde(default)]
+    pub device_id: String,
+    /// The computers this one is paired with, each with its own key (R44).
+    pub paired: Vec<PairedDevice>,
+    /// The paired computer this one was last with, or the one the user clicked Connect on
+    /// (R45), by device ID. Reconnecting goes to this one only. Empty: none yet.
+    pub connect_to: String,
+    /// The switch list on the computer with the mouse (R46): device IDs in order, this
+    /// computer's own ID included. Position N (from 1) is Ctrl+Alt+Shift+N unless
+    /// `switch_keys` says otherwise. Normalised by [`Config::switch_targets`].
+    pub switch_order: Vec<String>,
+    /// A changed shortcut for an entry of the switch list, by device ID (R46).
+    pub switch_keys: std::collections::BTreeMap<String, String>,
+    /// Before R44 the one key every paired computer shared. No longer accepted by the
+    /// link; kept only to sign the development log upload (`auth::log_upload_token`).
     pub shared_secret: String,
     /// The connection password (PIN), kept on the client and typed on the server (R35).
     /// One password for both places below. Empty until the user sets one. Kept in the clear
@@ -469,6 +525,11 @@ impl Default for Config {
         Config {
             name: default_name(),
             role: Role::Server,
+            device_id: new_device_id(),
+            paired: Vec::new(),
+            connect_to: String::new(),
+            switch_order: Vec::new(),
+            switch_keys: Default::default(),
             shared_secret: DEFAULT_SECRET.into(),
             connection_pin: String::new(),
             pin_enabled: false,
@@ -538,7 +599,63 @@ impl Default for Config {
     }
 }
 
+/// One entry of the switch list (R46).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SwitchTarget {
+    /// A paired computer's device ID, or this computer's own.
+    pub id: String,
+    pub name: String,
+    /// The shortcut, like "ctrl+alt+shift+1".
+    pub hotkey: String,
+    /// True for this computer's own entry: its shortcut brings control home.
+    pub is_self: bool,
+}
+
+/// The shortcut for position `n` (from 1) when none was set: Ctrl+Alt+Shift+N for the
+/// first nine.
+pub fn default_switch_key(n: usize) -> String {
+    if (1..=9).contains(&n) {
+        format!("ctrl+alt+shift+{n}")
+    } else {
+        String::new()
+    }
+}
+
 impl Config {
+    /// The switch list in order: `switch_order` with unknown IDs dropped, and this
+    /// computer and any paired computer it does not mention added at the end, so a new
+    /// pairing gets the next number by itself.
+    pub fn switch_targets(&self) -> Vec<SwitchTarget> {
+        let mut ids: Vec<String> = Vec::new();
+        let known = |id: &str| id == self.device_id || self.paired.iter().any(|d| d.id == id);
+        for id in &self.switch_order {
+            if known(id) && !ids.contains(id) {
+                ids.push(id.clone());
+            }
+        }
+        if !ids.contains(&self.device_id) {
+            ids.insert(0, self.device_id.clone());
+        }
+        for d in &self.paired {
+            if !ids.contains(&d.id) {
+                ids.push(d.id.clone());
+            }
+        }
+        ids.into_iter()
+            .enumerate()
+            .map(|(i, id)| {
+                let is_self = id == self.device_id;
+                let name = if is_self {
+                    self.name.clone()
+                } else {
+                    self.paired.iter().find(|d| d.id == id).map(|d| d.name.clone()).unwrap_or_default()
+                };
+                let hotkey = self.switch_keys.get(&id).cloned().unwrap_or_else(|| default_switch_key(i + 1));
+                SwitchTarget { id, name, hotkey, is_self }
+            })
+            .collect()
+    }
+
     /// Default config path: `~/.mouse_share/config.json` (same as the Python app).
     pub fn default_path() -> PathBuf {
         let home = std::env::var_os("HOME")
@@ -554,6 +671,15 @@ impl Config {
         let trimmed = raw.strip_prefix('\u{feff}').unwrap_or(&raw);
         let mut cfg: Config = serde_json::from_str(trimmed).map_err(ConfigError::Parse)?;
         cfg.tidy();
+        // A file from before R44 has no device ID. Make one and write it back at once: an
+        // ID that changed on every start would undo every pairing.
+        if cfg.device_id.is_empty() {
+            cfg.device_id = new_device_id();
+            match cfg.save(path) {
+                Ok(()) => tracing::info!("gave this computer a device ID (R44)"),
+                Err(e) => tracing::warn!("could not save the new device ID ({e}); it will change next start"),
+            }
+        }
         Ok(cfg)
     }
 
@@ -576,7 +702,9 @@ impl Config {
             );
             self.name = name.to_string();
         }
-        if self.name.is_empty() {
+        // "mouse-rs" is only ever the stand-in for a computer name that could not be read
+        // (seen on a Windows VM): use the real name once it can be.
+        if self.name.is_empty() || self.name == "mouse-rs" {
             self.name = default_name();
         }
         // Same reasoning: a stray space in a host or URL fails in a way that reads as a
@@ -960,5 +1088,48 @@ mod tests {
         let c = Config::load(&p).expect("loads");
         assert!(!c.name.is_empty(), "an empty name would show as a blank peer everywhere");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_config_from_before_pairing_keys_gets_one_device_id_that_lasts() {
+        // An ID made fresh on every start would undo every pairing (R44).
+        let dir = std::env::temp_dir().join("mouse-rs-cfg-device-id");
+        let _ = std::fs::create_dir_all(&dir);
+        let p = dir.join("config.json");
+        std::fs::write(&p, br#"{"name":"kali","shared_secret":"old"}"#).unwrap();
+        let first = Config::load(&p).expect("loads");
+        assert_eq!(first.device_id.len(), 32);
+        assert!(first.paired.is_empty(), "the old shared secret pairs with nobody");
+        let again = Config::load(&p).expect("loads");
+        assert_eq!(again.device_id, first.device_id, "saved the first time, not made again");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn every_new_install_is_a_different_device() {
+        assert_ne!(Config::default().device_id, Config::default().device_id);
+    }
+
+    #[test]
+    fn the_switch_list_numbers_this_computer_and_each_paired_one() {
+        let pd = |id: &str, name: &str| PairedDevice { id: id.into(), name: name.into(), key: "k".into(), paired_at: 0 };
+        let mut c = Config { device_id: "me".into(), name: "laptop".into(), ..Default::default() };
+        c.paired = vec![pd("kali", "kali-desktop"), pd("vm", "win-vm")];
+        let t = c.switch_targets();
+        let got: Vec<(&str, &str)> = t.iter().map(|t| (t.id.as_str(), t.hotkey.as_str())).collect();
+        assert_eq!(got, [("me", "ctrl+alt+shift+1"), ("kali", "ctrl+alt+shift+2"), ("vm", "ctrl+alt+shift+3")]);
+        assert!(t[0].is_self);
+        // The owner's order and one changed shortcut; a removed computer drops out.
+        c.switch_order = vec!["kali".into(), "gone".into(), "me".into(), "vm".into()];
+        c.switch_keys.insert("me".into(), "ctrl+shift+alt+3".into());
+        let got: Vec<(String, String)> = c.switch_targets().into_iter().map(|t| (t.name, t.hotkey)).collect();
+        assert_eq!(
+            got,
+            [
+                ("kali-desktop".to_string(), "ctrl+alt+shift+1".to_string()),
+                ("laptop".to_string(), "ctrl+shift+alt+3".to_string()),
+                ("win-vm".to_string(), "ctrl+alt+shift+3".to_string()),
+            ]
+        );
     }
 }

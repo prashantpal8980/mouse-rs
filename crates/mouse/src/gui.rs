@@ -98,6 +98,8 @@ impl Page {
 enum HotkeyField {
     Lock,
     Return,
+    /// Entry N of the switch list (R46).
+    Switch(usize),
 }
 
 #[derive(Debug, Clone)]
@@ -129,9 +131,16 @@ enum Message {
     TabPicked(Tab),
     NameChanged(String),
     RolePicked(Role),
-    SecretChanged(String),
-    ToggleShowSecret,
-    GenerateSecret,
+    /// Settings → Security: first press arms Remove for this device ID, the second removes it.
+    RemovePaired(String),
+    /// Main window: work with this paired computer from now on (R45).
+    ConnectTo(String),
+    /// Main window: close the link with the computer in use (stops sharing).
+    DisconnectPeer,
+    /// The computer with the mouse: move entry N of the switch list up (true) or down (R46).
+    MoveSwitch(usize, bool),
+    /// Settings: put entry N's shortcut back to its number's default (R46).
+    SwitchKeyDefault(usize),
     TlsToggled(bool),
     ClipboardToggled(bool),
     // --- clipboard manager ---
@@ -254,7 +263,8 @@ enum Message {
     PinTyped(String),
     PinSubmit,
     /// Client: the pairing-code box.
-    PairCodeTyped(String),
+    /// A digit typed (or pasted, or deleted) in pairing-code box N.
+    PairCodeTyped(usize, String),
     PairWithCode,
     /// Server: show a new pairing code / stop showing it.
     ShowPairCode,
@@ -304,7 +314,7 @@ fn pending_restart_changes(live: &Config, now: &Config) -> Vec<&'static str> {
     };
     chk(live.name != now.name, "machine name");
     chk(live.role != now.role, "role");
-    chk(live.shared_secret != now.shared_secret, "shared secret");
+    chk(live.switch_order != now.switch_order || live.switch_keys != now.switch_keys, "switch shortcuts");
     chk(
         live.pin_enabled != now.pin_enabled || live.connection_pin != now.connection_pin,
         "connection PIN",
@@ -368,7 +378,8 @@ struct App {
     system_dark: Option<bool>,
     tab: Tab,
     engine: Option<EngineHandle>,
-    show_secret: bool,
+    /// The paired computer whose Remove was pressed once and waits for the second press.
+    remove_armed: Option<String>,
     feedback: String,
     /// Saved profiles with their settings, so the list can mark the one in use.
     profiles: Vec<(String, Config)>,
@@ -576,8 +587,8 @@ enum PairState {
     #[default]
     Idle,
     Running,
-    /// The server's name and the shared secret, or why not.
-    Done(Result<(String, String), String>),
+    /// The computer we paired with, or why not.
+    Done(Result<mouse_core::config::PairedDevice, String>),
 }
 
 #[derive(Default)]
@@ -589,12 +600,18 @@ enum ScanState {
 }
 
 impl App {
-    fn new(cfg: Config) -> Self {
+    fn new(mut cfg: Config) -> Self {
+        // The real screen size, so "This computer · 1440×900" is true from the first
+        // window, and not the 1920×1080 default until sharing has started once.
+        if let Ok((w, h)) = screen_size() {
+            cfg.screen_width = w;
+            cfg.screen_height = h;
+        }
         let mut app = App {
             system_dark: None,
             tab: Tab::Connection,
             engine: None,
-            show_secret: false,
+            remove_armed: None,
             feedback: String::new(),
             profiles: load_profiles(),
             profile_name_input: String::new(),
@@ -807,6 +824,8 @@ impl App {
     }
 
     fn stop_engine(&mut self) {
+        // Stopped, nothing is being waited for (R45).
+        mouse_core::trust::reserve(&self.cfg.device_id, None);
         if let Some(e) = &self.engine {
             // Without this line a deliberate Stop and a crash look identical in the log,
             // which is the worst possible ambiguity for a tool whose symptom is
@@ -947,10 +966,11 @@ impl App {
     fn handle(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::Tick => {
-                // At start (a little after, so launch is not slowed) and once a day.
+                // At start, a little after so launch is not slowed. A test build also
+                // checks every minute, so a new test version shows up without a restart.
                 let due = match self.update_checked_at {
                     None => self.opened_at.elapsed() >= std::time::Duration::from_secs(8),
-                    Some(t) => t.elapsed() >= std::time::Duration::from_secs(24 * 3600),
+                    Some(t) => crate::update::TEST_BUILD && t.elapsed() >= std::time::Duration::from_secs(60),
                 };
                 if self.cfg.check_updates && due && self.update_idle() {
                     self.update_checked_at = Some(std::time::Instant::now());
@@ -1024,16 +1044,17 @@ impl App {
                 // A pairing attempt finished.
                 let paired = std::mem::take(&mut *self.pairing.lock().unwrap());
                 match paired {
-                    PairState::Done(Ok((server, secret))) => {
-                        self.cfg.shared_secret = secret;
+                    PairState::Done(Ok(dev)) => {
                         self.pair_code_input.clear();
-                        tracing::info!("paired with {server}");
+                        tracing::info!("paired with {} (device {})", dev.name, dev.id.get(..8).unwrap_or(&dev.id));
+                        let server = dev.name.clone();
+                        self.save_pairings();
                         let t = self.save_and_apply();
                         if !self.running() {
                             self.start_engine();
                         }
                         self.feedback = format!("paired with {server}");
-                        return t;
+                        return Task::batch([t, self.refresh_login_copy()]);
                     }
                     PairState::Done(Err(why)) => {
                         tracing::warn!("pairing failed: {why}");
@@ -1043,6 +1064,21 @@ impl App {
                 }
                 if let Some(client) = mouse_core::pairing::take_last_paired() {
                     self.feedback = format!("paired with {client}");
+                }
+                // A computer paired with this one while it showed a code: keep it.
+                if self.save_pairings() {
+                    return self.refresh_login_copy();
+                }
+                // Remember the computer this one is now with, for the next start (R45).
+                if let Some(id) = mouse_core::trust::take_last(&self.cfg.device_id) {
+                    if self.cfg.connect_to != id {
+                        self.cfg.connect_to = id.clone();
+                        self.saved_cfg.connect_to = id.clone();
+                        if let Some(live) = self.live_cfg.as_mut() {
+                            live.connect_to = id;
+                        }
+                        let _ = self.cfg.save(&Config::default_path());
+                    }
                 }
                 // Clear a handle whose engine thread has exited on its own.
                 if self.engine.as_ref().is_some_and(|e| !e.is_running()) {
@@ -1226,7 +1262,7 @@ impl App {
                         let combo = match which {
                             // One key: modifiers held with it are not part of it.
                             HotkeyField::Lock => tok,
-                            HotkeyField::Return => {
+                            HotkeyField::Return | HotkeyField::Switch(_) => {
                                 let mut parts: Vec<&str> = Vec::new();
                                 if modifiers.control() { parts.push("ctrl"); }
                                 if modifiers.shift() { parts.push("shift"); }
@@ -1239,6 +1275,11 @@ impl App {
                         match which {
                             HotkeyField::Lock => self.cfg.lock_hotkey = combo.clone(),
                             HotkeyField::Return => self.cfg.return_hotkey = combo.clone(),
+                            HotkeyField::Switch(i) => {
+                                if let Some(t) = self.cfg.switch_targets().get(i) {
+                                    self.cfg.switch_keys.insert(t.id.clone(), combo.clone());
+                                }
+                            }
                         }
                         self.recording = None;
                         self.last_edit = Some(std::time::Instant::now());
@@ -1271,11 +1312,78 @@ impl App {
             }
             Message::NameChanged(s) => self.cfg.name = s,
             Message::RolePicked(r) => self.cfg.role = r,
-            Message::SecretChanged(s) => self.cfg.shared_secret = s,
-            Message::ToggleShowSecret => self.show_secret = !self.show_secret,
-            Message::GenerateSecret => {
-                self.cfg.shared_secret = generate_secret();
-                self.feedback = "generated a new secret".into();
+            Message::ConnectTo(id) => {
+                let Some(name) = self.cfg.paired.iter().find(|d| d.id == id).map(|d| d.name.clone()) else {
+                    return Task::none();
+                };
+                let own = self.cfg.device_id.clone();
+                // Controlled: connect to this one only. With the mouse: let only this one in
+                // until it arrives, even if another keeps asking (R45).
+                mouse_core::trust::set_choice(&own, Some(&id));
+                if self.cfg.role == Role::Server {
+                    // Connected to all at once (R46): switching is instant, nothing restarts.
+                    mouse_core::trust::reserve(&own, Some(&id));
+                    self.feedback = format!("using {name}");
+                    if !self.running() {
+                        self.start_engine();
+                    }
+                    return Task::none();
+                }
+                self.cfg.connect_to = id;
+                self.saved_cfg.connect_to = self.cfg.connect_to.clone();
+                if let Some(live) = self.live_cfg.as_mut() {
+                    live.connect_to = self.cfg.connect_to.clone();
+                }
+                let _ = self.cfg.save(&Config::default_path());
+                tracing::info!("switching to {name}, as the user chose");
+                self.feedback = format!("switching to {name}…");
+                // Close the current link so the switch happens now.
+                if self.running() {
+                    return self.leave(Leave::Restart);
+                }
+                self.start_engine();
+            }
+            Message::MoveSwitch(i, up) => {
+                let mut ids: Vec<String> = self.cfg.switch_targets().into_iter().map(|t| t.id).collect();
+                let j = if up { i.checked_sub(1) } else { Some(i + 1).filter(|j| *j < ids.len()) };
+                if let Some(j) = j {
+                    ids.swap(i, j);
+                    // A shortcut that was the position's default moves with the position:
+                    // only shortcuts the user typed stay with their computer.
+                    self.cfg.switch_order = ids;
+                }
+            }
+            Message::SwitchKeyDefault(i) => {
+                if let Some(t) = self.cfg.switch_targets().get(i) {
+                    self.cfg.switch_keys.remove(&t.id);
+                }
+            }
+            Message::DisconnectPeer => {
+                // Disconnect means stop working with it now: close the link, wait for no one.
+                mouse_core::trust::reserve(&self.cfg.device_id, None);
+                return self.leave(Leave::Stop);
+            }
+            Message::RemovePaired(id) => {
+                if self.remove_armed.as_deref() != Some(id.as_str()) {
+                    self.remove_armed = Some(id);
+                    return Task::none();
+                }
+                self.remove_armed = None;
+                let name = self.cfg.paired.iter().find(|d| d.id == id).map(|d| d.name.clone()).unwrap_or_default();
+                // Refused from this moment, without restarting sharing (R44).
+                mouse_core::trust::remove(&self.cfg.device_id, &id);
+                self.cfg.paired.retain(|d| d.id != id);
+                if self.cfg.connect_to == id {
+                    self.cfg.connect_to.clear();
+                    mouse_core::trust::set_choice(&self.cfg.device_id, None);
+                }
+                if mouse_core::trust::reserved(&self.cfg.device_id).as_deref() == Some(id.as_str()) {
+                    mouse_core::trust::reserve(&self.cfg.device_id, None);
+                }
+                tracing::info!("removed the pairing with {name}");
+                self.feedback = format!("removed {name}; it needs a new code to connect again");
+                let _ = self.update(Message::SaveConfig);
+                return self.refresh_login_copy();
             }
             Message::TlsToggled(v) => self.cfg.tls_enabled = v,
             Message::ClipboardToggled(v) => self.cfg.clipboard_sync = v,
@@ -1749,7 +1857,15 @@ impl App {
             Message::SwitchProfile(name) => {
                 self.menu_open = false;
                 self.feedback = match Config::load_profile(&name) {
-                    Ok(c) => {
+                    Ok(mut c) => {
+                        // A profile holds preferences. Whom this computer is paired with,
+                        // and who it is, stay as they are now: a profile saved before a
+                        // pairing must not quietly undo it (R44).
+                        c.device_id = self.cfg.device_id.clone();
+                        c.paired = self.cfg.paired.clone();
+                        c.connect_to = self.cfg.connect_to.clone();
+                        c.screen_width = self.cfg.screen_width;
+                        c.screen_height = self.cfg.screen_height;
                         self.cfg = c;
                         self.sync_buffers();
                         format!("switched to '{name}'")
@@ -1808,7 +1924,7 @@ impl App {
             Message::PinTyped(v) => self.pin_input = v.chars().take(mouse_core::pin::MAX_LEN).collect(),
             Message::PinSubmit => match mouse_core::pin::prompt() {
                 Some((client, _)) if mouse_core::pin::is_valid(&self.pin_input) => {
-                    mouse_core::pin::enter(&client, std::mem::take(&mut self.pin_input));
+                    mouse_core::pin::enter(std::mem::take(&mut self.pin_input));
                     self.feedback = format!("sent; {client} connects in a moment if the PIN is right");
                 }
                 Some(_) => {
@@ -1816,9 +1932,15 @@ impl App {
                 }
                 None => {}
             },
-            Message::PairCodeTyped(v) => {
-                self.pair_code_input =
-                    v.chars().filter(char::is_ascii_digit).take(mouse_core::pairing::CODE_DIGITS).collect();
+            Message::PairCodeTyped(i, v) => {
+                let (code, next) = code_after_typing(&self.pair_code_input, i, &v, mouse_core::pairing::CODE_DIGITS);
+                self.pair_code_input = code;
+                if let Some(j) = next {
+                    return Task::batch([
+                        iced::widget::operation::focus(code_box_id(j)),
+                        iced::widget::operation::select_all(code_box_id(j)),
+                    ]);
+                }
             }
             Message::PairWithCode => {
                 if !mouse_core::pairing::is_valid_code(&self.pair_code_input) {
@@ -1837,19 +1959,11 @@ impl App {
                 });
             }
             Message::ShowPairCode => {
-                // A fresh install still has the placeholder secret; every other install
-                // has it too, so pairing on it would pair with all of them. Make a real one.
-                let new_secret = self.cfg.shared_secret == mouse_core::config::DEFAULT_SECRET;
-                if new_secret {
-                    self.cfg.shared_secret = generate_secret();
-                    tracing::info!("replaced the placeholder shared secret before pairing");
-                }
+                // Each pairing makes its own key (R44), so there is nothing to prepare.
                 mouse_core::pairing::start_code();
                 self.feedback = "pairing code shown; type it on the other computer".into();
                 if !self.running() {
                     self.start_engine();
-                } else if new_secret {
-                    return self.leave(Leave::Restart);
                 }
             }
             Message::CancelPairCode => mouse_core::pairing::cancel_code(),
@@ -1959,10 +2073,16 @@ impl App {
                 // Asked for first (About → Restore…), then saved like any other change.
                 let (secret, name, peer) =
                     (self.cfg.shared_secret.clone(), self.cfg.name.clone(), self.cfg.peer_name.clone());
+                let (device_id, paired, connect_to) =
+                    (self.cfg.device_id.clone(), self.cfg.paired.clone(), self.cfg.connect_to.clone());
                 let (w, h) = screen_size()
                     .unwrap_or((self.cfg.screen_width, self.cfg.screen_height));
                 self.cfg = Config {
                     shared_secret: secret,
+                    // Who this computer is and whom it is paired with are not settings.
+                    device_id,
+                    paired,
+                    connect_to,
                     name,
                     peer_name: peer,
                     screen_width: w,
@@ -1970,7 +2090,7 @@ impl App {
                     ..Config::default()
                 };
                 self.sync_buffers();
-                self.feedback = format!("defaults restored — kept your name, secret and screen ({w}×{h})");
+                self.feedback = format!("defaults restored — kept your name, pairings and screen ({w}×{h})");
             }
             Message::Quit | Message::CloseRequested => return self.leave(Leave::Quit),
             Message::LeaveAnyway => {
@@ -2251,7 +2371,7 @@ impl App {
     /// a version already waiting for a restart.
     fn update_idle(&self) -> bool {
         use crate::update::State as U;
-        matches!(crate::update::get(&self.update), U::Idle | U::UpToDate | U::CheckFailed(_))
+        matches!(crate::update::get(&self.update), U::Idle | U::UpToDate | U::CheckFailed(_) | U::Ready(_) | U::Failed(_))
     }
 
     /// "Version x.y is available" (R36). A failed check shows nothing: a network blip
@@ -2547,9 +2667,58 @@ impl App {
         }
     }
 
-    /// Has this computer been paired? A fresh install still has the placeholder secret.
+    /// Has this computer been paired with anyone?
     fn paired(&self) -> bool {
-        self.cfg.shared_secret != mouse_core::config::DEFAULT_SECRET
+        !self.cfg.paired.is_empty()
+    }
+
+    /// Save pairings the link made (on either side) that are not in the file yet. True if
+    /// there were any.
+    fn save_pairings(&mut self) -> bool {
+        let new = mouse_core::trust::take_unsaved(&self.cfg.device_id);
+        if new.is_empty() {
+            return false;
+        }
+        for dev in new {
+            self.cfg.paired.retain(|d| d.id != dev.id);
+            self.cfg.paired.push(dev.clone());
+            // A newly paired computer becomes the one in use (R45).
+            self.cfg.connect_to = dev.id.clone();
+            mouse_core::trust::set_choice(&self.cfg.device_id, Some(&dev.id));
+            self.saved_cfg.connect_to = dev.id.clone();
+            if let Some(live) = self.live_cfg.as_mut() {
+                live.connect_to = dev.id.clone();
+            }
+            // Keep `saved_cfg` and `live_cfg` in step too: a pairing is not a setting that
+            // waits for a restart.
+            self.saved_cfg.paired = self.cfg.paired.clone();
+            if let Some(live) = self.live_cfg.as_mut() {
+                live.paired = self.cfg.paired.clone();
+            }
+        }
+        // Once paired, sharing starts by itself whenever mouse-rs starts, as a new user
+        // expects: a restart no longer needs "Start sharing" on both computers. It can be
+        // turned off in Settings.
+        if !self.cfg.autoconnect {
+            tracing::info!("paired: sharing now starts by itself when mouse-rs starts");
+            self.cfg.autoconnect = true;
+            self.saved_cfg.autoconnect = true;
+        }
+        if let Err(e) = self.cfg.save(&Config::default_path()) {
+            tracing::warn!("could not save the new pairing: {e}");
+        }
+        true
+    }
+
+    /// The login screen keeps its own copy of the settings, pairings included. After a
+    /// pairing is added or removed, refresh it if that service is on (it asks for the
+    /// computer's password through the desktop).
+    fn refresh_login_copy(&mut self) -> Task<Message> {
+        #[cfg(target_os = "linux")]
+        if self.login_screen.on() {
+            self.apply_login_screen(true);
+        }
+        Task::none()
     }
 
     /// The client asking this server for its PIN, if any.
@@ -2613,7 +2782,7 @@ impl App {
                     ),
                 }
             }
-            Some(StatusSnapshot { refused: Some(why), .. }) => ("Couldn't connect".into(), why.clone()),
+            Some(StatusSnapshot { refused: Some(why), .. }) => ("Couldn't connect".into(), refusal_text(why)),
             _ => {
                 let peer = self.peer_name();
                 (format!("Waiting for {peer}"), format!("It will connect as soon as {peer} is reachable"))
@@ -2807,43 +2976,15 @@ impl App {
         rows.push(nav(p, "Take control back", "", keycaps(p, &self.cfg.lock_hotkey), Message::OpenSettings(Page::Keys)));
         col = col.push(group(p, rows));
 
-        // The last few clipboard entries, so the main window shows the other half of what
-        // the app does without a tab switch.
-        if let Some(entries) = self.engine.as_ref().map(|e| e.clipboard_meta()).filter(|e| !e.is_empty()) {
-            col = col.push(
-                row![
-                    text("Recent clipboard").size(12.5).font(BOLD).color(p.txt2).width(Length::Fill),
-                    btn_link(p, "See all", Message::TabPicked(Tab::Clipboard)),
-                ]
-                .align_y(Alignment::Center),
-            );
-            let mut list = column![].spacing(8.0);
-            for m in entries.iter().take(3) {
-                let what = if m.incoming { "Received" } else { "Sent" };
-                let size = if m.is_files { human_bytes(m.disk_bytes as usize) } else { human_bytes(m.bytes) };
-                list = list.push(
-                    button(
-                        row![
-                            kind_badge(p, m),
-                            text(m.preview.clone())
-                                .size(13.0)
-                                .font(if m.is_files || m.is_image { iced::Font::DEFAULT } else { MONO })
-                                .color(p.txt)
-                                .width(Length::Fill)
-                                .wrapping(iced::widget::text::Wrapping::WordOrGlyph),
-                            text(format!("{what} · {size}")).size(11.5).color(p.txt3),
-                        ]
-                        .spacing(10.0)
-                        .align_y(Alignment::Center),
-                    )
-                    .style(ui_theme::choice(p, false))
-                    .padding([10.0, 14.0])
-                    .width(Length::Fill)
-                    .on_press(Message::ClipReuse(m.id)),
-                );
-            }
-            col = col.push(list);
+        // Which paired computer to work with, like choosing a Bluetooth device (R45).
+        if !self.cfg.paired.is_empty() {
+            let heading = if server_side { "Computers · switch with Ctrl+Alt+Shift+number" } else { "Paired computers" };
+            col = col
+                .push(text(heading).size(12.5).font(BOLD).color(p.txt2))
+                .push(group(p, self.paired_switch_rows(p, connected_peer.is_some())));
         }
+
+        // No recent-clipboard list here: the Clipboard tab beside this one has it (R47).
         col.into()
     }
 
@@ -3075,7 +3216,7 @@ impl App {
                     "Pair with its code",
                     column![
                         self.pair_client_view(p),
-                        text("On the other computer, open Settings › Security & pairing › Pair a new device, then type the code it shows.")
+                        text("On the computer with the mouse, press \"Pair a new device\", then type the code it shows here.")
                             .size(11.5)
                             .color(p.txt3),
                     ]
@@ -4045,6 +4186,31 @@ impl App {
             ret = ret.push(btn_link(p, "Clear", Message::ClearReturnHotkey));
         }
         let adv = group(p, vec![srow(p, "Return combo", "Optional · works on the computer with the mouse", ret)]);
+        // R46: the switch shortcuts, on the computer with the mouse.
+        if self.cfg.role == Role::Server {
+            let targets = self.cfg.switch_targets();
+            let mut rows: Vec<Element<'_, Message>> = Vec::new();
+            for (i, t) in targets.iter().enumerate() {
+                let field = HotkeyField::Switch(i);
+                let mut r = row![cap(field, &t.hotkey), change(field)].spacing(10.0).align_y(Alignment::Center);
+                if self.cfg.switch_keys.contains_key(&t.id) && self.recording != Some(field) {
+                    r = r.push(btn_link(p, "Default", Message::SwitchKeyDefault(i)));
+                }
+                let sub = if t.is_self { "this computer: brings control back here".to_string() } else { "jumps into it".to_string() };
+                rows.push(srow(p, format!("{}. {}", i + 1, t.name), sub, r));
+            }
+            let dupes: Vec<&str> = targets
+                .iter()
+                .enumerate()
+                .filter(|(i, t)| !t.hotkey.is_empty() && targets[..*i].iter().any(|o| o.hotkey.eq_ignore_ascii_case(&t.hotkey)))
+                .map(|(_, t)| t.name.as_str())
+                .collect();
+            col = col.push(section(p, "Switch between computers")).push(group(p, rows));
+            if !dupes.is_empty() {
+                col = col.push(note(p, p.warn, &format!("Two entries share a shortcut; the first one wins. Change the one for {}.", dupes.join(", "))));
+            }
+            col = col.push(text("The order is set on the main window with ▲▼. Changes apply when sharing restarts.").size(11.5).color(p.txt3));
+        }
         col.push(self.advanced(p, Page::Keys, adv)).into()
     }
 
@@ -4105,7 +4271,7 @@ impl App {
             .align_y(Alignment::Center)
             .into(),
             // Said plainly because a profile is as sensitive as the config file itself.
-            "A named copy of all your settings, to switch between setups like \"desk\" and \"travel\". Profiles include the shared secret · stored in ~/.mouse_share/profiles/",
+            "A named copy of all your settings, to switch between setups like \"desk\" and \"travel\". Pairings are not part of a profile · stored in ~/.mouse_share/profiles/",
         ));
 
         let mut ports: Vec<Element<'_, Message>> = Vec::new();
@@ -4167,7 +4333,8 @@ impl App {
                 .push(section(p, "Pairing"));
             let mut pairing = Vec::new();
             if self.paired() {
-                pairing.push(srow(p, format!("Paired with {}", self.peer_name()), "", dot(p.good, 8.0)));
+                let names: Vec<&str> = self.cfg.paired.iter().map(|d| d.name.as_str()).collect();
+                pairing.push(srow(p, format!("Paired with {}", names.join(", ")), "", dot(p.good, 8.0)));
             }
             pairing.push(stacked(p, if self.paired() { "Pair with a new code" } else { "Pair with a code" }, self.pair_client_view(p), ""));
             col = col.push(group(p, pairing));
@@ -4187,25 +4354,128 @@ impl App {
                 )]));
         }
 
-        // Pairing with a code replaced typing the secret; the secret stays here for setups
-        // made before pairing existed.
+        // Every computer this one is paired with, each with its own key (R44).
+        col = col.push(section(p, "Paired computers")).push(group(p, self.paired_rows(p)));
+
         let adv = group(p, vec![
-            stacked(
-                p,
-                "Shared secret",
-                row![
-                    input(p, "shared secret", &self.cfg.shared_secret, Message::SecretChanged).secure(!self.show_secret),
-                    btn_secondary(p, if self.show_secret { "Hide" } else { "Show" }, Some(Message::ToggleShowSecret)),
-                    btn_secondary(p, "Generate", Some(Message::GenerateSecret)),
-                ]
-                .spacing(8.0)
-                .align_y(Alignment::Center)
-                .into(),
-                "Identical on both computers. Pairing sets it for you.",
-            ),
             tog(p, "Encrypt the connection (TLS)", "rustls, self-signed certificate", self.cfg.tls_enabled, Message::TlsToggled),
         ]);
         col.push(self.advanced(p, Page::Security, adv)).into()
+    }
+
+    /// Main window: each paired computer. Connect on the others; on the one in use, its
+    /// state (connecting, or connected with the row tinted) and Disconnect. With sharing
+    /// stopped nothing is waiting, so every row offers Connect.
+    fn paired_switch_rows(&self, p: Palette, connected: bool) -> Vec<Element<'_, Message>> {
+        if self.cfg.role == Role::Server {
+            return self.switch_list_rows(p);
+        }
+        let own = &self.cfg.device_id;
+        let running = self.running();
+        let current = mouse_core::trust::choice(own).unwrap_or_else(|| self.cfg.connect_to.clone());
+        let mut list = self.cfg.paired.clone();
+        list.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+        list.into_iter()
+            .map(|d| {
+                let in_use = running && d.id == current;
+                let state = |color, label: &'static str| {
+                    row![dot(color, 8.0), text(label).size(12.0).color(p.txt2)].spacing(6.0).align_y(Alignment::Center)
+                };
+                let right: Element<'_, Message> = if in_use {
+                    let (c, l) = if connected { (p.good, "connected") } else { (p.warn, "connecting…") };
+                    row![state(c, l), btn_secondary(p, "Disconnect", Some(Message::DisconnectPeer))]
+                        .spacing(12.0)
+                        .align_y(Alignment::Center)
+                        .into()
+                } else {
+                    btn_secondary(p, "Connect", Some(Message::ConnectTo(d.id.clone())))
+                };
+                let sub = match (in_use, connected) {
+                    (true, true) => "in use".to_string(),
+                    (true, false) => "not connected yet".to_string(),
+                    _ if d.id == current => "last used".to_string(),
+                    _ => String::new(),
+                };
+                let r = srow(p, d.name.clone(), sub, right);
+                if in_use && connected {
+                    container(r).style(move |_| ui_theme::row_connected(p)).width(Length::Fill).into()
+                } else {
+                    r
+                }
+            })
+            .collect()
+    }
+
+    /// The computer with the mouse (R46): the switch list in order, this computer included.
+    /// Each row: its number's shortcut, whether it is connected or in use, Use for a
+    /// connected one, and ▲▼ to change its number.
+    fn switch_list_rows(&self, p: Palette) -> Vec<Element<'_, Message>> {
+        let own = &self.cfg.device_id;
+        let running = self.running();
+        let connected = if running { mouse_core::trust::connected(own) } else { Vec::new() };
+        let in_use = if running { mouse_core::trust::input_peer(own) } else { None };
+        let targets = self.cfg.switch_targets();
+        let last = targets.len().saturating_sub(1);
+        targets
+            .into_iter()
+            .enumerate()
+            .map(|(i, t)| {
+                let is_connected = connected.contains(&t.id);
+                let using = in_use.as_deref() == Some(t.id.as_str()) && is_connected;
+                let state = |color, label: &'static str| -> Element<'_, Message> {
+                    row![dot(color, 8.0), text(label).size(12.0).color(p.txt2)].spacing(6.0).align_y(Alignment::Center).into()
+                };
+                let status: Element<'_, Message> = if t.is_self {
+                    text("").into()
+                } else if using {
+                    state(p.good, "in use")
+                } else if is_connected {
+                    row![state(p.good, "connected"), btn_secondary(p, "Use", Some(Message::ConnectTo(t.id.clone())))]
+                        .spacing(10.0)
+                        .align_y(Alignment::Center)
+                        .into()
+                } else {
+                    state(p.txt3, "not connected")
+                };
+                let arrows = row![
+                    btn_secondary(p, "▲", (i > 0).then_some(Message::MoveSwitch(i, true))),
+                    btn_secondary(p, "▼", (i < last).then_some(Message::MoveSwitch(i, false))),
+                ]
+                .spacing(4.0);
+                let right = row![status, keycaps(p, &t.hotkey), arrows].spacing(12.0).align_y(Alignment::Center);
+                let title = format!("{}. {}", i + 1, t.name);
+                let sub = if t.is_self { "this computer" } else { "" };
+                let r = srow(p, title, sub, right);
+                if using {
+                    container(r).style(move |_| ui_theme::row_connected(p)).width(Length::Fill).into()
+                } else {
+                    r
+                }
+            })
+            .collect()
+    }
+
+    /// One row per paired computer, with Remove (pressed twice, so a slip does not undo a
+    /// pairing). Removing it refuses that computer at once.
+    fn paired_rows(&self, p: Palette) -> Vec<Element<'_, Message>> {
+        if self.cfg.paired.is_empty() {
+            return vec![srow(p, "None yet", "Pair with a code above. Each pairing gets its own key.", Space::new().width(0.0))];
+        }
+        let mut list = self.cfg.paired.clone();
+        list.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+        list.into_iter()
+            .map(|d| {
+                let when = if d.paired_at > 0 { format!("paired {}", day_text(d.paired_at)) } else { "paired".into() };
+                let sub = format!("{when} · its own key · device {}", d.id.get(..8).unwrap_or(&d.id));
+                let armed = self.remove_armed.as_deref() == Some(d.id.as_str());
+                let button = if armed {
+                    btn_danger(p, "Remove for good", Some(Message::RemovePaired(d.id.clone())))
+                } else {
+                    btn_secondary(p, "Remove", Some(Message::RemovePaired(d.id.clone())))
+                };
+                srow(p, d.name.clone(), sub, button)
+            })
+            .collect()
     }
 
     /// Client: the PIN rows of Security & pairing.
@@ -4384,26 +4654,46 @@ impl App {
         }
     }
 
+    /// The button beside the update status on About: whatever the next step is, right
+    /// there, so a "Check now" that finds a version can be installed without going back to
+    /// the main window (owner, 30 Oct).
+    fn update_action(&self, p: Palette) -> Element<'_, Message> {
+        use crate::update::State as U;
+        match crate::update::get(&self.update) {
+            U::Available(_) => btn_primary(p, "Update now", Some(Message::UpdateInstall)),
+            U::Downloading { done, total, .. } => {
+                let pct = if total > 0 { done * 100 / total } else { 0 };
+                text(format!("{pct}%")).size(12.5).color(p.txt2).into()
+            }
+            // Installed and waiting for a restart; a newer one can still be looked for.
+            U::Ready(_) => row![
+                btn_secondary(p, "Check now", Some(Message::UpdateCheckNow)),
+                btn_primary(p, "Restart mouse-rs", Some(Message::UpdateRestart)),
+            ]
+            .spacing(8.0)
+            .into(),
+            U::Failed(_) => btn_secondary(p, "Try again", Some(Message::UpdateCheckNow)),
+            _ => btn_secondary(p, "Check now", self.update_idle().then_some(Message::UpdateCheckNow)),
+        }
+    }
+
     fn page_about(&self, p: Palette) -> Element<'_, Message> {
         column![
             Space::new().height(8.0),
             group(p, vec![
                 srow(p, "mouse-rs", format!("Version {}", crate::update::VERSION), Space::new().width(0.0)),
-                srow(p, "Updates", self.update_status(), {
-                    let can = self.update_idle();
-                    btn_secondary(p, "Check now", can.then_some(Message::UpdateCheckNow))
-                }),
+                srow(p, "Updates", self.update_status(), self.update_action(p)),
                 tog(
                     p,
                     "Check for updates automatically",
-                    "At start and once a day, only while mouse-rs is running",
+                    if crate::update::TEST_BUILD { "Test build: at start and every minute" } else { "Each time mouse-rs starts" },
                     self.cfg.check_updates,
                     Message::UpdatesToggled,
                 ),
                 srow(
                     p,
                     "Restore default settings",
-                    "Keeps this computer's name, shared secret and screen size",
+                    "Keeps this computer's name, its pairings and screen size",
                     btn_danger(p, "Restore…", Some(Message::AskRestoreDefaults)),
                 ),
             ]),
@@ -4736,39 +5026,79 @@ fn chip_toggle<'a>(p: Palette, label: &'static str, on: bool, msg: Message) -> E
 
 /// The code being typed, drawn as one box per digit. An invisible input on top takes the
 /// typing, so the boxes behave like one field (paste works too).
+/// The pairing code as one box per digit, each a real input: it shows the blinking cursor
+/// and a highlighted border when selected, any box can be clicked to change just that
+/// digit, and typing moves on to the next box (owner, 30 Oct). Pasting a whole code into
+/// any box fills the boxes from there.
 fn code_boxes<'a>(
     p: Palette,
     value: &'a str,
     n: usize,
-    on_input: impl Fn(String) -> Message + 'a,
+    on_digit: impl Fn(usize, String) -> Message + Clone + 'a,
     on_submit: Message,
 ) -> Element<'a, Message> {
     let typed: Vec<char> = value.chars().collect();
     let mut boxes = row![].spacing(7.0);
     for i in 0..n {
-        let ch = typed.get(i).map(|c| c.to_string()).unwrap_or_default();
-        let next = i == typed.len().min(n - 1) && typed.len() < n;
+        let ch = typed.get(i).filter(|c| c.is_ascii_digit()).map(|c| c.to_string()).unwrap_or_default();
+        let f = on_digit.clone();
         boxes = boxes.push(
-            container(text(ch).size(18.0).font(MONO).color(p.txt))
-                .width(36.0)
-                .height(42.0)
+            text_input("", &ch)
+                .id(code_box_id(i))
+                .on_input(move |v| f(i, v))
+                .on_submit(on_submit.clone())
+                .style(ui_theme::input(p))
                 .align_x(Alignment::Center)
-                .align_y(Alignment::Center)
-                .style(move |_| ui_theme::code_box(p, next)),
+                .font(MONO)
+                .size(18.0)
+                .padding([9.0, 2.0])
+                .width(36.0),
         );
     }
-    let width = n as f32 * 36.0 + (n.saturating_sub(1)) as f32 * 7.0;
-    stack![
-        boxes,
-        text_input("", value)
-            .on_input(on_input)
-            .on_submit(on_submit)
-            .style(ui_theme::input_invisible())
-            .padding([11.0, 4.0])
-            .size(18.0)
-            .width(width),
-    ]
-    .into()
+    boxes.into()
+}
+
+/// The widget ID of pairing-code box `i`, so typing can move the cursor between boxes.
+fn code_box_id(i: usize) -> iced::widget::Id {
+    iced::widget::Id::from(format!("pair-digit-{i}"))
+}
+
+/// The code after `typed` arrived in box `i` of `old` (one char per box, ' ' for empty),
+/// and the box to put the cursor in next.
+fn code_after_typing(old: &str, i: usize, typed: &str, n: usize) -> (String, Option<usize>) {
+    let mut slots: Vec<char> = old.chars().chain(std::iter::repeat(' ')).take(n).collect();
+    let digits: Vec<char> = typed.chars().filter(char::is_ascii_digit).collect();
+    let before = slots[i];
+    let next = match digits.len() {
+        // The box was emptied: go back one, like Backspace in a single field.
+        0 => {
+            slots[i] = ' ';
+            i.checked_sub(1)
+        }
+        1 => {
+            slots[i] = digits[0];
+            Some(i + 1).filter(|j| *j < n)
+        }
+        // One new digit typed beside the old one: the new one replaces it.
+        2 if digits.contains(&before) => {
+            slots[i] = if digits[0] == before { digits[1] } else { digits[0] };
+            Some(i + 1).filter(|j| *j < n)
+        }
+        // A pasted code: fill from this box on.
+        _ => {
+            let mut j = i;
+            for d in digits {
+                if j >= n {
+                    break;
+                }
+                slots[j] = d;
+                j += 1;
+            }
+            Some(j.min(n - 1))
+        }
+    };
+    let code: String = slots.into_iter().collect();
+    (code.trim_end().to_string(), next)
 }
 
 fn btn_primary<'a>(p: Palette, label: impl Into<String>, msg: Option<Message>) -> Element<'a, Message> {
@@ -5027,23 +5357,15 @@ fn tray_tooltip(running: bool, snap: Option<&StatusSnapshot>, waiting: usize) ->
             }
             t
         }
-        (true, Some(StatusSnapshot { refused: Some(why), .. })) => format!("mouse-rs — refused: {why}"),
+        (true, Some(StatusSnapshot { refused: Some(why), .. })) => format!("mouse-rs — refused: {}", refusal_text(why)),
         (true, _) => "mouse-rs — waiting for peer".to_owned(),
     }
-}
-
-/// A random URL-safe-ish secret for the Generate button.
-fn generate_secret() -> String {
-    use rand::Rng;
-    const CH: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-    let mut rng = rand::thread_rng();
-    (0..32).map(|_| CH[rng.gen_range(0..CH.len())] as char).collect()
 }
 
 /// Pair with the server using `code`. With no server address set, every machine on this
 /// computer's networks that answers on the server port is tried; only the one showing the
 /// code can pair. Blocking: runs on its own thread.
-fn pair_in_background(cfg: &Config, code: &str) -> Result<(String, String), String> {
+fn pair_in_background(cfg: &Config, code: &str) -> Result<mouse_core::config::PairedDevice, String> {
     let hosts: Vec<String> = if cfg.server_host.trim().is_empty() {
         mouse_core::discover::scan_for_servers(cfg.server_port, std::time::Duration::from_millis(300))
             .into_iter()
@@ -5071,6 +5393,22 @@ fn pair_in_background(cfg: &Config, code: &str) -> Result<(String, String), Stri
     last
 }
 
+/// A moment (seconds since 1970, UTC) as a date, like "30 Oct 2026".
+fn day_text(secs: u64) -> String {
+    // Days to a civil date (Howard Hinnant's algorithm), so no date library is needed.
+    let z = (secs / 86_400) as i64 + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    format!("{d} {} {y}", MONTHS[(m - 1) as usize])
+}
+
 /// Today, as days since 1970 (UTC): enough to show the reminder at most once a day.
 fn today() -> u64 {
     std::time::SystemTime::now()
@@ -5089,7 +5427,27 @@ fn pair_error_text(why: &str) -> String {
         ),
         "no_server" => "no server found on this computer's networks; type its address and try again".into(),
         "old_version" => "the server runs an older mouse-rs; update it".into(),
+        "that is this computer" => "that code is showing on this computer; type it on the other one".into(),
         other => format!("pairing failed: {other}"),
+    }
+}
+
+/// Why a connection was refused, in words. Reasons from the other computer arrive as
+/// short codes; reasons this computer wrote itself are already sentences.
+fn refusal_text(why: &str) -> String {
+    match why {
+        busy if busy.starts_with("busy:") => format!(
+            "the other computer is working with {} right now; on it, click Connect next to this computer to switch",
+            &busy[5..]
+        ),
+        "not_paired_server" | "not_chosen_server" => {
+            "a computer answered that isn't the one chosen here; it was ignored (Connect picks another)".into()
+        }
+        "not_paired" => "the other computer is not paired with this one (or removed it); pair them again with a code".into(),
+        "server_not_verified" => "the other computer could not prove it is the one you paired with; nothing was sent to it".into(),
+        "bad_secret" => "the pairing keys don't match; pair the two computers again with a code".into(),
+        "old_version" => "the other computer runs an older mouse-rs; update both".into(),
+        other => other.into(),
     }
 }
 
@@ -5122,6 +5480,29 @@ pub fn launch(cfg: Config) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn typing_into_the_code_boxes() {
+        // Typing moves on box by box.
+        assert_eq!(code_after_typing("", 0, "4", 6), ("4".into(), Some(1)));
+        assert_eq!(code_after_typing("4", 1, "7", 6), ("47".into(), Some(2)));
+        // Fixing just the third digit of a full code.
+        assert_eq!(code_after_typing("123456", 2, "39", 6), ("129456".into(), Some(3)));
+        assert_eq!(code_after_typing("123456", 2, "93", 6), ("129456".into(), Some(3)));
+        // Deleting a digit empties that box only and steps back.
+        assert_eq!(code_after_typing("123456", 2, "", 6), ("12 456".into(), Some(1)));
+        // A whole code pasted into the first box fills all six.
+        assert_eq!(code_after_typing("", 0, "654321", 6), ("654321".into(), Some(5)));
+        // Letters are ignored.
+        assert_eq!(code_after_typing("1", 1, "a", 6), ("1".into(), Some(0)));
+    }
+
+    #[test]
+    fn pairing_dates_read_as_dates() {
+        assert_eq!(day_text(0), "1 Jan 1970");
+        assert_eq!(day_text(1_793_330_000), "30 Oct 2026");
+        assert_eq!(day_text(951_782_400), "29 Feb 2000");
+    }
 
     /// R40, from the owner's design (28 Oct; R30 had Startup under Everyday): the
     /// categories, their order and their groups. Every page is listed exactly once.

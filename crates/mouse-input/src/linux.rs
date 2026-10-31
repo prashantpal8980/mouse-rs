@@ -424,6 +424,7 @@ impl X11Capture {
     pub fn start(
         sink: UnboundedSender<CaptureSignal>,
         suppress: Arc<AtomicBool>,
+        hotkeys: Vec<crate::LocalHotkey>,
     ) -> Result<X11Capture, InputError> {
         let stop = Arc::new(AtomicBool::new(false));
         let s2 = suppress.clone();
@@ -435,7 +436,7 @@ impl X11Capture {
         let join = std::thread::Builder::new()
             .name("x11-capture".into())
             .spawn(move || {
-                if let Err(e) = capture_loop(conn, screen_num, sink, s2, st2) {
+                if let Err(e) = capture_loop(conn, screen_num, sink, s2, st2, hotkeys) {
                     tracing::error!("x11 capture loop ended: {e}");
                 }
             })
@@ -492,6 +493,7 @@ fn capture_loop(
     sink: UnboundedSender<CaptureSignal>,
     suppress: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
+    hotkeys: Vec<crate::LocalHotkey>,
 ) -> Result<(), InputError> {
     let screen = &conn.setup().roots[screen_num];
     let root = screen.root;
@@ -508,11 +510,17 @@ fn capture_loop(
         tracing::debug!("detectable auto-repeat unavailable: {e}");
     }
 
+    let hot = grab_switch_keys(&conn, root, &kbd, &hotkeys);
+
     let mut grabbed = false;
     // We asked to suppress but the grab was refused (another grab is active). Latch
     // so we report it once and don't busy-retry until the request is withdrawn.
     let mut grab_failed = false;
     let mut last_pos: Option<(i32, i32)> = None;
+    // Where the pointer was when the grab was taken (the crossing point on the edge).
+    // The grab parks it in the centre, so on release it is put back here; otherwise
+    // control came back with the pointer in the middle of the screen (B48).
+    let mut crossed_at: Option<(i32, i32)> = None;
     // Pointer-motion tracking within the current grab: deltas are taken relative to
     // the previous event (robust to the server batching MotionNotify), and warp
     // echoes are absorbed by a pending-warp counter (see `Motion`).
@@ -530,7 +538,9 @@ fn capture_loop(
         // Reconcile suppression state with the requested state.
         let want = suppress.load(Ordering::SeqCst);
         if want && !grabbed && !grab_failed {
+            let before = query_pointer_pos(&conn, root).ok();
             if grab(&conn, root)? {
+                crossed_at = before;
                 // Discard anything queued before the grab took effect (stale
                 // pre-grab motion) so the first forwarded delta is genuine.
                 drain_pending(&conn)?;
@@ -553,6 +563,10 @@ fn capture_loop(
         } else if !want && (grabbed || grab_failed) {
             if grabbed {
                 ungrab(&conn)?;
+                if let Some(p) = crossed_at.take() {
+                    let (x, y) = inside_edge(p, w, h);
+                    warp_center(&conn, root, x, y)?;
+                }
             }
             grabbed = false;
             grab_failed = false;
@@ -566,6 +580,12 @@ fn capture_loop(
         {
             if grabbed {
                 handle_event(&event, &conn, root, geom, &mut motion, &mut kbd, &sink)?;
+            } else if let Event::KeyPress(e) = &event {
+                // A switch shortcut, pressed while input is local (R46).
+                let state = u16::from(e.state) & SWITCH_MODS;
+                if let Some(&(_, _, i)) = hot.iter().find(|(kc, m, _)| *kc == e.detail && *m == state) {
+                    let _ = sink.send(CaptureSignal::Hotkey(i));
+                }
             } else if let Event::MappingNotify(_) = event {
                 kbd = KeyboardMap::fetch(&conn)?;
             }
@@ -585,6 +605,54 @@ fn capture_loop(
         // toggles and stop are honoured even with no input flowing.
         wait_readable(fd, 5);
     }
+}
+
+/// The modifiers a switch shortcut is made of: Shift, Control, Mod1 (Alt), Mod4 (Super).
+const SWITCH_MODS: u16 = 0x0001 | 0x0004 | 0x0008 | 0x0040;
+
+/// Take the switch shortcuts (R46) from the desktop with passive key grabs, so they reach
+/// us, and not the focused app, while input is local. Each is grabbed with and without
+/// Caps Lock and Num Lock, which would otherwise make it miss. Returns
+/// (keycode, modifiers, index) for matching the presses.
+fn grab_switch_keys(
+    conn: &RustConnection,
+    root: Window,
+    kbd: &KeyboardMap,
+    hotkeys: &[crate::LocalHotkey],
+) -> Vec<(u8, u16, usize)> {
+    use x11rb::protocol::xproto::ModMask;
+    let mut out = Vec::new();
+    for (i, hk) in hotkeys.iter().enumerate() {
+        let Some((keycode, _)) = kbd.lookup(key_to_keysym(&hk.key)) else {
+            tracing::warn!(?hk, "switch shortcut: this keyboard has no such key; skipped");
+            continue;
+        };
+        let mut mods = 0u16;
+        if hk.shift { mods |= 0x0001; }
+        if hk.ctrl { mods |= 0x0004; }
+        if hk.alt { mods |= 0x0008; }
+        if hk.super_key { mods |= 0x0040; }
+        let mut ok = true;
+        for extra in [0u16, 0x0002, 0x0010, 0x0012] {
+            let r = conn
+                .grab_key(true, root, ModMask::from(mods | extra), keycode, GrabMode::ASYNC, GrabMode::ASYNC)
+                .map_err(|e| e.to_string())
+                .and_then(|c| c.check().map_err(|e| format!("{e:?}")));
+            if let Err(e) = r {
+                ok = false;
+                tracing::warn!(?hk, "switch shortcut is taken by another program here: {e}");
+                break;
+            }
+        }
+        if ok {
+            out.push((keycode, mods, i));
+        }
+    }
+    if !out.is_empty() {
+        tracing::info!("listening for {} switch shortcut(s)", out.len());
+    }
+    let _ = conn.flush();
+    out
 }
 
 /// Ask the X server for detectable auto-repeat on the core keyboard (XKB).
@@ -717,6 +785,17 @@ fn ungrab(conn: &RustConnection) -> Result<(), InputError> {
     Ok(())
 }
 
+/// `p` moved a few pixels in from whichever screen edge it sits on, so a returning
+/// pointer lands next to the edge it left by, outside the crossing band: it does not
+/// cross straight back, but one more push outward does.
+fn inside_edge(p: (i32, i32), w: i32, h: i32) -> (i32, i32) {
+    const INSET: i32 = 8;
+    (
+        p.0.clamp(INSET.min(w / 2), (w - 1 - INSET).max(w / 2)),
+        p.1.clamp(INSET.min(h / 2), (h - 1 - INSET).max(h / 2)),
+    )
+}
+
 fn warp_center(conn: &RustConnection, root: Window, cx: i32, cy: i32) -> Result<(), InputError> {
     conn.warp_pointer(x11rb::NONE, root, 0, 0, 0, 0, cx as i16, cy as i16)?;
     conn.flush()?;
@@ -802,6 +881,17 @@ fn wait_readable(fd: std::os::unix::io::RawFd, timeout_ms: i32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_returning_pointer_lands_just_inside_the_edge_it_left_by() {
+        // Left the right edge of a 1440x900 screen at y=604: comes back beside it.
+        assert_eq!(inside_edge((1439, 604), 1440, 900), (1431, 604));
+        assert_eq!(inside_edge((0, 300), 1440, 900), (8, 300));
+        assert_eq!(inside_edge((700, 0), 1440, 900), (700, 8));
+        assert_eq!(inside_edge((700, 899), 1440, 900), (700, 891));
+        // Away from any edge it is left alone.
+        assert_eq!(inside_edge((700, 450), 1440, 900), (700, 450));
+    }
 
     #[test]
     fn keysym_named_roundtrip() {

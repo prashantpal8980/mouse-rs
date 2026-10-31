@@ -21,6 +21,8 @@ mod update;
 
 #[cfg(target_os = "linux")]
 mod greeter;
+#[cfg(target_os = "linux")]
+mod glibc_compat;
 
 #[cfg(feature = "gui")]
 mod autostart;

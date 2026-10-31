@@ -562,6 +562,11 @@ struct HookState {
     locally_held: crate::held::LocallyHeld,
     /// The last event the hook saw for each key; see [`release_stuck_modifiers`].
     last_seen: crate::held::LastSeen,
+    /// The switch shortcuts (R46), matched here while input is local.
+    hotkeys: Vec<crate::LocalHotkey>,
+    /// Keys whose press was taken as a switch shortcut, so their release is kept from
+    /// local apps too.
+    hotkey_up: Vec<u16>,
 }
 
 thread_local! {
@@ -670,6 +675,28 @@ impl HookState {
         let vk = info.vkCode as u16;
         self.last_seen.note(vk, pressed);
         if !self.suppress.load(Ordering::SeqCst) {
+            // A switch shortcut (R46): report it and keep it from the local app.
+            if pressed && !self.hotkeys.is_empty() {
+                if let Some(key) = vk_to_key(vk, extended) {
+                    let ctrl = vk_physically_down(vk::CONTROL);
+                    let alt = vk_physically_down(vk::MENU);
+                    let shift = vk_physically_down(vk::SHIFT);
+                    let sup = vk_physically_down(vk::LWIN) || vk_physically_down(vk::RWIN);
+                    if let Some(i) = self.hotkeys.iter().position(|h| {
+                        h.key == key && h.ctrl == ctrl && h.alt == alt && h.shift == shift && h.super_key == sup
+                    }) {
+                        let _ = self.sink.send(CaptureSignal::Hotkey(i));
+                        self.hotkey_up.push(vk);
+                        return true;
+                    }
+                }
+            }
+            if !pressed {
+                if let Some(at) = self.hotkey_up.iter().position(|v| *v == vk) {
+                    self.hotkey_up.swap_remove(at);
+                    return true;
+                }
+            }
             self.locally_held.note(vk, pressed);
             if !pressed {
                 if let Some(f) = REACHED_WINDOWS.get(vk as usize) {
@@ -1175,6 +1202,7 @@ fn capture_loop(
     heartbeat: Arc<AtomicU64>,
     return_vk: u16,
     diag: std::sync::mpsc::Sender<DiagEvent>,
+    hotkeys: Vec<crate::LocalHotkey>,
 ) -> Result<(), InputError> {
     ensure_dpi_aware();
 
@@ -1208,6 +1236,8 @@ fn capture_loop(
             diag: diag.clone(),
             locally_held: Default::default(),
             last_seen: Default::default(),
+            hotkeys: hotkeys.clone(),
+            hotkey_up: Vec::new(),
         });
     });
 
@@ -1859,6 +1889,7 @@ impl WinCapture {
         sink: UnboundedSender<CaptureSignal>,
         suppress: Arc<AtomicBool>,
         return_hotkey: Option<NamedKey>,
+        hotkeys: Vec<crate::LocalHotkey>,
     ) -> Result<WinCapture, InputError> {
         ensure_dpi_aware();
         let stop = Arc::new(AtomicBool::new(false));
@@ -1891,7 +1922,7 @@ impl WinCapture {
             .name("win-capture".into())
             .spawn(move || {
                 tid2.store(unsafe { GetCurrentThreadId() }, Ordering::SeqCst);
-                if let Err(e) = capture_loop(sink, s2, st2, hb2, return_vk, diag_tx) {
+                if let Err(e) = capture_loop(sink, s2, st2, hb2, return_vk, diag_tx, hotkeys) {
                     tracing::error!("win capture loop ended: {e}");
                 }
             })

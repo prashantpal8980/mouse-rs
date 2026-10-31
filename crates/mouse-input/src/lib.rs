@@ -95,6 +95,20 @@ pub enum CaptureSignal {
     /// locker). The engine should revert to Local rather than strand the user in a
     /// pseudo-Remote state with input still reaching local apps.
     SuppressRejected,
+    /// One of the switch shortcuts (R46), pressed while **not** suppressing: the index
+    /// into the list given to [`start_capture`]. The key press is kept from local apps.
+    /// (While suppressing, keys arrive as `Input` and the engine matches them itself.)
+    Hotkey(usize),
+}
+
+/// A key combination the capture watches for while input is local (R46).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalHotkey {
+    pub ctrl: bool,
+    pub alt: bool,
+    pub shift: bool,
+    pub super_key: bool,
+    pub key: Key,
 }
 
 /// Errors from the platform input backends.
@@ -183,20 +197,23 @@ pub fn new_injector() -> Result<Box<dyn InputInjector>, InputError> {
 /// backend uses it for its in-callback + watchdog failsafe self-release (so the
 /// user can always escape suppression); on Linux the engine handles the hotkey, so
 /// it is ignored there.
+/// `local_hotkeys` are the switch shortcuts (R46): pressed while input is local, each is
+/// reported as [`CaptureSignal::Hotkey`] with its index.
 pub fn start_capture(
     sink: UnboundedSender<CaptureSignal>,
     return_hotkey: Option<NamedKey>,
+    local_hotkeys: Vec<LocalHotkey>,
 ) -> Result<(Box<dyn InputCapture>, Suppressor), InputError> {
     let suppressor = Suppressor::new();
     #[cfg(target_os = "linux")]
     {
         let _ = return_hotkey; // the engine handles the hotkey on Linux
-        let cap = linux::X11Capture::start(sink, suppressor.shared())?;
+        let cap = linux::X11Capture::start(sink, suppressor.shared(), local_hotkeys)?;
         Ok((Box::new(cap), suppressor))
     }
     #[cfg(target_os = "windows")]
     {
-        let cap = windows::WinCapture::start(sink, suppressor.shared(), return_hotkey)?;
+        let cap = windows::WinCapture::start(sink, suppressor.shared(), return_hotkey, local_hotkeys)?;
         Ok((Box::new(cap), suppressor))
     }
     #[cfg(not(any(target_os = "linux", target_os = "windows")))]
@@ -204,6 +221,7 @@ pub fn start_capture(
         let _ = sink;
         let _ = suppressor;
         let _ = return_hotkey;
+        let _ = local_hotkeys;
         Err(InputError::Unsupported)
     }
 }

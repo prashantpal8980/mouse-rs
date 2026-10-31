@@ -23,6 +23,8 @@ VERSION="${2:?version}"
 BASE="http://192.168.137.2:8000/release"
 export MOUSE_RS_VERSION="$VERSION"
 export MOUSE_RS_UPDATE_URL="$BASE/latest.json"
+# Checks every minute instead of only at start (update::TEST_BUILD).
+export MOUSE_RS_TEST_BUILD=1
 [ -d "$REPO_ROOT/.xdo-shim" ] && export RUSTFLAGS="-L $REPO_ROOT/.xdo-shim"
 
 case "$MODE" in

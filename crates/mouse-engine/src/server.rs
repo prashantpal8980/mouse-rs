@@ -77,6 +77,13 @@ pub async fn run_server_engine(
         );
     }
 
+    // The switch shortcuts (R46): index i here is CaptureSignal::Hotkey(i).
+    let switch = hotkey::switch_hotkeys(&cfg);
+    let own = cfg.device_id.clone();
+    // A shortcut asked for a computer that is not the one in use yet: jump into it as soon
+    // as the link says it is.
+    let mut jump_pending = false;
+
     let mut state = State::Local;
     let mut connected = false;
     let mut peer_dims: Option<(i32, i32)> = None;
@@ -120,8 +127,25 @@ pub async fn run_server_engine(
                             }
                         }
                     }
+                    (CaptureSignal::Hotkey(i), _) => {
+                        if let Some((_, target)) = switch.get(i) {
+                            let t = target.clone();
+                            switch_to(&t, &own, &to_peer, &suppress, &mut state, &mut cross_armed, &status, &health, &mut held_mods, connected, peer_dims, &mut jump_pending);
+                        }
+                    }
                     (CaptureSignal::Input(ev), State::Remote) => {
-                        if check_return(&ev, &mut held_mods, &lock_hk, &return_hk) {
+                        // A switch shortcut typed while on the other computer: not
+                        // forwarded, acted on here.
+                        let hit = match &ev {
+                            InputEvent::Key { key, pressed: true } => switch
+                                .iter()
+                                .find(|(hk, _)| hk.matches_exactly(key, held_mods))
+                                .map(|(_, t)| t.clone()),
+                            _ => None,
+                        };
+                        if let Some(t) = hit {
+                            switch_to(&t, &own, &to_peer, &suppress, &mut state, &mut cross_armed, &status, &health, &mut held_mods, connected, peer_dims, &mut jump_pending);
+                        } else if check_return(&ev, &mut held_mods, &lock_hk, &return_hk) {
                             return_to_local(&to_peer, &suppress, &mut state, &mut cross_armed, &status, &health, &mut held_mods);
                         } else {
                             let _ = to_peer.send(ev.to_message());
@@ -169,6 +193,11 @@ pub async fn run_server_engine(
                         } else {
                             set_status_connected(&status, &peer, width, height, false);
                             tracing::info!("peer '{peer}' connected: {width}x{height}");
+                        }
+                        // Switched to by a shortcut: go straight in (R46).
+                        if jump_pending {
+                            jump_pending = false;
+                            jump_into(&to_peer, &suppress, &mut state, &mut cross_armed, &status, &health, &mut held_mods, (width, height));
                         }
                     }
                     Some(LinkEvent::Disconnected(reason)) => {
@@ -219,6 +248,75 @@ pub async fn run_server_engine(
             }
         }
     }
+}
+
+/// A switch shortcut (R46) for the computer with device ID `target`. This computer's own
+/// ID brings control home. The computer in use is jumped into at once; another connected
+/// one is asked of the link, and jumped into when the link says it is in use.
+#[allow(clippy::too_many_arguments)]
+fn switch_to(
+    target: &str,
+    own: &str,
+    to_peer: &UnboundedSender<Message>,
+    suppress: &Suppressor,
+    state: &mut State,
+    cross_armed: &mut bool,
+    status: &Option<crate::status::StatusHandle>,
+    health: &Option<std::sync::Arc<mouse_core::bulk::LinkHealth>>,
+    held_mods: &mut u8,
+    connected: bool,
+    peer_dims: Option<(i32, i32)>,
+    jump_pending: &mut bool,
+) {
+    if target == own {
+        tracing::info!("switch shortcut: back to this computer");
+        if *state == State::Remote {
+            return_to_local(to_peer, suppress, state, cross_armed, status, health, held_mods);
+        }
+        return;
+    }
+    let in_use = mouse_core::trust::input_peer(own).as_deref() == Some(target);
+    if in_use && connected {
+        if *state == State::Local {
+            if let Some(dims) = peer_dims {
+                jump_into(to_peer, suppress, state, cross_armed, status, health, held_mods, dims);
+            }
+        }
+        return;
+    }
+    if !mouse_core::trust::connected(own).iter().any(|d| d == target) {
+        let name = mouse_core::trust::get(own, target).map(|d| d.name).unwrap_or_else(|| target.to_owned());
+        tracing::info!("switch shortcut: {name} is not connected; nothing to switch to");
+        return;
+    }
+    if *state == State::Remote {
+        return_to_local(to_peer, suppress, state, cross_armed, status, health, held_mods);
+    }
+    mouse_core::trust::reserve(own, Some(target));
+    *jump_pending = true;
+}
+
+/// Go into the computer in use with the pointer in the middle of its screen (R46).
+#[allow(clippy::too_many_arguments)]
+fn jump_into(
+    to_peer: &UnboundedSender<Message>,
+    suppress: &Suppressor,
+    state: &mut State,
+    cross_armed: &mut bool,
+    status: &Option<crate::status::StatusHandle>,
+    health: &Option<std::sync::Arc<mouse_core::bulk::LinkHealth>>,
+    held_mods: &mut u8,
+    (w, h): (i32, i32),
+) {
+    let (x, y) = (w / 2, h / 2);
+    let _ = to_peer.send(Message::Enter { x, y });
+    suppress.set(true);
+    *state = State::Remote;
+    *cross_armed = false;
+    *held_mods = 0;
+    set_status_engaged(status, true);
+    set_crossed(health, true);
+    tracing::info!("switched into the other computer by shortcut, entry ({x},{y})");
 }
 
 /// Hand control back to the local machine: release suppression and tell the peer.
@@ -282,6 +380,66 @@ mod tests {
 
     async fn recv_msg(rx: &mut UnboundedReceiver<Message>) -> Option<Message> {
         timeout(Duration::from_millis(500), rx.recv()).await.ok().flatten()
+    }
+
+    /// R46: a switch shortcut asks the link for another connected computer, jumps into
+    /// it (pointer in the middle) once the link says it is in use, and this computer's
+    /// own shortcut brings control home. Typed while on the other side, it is not
+    /// forwarded.
+    #[tokio::test]
+    async fn switch_shortcuts_jump_between_computers_and_home() {
+        use mouse_core::config::PairedDevice;
+        let pd = |id: &str| PairedDevice { id: id.into(), name: id.into(), key: "k".into(), paired_at: 0 };
+        let own = "eng46-own";
+        let cfg = Config {
+            device_id: own.into(),
+            paired: vec![pd("eng46-kali"), pd("eng46-vm")],
+            ..server_cfg()
+        };
+        mouse_core::trust::set_connected(own, &["eng46-kali".into(), "eng46-vm".into()]);
+        mouse_core::trust::set_input_peer(own, Some("eng46-kali"));
+        let (mut chans, engine_link) = EngineLink::new();
+        let supp = Suppressor::new();
+        let (cap_tx, cap_rx) = unbounded_channel();
+        let cancel = CancellationToken::new();
+        let h = tokio::spawn(run_server_engine(cfg, (1920, 1080), engine_link, supp.clone(), cap_rx, cancel.clone(), None));
+        chans
+            .events
+            .send(LinkEvent::Connected { peer: "eng46-kali".into(), width: 1920, height: 1080, login_screen: false })
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(15)).await;
+
+        // Ctrl+Alt+Shift+3 (the VM, third in the list): asked of the link.
+        cap_tx.send(CaptureSignal::Hotkey(2)).unwrap();
+        tokio::time::sleep(Duration::from_millis(15)).await;
+        assert_eq!(mouse_core::trust::reserved(own).as_deref(), Some("eng46-vm"));
+        // The link switches: the engine goes straight in, in the middle of its screen.
+        mouse_core::trust::set_input_peer(own, Some("eng46-vm"));
+        chans
+            .events
+            .send(LinkEvent::Connected { peer: "eng46-vm".into(), width: 1280, height: 800, login_screen: false })
+            .unwrap();
+        assert_eq!(recv_msg(&mut chans.to_peer).await, Some(Message::Enter { x: 640, y: 400 }));
+        assert!(supp.get());
+
+        // On the VM, Ctrl+Alt+Shift+1 (this computer) is typed: not forwarded, and home.
+        for k in [NamedKey::CtrlL, NamedKey::AltL, NamedKey::ShiftL] {
+            cap_tx.send(CaptureSignal::Input(InputEvent::Key { key: Key::Named(k), pressed: true })).unwrap();
+        }
+        for _ in 0..3 {
+            let _ = recv_msg(&mut chans.to_peer).await; // the modifiers go to the VM
+        }
+        cap_tx.send(CaptureSignal::Input(InputEvent::Key { key: Key::Char('1'), pressed: true })).unwrap();
+        assert_eq!(recv_msg(&mut chans.to_peer).await, Some(Message::Leave), "home, and the 1 never reached the VM");
+        assert!(!supp.get());
+
+        // Back on this computer, Ctrl+Alt+Shift+3 again: the VM is in use, so straight in.
+        cap_tx.send(CaptureSignal::Hotkey(2)).unwrap();
+        assert_eq!(recv_msg(&mut chans.to_peer).await, Some(Message::Enter { x: 640, y: 400 }));
+
+        cancel.cancel();
+        let _ = h.await;
+        mouse_core::trust::reserve(own, None);
     }
 
     #[tokio::test]

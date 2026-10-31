@@ -302,7 +302,7 @@ is looking right now… there are six colour implementations… implement that U
 - **Main window:** status card with a title sentence ("Connected to laptop"), both computers as tiles (the one with the
   mouse outlined, "● Has the mouse") and a ⇄ swap-roles button. Underlined tabs Connection · Clipboard (with count).
   Connection is a grouped list: This computer (Shares mouse | Is controlled), Connection details (expands in place:
-  addresses, pairing, server address), Connection PIN (client), Take control back, then Recent clipboard + See all.
+  addresses, pairing, server address), Connection PIN (client), Take control back, then the paired computers. (No Recent clipboard here since R47.)
 - **Before pairing** the Connection tab is a 3-step setup: what does this computer do → find the other computer → pair
   with its code. After pairing it folds into the list above.
 - **Server PIN prompt** sits in the main window ("laptop wants its PIN"), not a pop-up.
@@ -353,3 +353,92 @@ leaves and appears; no restart prompt was visible; only the server should decide
 - Server picture: both screens have four clickable edge strips — this one's choose where the pointer leaves, the other's where it appears (no longer hidden in Advanced). The lit one is "leaves: right", the other screen sits on
   that side with its "appears: left" strip lit, an arrow between. Advanced keeps "Appears on … at: Auto…".
 - "N changes wait for a restart" + a Restart button now sit in the footer on every page, Settings included.
+
+### R44 — one key per pairing, and both sides know exactly whom they paired with (agreed 2026-10-30)
+Found by the owner (B50): the Windows VM paired with the laptop and then connected to Kali, because every computer
+handed out one shared secret. Owner: "it should properly authenticate which key it is assigned to… which is the device
+which is offering this pairing", and asked what happens when roles are swapped.
+- **Every install has a device ID**: random, made once, never changes, never typed. The login-screen copy carries the
+  same ID, because it is the same computer.
+- **Pairing makes a new key for those two computers only.** Both sides derive it from the code exchange (SPAKE2), so
+  the key never crosses the network, not even encrypted. Each side's device ID and name are sealed into the exchange:
+  a correct code proves the other end is the computer that is showing that code, and tells each side which computer
+  that is. A third machine cannot put its own ID in, and pairing with one computer gives nothing that opens another.
+- **Each computer keeps a list of paired computers** (name, ID, key, date). Settings → Security & pairing shows the list
+  with **Remove**. Pairing the same computer again replaces its entry.
+- **Connecting:** the computer being controlled says which device it is; the computer with the mouse looks up the
+  key for that device and proves itself first with it. The controlled computer accepts only a computer on its own
+  list. One that is not on the list is refused before any key is used ("not paired with this computer"), and the
+  refusal is shown on both sides by name.
+- **Swapping roles uses the same key, with no re-pairing.** A pairing belongs to the two computers, not to which one
+  has the mouse. Each proof is labelled with its side, both device IDs and this session, so a proof made in one
+  direction can never be replayed in the other; a second key per direction would add nothing.
+- **Discovery** beacons are signed with each pairing's key; a computer paired with nobody sends none (pairing finds
+  computers by scanning, as before).
+- **The connection PIN (R35)** is bound to the pairing key as well, so a machine that is not paired cannot collect a
+  PIN proof to guess at offline.
+- **The old single shared secret no longer lets anyone in.** Computers set up before this pair once more after the
+  update; the typed "shared secret" box is removed. Protocol version 3: an older peer is told to update.
+
+### R36 addendum — install from About too (agreed 2026-10-30)
+Owner: after **About → Check now** finds a version, the next step must be right there: "if I am checking it, I want to
+install directly from there". The button beside the update status follows the state: **Check now** → **Update now**
+→ download percentage → **Restart mouse-rs**; after a failed install, **Try again**. The main-window banner stays.
+
+### R38 addendum — the code boxes behave like boxes (agreed 2026-10-30)
+Owner: no blinking cursor showed which box was being typed in, and one wrong digit could not be fixed on its own. Each
+of the six boxes is now a real input: the selected one shows the cursor and a highlighted border, typing moves to
+the next box, any box can be clicked to change just that digit, deleting a digit steps back one box, and a whole code
+pasted into any box fills the boxes from there.
+
+### R45 — reconnect to the computer you were last with; switch with one click (agreed 2026-10-30)
+Owner: like Wi-Fi or Bluetooth, "it prioritized the device last it is connected to… I just want to conveniently change
+it to VM, I just click on it or connect". And: "automatic" is about **finding** a computer, not choosing one — when both
+computers move from the router to a phone hotspot, mouse-rs finds the same computer at its new address by itself. "It
+doesn't automatically decide who to connect."
+- **Each computer remembers the paired computer it was last with**, and reconnects only to that one: after a restart, a
+  network drop or a network change. It never picks some other paired computer because that one answered first.
+- **The main window lists the paired computers.** The one in use is marked; each other one has **Connect**. Clicking it
+  switches: the current link closes and only the clicked computer is used from then on (and remembered as the last one).
+- **On the computer being controlled**, Connect chooses which computer may drive it. **On the computer with the mouse**,
+  Connect chooses which computer to drive: it closes the current link and waits for the clicked one only, even if
+  another paired computer keeps trying.
+- A computer with the mouse that is not waiting for anyone in particular accepts the first paired computer that asks
+  for it, and that one becomes its last; while it is busy with one, another is told "busy with <name>" by name.
+- A newly paired computer becomes the one in use.
+- **Each row says where it stands** (owner, 30 Oct, on the first version): Connect on a computer not in use; once
+  clicked, the row shows "connecting… / not connected yet" in amber with **Disconnect**; connected, a green dot and the
+  row tinted green, still with Disconnect. Disconnect closes the link (stops sharing). **Stop sharing cancels any wait**:
+  with sharing off nothing shows as waiting and every row offers Connect.
+- **Finding stays automatic**: the same computer is found again on whatever network both are on (beacons, R37/R39).
+
+### R46 — connected to several computers at once, switch with a shortcut (agreed 2026-10-31)
+Owner: "the person who is using two desktop usually comes with multiple device like it could have three, four or any
+number of devices. The connected at once is I think is much more better… I need it finished today". Replaces the
+one-at-a-time rule of R45 on the computer with the mouse; the controlled side is unchanged (it is with one computer).
+- **The computer with the mouse stays connected to every paired computer that is on**, all at once. Mouse and keyboard
+  go to one of them at a time; switching is instant because nothing reconnects.
+- **Shortcuts: Ctrl+Alt+Shift+1, 2, 3…** One per position in a list. The list is set on the computer with the mouse and
+  holds **this computer too**, so one number brings control home. Pressing a number jumps straight into that computer
+  (the pointer appears in the middle of its screen); pressing this computer's number brings it back here.
+- **Order:** on the main window the paired computers can be moved up and down; the position is the number. In Settings
+  each entry's shortcut can be changed to any combination (e.g. Ctrl+Shift+Alt+3 for this computer).
+- **The edge** still leads to one computer: the one most recently switched to (or clicked). A screen layout with a
+  computer on each edge is v1.1.
+- **Clipboard:** superseded by R47 (one clipboard for all connected computers).
+- The main window shows each paired computer as connected (green) or not, independently; Connect on the computer with
+  the mouse makes that one the one being used.
+
+### R47 — one clipboard for all connected computers; no clipboard list on Connection; quick update checks on test builds (agreed 2026-10-31)
+Owner: "all three device gonna share the clipboard… if I copy a thing it is gonna available for device one… two three
+four the number doesn't matter"; "I don't want to show any recent clipboard… on the connection page"; "make sure the
+update check time gets decreased… on our testing device… the checking will be only when the device starts".
+- **Text and images up to 256 KB** copied on any connected computer reach every other connected computer at once,
+  whichever one is in use. The computer with the mouse relays between the controlled ones.
+- **Larger images and files** are fetched over the file lane, which serves one computer at a time. A copy made on the
+  computer with the mouse goes to the computer in use, and to each other computer that was connected at the time
+  when it comes into use. A computer that connects later is not handed an old copy.
+  *Not yet:* files or a large image copied on one controlled computer do not reach another controlled computer.
+- **Connection page:** no Recent clipboard list. The Clipboard tab has the history.
+- **Update checks:** a release build checks once, when mouse-rs starts. A test build (one pointed at a local release
+  server) also checks every minute.

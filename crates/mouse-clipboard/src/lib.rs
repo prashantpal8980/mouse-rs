@@ -45,6 +45,8 @@ const DEFAULT_MAX_ITEM_BYTES: usize = 5 * 1024 * 1024;
 const DEFAULT_MEMORY_BUDGET: usize = 64 * 1024 * 1024;
 /// Default largest accepted image edge, in pixels.
 const DEFAULT_MAX_IMAGE_PX: usize = 4096;
+/// Largest image sent over the bulk lane (the history's whole memory budget).
+const LARGE_IMAGE_MAX: usize = 64 * 1024 * 1024;
 /// Default largest image still sent inline on the input lane.
 ///
 /// 256 KB is roughly a 1080p screenshot: about 50 ms even on a weak hotspot, which is
@@ -1765,12 +1767,12 @@ fn poll_local_image<C: SystemClipboard>(
     } else {
         None
     };
-    if png.len() > settings.max_item_bytes {
-        tracing::debug!(
-            bytes = png.len(),
-            cap = settings.max_item_bytes,
-            "local clipboard image is over the per-item limit; not syncing"
-        );
+    // The per-item limit is for what rides the input lane. A large image goes over the
+    // bulk lane, where a 4K screenshot or a photo of 5-20 MB is no trouble; it was
+    // dropped without a word before.
+    let cap = if staged.is_some() { settings.max_item_bytes.max(LARGE_IMAGE_MAX) } else { settings.max_item_bytes };
+    if png.len() > cap {
+        tracing::info!(bytes = png.len(), cap, "local clipboard image is over the size limit; not syncing");
         return None;
     }
     // Small images stay on the input lane: they cross in a few milliseconds, and a

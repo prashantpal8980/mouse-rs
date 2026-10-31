@@ -115,8 +115,10 @@ pub fn run_blocking_in(
             let (cap_tx, cap_rx) = unbounded_channel();
             // Pass the configured lock/return hotkey so the Windows capture failsafe
             // can self-release suppression on it (the Linux backend ignores it).
+            // And the switch shortcuts (R46), watched for while input is local.
+            let switch_keys = mouse_engine::hotkey::switch_hotkeys(&cfg).iter().map(|(h, _)| h.to_local()).collect();
             let (capture, suppressor) =
-                start_capture(cap_tx, NamedKey::from_name(&cfg.lock_hotkey))?;
+                start_capture(cap_tx, NamedKey::from_name(&cfg.lock_hotkey), switch_keys)?;
             let (clip_route, clipboard) = setup_clipboard(
                 &cfg,
                 &engine_link.to_peer,
@@ -661,7 +663,10 @@ async fn run_bulk_client_forever(
             _ = cancel.cancelled() => return,
             _ = tokio::time::sleep(backoff) => {}
         }
-        backoff = (backoff * 2).min(params.reconnect_max);
+        // At most a few seconds apart: with several computers connected (R46) the server
+        // refuses the file lane of one not in use, and when it is switched to, its files
+        // should not wait out a long back-off.
+        backoff = (backoff * 2).min(params.reconnect_max).min(std::time::Duration::from_secs(3));
     }
 }
 

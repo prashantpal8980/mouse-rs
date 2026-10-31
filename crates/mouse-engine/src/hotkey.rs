@@ -64,6 +64,34 @@ impl Hotkey {
     pub fn matches(&self, pressed: &Key, held_mods: u8) -> bool {
         (held_mods & self.mods) == self.mods && key_eq(pressed, &self.key)
     }
+
+    /// Like [`Hotkey::matches`], but no other modifier may be held: Ctrl+Alt+Shift+1 is
+    /// not Ctrl+Alt+1. Used for the switch shortcuts (R46), which differ only in that way.
+    pub fn matches_exactly(&self, pressed: &Key, held_mods: u8) -> bool {
+        held_mods == self.mods && key_eq(pressed, &self.key)
+    }
+
+    /// The same combination in the capture layer's terms, so it can be watched for while
+    /// input is local (R46).
+    pub fn to_local(&self) -> mouse_input::LocalHotkey {
+        mouse_input::LocalHotkey {
+            ctrl: self.mods & MOD_CTRL != 0,
+            alt: self.mods & MOD_ALT != 0,
+            shift: self.mods & MOD_SHIFT != 0,
+            super_key: self.mods & MOD_SUPER != 0,
+            key: self.key.clone(),
+        }
+    }
+}
+
+/// The switch shortcuts from the config, in order: each with the device ID it switches
+/// to (this computer's own ID brings control home). Entries without a usable shortcut are
+/// left out.
+pub fn switch_hotkeys(cfg: &mouse_core::config::Config) -> Vec<(Hotkey, String)> {
+    cfg.switch_targets()
+        .into_iter()
+        .filter_map(|t| Hotkey::parse(&t.hotkey).map(|h| (h, t.id)))
+        .collect()
 }
 
 fn single_char(s: &str) -> Option<char> {

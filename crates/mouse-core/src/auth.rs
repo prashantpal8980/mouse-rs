@@ -1,11 +1,13 @@
-//! HMAC-SHA256 mutual authentication (B34).
+//! HMAC-SHA256 mutual authentication (B34), with one key per pairing (R44).
 //!
-//! Both sides prove they know the shared secret. The client sends a nonce in its
+//! Both sides prove they know the key of their pairing. The client sends a nonce in its
 //! Hello; the server answers with its own nonce and a server proof; the client
 //! checks that proof before sending its own. Each proof is
-//! `HMAC-SHA256(secret, label || binding || client_nonce || server_nonce)`, where
-//! the label differs per side (a proof can't be echoed back) and `binding` is
-//! keying material exported from this TLS session. A machine in the middle runs two
+//! `HMAC-SHA256(key, label || client_id || server_id || binding || client_nonce || server_nonce)`,
+//! where the label differs per side (a proof can't be echoed back), the two device IDs say
+//! which computer is which this time (so a proof made with the roles one way round is no
+//! use the other way round), and `binding` is keying material exported from this TLS
+//! session. A machine in the middle runs two
 //! TLS sessions with two different bindings, so proofs relayed through it fail.
 //! The transport (async handshake) lives in `net`; this module is the pure,
 //! testable crypto core.
@@ -43,10 +45,17 @@ pub enum Side {
 impl Side {
     fn label(self) -> &'static [u8] {
         match self {
-            Side::Server => b"mouse-rs v2 server proof",
-            Side::Client => b"mouse-rs v2 client proof",
+            Side::Server => b"mouse-rs v3 server proof",
+            Side::Client => b"mouse-rs v3 client proof",
         }
     }
+}
+
+/// The two computers of one session, by device ID (R44).
+#[derive(Debug, Clone, Copy)]
+pub struct Ends<'a> {
+    pub client: &'a str,
+    pub server: &'a str,
 }
 
 /// Label for the TLS keying-material exporter that yields the session binding.
@@ -55,6 +64,7 @@ pub const TLS_EXPORTER_LABEL: &[u8] = b"EXPORTER-mouse-rs-auth";
 fn proof_mac(
     secret: &str,
     side: Side,
+    ends: Ends,
     binding: &[u8],
     client_nonce_hex: &str,
     server_nonce_hex: &str,
@@ -64,7 +74,7 @@ fn proof_mac(
     let mut mac =
         HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC accepts any key length");
     // Every field is length-prefixed, so no two inputs can run together into the same bytes.
-    for part in [side.label(), binding, &client_nonce, &server_nonce] {
+    for part in [side.label(), ends.client.as_bytes(), ends.server.as_bytes(), binding, &client_nonce, &server_nonce] {
         mac.update(&(part.len() as u32).to_be_bytes());
         mac.update(part);
     }
@@ -75,11 +85,12 @@ fn proof_mac(
 pub fn proof_hex(
     secret: &str,
     side: Side,
+    ends: Ends,
     binding: &[u8],
     client_nonce_hex: &str,
     server_nonce_hex: &str,
 ) -> Result<String, AuthError> {
-    let mac = proof_mac(secret, side, binding, client_nonce_hex, server_nonce_hex)?;
+    let mac = proof_mac(secret, side, ends, binding, client_nonce_hex, server_nonce_hex)?;
     Ok(hex_encode(&mac.finalize().into_bytes()))
 }
 
@@ -87,13 +98,14 @@ pub fn proof_hex(
 pub fn verify_proof(
     secret: &str,
     side: Side,
+    ends: Ends,
     binding: &[u8],
     client_nonce_hex: &str,
     server_nonce_hex: &str,
     candidate_hex: &str,
 ) -> bool {
     match (
-        proof_mac(secret, side, binding, client_nonce_hex, server_nonce_hex),
+        proof_mac(secret, side, ends, binding, client_nonce_hex, server_nonce_hex),
         hex_decode(candidate_hex),
     ) {
         // verify_slice is constant-time on the tag comparison.
@@ -137,8 +149,26 @@ fn hex_decode(s: &str) -> Result<Vec<u8>, AuthError> {
 mod tests {
     use super::*;
 
+    const ENDS: Ends = Ends { client: "vm", server: "laptop" };
+
     fn proof(secret: &str, side: Side, binding: &[u8], c: &str, s: &str) -> String {
-        proof_hex(secret, side, binding, c, s).unwrap()
+        proof_hex(secret, side, ENDS, binding, c, s).unwrap()
+    }
+
+    fn verify_proof(secret: &str, side: Side, binding: &[u8], c: &str, s: &str, p: &str) -> bool {
+        super::verify_proof(secret, side, ENDS, binding, c, s, p)
+    }
+
+    #[test]
+    fn a_proof_is_only_good_for_the_two_computers_it_was_made_for() {
+        let (c, s) = (generate_nonce_hex(), generate_nonce_hex());
+        let p = proof("k", Side::Client, b"tls", &c, &s);
+        let other = Ends { client: "vm", server: "kali" };
+        assert!(!super::verify_proof("k", Side::Client, other, b"tls", &c, &s, &p));
+        // Roles swapped: the same two computers, the other way round.
+        let swapped = Ends { client: "laptop", server: "vm" };
+        assert!(!super::verify_proof("k", Side::Client, swapped, b"tls", &c, &s, &p));
+        assert!(!super::verify_proof("k", Side::Server, swapped, b"tls", &c, &s, &p));
     }
 
     #[test]

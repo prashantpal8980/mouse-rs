@@ -1,0 +1,204 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Same-OS Test Checklist</title>
+<style>
+:root{--bg:#f6f5f2;--card:#fff;--ink:#1d1d1f;--mute:#6b6b70;--line:#e2e0da;--accent:#0f766e;--done:#e7f4f1;--bad:#b42318;--badbg:#fdecea;--code:#efeee9}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#141416;--card:#1d1d21;--ink:#ececef;--mute:#9a9aa3;--line:#2e2e34;--accent:#5eead4;--done:#16302c;--bad:#f97066;--badbg:#3a1d1b;--code:#2a2a30}}
+:root[data-theme="dark"]{--bg:#141416;--card:#1d1d21;--ink:#ececef;--mute:#9a9aa3;--line:#2e2e34;--accent:#5eead4;--done:#16302c;--bad:#f97066;--badbg:#3a1d1b;--code:#2a2a30}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif}
+main{max-width:860px;margin:0 auto;padding:24px 16px 80px}
+h1{font-size:24px;margin:0 0 4px}
+h2{font-size:17px;margin:32px 0 8px;padding-top:8px;border-top:1px solid var(--line)}
+p.lead,.mute{color:var(--mute)}
+code{background:var(--code);padding:1px 6px;border-radius:5px;font-size:13px;word-break:break-word}
+.bar{position:sticky;top:0;z-index:2;background:var(--bg);padding:10px 0;display:flex;gap:10px;align-items:center;flex-wrap:wrap;border-bottom:1px solid var(--line)}
+.prog{flex:1;min-width:160px;height:8px;background:var(--line);border-radius:4px;overflow:hidden}
+.prog i{display:block;height:100%;width:0;background:var(--accent);transition:width .2s}
+button{font:inherit;border:1px solid var(--line);background:var(--card);color:var(--ink);border-radius:8px;padding:6px 12px;cursor:pointer}
+button.primary{background:var(--accent);border-color:var(--accent);color:var(--bg)}
+.item{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px 14px;margin:8px 0;display:grid;grid-template-columns:auto 1fr;gap:4px 12px}
+.item.ok{background:var(--done)}
+.item.fail{background:var(--badbg);border-color:var(--bad)}
+.item .btns{display:flex;flex-direction:column;gap:6px}
+.item .btns button{padding:4px 10px;font-size:13px;min-width:64px}
+.item.ok .b-ok{background:var(--accent);color:var(--bg);border-color:var(--accent)}
+.item.fail .b-fail{background:var(--bad);color:#fff;border-color:var(--bad)}
+.item b{display:block}
+.item .how{color:var(--mute);font-size:14px}
+.item textarea{grid-column:2;width:100%;min-height:34px;font:inherit;font-size:13px;background:var(--bg);color:var(--ink);border:1px solid var(--line);border-radius:6px;padding:6px;resize:vertical}
+.box{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px 14px;margin:10px 0}
+#out{width:100%;min-height:160px;font:12px/1.4 ui-monospace,monospace;background:var(--card);color:var(--ink);border:1px solid var(--line);border-radius:8px;padding:8px;display:none}
+</style>
+</head>
+<body>
+<main>
+<h1>Same-OS test checklist</h1>
+<p class="lead">Kali ↔ Linux Mint first, then Windows ↔ Windows. Press <b>Done</b> or <b>Problem</b> on each line. If something goes wrong, write what you saw and the time in the box. Your ticks are saved in this browser. When you finish, press <b>Copy results</b> and paste them to Claude.</p>
+
+<div class="bar">
+  <div class="prog"><i id="pbar"></i></div><span id="ptext" class="mute"></span>
+  <button class="primary" id="copy">Copy results</button>
+  <button id="reset">Clear all</button>
+</div>
+
+<div class="box">
+<b>Test files</b>
+<ul>
+<li><b>On Kali</b>: already made, in <code>/home/kalip/mouse/test-files/from-kalip</code>. Claude opened it for you.</li>
+<li><b>On Mint</b> open Terminal and type <code>wget -qO- 192.168.122.1:8002/f | sh</code>. The <b>O</b> is a capital letter O. This makes the same set in a <b>mouse-test-files</b> folder on Mint's Desktop. Run it again after every Mint restart, because the live session forgets files.</li>
+</ul>
+<p class="mute">Each set: <b>1</b> a note · <b>2</b> a file with a strange name · <b>3</b> a folder 3 levels deep with an empty folder inside · <b>4</b> a folder of 300 small files · <b>5</b> a 5 MB file · <b>6</b> a 300 MB file · and <b>checksums</b>, used to prove the big files arrived intact.</p>
+<p class="mute">Always paste on the other computer's <b>Desktop</b> (click an empty spot, then Ctrl+V).</p>
+</div>
+
+<div id="list"></div>
+
+<h2>Results</h2>
+<textarea id="out" readonly></textarea>
+</main>
+
+<script>
+const S = [
+ ["A. Kali shares its mouse → Mint is controlled", [
+  ["a1","Pointer goes across","Push Kali's mouse off Kali's right edge. Mint's own arrow appears at Mint's left edge, at about the same height."],
+  ["a2","Pointer comes back at the edge (the fix from today)","From Mint, push off Mint's left edge. Kali's pointer should appear at Kali's right edge, NOT in the middle of the screen. Try at the top, middle and bottom."],
+  ["a3","Back and forth quickly","Cross over and back 10 times quickly. It never gets stuck and never jumps."],
+  ["a4","Left click, double click, right click","On Mint: open a folder by double-clicking, right-click the desktop for its menu."],
+  ["a5","Drag","On Mint: drag a window by its title bar, and select text by dragging over it."],
+  ["a6","Scroll","On Mint: scroll a long page or folder, both up and down."],
+  ["a7","Typing","On Mint: open Text Editor and type a sentence with capitals, numbers and symbols: Hello World 123 !@#$%"],
+  ["a8","Shortcuts","On Mint: Ctrl+A, Ctrl+Z, Alt+Tab, Ctrl+Alt+T (opens a terminal)."],
+  ["a9","Scroll Lock brings you back","While on Mint, press Scroll Lock. The pointer is back on Kali straight away."],
+  ["a10","No stuck keys","After coming back from Mint while holding Ctrl or Alt, typing on Kali is normal (no stuck Ctrl or Alt)."],
+ ]],
+ ["B. Copy and paste, Kali → Mint", [
+  ["b1","Text","Copy a sentence on Kali (Ctrl+C), move to Mint, paste it in Text Editor (Ctrl+V)."],
+  ["b2","Image","On Kali, copy a picture (e.g. a screenshot: PrtSc, then copy), and paste it in Mint."],
+ ]],
+ ["B (files). Kali → Mint  (copy from Kali's open folder, paste on Mint's Desktop)", [
+  ["b3","1 note from kalip.txt","Kali: in the open <b>from-kalip</b> folder window (<code>/home/kalip/mouse/test-files/from-kalip</code>) click <i>1 note from kalip.txt</i> → Ctrl+C. Mint: click an empty spot on Mint's Desktop → Ctrl+V. Double-click it: one line of text."],
+  ["b4","2 weird name — ünïcödé (kalip).txt","Same: copy it on Kali, Ctrl+V on Mint's Desktop. The name on Mint is exactly the same."],
+  ["b5","3 folder from kalip","Copy the folder. On Mint's Desktop open it: <i>empty folder</i>, <i>level 1</i>, top-1/2/3.txt; inside level 1 → level 2 → level 3 → deep.txt."],
+  ["b6","4 many small files from kalip","Copy the folder, paste on Mint's Desktop. Mint: right-click it → Properties → <b>300 items</b>."],
+  ["b7","5 + 6 + checksums together","On Kali hold Ctrl and click <i>5 medium 5MB from kalip.bin</i>, <i>6 big 300MB from kalip.bin</i> and <i>checksums from kalip.txt</i> → Ctrl+C → Mint's Desktop → Ctrl+V. Wait until it finishes."],
+  ["b8","Big files arrived intact","Mint: open Terminal and type <code>cd ~/Desktop && sha256sum -c checksums*kalip*</code> → both lines say <b>OK</b>."],
+ ]],
+ ["C. Mint → Kali  (copy on Mint, paste into Kali's <code>/home/kalip/mouse/test-files/from-mint</code>)", [
+  ["c0","Make Mint's test files","Mint Terminal: <code>wget -qO- 192.168.122.1:8002/f | sh</code> (capital O). A <b>mouse-test-files</b> folder appears on Mint's Desktop; double-click it to open."],
+  ["c1","Text","Copy any sentence on Mint → come back to Kali → paste in any text box."],
+  ["c2","Image","Mint: PrtSc → copy the screenshot → paste on Kali."],
+  ["c3","1 note from mint.txt + 2 weird name … (mint).txt","On Mint select both (Ctrl+click) → Ctrl+C → Kali: click inside the from-mint window → Ctrl+V. Both open; names unchanged."],
+  ["c4","3 folder from mint","Copy → Kali's from-mint window → Ctrl+V. Same contents check as B5."],
+  ["c5","4 many small files from mint","Kali: right-click → Properties → 300 items."],
+  ["c6","5 + 6 + checksums from mint","Ctrl+click the three files → copy → Kali's from-mint window → Ctrl+V. Then on Kali: <code>cd ~/mouse/test-files/from-mint && sha256sum -c checksums*mint*</code> → both <b>OK</b>."],
+ ]],
+ ["D. Connection troubles", [
+  ["d1","Mint's app closed and opened again","On Mint: quit mouse-rs (tray icon → Quit), start it again. It reconnects by itself, without pairing again."],
+  ["d2","Kali's app restarted","On Kali: Restart. Mint reconnects by itself."],
+  ["d3","Network cut","In virt-manager, Mint → ⓘ → NIC → untick <i>Link state: active</i> → Apply. Kali shows disconnected within a few seconds and the pointer is NOT stuck on Mint. Tick it again: it reconnects."],
+  ["d4","Crossing while a menu is open","Open a right-click menu on Kali, then push to the edge. Either it crosses or it stays put. Nothing freezes."],
+  ["d5","Mint screen locked","Lock Mint (Ctrl+Alt+L), cross over and type the password (empty on the live session: just press Enter)."],
+ ]],
+ ["E. Swap roles: Mint shares its mouse → Kali is controlled", [
+  ["e1","Switch both","Kali: Is controlled → Restart sharing. Mint: Shares mouse → Restart sharing. If it asks for a code, pair again: the code shows on Mint, type it on Kali."],
+  ["e2","Pointer goes across and back","With the mouse in the Mint window, push off Mint's right edge → Kali. Come back: lands at Mint's edge, not the middle."],
+  ["e3","Click, type, scroll on Kali","Driven from Mint."],
+  ["e4","Text both ways","Copy text Mint → Kali and Kali → Mint."],
+  ["e5","Folder 3 both ways","One folder each way."],
+  ["e6","Swap back","Kali: Shares mouse. Mint: Is controlled. To use the laptop again: Kali → Is controlled → Restart sharing."],
+ ]],
+ ["F0. Windows VM first-time setup, with a local account (no Microsoft account, no internet)", [
+  ["w1","Network is unplugged","Claude unplugs both of the VM's network cables before setup. Leave them unplugged until the desktop appears."],
+  ["w2","Country","Scroll to <b>India</b> (or your country) → <b>Yes</b>."],
+  ["w3","Keyboard","<b>US</b> → Yes. Second keyboard → <b>Skip</b>."],
+  ["w4","Network screen: open the command prompt","On \"Let's connect you to a network\", press <b>Shift+F10</b>. A black window opens."],
+  ["w5","Try 1: local account","Type <code>start ms-cxh:localonly</code> → Enter. If a window asks <i>Who's going to use this device?</i>, go to W7. If nothing happens, do W6."],
+  ["w6","Try 2: if try 1 did nothing","Type <code>reg add HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\OOBE /v BypassNRO /t REG_DWORD /d 1 /f</code> → Enter, then <code>shutdown /r /t 0</code> → Enter. After the restart, redo country + keyboard; on the network screen click <b>I don't have internet</b> → <b>Continue with limited setup</b>. If neither try works, tell Claude: the fallback is signing in with a Microsoft account."],
+  ["w7","Name and password","Name: <code>tester</code>. Password: <code>test123</code> (needed later for the lock-screen test). Three security questions: any answers."],
+  ["w8","Privacy screens","Turn every switch <b>off</b> → Accept / Next until the desktop appears."],
+  ["w9","Plug the network back in","Tell Claude \"Windows desktop is up\": Claude plugs the cables back in and gives you the one line that installs mouse-rs."],
+ ]],
+ ["F. Windows ↔ Windows: laptop shares its mouse, the VM is controlled", [
+  ["f1","Both on the newest version","Laptop: ⋯ → About shows the newest test version. VM: <code>irm 192.168.122.1:8002/w.txt | iex</code> in PowerShell."],
+  ["f2","Paired and connected","Laptop: Shares mouse. VM: Is controlled. Laptop → Settings → Security &amp; pairing → Pair a new device → type the code in the VM. Both main windows show the other one, green, \"connected\"."],
+  ["f3","Pointer across and back","Push off the laptop's edge toward the VM: the VM's arrow moves (look at the VM window on Kali's monitor). Come back: the laptop's pointer appears at the edge."],
+  ["f4","Click, type, scroll, shortcuts","In the VM: open Notepad, type <i>Hello World 123 !@#</i>, double-click, right-click, scroll, Alt+Tab, Ctrl+A. Then Scroll Lock brings you back."],
+  ["f5","No stuck keys","Come back from the VM while holding Ctrl or Alt: typing on the laptop is normal afterwards."],
+  ["f6","Text both ways","Copy a sentence on the laptop, paste in the VM's Notepad. Copy in the VM, paste on the laptop."],
+  ["f7","Image both ways","Win+Shift+S, take a screenshot, paste it in the other one (Paint or Word)."],
+  ["f8","Make the test files","On BOTH: PowerShell → laptop: <code>irm 192.168.137.2:8000/fw.txt | iex</code>, VM: <code>irm 192.168.122.1:8002/fw.txt | iex</code>. Two Explorer windows open: <b>from-&lt;name&gt;</b> (copy from) and <b>pasted</b> (paste into). All in one folder: <code>%USERPROFILE%\\mouse-test</code>."],
+  ["f9","Laptop → VM: everything at once","Laptop's from- window: Ctrl+A, Ctrl+C. VM's <b>pasted</b> window: click inside, Ctrl+V. Wait until it finishes."],
+  ["f10","Check it arrived intact (VM)","VM PowerShell: <code>irm 192.168.122.1:8002/cw.txt | iex</code>. Every line green: both files OK, 300 files, deep.txt + empty folder OK. Also look: the ünïcödé name is unchanged."],
+  ["f11","VM → laptop: everything at once","VM's from- window: Ctrl+A, Ctrl+C. Laptop's <b>pasted</b> window: Ctrl+V."],
+  ["f12","Check it arrived intact (laptop)","Laptop PowerShell: <code>irm 192.168.137.2:8000/cw.txt | iex</code>. Every line green."],
+  ["f13","Swap roles, no new code","Laptop: Is controlled. VM: Shares mouse. They connect without asking for a code. Pointer + typing + one text copy. Then swap back."],
+  ["f14","Several computers at once (R46)","Kali: Is controlled. VM: Is controlled. Laptop: Shares mouse. Both pair with the laptop. Laptop main window → <b>Computers</b>: laptop 1, kali-desktop 2, win-vm 3; Kali and win-vm both green \"connected\" at the same time."],
+  ["f14b","Shortcuts jump between them","On the laptop: <b>Ctrl+Alt+Shift+2</b> → the pointer appears in the middle of Kali. <b>Ctrl+Alt+Shift+3</b> → straight into the VM. <b>Ctrl+Alt+Shift+1</b> → back on the laptop. Try them from each computer. The number key never types anything."],
+  ["f14c","Use button and the edge","Laptop: click <b>Use</b> on kali-desktop, then push off the laptop's edge: you land on Kali. Click Use on win-vm: the edge now leads to the VM."],
+  ["f14d","Order and your own shortcut","Laptop: ▲▼ move win-vm to number 2 → Restart sharing → Ctrl+Alt+Shift+2 now goes to the VM. Settings → Keyboard &amp; hotkeys → Switch between computers → Change the laptop's to Ctrl+Shift+Alt+9 → Restart → it brings you home."],
+  ["f14e","Copy between all three","Copy text on Kali, Ctrl+Alt+Shift+3, paste in the VM. Copy a file on the VM, Ctrl+Alt+Shift+1, paste on the laptop."],
+  ["f14f","One goes away","Shut Kali's mouse-rs while on the VM: you stay on the VM; Kali shows not connected. Start it again: it comes back by itself."],
+  ["f15","The B50 check","With the VM paired only with the laptop: Kali must never connect to the VM. Claude reads Kali's log for the refusals."],
+  ["f16","Clean up","Delete <code>%USERPROFILE%\\mouse-test</code> on both."],
+ ]],
+];
+
+const KEY = "mouse-rs-sameos-checklist-v1";
+let st = {};
+try { st = JSON.parse(localStorage.getItem(KEY) || "{}"); } catch (e) { st = {}; }
+const save = () => { try { localStorage.setItem(KEY, JSON.stringify(st)); } catch (e) {} };
+
+const list = document.getElementById("list");
+for (const [title, items] of S) {
+  const h = document.createElement("h2"); h.textContent = title; list.appendChild(h);
+  for (const [id, name, how] of items) {
+    const d = document.createElement("div"); d.className = "item"; d.dataset.id = id;
+    d.innerHTML = `<div class="btns"><button class="b-ok">Done</button><button class="b-fail">Problem</button></div>
+      <div><b>${id.toUpperCase()} · ${name}</b><span class="how">${how}</span></div>
+      <textarea placeholder="Notes (what happened, and the time)"></textarea>`;
+    const ta = d.querySelector("textarea");
+    const s = st[id] || {};
+    ta.value = s.note || "";
+    const paint = () => { d.classList.toggle("ok", st[id]?.r === "ok"); d.classList.toggle("fail", st[id]?.r === "fail"); progress(); };
+    const set = r => { st[id] = { ...(st[id] || {}), r: st[id]?.r === r ? null : r }; save(); paint(); };
+    d.querySelector(".b-ok").onclick = () => set("ok");
+    d.querySelector(".b-fail").onclick = () => set("fail");
+    ta.oninput = () => { st[id] = { ...(st[id] || {}), note: ta.value }; save(); };
+    list.appendChild(d); paint();
+  }
+}
+function progress() {
+  const all = S.flatMap(s => s[1]).length;
+  const done = Object.values(st).filter(v => v && v.r).length;
+  const bad = Object.values(st).filter(v => v && v.r === "fail").length;
+  document.getElementById("pbar").style.width = (100 * done / all) + "%";
+  document.getElementById("ptext").textContent = `${done}/${all} checked` + (bad ? ` · ${bad} problem${bad > 1 ? "s" : ""}` : "");
+}
+document.getElementById("copy").onclick = async () => {
+  const lines = [];
+  for (const [title, items] of S) {
+    lines.push(title);
+    for (const [id, name] of items) {
+      const s = st[id] || {};
+      const mark = s.r === "ok" ? "DONE" : s.r === "fail" ? "PROBLEM" : "not tested";
+      lines.push(`  ${id.toUpperCase()} ${name}: ${mark}${s.note ? " — " + s.note.trim() : ""}`);
+    }
+  }
+  const out = document.getElementById("out");
+  out.style.display = "block"; out.value = lines.join("\n");
+  out.select();
+  try { await navigator.clipboard.writeText(out.value); document.getElementById("copy").textContent = "Copied ✓"; }
+  catch (e) { document.execCommand("copy"); }
+};
+document.getElementById("reset").onclick = () => {
+  if (!document.getElementById("reset").dataset.armed) { document.getElementById("reset").dataset.armed = 1; document.getElementById("reset").textContent = "Press again to clear"; return; }
+  st = {}; save(); location.reload();
+};
+progress();
+</script>
+</body>
+</html>

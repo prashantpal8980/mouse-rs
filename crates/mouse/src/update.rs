@@ -7,7 +7,7 @@
 //! public half is built in below. So a download is trusted only if the signed JSON says
 //! so, whatever the server or network in between did.
 //!
-//! The check runs at start and once a day, on a thread of this process only: nothing is
+//! The check runs at start (test builds: every minute), on a thread of this process only: nothing is
 //! left running after Quit (R33). **Update** downloads next to the running binary,
 //! checks size and hash, then swaps the file; the user restarts when they choose.
 //!
@@ -35,8 +35,16 @@ pub const MANIFEST_URL: &str = match option_env!("MOUSE_RS_UPDATE_URL") {
     None => "https://github.com/prashantpal8980/mouse-rs-downloads/releases/latest/download/latest.json",
 };
 
+/// A test build (`scripts/fake-release.sh` sets `MOUSE_RS_TEST_BUILD`): it checks for
+/// updates every minute instead of only at start. Its own marker, because a release
+/// may also be built with another `MOUSE_RS_UPDATE_URL` (a renamed downloads repo).
+pub const TEST_BUILD: bool = option_env!("MOUSE_RS_TEST_BUILD").is_some();
+
 /// The page a user can download from by hand, when updating in place is not possible.
-pub const DOWNLOAD_PAGE: &str = "https://github.com/prashantpal8980/mouse-rs-downloads/releases/latest";
+pub const DOWNLOAD_PAGE: &str = match option_env!("MOUSE_RS_DOWNLOAD_PAGE") {
+    Some(u) => u,
+    None => "https://github.com/prashantpal8980/mouse-rs-downloads/releases/latest",
+};
 
 /// Ed25519 public key matching the release signing key.
 const PUBLIC_KEY: [u8; 32] = [
@@ -208,19 +216,30 @@ fn version_key(v: &str) -> (Vec<u64>, bool, Vec<Part>) {
 
 /// Asks the release server whether there is something newer. Runs on its own thread.
 pub fn spawn_check(shared: Shared) {
+    // A version already installed and waiting for a restart: a check may still find a
+    // newer one, but anything else leaves "installed, restart" as it was.
+    let ready = match get(&shared) {
+        State::Ready(v) => Some(v),
+        _ => None,
+    };
     set(&shared, State::Checking);
     std::thread::spawn(move || {
         let result = check();
-        let next = match result {
-            Ok(Some(m)) => {
+        let next = match (result, ready) {
+            (Ok(Some(m)), Some(r)) if !is_newer(&m.version, &r) => State::Ready(r),
+            (Ok(None) | Err(_), Some(r)) => {
+                tracing::info!("update: {r} is installed and is still the newest");
+                State::Ready(r)
+            }
+            (Ok(Some(m)), _) => {
                 tracing::info!("update: version {} is available (this is {VERSION})", m.version);
                 State::Available(m)
             }
-            Ok(None) => {
+            (Ok(None), None) => {
                 tracing::info!("update: {VERSION} is the newest");
                 State::UpToDate
             }
-            Err(e) => {
+            (Err(e), None) => {
                 tracing::info!("update: check did not get an answer: {e}");
                 State::CheckFailed(e)
             }
@@ -338,9 +357,13 @@ fn swap(exe: &Path, new: &Path) -> Result<(), String> {
 
 #[cfg(windows)]
 fn swap(exe: &Path, new: &Path) -> Result<(), String> {
-    // A running .exe cannot be overwritten, but it can be renamed out of the way.
-    let old = sibling(exe, "old");
-    let _ = std::fs::remove_file(&old);
+    // A running .exe cannot be overwritten, but it can be renamed out of the way. After a
+    // second update without a restart, ".old" is the copy still running and cannot be
+    // removed, so the first free spare name is used.
+    let old = (0..10)
+        .map(|n| sibling(exe, &if n == 0 { "old".to_owned() } else { format!("old{n}") }))
+        .find(|o| !o.exists() || std::fs::remove_file(o).is_ok())
+        .ok_or("too many updates without a restart; restart mouse-rs first")?;
     std::fs::rename(exe, &old).map_err(|e| format!("could not move the running copy aside: {e}"))?;
     if let Err(e) = std::fs::rename(new, exe) {
         let _ = std::fs::rename(&old, exe);
@@ -355,6 +378,11 @@ pub fn relaunch() -> Result<(), String> {
     let exe = exe_path().ok_or("could not find where mouse-rs is installed")?;
     let mut cmd = std::process::Command::new(exe);
     cmd.args(std::env::args_os().skip(1)).env(WAIT_PID_VAR, std::process::id().to_string());
+    // No standard handles for the new copy. Passing ours on fails when this copy was
+    // started by Windows' logon task: its handles cannot be duplicated, and the spawn
+    // failed with "The request is not supported (os error 50)".
+    use std::process::Stdio;
+    cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -362,7 +390,43 @@ pub fn relaunch() -> Result<(), String> {
         const DETACHED_PROCESS: u32 = 0x0000_0008;
         cmd.creation_flags(DETACHED_PROCESS);
     }
-    cmd.spawn().map(|_| ()).map_err(|e| format!("could not start the new version: {e}"))
+    match cmd.spawn() {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            tracing::warn!("update restart: starting {} directly failed: {e}", exe.display());
+            relaunch_fallback(exe).map_err(|e2| {
+                tracing::warn!("update restart: the fallback failed too: {e2}");
+                format!("could not start the new version: {e}. Quit mouse-rs and start it again.")
+            })
+        }
+    }
+}
+
+/// Second way in on Windows: let the shell start it (`cmd /c start`), which does not
+/// hand the new copy anything of ours but the environment, so it still waits for us.
+#[cfg(windows)]
+fn relaunch_fallback(exe: &Path) -> std::io::Result<()> {
+    use std::os::windows::process::CommandExt;
+    use std::process::Stdio;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    std::process::Command::new("cmd.exe")
+        .arg("/c")
+        .arg("start")
+        .arg("")
+        .arg(exe)
+        .args(std::env::args_os().skip(1))
+        .env(WAIT_PID_VAR, std::process::id().to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn()
+        .map(|_| tracing::info!("update restart: started the new version through the shell"))
+}
+
+#[cfg(not(windows))]
+fn relaunch_fallback(_exe: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::other("no other way to start it here"))
 }
 
 const WAIT_PID_VAR: &str = "MOUSE_RS_WAIT_PID";
@@ -377,7 +441,9 @@ pub fn after_restart() {
     wait_for_exit(pid, Duration::from_secs(5));
     #[cfg(windows)]
     if let Some(exe) = exe_path() {
-        let _ = std::fs::remove_file(sibling(exe, "old"));
+        for n in 0..10 {
+            let _ = std::fs::remove_file(sibling(exe, &if n == 0 { "old".to_owned() } else { format!("old{n}") }));
+        }
     }
 }
 
