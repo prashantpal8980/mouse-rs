@@ -1067,6 +1067,15 @@ impl App {
                 }
                 // A computer paired with this one while it showed a code: keep it.
                 if self.save_pairings() {
+                    // Its switch shortcut is registered when sharing starts, so start again
+                    // now: the new computer's Ctrl+Alt+Shift+number works straight away,
+                    // without "Restart sharing". The others reconnect by themselves.
+                    if self.cfg.role == Role::Server && self.running() {
+                        tracing::info!("new pairing: restarting sharing so its switch shortcut works");
+                        self.stop_engine();
+                        self.engine = None;
+                        self.start_engine();
+                    }
                     return self.refresh_login_copy();
                 }
                 // Remember the computer this one is now with, for the next start (R45).

@@ -1038,11 +1038,11 @@ When mouse-rs had been started by the logon task (Task Scheduler, elevated), its
 **fixed in test11** · Both states blocked checking. A second update before restarting would also have failed on Windows, because `mouse-rs.exe.old` was still the running copy. Now the first free spare name is used, and all spares are cleaned on the next start.
 
 ### B53 — after pairing, a restart needed "Start sharing" on both computers
-**fixed in test13** · `autoconnect` stayed off after a successful pairing. So a new user who restarted either computer found sharing off (seen on the test copies and on the Windows VM). Pairing now turns it on. Settings › Startup can turn it off again.
+**fixed in test13, proven on the test copies (fresh pair, restart both, connected with no click)** · `autoconnect` stayed off after a successful pairing. So a new user who restarted either computer found sharing off (seen on the test copies and on the Windows VM). Pairing now turns it on. Settings › Startup can turn it off again.
 
 ### B54 — images over 5 MB were silently not shared
 **fixed in test12** · The 5 MB per-item limit was applied to large images too, though they go over the bulk lane. A 4K screenshot or a photo did nothing, with only a debug-level log line. Images sent by reference may now be up to 64 MB, and the "too big" case is logged at info.
-*Not proven on hardware yet:* a large image (over 5 MB) end to end.
+Proven on the test copies with test13: a 6.4 MB PNG (1600×1000) crossed over the bulk lane intact. Note for testers: `xclip` cannot serve over ~1 MB on Xvfb, so use a GTK clipboard owner (the QA scratch script `gclip.py`).
 
 ### B55 — "This computer · 1920×1080" on a screen of another size
 **fixed in test12** · The main window showed the config's default size until sharing had started once. The real size is now read when the window opens.
@@ -1051,7 +1051,7 @@ When mouse-rs had been started by the logon task (Task Scheduler, elevated), its
 **fixed in test12** · A profile replaced the whole config, including `paired`, `device_id` and `connect_to`. Those now stay as they are. Profile and Restore-defaults texts no longer mention the shared secret.
 
 ### B57 — a Windows VM named itself "mouse-rs"
-**fixed in test13** · Its config was created when `COMPUTERNAME` could not be read (cause unknown), and the fallback name stuck. A saved name equal to the fallback is now replaced by the real computer name when it can be read.
+**fixed in test13, proven on the VM (now WIN-VM)** · Its config was created when `COMPUTERNAME` could not be read (cause unknown), and the fallback name stuck. A saved name equal to the fallback is now replaced by the real computer name when it can be read.
 
 ### B58 — first-run hint on the controlled computer pointed into Settings
 **fixed in test12** · It now says to press "Pair a new device" on the computer with the mouse.
@@ -1061,3 +1061,12 @@ When mouse-rs had been started by the logon task (Task Scheduler, elevated), its
 
 ### B60 — files or a large image copied on one controlled computer don't reach another controlled computer
 **open, by design for v1.0 (R47)** · Text and images up to 256 KB are relayed between all computers. Files go between the computer with the mouse and each other computer.
+
+### B61 — the paired list keeps a computer's old name after it is renamed
+**open, cosmetic** · The live status uses the new name ("Controlling second"), but Settings › Security and the Computers list keep the name saved at pairing ("kalip"). Fix later: update the stored name when a paired computer connects under a new one.
+
+### B62 — a newly paired computer's switch shortcut did nothing until "Restart sharing"
+**fixed in test14** · Shortcuts are registered when sharing starts. The computer with the mouse now restarts sharing right after a new pairing, so Ctrl+Alt+Shift+N for the new computer works at once. Found with three test copies: shortcut 2 (in use) and 1 (home) worked, and 3 (just paired) did not, with no log line.
+
+### Several computers at once — proven on Linux test copies, 31 Oct
+Three copies on hidden displays: Ctrl+Alt+Shift+2 jumped into the computer in use (pointer centred, then followed), +1 came home, **Use** switched to the third, and the edge then led to the third (entered at its right edge). Clipboard text was shared across laptop + Kali + Windows VM in both directions on real hardware.

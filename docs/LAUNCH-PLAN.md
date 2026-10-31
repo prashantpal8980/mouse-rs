@@ -118,6 +118,14 @@ Code for items 1–5 depends on these. A suggested answer is given for each; "ye
 - [ ] Claude: scan for secrets, then push the source to the private repo.
 - [ ] Owner: final OK.
 
+**Sat 31 status (Claude):**
+- `scripts/release.sh <version> [owner/downloads-repo]` builds the release in its own target dir and refuses a binary that holds a test address. It produces the zip, the tarball, the raw binaries and a signed latest.json. Nothing is uploaded.
+- Log shipping is off by default (an empty setting), so the release build needs nothing extra.
+- README rewritten for pairing, several computers and in-app updates.
+- Owner decisions: launch free, SmartScreen note accepted. The **product name is decided on 1 Nov**, and the release is built after that, because the update URL contains the repo name. The **licence, and whether the source goes public, is undecided**, so the source stays private for now.
+- QA pass on Kali test copies and the Windows VM found B51–B60 (KNOWN-ISSUES), fixed in test10–13.
+- The shared clipboard across laptop + Kali + VM was proven both ways on hardware.
+
 ### Sun 1 Nov: launch
 - [ ] Owner's go: create the public downloads repo and publish release 1.0.0. The update check now points at it.
 - [ ] Reels: tip: **screen-record during the Tue–Fri tests** (pairing, copy a folder across, lock-screen unlock,
