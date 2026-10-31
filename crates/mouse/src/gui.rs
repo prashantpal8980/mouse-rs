@@ -2380,7 +2380,7 @@ impl App {
     /// a version already waiting for a restart.
     fn update_idle(&self) -> bool {
         use crate::update::State as U;
-        matches!(crate::update::get(&self.update), U::Idle | U::UpToDate | U::CheckFailed(_) | U::Ready(_) | U::Failed(_))
+        matches!(crate::update::get(&self.update), U::Idle | U::UpToDate | U::CheckFailed(_) | U::Ready(_) | U::Failed(_) | U::Available(_))
     }
 
     /// "Version x.y is available" (R36). A failed check shows nothing: a network blip

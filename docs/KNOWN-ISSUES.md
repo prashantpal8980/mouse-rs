@@ -1070,3 +1070,9 @@ Proven on the test copies with test13: a 6.4 MB PNG (1600×1000) crossed over th
 
 ### Several computers at once — proven on Linux test copies, 31 Oct
 Three copies on hidden displays: Ctrl+Alt+Shift+2 jumped into the computer in use (pointer centred, then followed), +1 came home, **Use** switched to the third, and the edge then led to the third (entered at its right edge). Clipboard text was shared across laptop + Kali + Windows VM in both directions on real hardware.
+
+### B63 — after the laptop restarted, the computer that reconnected first was used, not the one in use before
+**fixed in test15** · Seen in the laptop's log after the test11→test14 update: "now using WIN-VM", though Kali had been in use, so the edge led to the VM. The computer last in use (`connect_to`) now gets 20 s to come back. One that connects first stands in, then hands over when it arrives. A switch the user asks for always wins. Test: `after_a_restart_the_computer_last_in_use_is_used_again`.
+
+### B64 — test builds: a stale "version X is available" banner stopped further checks
+**fixed in test15** · While the banner was up the per-minute check did not run. So clicking Update downloaded a file that had since been replaced by a newer build, and the size check correctly refused it ("the download has 13481985 bytes, the release says 13481984"). A banner now stays up through checks and is replaced when a newer version appears. Release builds check only at start, so they were not affected in practice.

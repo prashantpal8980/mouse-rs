@@ -350,6 +350,12 @@ pub async fn run_server(
     // The last large image or file list copied here, and the computers that were
     // connected then but not in use, so are still owed it. One that connects later is
     // not handed an old copy.
+    // After a restart, the computer last in use (R45) gets a moment to come back: another
+    // that happens to connect first is used meanwhile, then handed over when it arrives.
+    // A switch the user asks for always wins.
+    let started = tokio::time::Instant::now();
+    let preferred = cfg.connect_to.clone();
+    let mut stand_in = false;
     let mut last_offer: Option<Message> = None;
     let mut owed: std::collections::HashSet<String> = std::collections::HashSet::new();
 
@@ -439,6 +445,7 @@ pub async fn run_server(
                         if let Some(old) = active.as_ref().and_then(|a| live.get(a)) {
                             let _ = old.to.send(Message::Leave);
                         }
+                        stand_in = false;
                         activate(&own, &live, &mut active, &want, &engine_events);
                     } else if active.as_deref() == Some(want.as_str()) {
                         crate::trust::reserve(&own, None);
@@ -576,7 +583,15 @@ pub async fn run_server(
                             // The one in use came back on a newer path: same as before.
                             let _ = engine_events.send(LinkEvent::Disconnected(DisconnectReason::Superseded));
                             activate(&own, &live, &mut active, &peer_device, &engine_events);
-                        } else if active.is_none() || wanted {
+                        } else if active.is_none()
+                            || wanted
+                            || (stand_in && peer_device == preferred && started.elapsed() < Duration::from_secs(20))
+                        {
+                            let first = active.is_none() && !wanted;
+                            if stand_in && peer_device == preferred {
+                                tracing::info!(peer = %peer_name, "{peer_name} was in use before the restart; using it again");
+                            }
+                            stand_in = first && !preferred.is_empty() && peer_device != preferred;
                             if let Some(old) = active.as_ref().and_then(|a| live.get(a)) {
                                 let _ = old.to.send(Message::Leave);
                             }
@@ -2372,6 +2387,61 @@ mod tests {
 
         cancel.cancel();
         let _ = tokio::join!(server, ca);
+    }
+
+    /// After a restart the computer last in use gets it back, even when another computer
+    /// happens to reconnect first (seen on hardware: the VM came back before Kali, and the
+    /// edge led to the VM).
+    #[tokio::test]
+    async fn after_a_restart_the_computer_last_in_use_is_used_again() {
+        let port = free_port().await;
+        let (srv, a, b) = (format!("srvlast-{port}"), format!("alast-{port}"), format!("blast-{port}"));
+        let cancel = CancellationToken::new();
+        let mut server_cfg = computer(
+            Role::Server,
+            port,
+            &srv,
+            "laptop",
+            vec![pairing(a.clone(), "kali", "k-a"), pairing(b.clone(), "win-vm", "k-b")],
+        );
+        server_cfg.connect_to = a.clone();
+        let (s_ch, _s_to, _s_from, mut s_events) = channels();
+        let server = tokio::spawn(run_server(server_cfg, fast_params(), cancel.clone(), s_ch, BulkServer::disabled(), LinkHealth::new()));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let client = |id: &str, name: &str, key: &str| computer(Role::Client, port, id, name, vec![pairing(srv.clone(), "laptop", key)]);
+        async fn next_use(ev: &mut mpsc::UnboundedReceiver<LinkEvent>) -> String {
+            loop {
+                match timeout(Duration::from_secs(3), ev.recv()).await {
+                    Ok(Some(LinkEvent::Connected { peer, .. })) => return peer,
+                    Ok(Some(_)) => continue,
+                    other => panic!("no Connected: {other:?}"),
+                }
+            }
+        }
+
+        // The VM is back first: used meanwhile.
+        let (ch, _b1, mut b_from, mut b_events) = channels();
+        let cb = tokio::spawn(run_client(client(&b, "win-vm", "k-b"), fast_params(), cancel.clone(), ch, LinkHealth::new()));
+        assert_eq!(outcome(&mut b_events).await, Ok(()));
+        assert_eq!(next_use(&mut s_events).await, "win-vm");
+
+        // Kali, last in use before the restart, arrives: it is used again, the VM is left.
+        let (ch, _a1, _a_from, mut a_events) = channels();
+        let ca = tokio::spawn(run_client(client(&a, "kali", "k-a"), fast_params(), cancel.clone(), ch, LinkHealth::new()));
+        assert_eq!(outcome(&mut a_events).await, Ok(()));
+        assert_eq!(next_use(&mut s_events).await, "kali");
+        let left = loop {
+            match timeout(Duration::from_secs(2), b_from.recv()).await.unwrap() {
+                Some(Message::Leave) => break true,
+                Some(_) => continue,
+                None => break false,
+            }
+        };
+        assert!(left, "the VM is told it was left");
+        assert_eq!(crate::trust::input_peer(&srv).as_deref(), Some(a.as_str()));
+
+        cancel.cancel();
+        let _ = tokio::join!(server, ca, cb);
     }
 
     /// One clipboard for all: text copied on any computer reaches every connected one,

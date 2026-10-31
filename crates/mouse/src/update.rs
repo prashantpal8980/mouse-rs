@@ -218,9 +218,10 @@ fn version_key(v: &str) -> (Vec<u64>, bool, Vec<Part>) {
 pub fn spawn_check(shared: Shared) {
     // A version already installed and waiting for a restart: a check may still find a
     // newer one, but anything else leaves "installed, restart" as it was.
-    let ready = match get(&shared) {
-        State::Ready(v) => Some(v),
-        _ => None,
+    let (ready, offered) = match get(&shared) {
+        State::Ready(v) => (Some(v), None),
+        State::Available(m) => (None, Some(m)),
+        _ => (None, None),
     };
     set(&shared, State::Checking);
     std::thread::spawn(move || {
@@ -231,6 +232,8 @@ pub fn spawn_check(shared: Shared) {
                 tracing::info!("update: {r} is installed and is still the newest");
                 State::Ready(r)
             }
+            // A banner already up stays up through a check that finds nothing newer.
+            (Ok(None) | Err(_), None) if offered.is_some() => State::Available(offered.expect("checked")),
             (Ok(Some(m)), _) => {
                 tracing::info!("update: version {} is available (this is {VERSION})", m.version);
                 State::Available(m)
