@@ -98,8 +98,11 @@ Windows and `~/.mouse_share/` on Linux, outside the program folder.
 
 ## 🐞 Report a problem
 
+Open an issue at **[github.com/prashantpal8980/mouse-rs/issues](https://github.com/prashantpal8980/mouse-rs/issues/new)**
+(a free GitHub account is needed). Questions and ideas are welcome there too.
+
 Every computer keeps a log of what mouse-rs did (**Settings › Diagnostics** shows where).
-Send it with your report:
+Attach it to your report:
 
 | Computer | Log file |
 |---|---|
