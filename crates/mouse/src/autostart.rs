@@ -357,11 +357,81 @@ mod win {
             .unwrap_or(false)
     }
 
+    /// The firewall rule for the copy the login task starts.
+    const FIREWALL_RULE_ELEVATED: &str = "mouse-rs (elevated)";
+
+    /// Where the copy started by the elevated login task lives: `Program Files\mouse-rs`,
+    /// which only administrators can change (B72).
+    ///
+    /// The task used to start the exe the user unpacked, in a folder any program the user
+    /// runs can write to. Swapping that file then got administrator rights at the next
+    /// login with no prompt: the user's one "Yes" became a standing open door. Asked of
+    /// Windows by known-folder ID, not from `%ProgramFiles%`, which a user-level
+    /// environment variable could point somewhere writable.
+    fn elevated_dir() -> Result<std::path::PathBuf> {
+        use windows_sys::Win32::System::Com::CoTaskMemFree;
+        use windows_sys::Win32::UI::Shell::{FOLDERID_ProgramFiles, SHGetKnownFolderPath};
+
+        let mut raw: windows_sys::core::PWSTR = std::ptr::null_mut();
+        // SAFETY: valid GUID pointer, flags 0, no token, and an out-pointer Windows fills
+        // with a CoTaskMem string that is freed below in every case.
+        let hr = unsafe { SHGetKnownFolderPath(&FOLDERID_ProgramFiles, 0, std::ptr::null_mut(), &mut raw) };
+        if hr != 0 || raw.is_null() {
+            if !raw.is_null() {
+                unsafe { CoTaskMemFree(raw as *const _) };
+            }
+            anyhow::bail!("could not find the Program Files folder (code {hr:#x})");
+        }
+        // SAFETY: Windows returned a NUL-terminated wide string.
+        let path = unsafe {
+            let len = (0..).take_while(|&i| *raw.add(i) != 0).count();
+            String::from_utf16_lossy(std::slice::from_raw_parts(raw, len))
+        };
+        unsafe { CoTaskMemFree(raw as *const _) };
+        Ok(std::path::PathBuf::from(path).join(super::ENTRY))
+    }
+
+    /// Put this program into [`elevated_dir`] and return the path the task should start.
+    /// Runs elevated. A copy already there that is running (the task's own) cannot be
+    /// overwritten, but can be renamed aside, the same way an update swaps it.
+    fn install_elevated_copy() -> Result<std::path::PathBuf> {
+        use anyhow::Context;
+        let src = super::exe_path()?;
+        let dir = elevated_dir()?;
+        let dest = dir.join("mouse-rs.exe");
+        let same = matches!(
+            (std::fs::canonicalize(&src), std::fs::canonicalize(&dest)),
+            (Ok(a), Ok(b)) if a == b
+        );
+        if same {
+            return Ok(dest);
+        }
+        std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+        let tmp = dir.join("mouse-rs.exe.new");
+        let _ = std::fs::remove_file(&tmp);
+        std::fs::copy(&src, &tmp).with_context(|| format!("copying mouse-rs to {}", dir.display()))?;
+        if dest.exists() && std::fs::remove_file(&dest).is_err() {
+            let aside = (0..10)
+                .map(|n| dir.join(if n == 0 { "mouse-rs.exe.old".to_string() } else { format!("mouse-rs.exe.old{n}") }))
+                .find(|o| !o.exists() || std::fs::remove_file(o).is_ok())
+                .context("too many old copies in Program Files; restart and try again")?;
+            std::fs::rename(&dest, &aside).context("moving the old copy aside")?;
+        }
+        std::fs::rename(&tmp, &dest).context("putting the copy in place")?;
+        tracing::info!(path = %dest.display(), "installed the copy the elevated login task starts");
+        Ok(dest)
+    }
+
     /// Create that task. **Requires the current process to be elevated** — Windows will
     /// not let a normal-privilege process register a task that runs with highest
     /// privileges, and refusing clearly is better than appearing to succeed.
+    ///
+    /// The task starts a copy in Program Files, never the one the user unpacked (B72).
+    /// That copy keeps itself current through the signed updater: running elevated, it
+    /// can write its own folder. Nothing from the user's folder is ever copied in
+    /// without the user's own "Yes" to this prompt.
     pub fn enable_elevated() -> Result<()> {
-        let exe = super::exe_path()?;
+        let exe = install_elevated_copy()?;
         let out = std::process::Command::new("schtasks.exe")
             .args([
                 "/Create",
@@ -384,6 +454,20 @@ mod win {
                 err.trim()
             );
         }
+        // The copy listens too; without its own rule Windows would ask about it.
+        let name = format!("name={FIREWALL_RULE_ELEVATED}");
+        let _ = std::process::Command::new("netsh.exe")
+            .args(["advfirewall", "firewall", "delete", "rule", &name])
+            .output();
+        let fw = std::process::Command::new("netsh.exe")
+            .args([
+                "advfirewall", "firewall", "add", "rule", &name, "dir=in", "action=allow",
+                &format!("program={}", exe.display()), "enable=yes", "profile=any",
+            ])
+            .output();
+        if !fw.is_ok_and(|o| o.status.success()) {
+            tracing::warn!("could not add the firewall rule for the elevated copy");
+        }
         Ok(())
     }
 
@@ -397,6 +481,15 @@ mod win {
                 "could not remove the elevated login task: {}",
                 String::from_utf8_lossy(&out.stderr).trim()
             );
+        }
+        let _ = std::process::Command::new("netsh.exe")
+            .args(["advfirewall", "firewall", "delete", "rule", &format!("name={FIREWALL_RULE_ELEVATED}")])
+            .output();
+        // Best effort: the copy cannot be removed while it is the one running.
+        if let Ok(dir) = elevated_dir() {
+            if std::fs::remove_dir_all(&dir).is_err() {
+                tracing::info!(dir = %dir.display(), "the elevated copy is in use; it goes when removed by hand or turned on again");
+            }
         }
         Ok(())
     }

@@ -76,6 +76,8 @@ ln -sfn "$REPO_ROOT/scripts/windows-update.ps1" "$SERVE_DIR/update.ps1"
 # .txt so PowerShell receives a string (a .ps1 arrives as bytes and iex fails), and run as
 # text so no execution policy applies. The script is kept ASCII and iex-safe for this.
 ln -sfn "$REPO_ROOT/scripts/windows-update.ps1" "$SERVE_DIR/u.txt"
+# B72 check (Start at login as administrator), as text for `irm <url>/b72.txt | iex`.
+ln -sfn "$REPO_ROOT/scripts/windows-b72-check.ps1" "$SERVE_DIR/b72.txt"
 ln -sfn "$REPO_ROOT/docs/windows-clipboard-prompt.md" "$SERVE_DIR/clipboard.md"
 printf 'mouse-rs.exe  %s bytes\nSHA256  %s\n' "$SIZE" "$SHA" > "$SERVE_DIR/CHECKSUM.txt"
 

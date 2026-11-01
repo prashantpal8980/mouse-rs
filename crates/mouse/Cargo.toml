@@ -65,4 +65,6 @@ windows-sys = { version = "0.59", features = ["Win32_System_Console", "Win32_Sys
     # which it grants through its own consent prompt rather than to us directly.
     "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging", "Win32_Foundation",
     # Waiting for that elevated helper to finish (Start at login as administrator).
-    "Win32_System_Threading"], optional = true }
+    "Win32_System_Threading",
+    # Freeing the Program Files path from SHGetKnownFolderPath (B72).
+    "Win32_System_Com"], optional = true }
