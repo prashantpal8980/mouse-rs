@@ -1076,3 +1076,40 @@ Three copies on hidden displays: Ctrl+Alt+Shift+2 jumped into the computer in us
 
 ### B64 — test builds: a stale "version X is available" banner stopped further checks
 **fixed in test15** · While the banner was up the per-minute check did not run. So clicking Update downloaded a file that had since been replaced by a newer build, and the size check correctly refused it ("the download has 13481985 bytes, the release says 13481984"). A banner now stays up through checks and is replaced when a newer version appears. Release builds check only at start, so they were not affected in practice.
+
+## Security audit, 31 Oct 2026 (run 1, quick profile)
+
+Full report: `~/security-audit-skill/mouse-rs/run-1/REPORT.md` (outside the repo). Source `d508659`. Each item below was reproduced in a sandbox unless marked otherwise. Fixed the same night (31 Oct), each with a regression test, except B72, which waits on the owner's decision. Decisions are in `status-mockup/security-fixes-2026-10-31.html`.
+
+### B65 — a computer on the network that never paired can crash the computer with the mouse
+**fixed 31 Oct** (was medium) · `net.rs:1191` passes a client's refusal (`AuthOk{ok:false}`) to `pin::note_refusal` *before* checking its proof. `pin.rs:229` adds the number from `pin_locked:<n>` to `Instant::now()` with `+`, which panics on a huge value. Release builds abort on panic, so mouse-rs exits. The attacker only needs a paired device ID, and the client's Hello sends that before any proof. The same path lets the attacker erase a typed PIN and put any name in the PIN prompt. Fixed: the client now signs a PIN refusal with the pairing key (`auth::refusal_hex`, new `AuthOk.proof` field). The server ignores an unsigned one, and the lockout uses a clamped `checked_add`. Tests: `an_unsigned_refusal_neither_crashes_the_server_nor_changes_the_pin_prompt`, plus a `pin.rs` overflow case.
+
+### B66 — a paired computer can read files on this one that were never shared
+**fixed 31 Oct** (was medium) · An incoming `ClipboardFiles` keeps the peer's `source_path` (`lib.rs:1012`), and serving looks up the hash in the whole history, including incoming entries (`lib.rs:336`, `transfer.rs:785`). With `content_hashed=false`, the only check is `quick_id = sha256(path|len|mtime)`, which the peer can compute itself. One message of about 38k guesses read a dummy file back. Fixed: incoming FileRefs lose `source_path` on arrival and on history reload. Serving uses `local_file_ref`, which covers only entries this computer offered. Test: `a_file_named_only_by_the_peer_is_never_served`.
+
+### B67 — a paired computer can replace the contents of files in the clipboard cache
+**fixed 31 Oct** (was medium) · A bulk `Begin` is accepted for any hash, even one not requested (`transfer.rs:837`). The check at `End` uses `content_hashed` from the newest history entry, which the peer can supply (`transfer.rs:926`). A length-only finish then renames over the existing blob (`cache.rs:404`). Re-pasting the user's own file from history then gives the peer's bytes. Fixed: a Begin that would write to disk must be in `requested` and match the offered size. Content is checked unless no description calls it a content hash. A length-only finish never replaces an existing blob. Test: `a_peer_cannot_replace_a_cached_file`.
+
+### B68 — a peer can overwrite an existing file in the received-files folder
+**fixed 31 Oct** (was low) · Only when "folder for received files" is set. After ` (2)`…` (9999)`, `unique_path` (`cache.rs:822`) returns the occupied path, and the copy fallback overwrites it (`cache.rs:254`). An offer with 9,999 same-named entries overwrote `notes.txt`. Fixed: `unique_path` returns `None` when all names are taken, and that file is skipped. The copy fallback uses `create_new`. No per-offer cap was added; it isn't needed once nothing can be overwritten. Test: `delivery_never_overwrites_even_when_every_free_name_is_taken`.
+
+### B69 — a peer can fill the disk with partial transfer files
+**fixed 31 Oct** (was low) · An unrequested `Begin` plus endless `Chunk`s are written past the declared total (`transfer.rs:878`). The `.part` file survives Abort and eviction (`cache.rs:531`). Fixed: the same `requested` and size checks as B67. A chunk past `total` stops the stream and removes the partial. `FileSet::total_bytes` now saturates instead of wrapping. Partials of transfers the user started are still kept for resume, as designed. Tests: `a_peer_cannot_fill_the_disk_with_partials`, `a_set_total_never_wraps`.
+
+### B70 — a replayed UDP motion hello redirects pointer motion
+**fixed 31 Oct** (was low) · The hello is a fixed MAC per session with no counter, and the server follows any source address that sends it (`motion_udp.rs:254`). This gives an outage of about 5 s per 60 s, and motion goes to the attacker's address. Moves cannot be forged. Fixed: the hello (now `MRH2`) carries a counter under the MAC. The server accepts only a higher counter, and only from the TCP peer's IP. An old client's hello is ignored, so its motion stays on TCP. Test: `a_replayed_or_foreign_hello_does_not_redirect_motion`.
+
+### B71 — log upload can fall back to an address that failed authentication
+**fixed 31 Oct** (was low, owner's dev setting only) · `note_peer_ip` runs straight after the TCP connect (`net.rs:894`), before TLS or the proof. When the collector is unreachable, `logship::put` retries on that IP with the log tail and token (`logship.rs:204`). Off by default. Fixed: `note_peer_ip` now runs only after `client_handshake` succeeds. The server side already did this.
+
+### B72 — needs checking on Windows: the "start as administrator" task runs an exe from a folder the user can write to
+**open, needs the owner's decision** · `autostart.rs:371` registers `/SC ONLOGON /RL HIGHEST` for `current_exe()`, which normally lives in `%USERPROFILE%\mouse-rs`. If that folder can be written without elevation, any process can swap the exe and get silent admin rights at the next logon. To check: run `icacls` on the folder. Fix if confirmed: copy the exe to an admin-only folder in the elevated helper and point the task there.
+
+### B73 — needs checking after launch: test releases are signed with the release key
+**fixed 31 Oct** · The signed manifest had no channel field (`update.rs:64`), and `fake-release.sh` signs with the production key. Today the only served test manifest is `1.0.0-test15`, which is below 1.0.0, so nothing can be replayed. The first rehearsal above a shipped version (for example `1.0.1-test1`) could be replayed to release installs by someone who controls the release URL. Fixed: `latest.json` now carries a signed `channel`. `sign-release.sh` defaults it to `release`, and `fake-release.sh` sets `test`. Release builds ignore anything but `release`, while test builds accept both. Test: `a_release_build_takes_only_release_descriptions`.
+
+### B74 — one silent connection froze the computer with the mouse for up to 20 s
+**fixed 31 Oct** (deferred by the audit's critic, then confirmed) · `run_server` awaited TLS accept and the handshake inline in its hub loop, up to 2 × 10 s. Meanwhile nothing was relayed, input to the computer in use included. Any device on the network could repeat this without a device ID. Handshakes now run in their own tasks, at most 16 at once, and the finished stream comes back to the hub on a channel. Test: `a_silent_connection_does_not_hold_up_a_paired_computer`, which fails on the old code.
+
+### B75 — removing a pairing did not end a session already running
+**fixed 31 Oct** (deferred by the audit's critic) · `trust::remove` only stopped new handshakes. Now the hub's 20 ms tick cancels any live session whose pairing is gone, and a client watches its server's pairing every 250 ms. Test: `removing_a_pairing_ends_the_live_session`, which covers removal on either side.

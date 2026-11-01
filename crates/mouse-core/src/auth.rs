@@ -40,6 +40,8 @@ pub fn generate_nonce_hex() -> String {
 pub enum Side {
     Server,
     Client,
+    /// A client refusing a server it has verified, over the PIN (B65).
+    ClientRefusal,
 }
 
 impl Side {
@@ -47,6 +49,7 @@ impl Side {
         match self {
             Side::Server => b"mouse-rs v3 server proof",
             Side::Client => b"mouse-rs v3 client proof",
+            Side::ClientRefusal => b"mouse-rs v3 client refusal",
         }
     }
 }
@@ -109,6 +112,53 @@ pub fn verify_proof(
         hex_decode(candidate_hex),
     ) {
         // verify_slice is constant-time on the tag comparison.
+        (Ok(mac), Ok(candidate)) => mac.verify_slice(&candidate).is_ok(),
+        _ => false,
+    }
+}
+
+fn refusal_mac(
+    secret: &str,
+    ends: Ends,
+    binding: &[u8],
+    client_nonce_hex: &str,
+    server_nonce_hex: &str,
+    reason: &str,
+) -> Result<HmacSha256, AuthError> {
+    let mut mac = proof_mac(secret, Side::ClientRefusal, ends, binding, client_nonce_hex, server_nonce_hex)?;
+    mac.update(&(reason.len() as u32).to_be_bytes());
+    mac.update(reason.as_bytes());
+    Ok(mac)
+}
+
+/// The client's signature on a refusal it sends this session (B65): binds the reason to
+/// the pairing key, the session and both nonces.
+pub fn refusal_hex(
+    secret: &str,
+    ends: Ends,
+    binding: &[u8],
+    client_nonce_hex: &str,
+    server_nonce_hex: &str,
+    reason: &str,
+) -> Result<String, AuthError> {
+    let mac = refusal_mac(secret, ends, binding, client_nonce_hex, server_nonce_hex, reason)?;
+    Ok(hex_encode(&mac.finalize().into_bytes()))
+}
+
+/// Constant-time check of a refusal signature.
+pub fn verify_refusal(
+    secret: &str,
+    ends: Ends,
+    binding: &[u8],
+    client_nonce_hex: &str,
+    server_nonce_hex: &str,
+    reason: &str,
+    candidate_hex: &str,
+) -> bool {
+    match (
+        refusal_mac(secret, ends, binding, client_nonce_hex, server_nonce_hex, reason),
+        hex_decode(candidate_hex),
+    ) {
         (Ok(mac), Ok(candidate)) => mac.verify_slice(&candidate).is_ok(),
         _ => false,
     }

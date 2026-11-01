@@ -783,7 +783,7 @@ impl Transfers {
         // hash limit unservable, reported to the peer as "no longer at the recorded
         // path" while it sat exactly where it always had.
         let (path, name) = self.source_for(hash, history)?;
-        let content_hashed = history.file_ref(hash).map(|f| f.content_hashed).unwrap_or(true);
+        let content_hashed = history.local_file_ref(hash).map(|f| f.content_hashed).unwrap_or(true);
         let p = PathBuf::from(&path);
         if content_hashed {
             let (actual, len) = cache::hash_file(&p).ok()?;
@@ -805,8 +805,9 @@ impl Transfers {
         history.file_ref(hash).map(|f| f.name)
     }
 
+    /// Where to re-read a blob from: only a file this computer offered (B66).
     fn source_for(&self, hash: &str, history: &ClipboardHistory) -> Option<(String, String)> {
-        let f = history.file_ref(hash)?;
+        let f = history.local_file_ref(hash)?;
         Some((f.source_path?, f.name))
     }
 
@@ -816,6 +817,13 @@ impl Transfers {
         match frame {
             BulkFrame::Begin { transfer, total, meta } => {
                 let meta: BlobMeta = serde_json::from_slice(&meta).ok()?;
+                // And no bigger than the file the peer described when it offered it.
+                if let Some(size) = history.file_ref(&meta.hash).map(|f| f.size) {
+                    if total != size {
+                        tracing::warn!(hash = %meta.hash, total, size, "ignored a file stream whose length differs from the offer");
+                        return None;
+                    }
+                }
                 // Arriving again, so not arrived until this stream ends. Left in, a file
                 // pasted earlier made a new paste of it count as done while it was still
                 // streaming.
@@ -832,6 +840,14 @@ impl Transfers {
                         transfer,
                         Incoming { hash: meta.hash, file: None, pipe: Some(pipe), got: meta.offset, total, entry },
                     );
+                    return None;
+                }
+                // Only what this computer asked for is written to disk (B67, B69). An
+                // unasked-for stream could replace a cached file or fill the disk, past both
+                // the ask-first limit and the cache budget. (A paste's stream, above, goes
+                // to memory and only once that paste has started it.)
+                if !self.requested.contains_key(&meta.hash) {
+                    tracing::warn!(hash = %meta.hash, "ignored a file stream this computer did not ask for");
                     return None;
                 }
                 let file = self.cache.open_partial(&meta.hash).ok()?;
@@ -872,6 +888,24 @@ impl Transfers {
             }
             BulkFrame::Chunk { transfer, data, .. } => {
                 let inc = self.incoming.get_mut(&transfer)?;
+                // Never past the declared length (B69): the overrun used to be noticed only
+                // at the end, after it was already on disk.
+                if inc.got.saturating_add(data.len() as u64) > inc.total {
+                    tracing::warn!(hash = %inc.hash, got = inc.got, total = inc.total, "a file stream ran past its length; stopped it");
+                    let hash = inc.hash.clone();
+                    let entry = inc.entry;
+                    let was_pipe = inc.pipe.is_some();
+                    self.incoming.remove(&transfer);
+                    self.requested.remove(&hash);
+                    if !was_pipe {
+                        self.cache.abandon(&hash);
+                    }
+                    if let Some(id) = entry {
+                        history.set_status(id, ClipStatus::Unavailable("arrived damaged; try again".into()));
+                        return Some(id);
+                    }
+                    return None;
+                }
                 if let Some(pipe) = &inc.pipe {
                     // A full window is handled by `drive_pipes`, which pauses the stream.
                     pipe.push(inc.got, &data);
@@ -923,10 +957,10 @@ impl Transfers {
                 self.last_completed = Some(inc.hash.clone());
                 // Verified by content when the sender hashed it, by length when it did
                 // not — see `BlobCache::identify` for why a large file is not hashed.
-                let content_hashed = history
-                    .file_ref(&inc.hash)
-                    .map(|f| f.content_hashed)
-                    .unwrap_or(true);
+                // Checked by content unless no description of this hash anywhere says it
+                // is a content hash (B67). The newest description alone was the peer's to
+                // choose, and saying "not hashed" skipped the check.
+                let content_hashed = history.any_content_hashed(&inc.hash).unwrap_or(true);
                 match self.cache.finish_checked(&inc.hash, content_hashed, inc.total) {
                     Ok(()) => {
                         tracing::info!(hash = %inc.hash, bytes = inc.got, "content received and verified");
@@ -1221,6 +1255,130 @@ fn stable_transfer_id(hash: &str) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// B67: a peer re-offers the hash of the user's own copied file, claims it is not
+    /// content-hashed, and pushes other bytes. The user's file must stay as it was.
+    #[test]
+    fn a_peer_cannot_replace_a_cached_file() {
+        let (root, mut t, hist) = setup("b67");
+        let genuine = root.join("report.txt");
+        fs::write(&genuine, b"GENUINE-CONTENT").unwrap();
+        let local = t
+            .describe_local(&FileList { paths: vec![genuine] }, "kali", 10_000, false, u64::MAX, u64::MAX)
+            .unwrap();
+        let h = local.files[0].hash.clone();
+        hist.record_files(Arc::new(local), false, ClipStatus::Ready).unwrap();
+        let evil = FileSet {
+            files: vec![FileRef { name: "x".into(), size: 4, hash: h.clone(), content_hashed: false, source_path: None, rel: String::new() }],
+            dirs: Vec::new(),
+            origin: "peer".into(),
+        };
+        hist.record_files(Arc::new(evil), true, ClipStatus::Ready).unwrap();
+        let push = |t: &mut Transfers, id: u64| {
+            let meta = serde_json::to_vec(&BlobMeta { hash: h.clone(), name: "x".into(), offset: 0 }).unwrap();
+            t.on_bulk_frame(BulkFrame::Begin { transfer: id, total: 4, meta }, &hist);
+            t.on_bulk_frame(BulkFrame::Chunk { transfer: id, seq: 0, data: b"EVIL".to_vec() }, &hist);
+            t.on_bulk_frame(BulkFrame::End { transfer: id }, &hist);
+        };
+        // Unasked for: ignored outright.
+        push(&mut t, 7);
+        assert_eq!(fs::read(t.cache.blob_path(&h)).unwrap(), b"GENUINE-CONTENT");
+        // Even if it had been asked for, the local description says "content hash", so
+        // the bytes are checked, and a blob already held is never replaced by length.
+        t.requested.insert(h.clone(), 0);
+        push(&mut t, 8);
+        assert_eq!(fs::read(t.cache.blob_path(&h)).unwrap(), b"GENUINE-CONTENT");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// B69: nothing unasked-for reaches the disk, and an asked-for stream stops at the
+    /// length it announced.
+    #[test]
+    fn a_peer_cannot_fill_the_disk_with_partials() {
+        let (root, mut t, hist) = setup("b69");
+        let h = "ab".repeat(32);
+        let meta = |h: &str| serde_json::to_vec(&BlobMeta { hash: h.to_string(), name: "y".into(), offset: 0 }).unwrap();
+        t.on_bulk_frame(BulkFrame::Begin { transfer: 1, total: 1, meta: meta(&h) }, &hist);
+        t.on_bulk_frame(BulkFrame::Chunk { transfer: 1, seq: 0, data: vec![0u8; 1 << 20] }, &hist);
+        assert!(!t.cache.part_path(&h).exists(), "an unasked-for stream writes nothing");
+
+        // Asked for, as a 4-byte file: a stream claiming another length is refused...
+        let set = FileSet {
+            files: vec![FileRef { name: "y".into(), size: 4, hash: h.clone(), content_hashed: false, source_path: None, rel: String::new() }],
+            dirs: Vec::new(),
+            origin: "peer".into(),
+        };
+        let entry = hist.record_files(Arc::new(set), true, ClipStatus::Remote).unwrap();
+        t.requested.insert(h.clone(), entry);
+        t.on_bulk_frame(BulkFrame::Begin { transfer: 2, total: 1 << 30, meta: meta(&h) }, &hist);
+        t.on_bulk_frame(BulkFrame::Chunk { transfer: 2, seq: 0, data: vec![0u8; 1 << 20] }, &hist);
+        assert!(!t.cache.part_path(&h).exists(), "a length unlike the offer's is refused");
+        // ...and one that runs past its length is stopped and its partial removed.
+        t.on_bulk_frame(BulkFrame::Begin { transfer: 3, total: 4, meta: meta(&h) }, &hist);
+        t.on_bulk_frame(BulkFrame::Chunk { transfer: 3, seq: 0, data: vec![0u8; 1 << 20] }, &hist);
+        assert!(!t.cache.part_path(&h).exists(), "an overrun is not kept");
+        assert!(matches!(hist.status(entry), Some(ClipStatus::Unavailable(_))));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Sizes come from the peer; a wrapped sum slipped a huge set under ask-first.
+    #[test]
+    fn a_set_total_never_wraps() {
+        let f = |size| FileRef { name: "f".into(), size, hash: "a".repeat(64), content_hashed: false, source_path: None, rel: String::new() };
+        let set = FileSet { files: vec![f(u64::MAX), f(2)], dirs: Vec::new(), origin: "peer".into() };
+        assert_eq!(set.total_bytes(), u64::MAX);
+    }
+
+    /// B66: a peer's own file list names a path on this computer and the exact quick id
+    /// of the file there. It was never offered here, so it must not be served.
+    #[test]
+    fn a_file_named_only_by_the_peer_is_never_served() {
+        let root = std::env::temp_dir().join(format!("mouse-rs-b66-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let mut victim = Transfers::new(Arc::new(BlobCache::new(root.join("cache")).unwrap()));
+        let hist = ClipboardHistory::new();
+        let secret = root.join("never-offered.txt");
+        std::fs::write(&secret, b"PRIVATE").unwrap();
+        let hash = cache::quick_id(&secret, &std::fs::metadata(&secret).unwrap());
+        let peer_ref = FileRef {
+            name: "x".into(),
+            size: 7,
+            hash: hash.clone(),
+            content_hashed: false,
+            source_path: Some(secret.to_string_lossy().into_owned()),
+            rel: String::new(),
+        };
+        hist.record_files(
+            Arc::new(FileSet { files: vec![peer_ref.clone()], dirs: Vec::new(), origin: "peer".into() }),
+            true,
+            ClipStatus::Remote,
+        );
+        let (to_peer, mut peer_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (to_bulk, mut bulk_rx) = tokio::sync::mpsc::unbounded_channel();
+        victim.serve_request(&hash, 0, &hist, &to_peer, &to_bulk, &test_queue());
+        assert!(matches!(peer_rx.try_recv(), Ok(Message::BlobUnavailable { .. })));
+        assert!(drain_bulk(&mut bulk_rx).is_empty(), "no byte of the file may be sent");
+
+        // The same file offered by this computer is served as before.
+        hist.record_files(
+            Arc::new(FileSet { files: vec![peer_ref], dirs: Vec::new(), origin: "me".into() }),
+            false,
+            ClipStatus::Ready,
+        );
+        let (to_peer, mut peer_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (to_bulk, mut bulk_rx) = tokio::sync::mpsc::unbounded_channel();
+        victim.serve_request(&hash, 0, &hist, &to_peer, &to_bulk, &test_queue());
+        assert!(peer_rx.try_recv().is_err(), "a local offer is not refused");
+        let mut got = Vec::new();
+        for f in drain_bulk(&mut bulk_rx) {
+            if let BulkFrame::Chunk { data, .. } = f {
+                got.extend_from_slice(&data);
+            }
+        }
+        assert_eq!(got, b"PRIVATE");
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     /// R33: the quit warning relies on this count, so a finished or panicked send must
     /// never leave it raised.
@@ -1766,6 +1924,7 @@ mod tests {
             .record_files(Arc::new(set), true, ClipStatus::Remote)
             .unwrap();
 
+        receiver.requested.insert(hash.clone(), entry);
         let meta = serde_json::to_vec(&BlobMeta { hash: hash.clone(), name: "f".into(), offset: 0 }).unwrap();
         receiver.on_bulk_frame(BulkFrame::Begin { transfer: 2, total: 16, meta }, &r_hist);
         receiver.on_bulk_frame(

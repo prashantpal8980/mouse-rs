@@ -1,0 +1,179 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>mouse-rs — security fixes, night of 31 Oct 2026</title>
+<style>
+  :root { --bg:#f7f7f5; --card:#fff; --ink:#1d1d1f; --mute:#6b6b70; --line:#e3e3e0; --ok:#1f7a3d; --okbg:#e8f5ec; --warn:#8a5a00; --warnbg:#fff4dc; --ask:#8a1f1f; --askbg:#fde9e9; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#161618; --card:#202024; --ink:#ececee; --mute:#a0a0a8; --line:#34343a; --okbg:#173022; --ok:#7fd69a; --warnbg:#3a2e12; --warn:#f0c46a; --askbg:#3a1a1a; --ask:#f29a9a; } }
+  body { margin:0; background:var(--bg); color:var(--ink); font:15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  main { max-width:1180px; margin:0 auto; padding:32px 24px 64px; }
+  h1 { font-size:26px; margin:0 0 4px; }
+  h2 { font-size:19px; margin:36px 0 12px; }
+  .sub { color:var(--mute); margin:0 0 24px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:16px 20px; margin:12px 0; }
+  .tiles { display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); gap:12px; }
+  .tile b { display:block; font-size:28px; }
+  .tile span { color:var(--mute); font-size:13px; }
+  table { width:100%; border-collapse:collapse; background:var(--card); border:1px solid var(--line); border-radius:10px; overflow:hidden; }
+  th, td { text-align:left; vertical-align:top; padding:12px 14px; border-bottom:1px solid var(--line); }
+  th { font-size:12px; text-transform:uppercase; letter-spacing:.04em; color:var(--mute); background:var(--bg); }
+  tr:last-child td { border-bottom:0; }
+  td:first-child { width:17%; font-weight:600; }
+  td.side { width:33%; }
+  .tag { display:inline-block; font-size:12px; font-weight:600; padding:1px 8px; border-radius:99px; margin-bottom:4px; }
+  .ok { background:var(--okbg); color:var(--ok); }
+  .warn { background:var(--warnbg); color:var(--warn); }
+  .ask { background:var(--askbg); color:var(--ask); }
+  code { font:13px ui-monospace, SFMono-Regular, Menlo, monospace; background:var(--bg); padding:1px 4px; border-radius:4px; }
+  ul { margin:6px 0; padding-left:20px; }
+  .note { color:var(--mute); font-size:13px; }
+</style>
+</head>
+<body>
+<main>
+<h1>Security fixes — night of 31 Oct 2026</h1>
+<p class="sub">Every audit finding except one is patched and tested. The table below puts what I did next to the alternative, so you can say "keep" or "change" for each row.</p>
+
+<div class="tiles">
+  <div class="card tile"><b>9 of 10</b><span>bugs fixed (B65–B71, B73, B74, B75)</span></div>
+  <div class="card tile"><b>1</b><span>needs your decision (B72, Windows admin task)</span></div>
+  <div class="card tile"><b>341</b><span>tests pass, 0 fail; 10 new regression tests</span></div>
+  <div class="card tile"><b>Linux + Windows</b><span>both compile; release-profile build checked</span></div>
+</div>
+
+<h2>First thing in the morning</h2>
+<div class="card">
+<ul>
+  <li><b>Decide B72</b> (first row of the table below).</li>
+  <li><b>Update both computers to the new build before testing.</b> Two fixes changed what goes over the network (rows 2 and 3). A new build talking to an old test15 build still connects, with two differences: the computer with the mouse won't show the PIN prompt for an old client's refusal, and pointer motion goes over TCP instead of UDP.</li>
+  <li><b>Hand test:</b>
+    <ul>
+      <li>Pair with a PIN set. With the wrong PIN, the PIN prompt must appear on the computer with the mouse.</li>
+      <li>Copy a file each way and paste it.</li>
+      <li>Move the pointer over Wi-Fi. The log should still say "moves by UDP".</li>
+      <li>Remove a pairing while connected. It must disconnect at once.</li>
+    </ul>
+  </li>
+  <li>The changes are committed on <code>wip/iced-ui-input-fixes</code> and <b>not pushed</b>.</li>
+</ul>
+</div>
+
+<h2>Decisions, side by side</h2>
+<table>
+<tr><th>Item</th><th>What I did</th><th>The alternative</th><th>Your call?</th></tr>
+
+<tr>
+<td>B72 — Windows "Start at login as administrator"</td>
+<td class="side"><span class="tag ask">not changed</span><br>
+The task runs <code>mouse-rs.exe</code> from <code>%USERPROFILE%\mouse-rs</code>, which an ordinary program can write to. Anything that swaps the exe gets admin rights at the next logon, with no prompt. I didn't change it: the fix moves where the elevated copy lives and how it updates, can only be tested on Windows, and your laptop is off.</td>
+<td class="side">
+<b>A.</b> Ship 1.0 as it is. The option is off by default, and Windows asks once before turning it on. Microsoft doesn't treat this as a security boundary. Fix in 1.1 by copying the exe to <code>Program Files</code> and pointing the task there.<br><br>
+<b>B.</b> Hide the toggle for 1.0. Simple and safe, but it brings back R20: crossing fails while an admin window is in front.<br><br>
+<b>C.</b> Build the Program Files copy tomorrow and test it on the laptop before release.</td>
+<td><span class="tag ask">yes</span><br>I'd pick <b>A</b> and list it in the release notes. To confirm the premise, run <code>icacls "%USERPROFILE%\mouse-rs"</code> on the laptop. If your user shows <code>(F)</code> or <code>(M)</code>, the issue is real.</td>
+</tr>
+
+<tr>
+<td>B65 — crash and PIN-prompt tampering</td>
+<td class="side"><span class="tag ok">fixed</span><br>
+The client signs its PIN refusal with the pairing key (new <code>proof</code> field). The computer with the mouse ignores unsigned refusals, and the lockout time is clamped so it can't overflow.</td>
+<td class="side">The minimal fix was the clamp alone, which stops the crash. But anyone who knew a paired device ID could still wipe a typed PIN and put any name in the PIN prompt.</td>
+<td><span class="tag warn">FYI</span><br>An old client's refusal doesn't show the PIN prompt. That only matters while one computer is still on test15.</td>
+</tr>
+
+<tr>
+<td>B70 — replayed UDP mouse-motion message</td>
+<td class="side"><span class="tag ok">fixed</span><br>The message (<code>MRH2</code>) now carries a counter that only goes up, and is accepted only from the IP the TCP link comes from.</td>
+<td class="side">Checking the IP alone stops attackers using their own address, but not one faking the client's.</td>
+<td><span class="tag warn">FYI</span><br>An old client's motion message is ignored, so motion between an old and a new build goes over TCP. It still works, just with a little more delay on Wi-Fi.</td>
+</tr>
+
+<tr>
+<td>B73 — test releases signed with the real key</td>
+<td class="side"><span class="tag ok">fixed</span><br><code>latest.json</code> now carries a signed <code>"channel"</code>. <code>release.sh</code> and <code>sign-release.sh</code> default to <code>release</code>, and <code>fake-release.sh</code> uses <code>test</code>. Release builds accept only <code>release</code>; test builds accept both.</td>
+<td class="side">Use a separate signing key for rehearsals. Cleaner, but it means managing a second key, and the test builds already installed trust only the real one.</td>
+<td><span class="tag warn">FYI</span><br><b>Important for launch:</b> sign the 1.0 release with <code>release.sh</code> or <code>sign-release.sh</code>, which add the channel. A hand-written <code>latest.json</code> without it would be ignored by every release install.</td>
+</tr>
+
+<tr>
+<td>B66 — peer reading files never shared</td>
+<td class="side"><span class="tag ok">fixed</span><br>A peer's file list loses any path on this computer, both on arrival and when history reloads. This computer serves only files it offered itself.</td>
+<td class="side">None worth taking: no legitimate case needs a peer to name a path on this computer.</td>
+<td><span class="tag ok">no</span></td>
+</tr>
+
+<tr>
+<td>B67 / B69 — cache overwrite, disk filling</td>
+<td class="side"><span class="tag ok">fixed</span><br>
+<ul>
+  <li>A stream is written to disk only if this computer asked for it, and only if it matches the size in the offer.</li>
+  <li>A stream that runs past its length is stopped and deleted.</li>
+  <li>A file the cache already holds is never replaced by one checked only by length.</li>
+  <li>Totals no longer wrap, so a peer can't slip a huge set under the "ask first" limit.</li>
+</ul></td>
+<td class="side">Also age out leftover partial files. I left that out: those partials exist so an interrupted transfer can resume, and a peer can no longer create them uninvited.</td>
+<td><span class="tag ok">no</span></td>
+</tr>
+
+<tr>
+<td>B68 — received-files folder overwrite</td>
+<td class="side"><span class="tag ok">fixed</span><br>When <code>notes (2)</code> … <code>notes (9999)</code> are all taken, that one file is <b>skipped</b>, with a log line. The fallback copy can never overwrite.</td>
+<td class="side">Use a random suffix instead, so the file always lands. The behavior is only reachable on purpose, so I kept it simple.</td>
+<td><span class="tag ok">no</span></td>
+</tr>
+
+<tr>
+<td>B71 — log upload fallback</td>
+<td class="side"><span class="tag ok">fixed</span><br>The fallback address is recorded only after the server has proved the pairing key.</td>
+<td class="side">Remove the fallback altogether. It's your dev tool, so I kept it working.</td>
+<td><span class="tag ok">no</span></td>
+</tr>
+
+<tr>
+<td>B74 — one silent connection froze the hub (new)</td>
+<td class="side"><span class="tag ok">fixed</span><br>The audit had deferred this one. I confirmed it with a test that fails on the old code: any device on the network could freeze input for up to 20 s, again and again. Logins now run beside the hub, at most <b>16 at once</b>; further connections are dropped until one finishes.</td>
+<td class="side">Shorten the timeout instead. That shrinks the freeze but doesn't remove it.</td>
+<td><span class="tag warn">FYI</span><br>This is the biggest change tonight, inside <code>run_server</code>. All 126 network tests pass, but please give connecting and switching computers a normal try.</td>
+</tr>
+
+<tr>
+<td>B75 — removing a pairing left the session running (new)</td>
+<td class="side"><span class="tag ok">fixed</span><br>The computer with the mouse checks every 20 ms; the other computer checks every 250 ms. The session ends either way.</td>
+<td class="side">Make the remove button signal the link directly. That would be a bigger change touching the panel.</td>
+<td><span class="tag ok">no</span></td>
+</tr>
+
+<tr>
+<td>This machine's screen lock</td>
+<td class="side"><span class="tag warn">changed</span><br>As you asked: the screensaver lock, blanking, DPMS and idle sleep are all set to never. The old values are in <code>/home/kalip/mouse/test-files/lock-settings-backup-2026-10-31.txt</code>.</td>
+<td class="side">To restore the 30-minute lock: <code>xfconf-query -c xfce4-screensaver -p /saver/idle-activation/enabled -s true</code> and <code>-p /lock/saver-activation/enabled -s true</code>.</td>
+<td><span class="tag warn">FYI</span></td>
+</tr>
+</table>
+
+<h2>Not done (hardening notes from the audit, not bugs)</h2>
+<div class="card">
+<ul>
+  <li><b>Log upload token:</b> it is derived from a public default secret, so it authenticates nothing. Dev-only.</li>
+  <li><b>Windows firewall rule:</b> it allows the exe on every network profile. Limit it to private and domain networks.</li>
+  <li><b>Greeter install:</b> it copies <code>current_exe()</code> by path after polkit, and <code>.new</code> follows symlinks. Root-only paths, so not exploitable today.</li>
+  <li><b>Replayed discovery beacon:</b> it can add a candidate address. Harmless now that both B71 and the handshake check the pairing key.</li>
+  <li><b>Images in the hub relay:</b> the 256 KB image cap isn't enforced there.</li>
+  <li><b>Windows file names:</b> reserved names like <code>CON</code> and <code>NUL</code> aren't mapped to safe ones.</li>
+  <li><b>Signed update descriptions:</b> they have no expiry, so an old one can be replayed to hide a newer update.</li>
+</ul>
+<p class="note">I suggest these for 1.1; none blocks the launch. The full list is in <code>~/security-audit-skill/mouse-rs/run-1/REPORT.md</code>, section 6.</p>
+</div>
+
+<h2>Where everything is</h2>
+<div class="card">
+<ul>
+  <li>Bug list with each fix and its test name: <code>docs/KNOWN-ISSUES.md</code>, entries B65–B75.</li>
+  <li>Audit report: <code>~/security-audit-skill/mouse-rs/run-1/REPORT.md</code>.</li>
+  <li>The local commit on <code>wip/iced-ui-input-fixes</code>: run <code>git show --stat HEAD</code> to see its files.</li>
+</ul>
+</div>
+</main>
+</body>
+</html>

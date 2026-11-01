@@ -239,10 +239,20 @@ impl BlobCache {
             }
             // Never overwrite something already there. A delivered file landing on top
             // of the user's own work would be a far worse bug than a suffixed name.
-            let dest = unique_path(dest);
+            // When every suffixed name is taken, this file is skipped rather than
+            // written over the original (B68).
+            let Some(dest) = unique_path(dest) else {
+                tracing::warn!(rel = %rel, "every free name for a received file is taken; skipped it");
+                continue;
+            };
             let blob = self.blob_path(hash);
             match fs::hard_link(&blob, &dest) {
                 Ok(()) => {}
+                // Something appeared there since the name was chosen: leave it alone.
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                    tracing::warn!(dest = %dest.display(), "a file appeared at the chosen name; skipped");
+                    continue;
+                }
                 Err(_) => {
                     // Different filesystem, or a filesystem without links. This is the
                     // only path that costs the space twice, so it is worth saying.
@@ -251,7 +261,14 @@ impl BlobCache {
                         "delivering by copy rather than link — the destination is on a \
                          different filesystem, so this file briefly uses twice its size"
                     );
-                    fs::copy(&blob, &dest)?;
+                    // create_new: a copy, too, never replaces an existing file (B68).
+                    let mut from = fs::File::open(&blob)?;
+                    let mut to = match fs::OpenOptions::new().write(true).create_new(true).open(&dest) {
+                        Ok(f) => f,
+                        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+                        Err(e) => return Err(e),
+                    };
+                    io::copy(&mut from, &mut to)?;
                 }
             }
             out.push(dest);
@@ -400,6 +417,13 @@ impl BlobCache {
         }
         if content_hashed {
             return self.finish(hash);
+        }
+        // Checked by length only, so it may never replace a blob already held (B67): that
+        // one was verified, or at least arrived first, and swapping it is how a peer
+        // changed the contents of the user's own copied file.
+        if self.blob_path(hash).exists() {
+            let _ = fs::remove_file(&part);
+            return Ok(());
         }
         fs::rename(&part, self.blob_path(hash))
     }
@@ -806,9 +830,11 @@ pub fn stream_copy(src: &mut impl Read, dst: &mut impl Write) -> io::Result<u64>
 ///
 /// Silently replacing a file that is already there would be the worst possible failure
 /// mode for a feature whose whole job is to put files on someone's desktop.
-fn unique_path(path: PathBuf) -> PathBuf {
+/// A free name for `path`: itself, or `name (2).ext` … `name (9999).ext`. `None` when all
+/// are taken — never the occupied original (B68).
+fn unique_path(path: PathBuf) -> Option<PathBuf> {
     if !path.exists() {
-        return path;
+        return Some(path);
     }
     let parent = path.parent().map(Path::to_path_buf).unwrap_or_default();
     let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("file").to_string();
@@ -816,10 +842,10 @@ fn unique_path(path: PathBuf) -> PathBuf {
     for n in 2..10_000 {
         let candidate = parent.join(format!("{stem} ({n}){ext}"));
         if !candidate.exists() {
-            return candidate;
+            return Some(candidate);
         }
     }
-    path
+    None
 }
 
 /// Add up a directory tree's file sizes, counting each inode once and ignoring
@@ -1063,6 +1089,28 @@ mod deliver_tests {
     }
 
     /// Landing on top of the user's own file would be far worse than an awkward name.
+    #[test]
+    fn delivery_never_overwrites_even_when_every_free_name_is_taken() {
+        // B68: once " (2)" … " (9999)" were all used, the original name came back and the
+        // copy fallback wrote over the user's file. Exhaust the names directly.
+        let root = std::env::temp_dir().join(format!("mouse-rs-b68-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let c = BlobCache::new(root.join("cache")).unwrap();
+        let src = root.join("peer.txt");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(&src, b"PEER").unwrap();
+        let (hash, _) = c.ingest(&src, u64::MAX).unwrap();
+        let dest = root.join("Received");
+        fs::create_dir_all(&dest).unwrap();
+        fs::write(dest.join("notes.txt"), b"MINE").unwrap();
+        for n in 2..10_000 {
+            fs::write(dest.join(format!("notes ({n}).txt")), b"").unwrap();
+        }
+        let _ = c.deliver(&dest, &[(hash, "notes.txt".into())], &[]);
+        assert_eq!(fs::read(dest.join("notes.txt")).unwrap(), b"MINE");
+        let _ = fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn delivery_never_overwrites_something_already_there() {
         let root = std::env::temp_dir().join("mouse-rs-deliver-clash");

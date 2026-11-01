@@ -22,6 +22,10 @@ DIR="${1:?release dir}"
 VERSION="${2:?version}"
 BASE="${3:?base url}"
 NOTES="${4:-}"
+# Signed into the description. Release builds accept only "release" (B73); rehearsals
+# (fake-release.sh) set "test", so their descriptions can never be replayed to customers.
+CHANNEL="${MOUSE_RS_CHANNEL:-release}"
+case "$CHANNEL" in release|test) ;; *) echo "MOUSE_RS_CHANNEL must be release or test" >&2; exit 1;; esac
 
 [ -f "$KEY" ] || { echo "no signing key at $KEY" >&2; exit 1; }
 [ "$(uname)" = "Linux" ] || { echo "run this on the Linux release machine" >&2; exit 1; }
@@ -38,7 +42,7 @@ entry() {   # <platform key> <file>
   e=$(entry windows-x86_64 mouse-rs.exe); [ -n "$e" ] && entries+=("$e")
   e=$(entry linux-x86_64 mouse-rs);       [ -n "$e" ] && entries+=("$e")
   [ ${#entries[@]} -gt 0 ] || { echo "no mouse-rs or mouse-rs.exe in $DIR" >&2; exit 1; }
-  printf '{\n  "version": "%s",\n  "notes": %s,\n  "files": {\n' "$VERSION" \
+  printf '{\n  "version": "%s",\n  "channel": "%s",\n  "notes": %s,\n  "files": {\n' "$VERSION" "$CHANNEL" \
     "$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$NOTES")"
   ( IFS=$'\n'; printf '%s' "${entries[0]}"; for x in "${entries[@]:1}"; do printf ',\n%s' "$x"; done )
   printf '\n  }\n}\n'

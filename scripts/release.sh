@@ -25,6 +25,7 @@ REPO="${2:-prashantpal8980/mouse-rs-downloads}"
 case "$VERSION" in *test*) echo "a release version may not contain 'test'" >&2; exit 1;; esac
 
 unset MOUSE_RS_TEST_BUILD
+export MOUSE_RS_CHANNEL=release   # signed into latest.json; release builds require it (B73)
 export MOUSE_RS_VERSION="$VERSION"
 export MOUSE_RS_UPDATE_URL="https://github.com/$REPO/releases/latest/download/latest.json"
 export MOUSE_RS_DOWNLOAD_PAGE="https://github.com/$REPO/releases/latest"

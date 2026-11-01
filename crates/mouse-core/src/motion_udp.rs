@@ -39,10 +39,12 @@ type HmacSha256 = Hmac<Sha256>;
 /// TLS exporter label for the datagram key. Distinct from the auth binding's label.
 pub(crate) const KEY_LABEL: &[u8] = b"EXPORTER-mouse-rs-motion";
 
-const HELLO: &[u8; 4] = b"MRH1";
+const HELLO: &[u8; 4] = b"MRH2";
 const MOVE: &[u8; 4] = b"MRM2";
 const TAG: usize = 16;
-const HELLO_LEN: usize = 4 + 16 + TAG;
+/// Magic, session token, counter, tag. The counter only goes up, so a captured hello
+/// cannot be replayed to redirect motion (B70).
+const HELLO_LEN: usize = 4 + 16 + 8 + TAG;
 /// Magic, seq, total x, total y, send time (ms on the sender's clock), tag.
 const MOVE_LEN: usize = 4 + 8 + 8 + 8 + 4 + TAG;
 /// Room for any datagram we send, with margin.
@@ -119,20 +121,21 @@ fn tag_ok(key: &Key, body: &[u8], t: &[u8]) -> bool {
     mac.verify_truncated_left(t).is_ok()
 }
 
-fn encode_hello(key: &Key, token: &[u8; 16]) -> [u8; HELLO_LEN] {
+fn encode_hello(key: &Key, token: &[u8; 16], counter: u64) -> [u8; HELLO_LEN] {
     let mut out = [0u8; HELLO_LEN];
     out[..4].copy_from_slice(HELLO);
     out[4..20].copy_from_slice(token);
-    let t = tag(key, &out[..20]);
-    out[20..].copy_from_slice(&t);
+    out[20..28].copy_from_slice(&counter.to_be_bytes());
+    let t = tag(key, &out[..28]);
+    out[28..].copy_from_slice(&t);
     out
 }
 
-fn decode_hello(key: &Key, buf: &[u8]) -> Option<[u8; 16]> {
-    if buf.len() != HELLO_LEN || &buf[..4] != HELLO || !tag_ok(key, &buf[..20], &buf[20..]) {
+fn decode_hello(key: &Key, buf: &[u8]) -> Option<([u8; 16], u64)> {
+    if buf.len() != HELLO_LEN || &buf[..4] != HELLO || !tag_ok(key, &buf[..28], &buf[28..]) {
         return None;
     }
-    buf[4..20].try_into().ok()
+    Some((buf[4..20].try_into().ok()?, u64::from_be_bytes(buf[20..28].try_into().ok()?)))
 }
 
 fn encode_move(key: &Key, seq: u64, sx: i64, sy: i64, sent_ms: u32) -> [u8; MOVE_LEN] {
@@ -203,6 +206,8 @@ pub(crate) struct ServerMotion {
     /// Whether the client has ever reported over TCP, and a hello's address held until it does.
     stats_readies_ever: u64,
     pending_hello: Option<SocketAddr>,
+    /// The highest hello counter accepted: an older or equal one is a replay (B70).
+    hello_counter: u64,
     /// When the last move went out, and how many of [`REPEAT_AFTER`] have been sent since.
     last_move: Option<(Instant, SocketAddr)>,
     repeats: usize,
@@ -229,6 +234,7 @@ impl ServerMotion {
             stats: ServerStats::new(),
             stats_readies_ever: 0,
             pending_hello: None,
+            hello_counter: 0,
             last_move: None,
             repeats: 0,
             epoch: Instant::now(),
@@ -246,10 +252,18 @@ impl ServerMotion {
     }
 
     pub(crate) fn on_datagram(&mut self, buf: &[u8], from: SocketAddr) {
-        if decode_hello(&self.key, buf) != Some(self.token) {
-            self.stats.junk += 1;
-            return;
-        }
+        // A hello is believed only if it is this session's, newer than any before, and
+        // from the computer the TCP link comes from (B70). A captured one replayed from
+        // anywhere used to redirect every move to the replaying address.
+        let same_host = from.ip().to_canonical() == self.tcp_peer.ip().to_canonical();
+        let counter = match decode_hello(&self.key, buf) {
+            Some((token, counter)) if token == self.token && counter > self.hello_counter && same_host => counter,
+            _ => {
+                self.stats.junk += 1;
+                return;
+            }
+        };
+        self.hello_counter = counter;
         self.stats.hellos += 1;
         self.use_peer(from, "hello");
     }
@@ -385,6 +399,8 @@ pub(crate) struct ClientMotion {
     sock: Arc<UdpSocket>,
     key: Key,
     token: [u8; 16],
+    /// Counts hellos sent this session, so the server can refuse a replayed one (B70).
+    hellos_sent: std::sync::atomic::AtomicU64,
     last_seq: u64,
     applied: (i64, i64),
     epoch: Instant,
@@ -424,6 +440,7 @@ impl ClientMotion {
             sock: Arc::new(sock),
             key,
             token,
+            hellos_sent: std::sync::atomic::AtomicU64::new(0),
             last_seq: 0,
             applied: (0, 0),
             epoch: Instant::now(),
@@ -476,7 +493,8 @@ impl ClientMotion {
     /// not `try_send`: on a fresh socket tokio doesn't yet know it is writable, and the
     /// first hello would be dropped.
     pub(crate) async fn hello(&self) {
-        let _ = self.sock.send(&encode_hello(&self.key, &self.token)).await;
+        let n = self.hellos_sent.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        let _ = self.sock.send(&encode_hello(&self.key, &self.token, n)).await;
     }
 
     pub(crate) fn on_datagram(&mut self, buf: &[u8]) -> Option<Message> {
@@ -581,14 +599,41 @@ mod tests {
         let mut bad = m;
         bad[13] ^= 1;
         assert_eq!(decode_move(&k, &bad), None, "tampered total");
-        let h = encode_hello(&k, &[9; 16]);
-        assert_eq!(decode_hello(&k, &h), Some([9; 16]));
+        let h = encode_hello(&k, &[9; 16], 3);
+        assert_eq!(decode_hello(&k, &h), Some(([9; 16], 3)));
         assert_eq!(decode_hello(&key(2), &h), None);
+        let mut bad = h;
+        bad[27] ^= 1;
+        assert_eq!(decode_hello(&k, &bad), None, "tampered counter");
     }
 
     #[tokio::test]
     async fn motion_flows_over_udp_once_the_client_says_hello_and_syncs_before_a_click() {
         flow("127.0.0.1:0").await;
+    }
+
+    /// B70: a captured hello, replayed, must not move the motion stream anywhere: not
+    /// from the client's own address (same counter) and not from another host.
+    #[tokio::test]
+    async fn a_replayed_or_foreign_hello_does_not_redirect_motion() {
+        let server_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let mut s = ServerMotion::new(server_sock.clone(), key(8), "127.0.0.1:40000".parse().unwrap());
+        let Some(Message::MotionOffer { port: _, token }) = s.offer() else { panic!("offer") };
+        let token = unhex16(&token).unwrap();
+        s.on_ready(40001, 0); // the client has reported over TCP
+        let client: SocketAddr = "127.0.0.1:50000".parse().unwrap();
+        let first = encode_hello(&key(8), &token, 1);
+        s.on_datagram(&first, client);
+        assert_eq!(s.peer.map(|(a, _)| a), Some(client));
+        // The same bytes again, from another port: a replay.
+        s.on_datagram(&first, "127.0.0.1:50001".parse().unwrap());
+        assert_eq!(s.peer.map(|(a, _)| a), Some(client), "a replayed hello is ignored");
+        // A fresh counter, but from a host that is not the TCP peer.
+        s.on_datagram(&encode_hello(&key(8), &token, 2), "127.0.0.2:50000".parse().unwrap());
+        assert_eq!(s.peer.map(|(a, _)| a), Some(client), "a hello from another host is ignored");
+        // The real client's next hello still counts.
+        s.on_datagram(&encode_hello(&key(8), &token, 3), client);
+        assert_eq!(s.peer.map(|(a, _)| a), Some(client));
     }
 
     #[tokio::test]

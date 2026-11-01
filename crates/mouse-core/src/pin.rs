@@ -38,6 +38,8 @@ pub const MAX_LEN: usize = 64;
 pub const REASON_REQUIRED: &str = "pin_required";
 pub const REASON_WRONG: &str = "wrong_pin";
 pub const REASON_LOCKED: &str = "pin_locked";
+/// Longest lockout a refusal may announce. Far above any real one; only a bound.
+const MAX_LOCK_SECS: u64 = 24 * 60 * 60;
 
 /// True if `pin` is [`MIN_LEN`]..=[`MAX_LEN`] characters with no control characters.
 pub fn is_valid(pin: &str) -> bool {
@@ -226,7 +228,12 @@ pub fn note_refusal(client: &str, name: &str, reason: &str) -> bool {
     let prompt = match kind {
         REASON_REQUIRED => Prompt::Needed,
         REASON_WRONG => Prompt::Wrong(num.unwrap_or(0) as u32),
-        REASON_LOCKED => Prompt::Locked(Instant::now() + Duration::from_secs(num.unwrap_or(60))),
+        // The number comes off the wire: clamp it, and never add with a panicking `+`. A
+        // huge value used to overflow Instant and abort the whole process (B65).
+        REASON_LOCKED => {
+            let secs = num.unwrap_or(60).min(MAX_LOCK_SECS);
+            Prompt::Locked(Instant::now().checked_add(Duration::from_secs(secs)).unwrap_or_else(Instant::now))
+        }
         _ => return false,
     };
     with_server(|s| {
@@ -298,6 +305,8 @@ mod tests {
         assert!(note_refusal("id-kali", "kali", "pin_required"));
         assert_eq!(prompt(), Some(("kali".into(), Prompt::Needed)));
         assert!(!note_refusal("id-kali", "kali", "bad_secret"));
+        // B65: a lockout number off the wire can be anything; it must not panic.
+        assert!(note_refusal("id-kali", "kali", "pin_locked:18446744073709551615"));
         enter("4321".into());
         assert_eq!(prompt(), None, "typing the PIN clears the prompt");
     }

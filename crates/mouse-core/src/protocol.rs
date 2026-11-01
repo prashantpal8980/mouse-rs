@@ -171,6 +171,11 @@ pub enum Message {
         height: Option<i32>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
+        /// A client's refusal, signed with the pairing key (B65). The server changes
+        /// its PIN prompt only for a refusal that carries a valid one, so a computer
+        /// that never proved itself cannot rewrite it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        proof: Option<String>,
     },
 
     // --- control of who owns input ---

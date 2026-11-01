@@ -252,6 +252,19 @@ fn enable_keepalive(stream: &TcpStream) {
 /// `bulk` receives any connection that declares [`Lane::Bulk`]. Pass
 /// [`BulkServer::disabled`] to refuse them, which is what a build with the bulk lane
 /// turned off does.
+/// Most connections being authenticated at once on the computer with the mouse. Far
+/// above what a few paired computers need; a bound on what a stranger can hold open.
+const MAX_HANDSHAKES: usize = 16;
+
+/// A connection that finished its handshake beside the hub: the stream, where it came
+/// from and arrived, and how the handshake went.
+type Shaken = (
+    Framed<LinkStream, MessageCodec>,
+    SocketAddr,
+    Option<SocketAddr>,
+    Result<Result<ClientHello, String>, tokio::time::error::Elapsed>,
+);
+
 pub async fn run_server(
     cfg: Config,
     params: LinkParams,
@@ -342,6 +355,10 @@ pub async fn run_server(
     let (incoming_tx, mut incoming_rx) = mpsc::unbounded_channel::<(String, Message)>();
     let mut active: Option<String> = None;
     let mut epoch = 0u64;
+    // Handshakes in progress, run beside the hub (see the accept arm).
+    let handshake_slots = Arc::new(tokio::sync::Semaphore::new(MAX_HANDSHAKES));
+    let shake_cfg = Arc::new(cfg.clone());
+    let (shaken_tx, mut shaken_rx) = mpsc::unbounded_channel::<Shaken>();
     // How often a switch asked for by a shortcut or a click is picked up.
     let mut tick = tokio::time::interval(Duration::from_millis(20));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -440,6 +457,14 @@ pub async fn run_server(
 
             // A switch asked for (a shortcut or Connect): take it if that one is here.
             _ = tick.tick() => {
+                // A computer whose pairing was just removed is cut off now, not at its next
+                // reconnect (audit, deferred lead). Its session ends through the usual path.
+                for (dev, l) in live.iter() {
+                    if !l.cancel.is_cancelled() && crate::trust::get(&own, dev).is_none() {
+                        tracing::info!(peer = %l.name, "the pairing with {} was removed; disconnecting it", l.name);
+                        l.cancel.cancel();
+                    }
+                }
                 if let Some(want) = crate::trust::reserved(&own) {
                     if active.as_deref() != Some(want.as_str()) && live.contains_key(&want) {
                         if let Some(old) = active.as_ref().and_then(|a| live.get(a)) {
@@ -464,31 +489,48 @@ pub async fn run_server(
                 let local_addr = tcp.local_addr().ok();
                 enable_keepalive(&tcp);
 
-                // Wrap in TLS if enabled.
-                let stream = match &acceptor {
-                    Some(acc) => match timeout(params.handshake_timeout, acc.accept(tcp)).await {
-                        Ok(Ok(s)) => LinkStream::ServerTls(Box::new(s)),
-                        Ok(Err(e)) => {
-                            let _ = events.send(LinkEvent::Error(format!("tls accept: {e}")));
-                            continue;
-                        }
-                        Err(_) => {
-                            let _ = events.send(LinkEvent::Error("tls accept timed out".into()));
-                            continue;
-                        }
-                    },
-                    None => LinkStream::Plain(tcp),
+                // TLS and the handshake run beside this loop, not in it. Awaited here, one
+                // connection that said nothing held up everything the hub does — input to
+                // the computer in use included — for up to twice the handshake timeout,
+                // and anyone on the network could repeat that for ever. The number at once
+                // is capped, so a flood of silent connections cannot pile up either.
+                let Ok(slot) = handshake_slots.clone().try_acquire_owned() else {
+                    tracing::warn!("{peer_addr}: {MAX_HANDSHAKES} handshakes already in progress; dropped this connection");
+                    continue;
                 };
+                let (acceptor, cfg, events, done, cancel, wait) =
+                    (acceptor.clone(), shake_cfg.clone(), events.clone(), shaken_tx.clone(), cancel.clone(), params.handshake_timeout);
+                tokio::spawn(async move {
+                    let _slot = slot;
+                    let stream = match &acceptor {
+                        Some(acc) => match timeout(wait, acc.accept(tcp)).await {
+                            Ok(Ok(s)) => LinkStream::ServerTls(Box::new(s)),
+                            Ok(Err(e)) => {
+                                let _ = events.send(LinkEvent::Error(format!("tls accept: {e}")));
+                                return;
+                            }
+                            Err(_) => {
+                                let _ = events.send(LinkEvent::Error("tls accept timed out".into()));
+                                return;
+                            }
+                        },
+                        None => LinkStream::Plain(tcp),
+                    };
+                    let mut framed = Framed::new(stream, MessageCodec::new());
+                    // Auth handshake, bounded and cancel-aware. The lane is only known once
+                    // the Hello has been read, so `Connecting` is not announced until we
+                    // know this is the input connection — a bulk connection is plumbing and
+                    // has no business changing what the panel says.
+                    let shook = tokio::select! {
+                        _ = cancel.cancelled() => return,
+                        r = timeout(wait, server_handshake(&mut framed, &cfg)) => r,
+                    };
+                    let _ = done.send((framed, peer_addr, local_addr, shook));
+                });
+            }
 
-                let mut framed = Framed::new(stream, MessageCodec::new());
-                // Auth handshake, bounded and cancel-aware. The lane is only known once
-                // the Hello has been read, so `Connecting` is not announced until we
-                // know this is the input connection — a bulk connection is plumbing and
-                // has no business changing what the panel says.
-                let shook = tokio::select! {
-                    _ = cancel.cancelled() => break,
-                    r = timeout(params.handshake_timeout, server_handshake(&mut framed, &cfg)) => r,
-                };
+            // A connection whose handshake has finished, one way or the other.
+            Some((framed, peer_addr, local_addr, shook)) = shaken_rx.recv() => {
                 let hello = match shook {
                     Ok(Ok(v)) => v,
                     Ok(Err(reason)) if reason.starts_with("pairing:") => {
@@ -891,7 +933,6 @@ async fn connect_once(
     };
     *last_good = Some(addr);
     health.set_peer(addr);
-    note_peer_ip(addr.ip());
     tracing::info!(
         "link to {addr} goes out through {} (candidates tried: {listing}; preference: {})",
         local_path(tcp.local_addr().ok()),
@@ -937,8 +978,14 @@ async fn connect_once(
         _ = cancel.cancelled() => return AttemptOutcome::Cancelled,
         r = timeout(params.handshake_timeout, client_handshake(&mut framed, cfg, Lane::Input)) => r,
     };
-    let (server_name, server_w, server_h) = match server_name {
-        Ok(Ok(v)) => v,
+    let (server_name, server_w, server_h, server_device) = match server_name {
+        Ok(Ok(v)) => {
+            // Only once the server has proved the pairing key (B71): the log shipper
+            // falls back to this address, and a host that merely answered TCP must not
+            // receive the log.
+            note_peer_ip(addr.ip());
+            v
+        }
         // Refused (a different secret, an older version, a server that can't prove the
         // secret). Keep retrying with the usual backoff: the fix happens on the other
         // machine, and the link should come up by itself once it does. Giving up would
@@ -969,7 +1016,37 @@ async fn connect_once(
         Some(key) => Motion::Client { key, server: addr, on_cable, live: None },
         None => Motion::Off,
     };
-    let reason = pump(framed, params, cancel, ch, health, net, motion).await;
+    // Removing the pairing here ends the session at once, not at the next reconnect: a
+    // computer the user has just removed must stop driving this one (audit, deferred lead).
+    let session = cancel.child_token();
+    let revoked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        let (session, revoked, own) = (session.clone(), revoked.clone(), cfg.device_id.clone());
+        tokio::spawn(async move {
+            let mut every = interval(Duration::from_millis(250));
+            loop {
+                tokio::select! {
+                    _ = session.cancelled() => break,
+                    _ = every.tick() => {
+                        if crate::trust::get(&own, &server_device).is_none() {
+                            tracing::info!("the pairing with this server was removed; disconnecting");
+                            revoked.store(true, std::sync::atomic::Ordering::Relaxed);
+                            session.cancel();
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+    }
+    let reason = pump(framed, params, &session, ch, health, net, motion).await;
+    session.cancel(); // stops the watcher
+    if revoked.load(std::sync::atomic::Ordering::Relaxed) && !cancel.is_cancelled() {
+        return AttemptOutcome::Lost {
+            was_connected: true,
+            reason: DisconnectReason::Io("the pairing was removed".into()),
+        };
+    }
     match reason {
         DisconnectReason::Cancelled => AttemptOutcome::Cancelled,
         reason => AttemptOutcome::Lost {
@@ -1187,9 +1264,18 @@ async fn server_handshake(
     let resp = framed.next().await;
     let hmac = match resp {
         Some(Ok(Message::AuthResponse { hmac })) => hmac,
-        // The client refused us, most often over its PIN: ask our user for it.
-        Some(Ok(Message::AuthOk { ok: false, reason, .. })) => {
+        // The client refused us, most often over its PIN: ask our user for it. Only a
+        // refusal signed with the pairing key may change what the panel asks (B65): this
+        // is before the client has proved anything, so an unsigned one could come from any
+        // computer that knows a paired device ID.
+        Some(Ok(Message::AuthOk { ok: false, reason, proof, .. })) => {
             let reason = reason.unwrap_or_else(|| "refused".into());
+            let signed = proof.is_some_and(|p| {
+                auth::verify_refusal(&pairing.key, ends, &binding, &client_nonce, &nonce, &reason, &p)
+            });
+            if !signed {
+                return Err(format!("{name} refused: {reason} (unsigned, so the PIN prompt is left alone)"));
+            }
             return Err(if crate::pin::note_refusal(&device, &name, &reason) {
                 format!("{reason} from {name}")
             } else {
@@ -1214,6 +1300,7 @@ async fn server_handshake(
             width: Some(cfg.screen_width),
             height: Some(cfg.screen_height),
             reason: None,
+            proof: None,
         })
         .await
         .map_err(|e| format!("send auth ok: {e}"))?;
@@ -1380,14 +1467,14 @@ async fn client_pair(
 }
 
 fn refusal(reason: &str) -> Message {
-    Message::AuthOk { ok: false, server: None, width: None, height: None, reason: Some(reason.into()) }
+    Message::AuthOk { ok: false, server: None, width: None, height: None, reason: Some(reason.into()), proof: None }
 }
 
 async fn client_handshake(
     framed: &mut Framed<LinkStream, MessageCodec>,
     cfg: &Config,
     lane: Lane,
-) -> Result<(String, i32, i32), String> {
+) -> Result<(String, i32, i32, String), String> {
     let binding = framed.get_ref().auth_binding()?;
     let client_nonce = auth::generate_nonce_hex();
     framed
@@ -1455,7 +1542,12 @@ async fn client_handshake(
         };
         if let Some(reason) = reason {
             crate::pin::set_awaiting(true);
-            let _ = framed.send(refusal(&reason)).await;
+            // Signed, so the server can trust it enough to ask its user for the PIN (B65).
+            let mut msg = refusal(&reason);
+            if let Message::AuthOk { proof, .. } = &mut msg {
+                *proof = auth::refusal_hex(&pairing.key, ends, &binding, &client_nonce, &nonce, &reason).ok();
+            }
+            let _ = framed.send(msg).await;
             return Err(reason);
         }
     }
@@ -1470,7 +1562,7 @@ async fn client_handshake(
             if lane == Lane::Input {
                 crate::trust::connected_with(&cfg.device_id, &server_device);
             }
-            Ok((server.unwrap_or_else(|| "server".into()), width.unwrap_or(0), height.unwrap_or(0)))
+            Ok((server.unwrap_or_else(|| "server".into()), width.unwrap_or(0), height.unwrap_or(0), server_device))
         }
         Some(Ok(Message::AuthOk { ok: false, reason, .. })) => {
             Err(reason.unwrap_or_else(|| "rejected".into()))
@@ -2548,6 +2640,102 @@ mod tests {
         cancel2.cancel();
         servers.cancel();
         let _ = tokio::join!(s1, s2, c2);
+    }
+
+    /// B65: a computer that knows a paired device ID but not the key answers the
+    /// challenge with a refusal. It must neither crash the server (a huge `pin_locked`
+    /// overflowed Instant and aborted the process) nor touch the PIN prompt.
+    #[tokio::test]
+    async fn an_unsigned_refusal_neither_crashes_the_server_nor_changes_the_pin_prompt() {
+        let _g = crate::pin::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let port = free_port().await;
+        let cancel = CancellationToken::new();
+        let (s_ch, _s_to, _s_from, _s_events) = channels();
+        let server = tokio::spawn(run_server(test_cfg(Role::Server, port, false), fast_params(), cancel.clone(), s_ch, BulkServer::disabled(), LinkHealth::new()));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let before = crate::pin::prompt();
+        for reason in ["pin_locked:18446744073709551615", "pin_required", "wrong_pin:1"] {
+            let tcp = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+            let mut framed = Framed::new(LinkStream::Plain(tcp), MessageCodec::new());
+            framed
+                .send(Message::Hello {
+                    name: "impostor".into(), width: 1, height: 1, version: PROTOCOL_VERSION, lane: Lane::Input,
+                    login_screen: false, nonce: Some(auth::generate_nonce_hex()), device: Some(client_id(port)),
+                })
+                .await
+                .unwrap();
+            assert!(matches!(framed.next().await, Some(Ok(Message::AuthChallenge { .. }))));
+            framed.send(refusal(reason)).await.unwrap();
+            let _ = timeout(Duration::from_millis(300), framed.next()).await;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!server.is_finished(), "the server must survive an unsigned refusal");
+        assert_eq!(crate::pin::prompt(), before, "an unsigned refusal must not change the PIN prompt");
+        assert!(TcpStream::connect(("127.0.0.1", port)).await.is_ok(), "still accepting");
+        cancel.cancel();
+        let _ = timeout(Duration::from_secs(2), server).await;
+    }
+
+    /// Audit, deferred lead: a connection that says nothing used to hold the hub for the
+    /// whole handshake timeout, so a paired computer could not get in meanwhile (and the
+    /// computer in use got no input). The handshake now runs beside the hub.
+    #[tokio::test]
+    async fn a_silent_connection_does_not_hold_up_a_paired_computer() {
+        for tls in [false, true] {
+            let port = free_port().await;
+            let cancel = CancellationToken::new();
+            let (s_ch, _s_to, _s_from, _s_events) = channels();
+            let server = tokio::spawn(run_server(test_cfg(Role::Server, port, tls), fast_params(), cancel.clone(), s_ch, BulkServer::disabled(), LinkHealth::new()));
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            // Silent: connects, sends nothing, stays open past the test.
+            let _silent = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let (c_ch, _c_to, _c_from, mut c_events) = channels();
+            let client = tokio::spawn(run_client(test_cfg(Role::Client, port, tls), fast_params(), cancel.clone(), c_ch, LinkHealth::new()));
+            // fast_params' handshake timeout is 3 s: connecting well inside it proves the
+            // silent one is not being waited on first.
+            assert!(wait_for_connect(&mut c_events, Duration::from_secs(1)).await, "tls={tls}: the paired computer got in");
+            cancel.cancel();
+            let _ = tokio::join!(server, client);
+        }
+    }
+
+    /// Audit, deferred lead: removing a pairing ends a session already running, on
+    /// whichever side it is removed.
+    #[tokio::test]
+    async fn removing_a_pairing_ends_the_live_session() {
+        async fn disconnected(events: &mut mpsc::UnboundedReceiver<LinkEvent>, within: Duration) -> bool {
+            let deadline = tokio::time::Instant::now() + within;
+            loop {
+                match tokio::time::timeout_at(deadline, events.recv()).await {
+                    Ok(Some(LinkEvent::Disconnected(_))) => return true,
+                    Ok(Some(_)) => continue,
+                    _ => return false,
+                }
+            }
+        }
+        for removed_on_server in [true, false] {
+            let port = free_port().await;
+            let cancel = CancellationToken::new();
+            let (s_ch, _s_to, _s_from, _s_events) = channels();
+            let server = tokio::spawn(run_server(test_cfg(Role::Server, port, true), fast_params(), cancel.clone(), s_ch, BulkServer::disabled(), LinkHealth::new()));
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let (c_ch, _c_to, _c_from, mut c_events) = channels();
+            let client = tokio::spawn(run_client(test_cfg(Role::Client, port, true), fast_params(), cancel.clone(), c_ch, LinkHealth::new()));
+            assert!(wait_for_connect(&mut c_events, Duration::from_secs(3)).await);
+            if removed_on_server {
+                crate::trust::remove(&server_id(port), &client_id(port));
+            } else {
+                crate::trust::remove(&client_id(port), &server_id(port));
+            }
+            assert!(
+                disconnected(&mut c_events, Duration::from_secs(1)).await,
+                "removed on the {}: the session must end at once",
+                if removed_on_server { "server" } else { "client" }
+            );
+            cancel.cancel();
+            let _ = tokio::join!(server, client);
+        }
     }
 
     /// Removing a computer refuses it from that moment, without restarting sharing.

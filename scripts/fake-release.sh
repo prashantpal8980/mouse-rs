@@ -25,6 +25,8 @@ export MOUSE_RS_VERSION="$VERSION"
 export MOUSE_RS_UPDATE_URL="$BASE/latest.json"
 # Checks every minute instead of only at start (update::TEST_BUILD).
 export MOUSE_RS_TEST_BUILD=1
+# Signed as a rehearsal: release builds refuse it (B73).
+export MOUSE_RS_CHANNEL=test
 [ -d "$REPO_ROOT/.xdo-shim" ] && export RUSTFLAGS="-L $REPO_ROOT/.xdo-shim"
 
 case "$MODE" in

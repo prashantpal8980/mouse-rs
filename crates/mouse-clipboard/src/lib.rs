@@ -124,7 +124,9 @@ pub struct FileSet {
 
 impl FileSet {
     pub fn total_bytes(&self) -> u64 {
-        self.files.iter().map(|f| f.size).sum()
+        // Saturating: sizes come from the peer, and a wrapped sum (u64::MAX + 2 = 1)
+        // slipped a huge set under the ask-first limit.
+        self.files.iter().fold(0u64, |t, f| t.saturating_add(f.size))
     }
 }
 
@@ -329,6 +331,35 @@ impl ClipboardHistory {
                 _ => false,
             })
             .map(|e| e.id)
+    }
+
+    /// Whether any description of this hash, from either side, says it is a content
+    /// hash. `None` when no entry mentions it.
+    pub fn any_content_hashed(&self, hash: &str) -> Option<bool> {
+        let g = self.inner.lock().ok()?;
+        let mut seen = None;
+        for e in g.entries.iter() {
+            if let ClipPayload::Files(set) = &e.payload {
+                for f in set.files.iter().filter(|f| f.hash == hash) {
+                    if f.content_hashed {
+                        return Some(true);
+                    }
+                    seen = Some(false);
+                }
+            }
+        }
+        seen
+    }
+
+    /// The description of a file **this computer offered**, by hash. Serving reads only
+    /// these (B66): an entry that came from the peer describes the peer's files, and its
+    /// path and kind of id are the peer's to choose.
+    pub fn local_file_ref(&self, hash: &str) -> Option<FileRef> {
+        let g = self.inner.lock().ok()?;
+        g.entries.iter().filter(|e| !e.incoming).find_map(|e| match &e.payload {
+            ClipPayload::Files(set) => set.files.iter().find(|f| f.hash == hash).cloned(),
+            _ => None,
+        })
     }
 
     /// The description of a file we hold a record of, by hash — so a request can be
@@ -1009,7 +1040,12 @@ fn run(
             }
             // Files copied on the other machine: record the description, then decide
             // whether to fetch now, ask first, or do nothing because we already have it.
-            Ok(Message::ClipboardFiles { files: refs, origin, dirs }) if settings.sync_files => {
+            Ok(Message::ClipboardFiles { files: mut refs, origin, dirs }) if settings.sync_files => {
+                // A path on *this* computer is never the peer's to name (B66). Kept, it let
+                // a peer point a "file it copied" at any file here and have it served.
+                for f in refs.iter_mut() {
+                    f.source_path = None;
+                }
                 if let (Some(t), Some(h)) = (transfers.as_mut(), history.as_ref()) {
                     let set = Arc::new(FileSet { files: refs, dirs, origin });
                     let status = t.initial_status(
@@ -2891,7 +2927,13 @@ impl ClipboardHistory {
                     Some(png) => self.record_image(Arc::new(png), img.w, img.h, s.incoming),
                     None => continue, // the pixels were evicted; the row would be dead
                 }
-            } else if let Some(f) = s.files {
+            } else if let Some(mut f) = s.files {
+                // A history saved before B66 was fixed may hold peer-named paths.
+                if s.incoming {
+                    for r in f.files.iter_mut() {
+                        r.source_path = None;
+                    }
+                }
                 let set = Arc::new(FileSet { files: f.files, dirs: f.dirs, origin: f.origin });
                 let status = match cache {
                     Some(c) if set.files.iter().all(|f| c.contains(&f.hash)) => ClipStatus::Ready,

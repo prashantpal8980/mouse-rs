@@ -63,6 +63,11 @@ const BINARY_MAX: u64 = 200 * 1024 * 1024;
 #[derive(Debug, Clone, Deserialize)]
 pub struct Manifest {
     pub version: String,
+    /// "release" for a real release, "test" for a rehearsal (`scripts/fake-release.sh`).
+    /// Signed with everything else, so a rehearsal's description can never pass for a
+    /// release on a customer's computer (B73): both are signed with the same key.
+    #[serde(default)]
+    pub channel: String,
     /// One or two sentences for the banner.
     #[serde(default)]
     pub notes: String,
@@ -152,6 +157,11 @@ fn decode_hex(s: &str) -> Option<Vec<u8>> {
         return None;
     }
     (0..s.len()).step_by(2).map(|i| u8::from_str_radix(s.get(i..i + 2)?, 16).ok()).collect()
+}
+
+/// A release build takes only release descriptions; a test build takes either (B73).
+fn channel_ok(m: &Manifest) -> bool {
+    TEST_BUILD || m.channel == "release"
 }
 
 /// `1.0.10` > `1.0.9`; a release > its own pre-release (`1.0.0` > `1.0.0-test2`);
@@ -260,6 +270,10 @@ fn check() -> Result<Option<Manifest>, String> {
     let json = fetch_small(&agent, MANIFEST_URL)?;
     let sig = fetch_small(&agent, &format!("{MANIFEST_URL}.sig"))?;
     let m = verify(&json, &sig)?;
+    if !channel_ok(&m) {
+        tracing::info!("update: {} is on the {:?} channel, not for this build", m.version, m.channel);
+        return Ok(None);
+    }
     if !is_newer(&m.version, VERSION) {
         return Ok(None);
     }
@@ -484,7 +498,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn versions_order_the_way_people_read_them() {
+    fn a_release_build_takes_only_release_descriptions() {
+        // B73: rehearsals are signed with the same key. Their channel keeps them out.
+        let m = |channel: &str| Manifest {
+            version: "9.9.9".into(),
+            channel: channel.into(),
+            notes: String::new(),
+            files: Default::default(),
+        };
+        assert!(channel_ok(&m("release")));
+        assert_eq!(channel_ok(&m("test")), TEST_BUILD);
+        assert_eq!(channel_ok(&m("")), TEST_BUILD, "a description from before channels existed");
+    }
+
+    #[test]
+        fn versions_order_the_way_people_read_them() {
         assert!(is_newer("1.0.1", "1.0.0"));
         assert!(is_newer("1.0.10", "1.0.9"));
         assert!(is_newer("1.1", "1.0.9"));
