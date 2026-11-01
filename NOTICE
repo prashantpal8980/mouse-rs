@@ -1,0 +1,8 @@
+mouse-rs
+Copyright 2026 Prashant Pal
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+It is built on open-source Rust crates under permissive licences (MIT, Apache-2.0,
+BSD, ISC, Zlib and similar); their copyright notices and licence texts remain with
+those crates.

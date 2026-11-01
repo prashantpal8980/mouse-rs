@@ -4,6 +4,26 @@ Dates are when the work was committed. Item codes refer to
 [docs/KNOWN-ISSUES.md](docs/KNOWN-ISSUES.md) (B…) and
 [docs/UI-REQUIREMENTS.md](docs/UI-REQUIREMENTS.md) (R…).
 
+## 1.0.0 — 2026-11-01 (first public release)
+
+- **Open source** under the Apache License 2.0. Release packages carry `LICENSE`, `NOTICE`
+  and `THIRD-PARTY-LICENSES.txt`.
+- **Security fixes from the pre-launch audit**, each with a regression test (details in
+  [docs/KNOWN-ISSUES.md](docs/KNOWN-ISSUES.md)):
+  - B65: a PIN refusal is now signed with the pairing key. An unpaired computer could crash the computer with the mouse.
+  - B66: a peer can no longer read files that were never shared.
+  - B67, B69: only requested transfers reach the disk; no cache overwrite or disk filling.
+  - B68: the received-files folder is never overwritten.
+  - B70: a replayed UDP motion message can't redirect the pointer.
+  - B71: log upload never goes to an unauthenticated address.
+  - B72: "Start at login as administrator" runs a protected copy in Program Files. It asks once, then never again.
+  - B73: update descriptions carry a signed channel; test releases can't reach users.
+  - B74: a silent connection no longer freezes input.
+  - B75: removing a pairing ends a live session at once.
+- B61: a computer renamed after pairing shows its new name.
+- CI build on GitHub Actions, ready for free code signing through SignPath Foundation
+  ([docs/CODE-SIGNING.md](docs/CODE-SIGNING.md)).
+
 ## 2026-10-13
 
 - **Network following (R22).** Signed UDP discovery beacons, connections raced over every

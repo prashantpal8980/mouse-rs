@@ -1292,6 +1292,8 @@ async fn server_handshake(
         return Err(format!("bad proof from {name}"));
     }
     crate::pin::accepted(&device);
+    // Proved, so its name is its own: a computer renamed since pairing shows as it is now (B61).
+    crate::trust::note_name(&cfg.device_id, &device, &name);
 
     framed
         .send(Message::AuthOk {
@@ -1561,6 +1563,9 @@ async fn client_handshake(
         Some(Ok(Message::AuthOk { ok: true, server, width, height, .. })) => {
             if lane == Lane::Input {
                 crate::trust::connected_with(&cfg.device_id, &server_device);
+                if let Some(n) = server.as_deref() {
+                    crate::trust::note_name(&cfg.device_id, &server_device, n);
+                }
             }
             Ok((server.unwrap_or_else(|| "server".into()), width.unwrap_or(0), height.unwrap_or(0), server_device))
         }
@@ -2736,6 +2741,29 @@ mod tests {
             cancel.cancel();
             let _ = tokio::join!(server, client);
         }
+    }
+
+    /// B61: a computer renamed after pairing shows its new name once it has proved
+    /// itself, on the computer it connects to, and the change is kept for the panel.
+    #[tokio::test]
+    async fn a_renamed_computer_shows_its_new_name_after_proving_itself() {
+        let port = free_port().await;
+        let cancel = CancellationToken::new();
+        let (s_ch, _s_to, _s_from, _s_events) = channels();
+        let server = tokio::spawn(run_server(test_cfg(Role::Server, port, true), fast_params(), cancel.clone(), s_ch, BulkServer::disabled(), LinkHealth::new()));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let mut ccfg = test_cfg(Role::Client, port, true);
+        ccfg.name = "laptop-renamed".into();
+        let (c_ch, _c_to, _c_from, mut c_events) = channels();
+        let client = tokio::spawn(run_client(ccfg, fast_params(), cancel.clone(), c_ch, LinkHealth::new()));
+        assert!(wait_for_connect(&mut c_events, Duration::from_secs(3)).await);
+        assert_eq!(crate::trust::get(&server_id(port), &client_id(port)).unwrap().name, "laptop-renamed");
+        assert_eq!(
+            crate::trust::take_renamed(&server_id(port)),
+            vec![(client_id(port), "laptop-renamed".to_string())]
+        );
+        cancel.cancel();
+        let _ = tokio::join!(server, client);
     }
 
     /// Removing a computer refuses it from that moment, without restarting sharing.

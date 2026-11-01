@@ -127,6 +127,17 @@ Code for items 1–5 depends on these. A suggested answer is given for each; "ye
 - The shared clipboard across laptop + Kali + VM was proven both ways on hardware.
 
 ### Sun 1 Nov: launch
+
+**Sun 1 status (Claude):**
+- Owner decisions today:
+  - The source goes **public under Apache-2.0**.
+  - Releases live on the source repo itself (`prashantpal8980/mouse-rs`), whose Releases page the README links to. This replaces a separate downloads repo.
+  - The product name stays **mouse-rs** for 1.0.0. GitHub redirects a renamed repo, so a later rename keeps the update link working.
+  - Windows code signing: apply to SignPath Foundation (free) after launch (docs/CODE-SIGNING.md).
+- Security audit fixes B65–B75 are in, each with a test. B72 ("Start at login as administrator" → Program Files copy) needs the owner's Windows check: `irm http://192.168.137.2:8000/b72.txt | iex`.
+- B61 fixed. B59 (cosmetic) and B60 and B9 (by design) move to v1.1.
+- `release.sh` ships LICENSE, NOTICE and THIRD-PARTY-LICENSES.txt.
+- The CI workflow builds and tests both platforms on every push.
 - [ ] Owner's go: create the public downloads repo and publish release 1.0.0. The update check now points at it.
 - [ ] Reels: tip: **screen-record during the Tue–Fri tests** (pairing, copy a folder across, lock-screen unlock,
       Wi-Fi ↔ Ethernet switch), so Sunday is just editing, not filming.

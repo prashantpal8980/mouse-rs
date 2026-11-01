@@ -7,7 +7,7 @@
 Move your pointer off the edge of your Windows screen and keep working on Linux.<br>
 Your keyboard follows, and so does your clipboard.
 
-![Windows](https://img.shields.io/badge/Windows-10%20%7C%2011-0078D6?logo=windows&logoColor=white) ![Linux](https://img.shields.io/badge/Linux-X11-FCC624?logo=linux&logoColor=black) ![Rust](https://img.shields.io/badge/built%20with-Rust-B7410E?logo=rust&logoColor=white) ![Tests](https://img.shields.io/badge/tests-330%20passing-2EA043) ![Licence](https://img.shields.io/badge/licence-proprietary-555555)
+![Windows](https://img.shields.io/badge/Windows-10%20%7C%2011-0078D6?logo=windows&logoColor=white) ![Linux](https://img.shields.io/badge/Linux-X11-FCC624?logo=linux&logoColor=black) ![Rust](https://img.shields.io/badge/built%20with-Rust-B7410E?logo=rust&logoColor=white) ![Tests](https://img.shields.io/badge/tests-342%20passing-2EA043) ![Licence](https://img.shields.io/badge/licence-Apache--2.0-2EA043)
 
 [Install](#-install) · [Connect your computers](#-connect-your-computers) · [Update](#-update) · [Report a problem](#-report-a-problem) · [Troubleshooting](#-troubleshooting) · [For developers](#-for-developers)
 
@@ -231,7 +231,7 @@ files pasteable after quitting, and the Windows file toast.
 
 <div align="center">
 
-**Proprietary software.** Copyright © 2026 Prashant Pal. All rights reserved. See [LICENSE](LICENSE).<br>
+**Open source** under the [Apache License 2.0](LICENSE). Copyright © 2026 Prashant Pal.<br>
 Built on open-source crates under permissive licences (MIT, Apache-2.0); their notices ship with every release.
 
 </div>

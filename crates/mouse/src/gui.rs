@@ -1065,6 +1065,8 @@ impl App {
                 if let Some(client) = mouse_core::pairing::take_last_paired() {
                     self.feedback = format!("paired with {client}");
                 }
+                // A paired computer that now goes by another name (B61): save it.
+                self.save_renames();
                 // A computer paired with this one while it showed a code: keep it.
                 if self.save_pairings() {
                     // Its switch shortcut is registered when sharing starts, so start again
@@ -2679,6 +2681,26 @@ impl App {
     /// Has this computer been paired with anyone?
     fn paired(&self) -> bool {
         !self.cfg.paired.is_empty()
+    }
+
+    /// Save the new names of paired computers renamed since pairing (B61).
+    fn save_renames(&mut self) {
+        let renamed = mouse_core::trust::take_renamed(&self.cfg.device_id);
+        if renamed.is_empty() {
+            return;
+        }
+        for (id, name) in &renamed {
+            tracing::info!(device = %id.get(..8).unwrap_or(id), "a paired computer is now called {name}");
+            let lists = [Some(&mut self.cfg.paired), Some(&mut self.saved_cfg.paired), self.live_cfg.as_mut().map(|l| &mut l.paired)];
+            for list in lists.into_iter().flatten() {
+                if let Some(d) = list.iter_mut().find(|d| &d.id == id) {
+                    d.name = name.clone();
+                }
+            }
+        }
+        if let Err(e) = self.cfg.save(&Config::default_path()) {
+            tracing::warn!("could not save a paired computer's new name: {e}");
+        }
     }
 
     /// Save pairings the link made (on either side) that are not in the file yet. True if

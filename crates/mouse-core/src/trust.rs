@@ -21,6 +21,9 @@ struct Store {
     paired: HashMap<String, Vec<PairedDevice>>,
     /// Own device ID → pairings made by the link that the panel has not saved yet.
     unsaved: HashMap<String, Vec<PairedDevice>>,
+    /// Own device ID → paired computers that proved themselves under a new name (B61),
+    /// device ID → name, for the panel to save.
+    renamed: HashMap<String, HashMap<String, String>>,
     /// Own device ID → the device holding this server's input link, if any.
     input_peer: HashMap<String, String>,
     /// Own device ID → the computer this one is to be with (R45): the one it was last
@@ -82,6 +85,32 @@ pub fn add(own: &str, dev: PairedDevice) {
 /// Pairings made since this was last asked, for the panel to save.
 pub fn take_unsaved(own: &str) -> Vec<PairedDevice> {
     with(|s| s.unsaved.remove(own).unwrap_or_default())
+}
+
+/// A paired computer has just proved itself, calling itself `name`. If it was renamed
+/// since pairing, use the new name from now on and keep it for the panel to save (B61).
+/// Only ever called after its proof checked out, so the name is the computer's own.
+pub fn note_name(own: &str, peer: &str, name: &str) {
+    let name: String = name.chars().filter(|c| !c.is_control()).take(64).collect();
+    let name = name.trim();
+    if name.is_empty() {
+        return;
+    }
+    with(|s| {
+        let Some(d) = s.paired.get_mut(own).and_then(|l| l.iter_mut().find(|d| d.id == peer)) else {
+            return;
+        };
+        if d.name == name {
+            return;
+        }
+        d.name = name.to_owned();
+        s.renamed.entry(own.to_owned()).or_default().insert(peer.to_owned(), name.to_owned());
+    })
+}
+
+/// Names learned by [`note_name`] since this was last asked: (device ID, name).
+pub fn take_renamed(own: &str) -> Vec<(String, String)> {
+    with(|s| s.renamed.remove(own).map(|m| m.into_iter().collect()).unwrap_or_default())
 }
 
 /// Forget `peer`: from now on it is refused.

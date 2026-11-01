@@ -4,7 +4,7 @@
 #
 #   scripts/release.sh 1.0.0 [owner/downloads-repo]
 #
-# The repo defaults to prashantpal8980/mouse-rs-downloads. When the product is renamed,
+# The repo defaults to prashantpal8980/mouse-rs, whose Releases page the README links to. When the product is renamed,
 # pass the new downloads repo here: the update check and the "download it yourself" link
 # are built into the binaries, so they must name the repo the release will live in.
 #
@@ -21,7 +21,7 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 VERSION="${1:?usage: release.sh <version> [owner/downloads-repo]}"
-REPO="${2:-prashantpal8980/mouse-rs-downloads}"
+REPO="${2:-prashantpal8980/mouse-rs}"
 case "$VERSION" in *test*) echo "a release version may not contain 'test'" >&2; exit 1;; esac
 
 unset MOUSE_RS_TEST_BUILD
@@ -67,6 +67,9 @@ chmod +x "$OUT/mouse-rs"
 WX="$STAGE/mouse-rs-$VERSION-windows-x86_64"
 mkdir -p "$WX"
 cp "$WIN_BIN" "$WX/mouse-rs.exe"
+# Apache-2.0 for mouse-rs itself, and the notices of every crate built into it.
+cp LICENSE NOTICE "$WX/"
+python3 scripts/third-party-licenses.py "$WX/THIRD-PARTY-LICENSES.txt" --filter-platform "$WIN_TARGET"
 cat > "$WX/README.txt" <<EOF
 mouse-rs $VERSION for Windows 10 and 11
 
@@ -90,6 +93,8 @@ EOF
 LX="$STAGE/mouse-rs-$VERSION-linux-x86_64"
 mkdir -p "$LX/lib"
 cp "$LIN_BIN" "$LX/mouse-rs"
+cp LICENSE NOTICE "$LX/"
+python3 scripts/third-party-licenses.py "$LX/THIRD-PARTY-LICENSES.txt" --filter-platform x86_64-unknown-linux-gnu
 LIBXDO="$(ldconfig -p 2>/dev/null | sed -nE 's/.*=> (.*libxdo\.so\.[0-9]+)$/\1/p' | head -1 || true)"
 [ -n "$LIBXDO" ] && cp -L "$LIBXDO" "$LX/lib/libxdo.so.3"
 cat > "$LX/run.sh" <<'EOF'
